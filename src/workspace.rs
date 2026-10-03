@@ -828,19 +828,12 @@ impl Workspace {
                         if ui.add(theme::ghost_button(label)).clicked() {
                             hunks_to_apply = Some((hunk_index, header.clone(), self.diff_from_index));
                         }
-                        ui.label(RichText::new(line).color(theme::STATUS_YELLOW).font(theme::field_font(11.0)));
+                        ui.label(RichText::new(line).color(theme::DIFF_HUNK).font(theme::field_font(11.0)));
                     });
                     hunk_index += 1;
                     continue;
                 }
-                let colour = if line.starts_with('+') && !line.starts_with("+++") {
-                    theme::STATUS_GREEN
-                } else if line.starts_with('-') && !line.starts_with("---") {
-                    theme::STATUS_RED
-                } else {
-                    theme::DIM
-                };
-                ui.label(RichText::new(line).color(colour).font(theme::field_font(11.0)));
+                patch_line(ui, line);
             }
         }
         if let Some((index, header, from_index)) = hunks_to_apply {
@@ -877,7 +870,7 @@ impl Workspace {
         let author = lines.next().unwrap_or("").to_owned();
         let date = lines.next().unwrap_or("").to_owned();
         let subject = display(lines.next().unwrap_or(""), 300);
-        let body: String = display(&lines.collect::<Vec<_>>().join("\n"), 2000);
+        let body: String = display_multiline(&lines.collect::<Vec<_>>().join("\n"), 2000);
         ui.label(RichText::new(subject).color(theme::TEXT).font(theme::font(12.5)));
         ui.label(RichText::new(format!("{} · {}", display(&author, 80), display(&date, 40))).color(theme::FAINT).font(theme::font(10.5)));
         ui.label(RichText::new(full_hash).color(theme::FAINT).font(theme::field_font(10.5)));
@@ -897,16 +890,7 @@ impl Workspace {
         theme::hairline(ui);
         ScrollArea::vertical().id_salt("workspace-commit-patch").auto_shrink([false, false]).show(ui, |ui| {
             for line in detail.patch.lines() {
-                let colour = if line.starts_with('+') && !line.starts_with("+++") {
-                    theme::STATUS_GREEN
-                } else if line.starts_with('-') && !line.starts_with("---") {
-                    theme::STATUS_RED
-                } else if line.starts_with("@@") {
-                    theme::STATUS_YELLOW
-                } else {
-                    theme::DIM
-                };
-                ui.label(RichText::new(line).color(colour).font(theme::field_font(11.0)));
+                patch_line(ui, line);
             }
         });
     }
@@ -1084,6 +1068,32 @@ fn section_color(section: git::Section) -> egui::Color32 {
     }
 }
 
+/// One patch line: added and removed lines get a full-width tinted band with
+/// the line colour on top, as in the reference diff view — colouring only the
+/// text is easy to miss.
+fn patch_line(ui: &mut egui::Ui, line: &str) {
+    // The bands must tile: any item spacing would show as a gap between lines.
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let (band, colour) = if line.starts_with('+') && !line.starts_with("+++") {
+        (Some(theme::DIFF_ADD_BG), theme::STATUS_GREEN)
+    } else if line.starts_with('-') && !line.starts_with("---") {
+        (Some(theme::DIFF_REMOVE_BG), theme::STATUS_RED)
+    } else if line.starts_with("@@") {
+        (None, theme::DIFF_HUNK)
+    } else {
+        (None, theme::DIM)
+    };
+    let galley = ui.painter().layout(line.to_owned(), theme::field_font(11.0), colour, ui.available_width());
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, galley.size().y), Sense::hover());
+    if let Some(band) = band {
+        // Half-pixel bleed: two bands sharing a fractional edge would blend
+        // with the background where they meet and read as a torn line.
+        ui.painter().rect_filled(rect.expand2(Vec2::new(0.0, 0.5)), 0.0, band);
+    }
+    ui.painter().galley(rect.min, galley, colour);
+}
+
 /// Untrusted names, subjects and bodies may contain control or bidirectional
 /// characters: they would break the fixed row grid or spoof a file extension,
 /// so they are stripped and bounded before painting.
@@ -1091,6 +1101,29 @@ fn display(text: &str, max_chars: usize) -> String {
     let mut out = String::with_capacity(text.len().min(max_chars * 4));
     let mut count = 0;
     for ch in text.chars() {
+        if ch.is_control() || is_format_control(ch) {
+            continue;
+        }
+        if count >= max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+        count += 1;
+    }
+    out
+}
+
+/// Like `display`, but keeps line breaks: commit bodies and patches are prose
+/// whose line structure carries meaning.
+fn display_multiline(text: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(text.len().min(max_chars * 4));
+    let mut count = 0;
+    for ch in text.chars() {
+        if ch == '\n' {
+            out.push('\n');
+            continue;
+        }
         if ch.is_control() || is_format_control(ch) {
             continue;
         }
