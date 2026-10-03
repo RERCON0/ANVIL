@@ -119,3 +119,28 @@ fn non_repository_is_reported_as_such() {
     assert!(git::find_root(&nested).is_none());
     assert!(git::status(&nested).is_err() || git::status(&nested).unwrap().changes.is_empty());
 }
+
+#[test]
+fn commit_detail_lists_files_and_patch() {
+    let Some(dir) = repo() else { return };
+    let root = git::find_root(dir.path()).expect("root");
+    std::fs::write(dir.path().join("tracked.txt"), "one\ntwo\n").unwrap();
+    run(dir.path(), &["add", "tracked.txt"]);
+    run(dir.path(), &["commit", "--quiet", "-m", "add a line"]);
+
+    let head = git::log(&root).expect("log").commits.first().expect("a commit").hash.clone();
+    let detail = git::commit_detail(&root, &head).expect("commit detail");
+    assert!(
+        detail.files.iter().any(|(status, path, additions, _)| *status == 'M' && path == "tracked.txt" && *additions == 1),
+        "files: {:?}",
+        detail.files
+    );
+    assert!(detail.patch.contains("+two"), "patch: {}", detail.patch);
+    assert!(detail.header.contains("add a line"), "header: {}", detail.header);
+
+    // A root commit has no parent and must still show its files and patch.
+    let first_hash = git::log(&root).expect("log").commits.last().expect("a commit").hash.clone();
+    let first = git::commit_detail(&root, &first_hash).expect("root commit detail");
+    assert!(first.files.iter().any(|(_, path, _, _)| path == "src/lib.rs"), "files: {:?}", first.files);
+    assert!(first.patch.contains("+pub fn a() {}"), "patch: {}", first.patch);
+}

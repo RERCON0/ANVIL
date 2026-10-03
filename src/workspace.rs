@@ -197,6 +197,21 @@ impl Workspace {
             match response {
                 Response::Status(status, root) => {
                     self.busy = false;
+                    // Another repository invalidates everything read from the
+                    // previous one: its commits, file browser and open commit
+                    // must never be shown under the new header.
+                    let root_changed = self.root != root;
+                    if root_changed {
+                        self.selected.clear();
+                        self.diff_path = None;
+                        self.diff_text.clear();
+                        self.diff_files.clear();
+                        self.detail = None;
+                        self.files.clear();
+                        self.file_preview = None;
+                        self.log = CommitLog::default();
+                        self.graph.clear();
+                    }
                     self.root = root;
                     self.status = status;
                     self.selected.retain(|path| self.status.changes.iter().any(|change| &change.path == path));
@@ -209,10 +224,10 @@ impl Workspace {
                             self.send(Request::Diff { path });
                         }
                     }
-                    if self.log.commits.is_empty() {
+                    if root_changed || self.log.commits.is_empty() {
                         self.send(Request::Log);
                     }
-                    if self.tab == PanelTab::Files && self.files.is_empty() {
+                    if root_changed || (self.tab == PanelTab::Files && self.files.is_empty()) {
                         self.send(Request::Files);
                     }
                 }
@@ -295,7 +310,12 @@ impl Workspace {
                     (PanelTab::Files, strings::WORKSPACE_TAB_FILES.to_owned()),
                     (PanelTab::Changes, strings::workspace_changes_tab(self.status.changes.len())),
                 ] {
-                    if theme::choice(ui, &label, self.tab == tab).clicked() {
+                    // Framed like the other panel chips, with the selection dot
+                    // of the settings rows inside.
+                    let selected = self.tab == tab;
+                    let (dot, color) = if selected { ("●", theme::ACCENT) } else { ("○", theme::DIM) };
+                    let text = egui::RichText::new(format!("{dot} {label}")).font(theme::field_font(12.5)).color(color);
+                    if ui.add(egui::Button::new(text)).clicked() {
                         self.tab = tab;
                         self.refresh_soon();
                         match tab {
@@ -1045,13 +1065,13 @@ enum Row {
     File { change: Change },
 }
 
-/// Graph colours by commit section: unpushed commits are pink, incoming
-/// purple, already-pushed history blue (the owner's request, VS Code tones).
+/// Graph colours by commit section. The owner wants commits in the pale pink
+/// of their reference (#D488B4) rather than the saturated magenta; only the
+/// incoming ones stay purple, so the sections are told apart by their headers.
 fn section_color(section: git::Section) -> egui::Color32 {
     match section {
-        git::Section::Outgoing => egui::Color32::from_rgb(0xDC, 0x26, 0x7F),
         git::Section::Incoming => egui::Color32::from_rgb(0xB1, 0x80, 0xD7),
-        git::Section::History => egui::Color32::from_rgb(0x59, 0xA4, 0xF9),
+        git::Section::Outgoing | git::Section::History => egui::Color32::from_rgb(0xD4, 0x88, 0xB4),
     }
 }
 
@@ -1339,4 +1359,51 @@ fn delete_path(root: &Path, path: &str) -> Result<(), String> {
 /// Width clamped to the panel bounds.
 pub fn clamp_width(width: f32) -> f32 {
     width.clamp(MIN_WIDTH, MAX_WIDTH)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn commit(hash: &str, section: git::Section) -> git::Commit {
+        git::Commit {
+            hash: hash.to_owned(),
+            short: hash[..7].to_owned(),
+            parents: Vec::new(),
+            author: "tester".to_owned(),
+            subject: format!("commit {hash}"),
+            refs: Vec::new(),
+            time: 0,
+            section,
+        }
+    }
+
+    /// A status from another repository must not leave the previous
+    /// repository's commits, files or open commit on screen.
+    #[test]
+    fn switching_repositories_drops_the_previous_view() {
+        let mut workspace = Workspace {
+            root: Some(PathBuf::from("C:/old")),
+            log: CommitLog { commits: vec![commit("0123456789", git::Section::History)], upstream: None, truncated: false },
+            files: vec!["old.txt".to_owned()],
+            file_preview: Some(("old.txt".to_owned(), "text".to_owned(), false)),
+            detail: Some(("0123456789".to_owned(), git::CommitDetail { files: Vec::new(), patch: String::new(), header: String::new() })),
+            ..Default::default()
+        };
+        workspace.selected.insert("old.txt".to_owned());
+
+        let (request_tx, request_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+        workspace.tx = Some(request_tx);
+        workspace.rx = Some(response_rx);
+        response_tx.send(Response::Status(Status::default(), Some(PathBuf::from("C:/new")))).unwrap();
+        let _ = request_rx.try_iter().count();
+
+        assert!(workspace.absorb(), "a response must ask for a repaint");
+        assert!(workspace.log.commits.is_empty(), "the other repository's commits must be dropped");
+        assert!(workspace.graph.is_empty() && workspace.files.is_empty() && workspace.detail.is_none());
+        assert!(workspace.selected.is_empty() && workspace.file_preview.is_none());
+        let requests: Vec<Request> = request_rx.try_iter().collect();
+        assert!(requests.iter().any(|request| matches!(request, Request::Log)), "the new repository must be read again");
+    }
 }

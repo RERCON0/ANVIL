@@ -79,11 +79,64 @@ pub fn show(ctx: &egui::Context, picker: &mut PickerState, profiles: &[(String, 
             }
         });
     if let Some(window) = window {
-        if window.response.clicked_elsewhere() {
+        if picker.opened_pass != ctx.cumulative_pass_nr() && window.response.clicked_elsewhere() {
             outcome = PickerOutcome::Closed;
         }
     } else {
         outcome = PickerOutcome::Closed;
     }
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::PickerState;
+
+    fn profiles() -> Vec<(String, String)> {
+        vec![("powershell".to_owned(), "PowerShell".to_owned()), ("gitbash".to_owned(), "Git Bash".to_owned())]
+    }
+
+    fn click(pos: egui::Pos2) -> egui::RawInput {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(1280.0, 800.0))),
+            ..Default::default()
+        };
+        let button = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        input.events.push(egui::Event::PointerMoved(pos));
+        input.events.push(button(true));
+        input.events.push(button(false));
+        input
+    }
+
+    fn run(ctx: &egui::Context, picker: &mut PickerState, input: egui::RawInput) -> PickerOutcome {
+        let profiles = profiles();
+        let mut outcome = PickerOutcome::None;
+        let _ = ctx.run(input, |ctx| outcome = show(ctx, picker, &profiles));
+        outcome
+    }
+
+    /// The very click that opens the picker must not count as a click
+    /// elsewhere, or the window closes in the frame where it appears.
+    #[test]
+    fn the_opening_click_keeps_the_picker_open() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        let profiles = profiles();
+        let mut picker = PickerState { filter: String::new(), selected: 0, focus: true, opened_pass: 0 };
+        let mut outcomes = Vec::new();
+        let _ = ctx.run(click(egui::Pos2::new(300.0, 300.0)), |ctx| {
+            // The panel action re-arms `opened_pass` in every pass of the
+            // frame, exactly like the tabbar button that opened the picker.
+            if ctx.input(|i| i.pointer.any_click()) {
+                picker.opened_pass = ctx.cumulative_pass_nr();
+            }
+            outcomes.push(show(ctx, &mut picker, &profiles));
+        });
+        assert!(outcomes.iter().all(|outcome| matches!(outcome, PickerOutcome::None)), "the opening click closed the picker");
+
+        // An idle frame keeps it open, a later click outside closes it.
+        assert!(matches!(run(&ctx, &mut picker, egui::RawInput::default()), PickerOutcome::None));
+        assert!(matches!(run(&ctx, &mut picker, click(egui::Pos2::new(300.0, 300.0))), PickerOutcome::Closed));
+    }
 }

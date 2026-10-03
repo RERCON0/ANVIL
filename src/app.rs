@@ -56,6 +56,9 @@ pub struct PickerState {
     pub filter: String,
     pub selected: usize,
     pub focus: bool,
+    /// The pass the picker appeared in. The click that opened it is otherwise
+    /// "a click elsewhere" for the brand-new window and closes it at once.
+    pub opened_pass: u64,
 }
 
 #[derive(Default)]
@@ -452,7 +455,7 @@ impl AnvilApp {
                 let cwd = self.focused_cwd();
                 self.new_tab_at_end(&profile, cwd);
             }
-            tabbar::TabbarAction::Profiles => self.open_picker(),
+            tabbar::TabbarAction::Profiles => self.open_picker(ctx),
             tabbar::TabbarAction::Settings => {
                 self.settings_open = true;
                 ctx.request_repaint();
@@ -657,7 +660,7 @@ impl AnvilApp {
                     self.new_tab_at_end(&profile, cwd);
                 }
             }
-            Action::ProfileSelector => self.open_picker(),
+            Action::ProfileSelector => self.open_picker(ctx),
             Action::Settings => self.settings_open = true,
             Action::ToggleFullscreen => commands.push(WindowCommand::ToggleFullscreen),
             Action::CtrlC => {
@@ -1517,8 +1520,8 @@ impl AnvilApp {
         ctx.request_repaint_after(Duration::from_millis(200));
     }
 
-    fn open_picker(&mut self) {
-        self.ui.picker = Some(PickerState { filter: String::new(), selected: 0, focus: true });
+    fn open_picker(&mut self, ctx: &egui::Context) {
+        self.ui.picker = Some(PickerState { filter: String::new(), selected: 0, focus: true, opened_pass: ctx.cumulative_pass_nr() });
     }
 
     fn show_picker(&mut self, ctx: &egui::Context) {

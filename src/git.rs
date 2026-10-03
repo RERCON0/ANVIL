@@ -500,10 +500,10 @@ pub fn commit_detail(root: &Path, hash: &str) -> Result<CommitDetail, String> {
     if !is_object_hash(hash) {
         return Err(crate::strings::WORKSPACE_NO_SUCH_FILE.to_owned());
     }
-    // `--end-of-options` keeps a revision from ever being read as an option.
-    let base: Vec<&str> = vec!["show", "--no-color", "--format=", "--end-of-options", hash];
-    let name_status = run_git_bytes(root, &base.iter().copied().chain(["--name-status", "-z"]).collect::<Vec<_>>())?;
-    let numstat = run_git_bytes(root, &base.iter().copied().chain(["--numstat", "-z"]).collect::<Vec<_>>())?;
+    // `--end-of-options` keeps a revision from ever being read as an option,
+    // so every option must precede it: git rejects options that follow.
+    let name_status = run_git_bytes(root, &["show", "--no-color", "--format=", "--name-status", "-z", "--end-of-options", hash])?;
+    let numstat = run_git_bytes(root, &["show", "--no-color", "--format=", "--numstat", "-z", "--end-of-options", hash])?;
     let stats = parse_numstat(&numstat);
     let mut files = Vec::new();
     let mut records = name_status.split(|b| *b == 0).filter(|record| !record.is_empty());
@@ -534,10 +534,10 @@ pub fn commit_detail(root: &Path, hash: &str) -> Result<CommitDetail, String> {
         let (additions, deletions) = stats.get(&path).copied().unwrap_or((0, 0));
         files.push((status, path, additions, deletions));
     }
-    let header = run_git(root, &["show", "--no-patch", "--end-of-options", "--format=%H%n%an <%ae>%n%ci%n%s%n%b", hash]).unwrap_or_default();
+    let header = run_git(root, &["show", "--no-patch", "--format=%H%n%an <%ae>%n%ci%n%s%n%b", "--end-of-options", hash]).unwrap_or_default();
     let patch = run_git(
         root,
-        &["show", "--no-color", "--no-ext-diff", "--end-of-options", "--unified=3", "--format=", "-m", "--first-parent", hash],
+        &["show", "--no-color", "--no-ext-diff", "--unified=3", "--format=", "-m", "--first-parent", "--end-of-options", hash],
     )
     .unwrap_or_default();
     Ok(CommitDetail { files, patch, header })
