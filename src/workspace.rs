@@ -23,6 +23,15 @@ pub const MAX_WIDTH: f32 = 800.0;
 const LANE_WIDTH: f32 = 11.0;
 /// Room the commit subject keeps even when a row is crowded with ref chips.
 const MIN_SUBJECT_WIDTH: f32 = 72.0;
+/// Files larger than this are skipped by "Посчитать строки".
+const MAX_COUNTED_FILE: u64 = 4 * 1024 * 1024;
+/// Height of one file-browser row; the list height is a multiple of it.
+const FILE_ROW_HEIGHT: f32 = 20.0;
+/// Width of the line-number gutter of the diff views.
+const GUTTER: f32 = 36.0;
+/// The Seti folder glyph (U+E032, "folder" in the font) in the folder blue of
+/// the reference file tree.
+const FOLDER_ICON: (char, egui::Color32) = ('\u{e032}', egui::Color32::from_rgb(0x7B, 0xB3, 0xD9));
 
 pub enum Request {
     Refresh { cwd: PathBuf },
@@ -33,6 +42,8 @@ pub enum Request {
     Log,
     CommitDetail { hash: String },
     Files,
+    /// Lines of every tracked file of the repository.
+    CountLines,
     ReadFile { path: String },
     /// `header` is the `@@ … @@` line the user saw; the worker refuses to apply
     /// when the freshly generated diff no longer has it at `index`.
@@ -54,6 +65,7 @@ pub enum Response {
     Log(CommitLog),
     CommitDetail { hash: String, detail: git::CommitDetail },
     Files(Vec<String>),
+    LineCount { files: usize, lines: u64 },
     FileText { path: String, text: String, truncated: bool },
     Applied,
     Fetched(String),
@@ -118,6 +130,10 @@ pub struct Workspace {
     pub graph: Vec<graph::Row>,
     pub detail: Option<(String, git::CommitDetail)>,
     pub files: Vec<String>,
+    /// Folders of the file tree that the user opened; the tree starts folded.
+    pub file_expanded: HashSet<String>,
+    /// Files and total lines of the last "Посчитать строки" run.
+    pub line_count: Option<(usize, u64)>,
     pub file_filter: String,
     pub file_preview: Option<(String, String, bool)>,
     pub prompt: Option<Prompt>,
@@ -148,6 +164,8 @@ impl Default for Workspace {
             graph: Vec::new(),
             detail: None,
             files: Vec::new(),
+            file_expanded: HashSet::new(),
+            line_count: None,
             file_filter: String::new(),
             file_preview: None,
             prompt: None,
@@ -210,6 +228,7 @@ impl Workspace {
                         self.diff_files.clear();
                         self.detail = None;
                         self.files.clear();
+                        self.line_count = None;
                         self.file_preview = None;
                         self.log = CommitLog::default();
                         self.graph.clear();
@@ -273,6 +292,10 @@ impl Workspace {
                     self.busy = false;
                     self.files = files;
                 }
+                Response::LineCount { files, lines } => {
+                    self.busy = false;
+                    self.line_count = Some((files, lines));
+                }
                 Response::FileText { path, text, truncated } => {
                     self.busy = false;
                     self.file_preview = Some((path, text, truncated));
@@ -308,6 +331,9 @@ impl Workspace {
         // in the salt two panels share one id, and egui paints a clash overlay
         // over them (and their scroll state is shared).
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner).id_salt(("workspace-panel", pane)), |ui| {
+            // Reserve the scroll-bar strip instead of letting it float over the
+            // rows: file names and hashes were running underneath it.
+            ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
             // Two modes only: the changes view keeps commits in the same
             // column (one scroll), the file browser is separate.
             ui.horizontal(|ui| {
@@ -820,7 +846,9 @@ impl Workspace {
         {
             let ui = &mut *ui;
             let mut hunk_index = 0;
+            let mut numbers = PatchNumbers::default();
             for line in self.diff_text.lines() {
+                let number = numbers.line(line);
                 if line.starts_with("@@") {
                     let label = if self.diff_from_index { "◂" } else { "▸" };
                     let header = line.to_owned();
@@ -833,7 +861,7 @@ impl Workspace {
                     hunk_index += 1;
                     continue;
                 }
-                patch_line(ui, line);
+                patch_line(ui, line, number);
             }
         }
         if let Some((index, header, from_index)) = hunks_to_apply {
@@ -889,13 +917,140 @@ impl Workspace {
         }
         theme::hairline(ui);
         ScrollArea::vertical().id_salt("workspace-commit-patch").auto_shrink([false, false]).show(ui, |ui| {
+            let mut numbers = PatchNumbers::default();
             for line in detail.patch.lines() {
-                patch_line(ui, line);
+                let number = numbers.line(line);
+                patch_line(ui, line, number);
             }
         });
     }
 
     // ---- files -----------------------------------------------------------
+
+    /// Rows of the file tree, honouring the expanded folders (the tree starts
+    /// folded, so only the top level is visible until a folder is opened). The
+    /// file list is sorted, so a folder starts a row exactly when it is not
+    /// shared with the previous path.
+    fn file_tree(&self) -> Vec<FileRow> {
+        let mut rows = Vec::new();
+        let mut previous: Vec<String> = Vec::new();
+        for path in &self.files {
+            let segments: Vec<&str> = path.split('/').collect();
+            let (dirs, name) = segments.split_at(segments.len() - 1);
+            let folders: Vec<String> = (0..dirs.len()).map(|index| dirs[..=index].join("/")).collect();
+            let shared = folders.iter().zip(previous.iter()).take_while(|(current, seen)| current == seen).count();
+            // A folder that is not expanded hides the whole subtree below it.
+            let mut hidden = folders[..shared].iter().any(|folder| !self.file_expanded.contains(folder));
+            for (index, (segment, folder)) in dirs.iter().zip(folders.iter()).enumerate().skip(shared) {
+                if !hidden {
+                    rows.push(FileRow { depth: index, name: (*segment).to_owned(), dir: None, path: folder.clone(), folder: true });
+                }
+                if !self.file_expanded.contains(folder) {
+                    hidden = true;
+                }
+            }
+            if !hidden && !name.is_empty() {
+                rows.push(FileRow { depth: dirs.len(), name: name[0].to_owned(), dir: None, path: path.clone(), folder: false });
+            }
+            previous = folders;
+        }
+        rows
+    }
+
+    /// One row of the file browser; returns the path to open when a file was
+    /// clicked. Folders fold instead.
+    fn file_row(&mut self, ui: &mut egui::Ui, row: &FileRow) -> Option<String> {
+        let width = ui.available_width();
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(width, FILE_ROW_HEIGHT), Sense::click());
+        let painter = ui.painter_at(rect);
+        if response.hovered() {
+            painter.rect_filled(rect, 0.0, theme::TAB_HOVER_BG);
+        }
+        let indent = row.depth as f32 * 12.0;
+        let mut opened = None;
+        if row.folder {
+            let open = self.file_expanded.contains(&row.path);
+            // The chevron is the affordance for folding: big and bright enough
+            // to read at a glance (the whole row toggles).
+            painter.text(
+                egui::Pos2::new(rect.min.x + 5.0 + indent, rect.center().y),
+                Align2::LEFT_CENTER,
+                if open { "▾" } else { "▸" },
+                theme::font(12.5),
+                theme::DIM,
+            );
+            painter.text(
+                egui::Pos2::new(rect.min.x + 18.0 + indent, rect.center().y),
+                Align2::LEFT_CENTER,
+                FOLDER_ICON.0,
+                theme::icon_font(13.0),
+                FOLDER_ICON.1,
+            );
+            let name = elide(&painter, &row.name, theme::font(11.5), (rect.width() - indent - 38.0).max(24.0));
+            painter.text(
+                egui::Pos2::new(rect.min.x + 34.0 + indent, rect.center().y),
+                Align2::LEFT_CENTER,
+                name,
+                theme::font(11.5),
+                theme::TEXT,
+            );
+            if response.clicked() {
+                if self.file_expanded.contains(&row.path) {
+                    self.file_expanded.remove(&row.path);
+                } else {
+                    self.file_expanded.insert(row.path.clone());
+                }
+            }
+        } else {
+            let (icon, icon_color) = crate::file_icons::for_file(&row.name);
+            painter.text(
+                egui::Pos2::new(rect.min.x + 4.0 + indent, rect.center().y),
+                Align2::LEFT_CENTER,
+                icon,
+                theme::icon_font(13.0),
+                icon_color,
+            );
+            // Long paths must not run past the row: keep the file name whole
+            // and elide the folders in front of it.
+            let mut x = rect.min.x + 20.0 + indent;
+            let limit = (rect.width() - indent - 24.0).max(24.0);
+            let name = elide(&painter, &row.name, theme::font(11.5), limit);
+            let name_width = painter.layout_no_wrap(name.clone(), theme::font(11.5), theme::TEXT).size().x;
+            if let Some(dir) = &row.dir {
+                let dir_limit = (limit - name_width).max(0.0);
+                if dir_limit > 10.0 {
+                    let dir = elide_front(&painter, dir, theme::font(11.0), dir_limit);
+                    let galley = painter.layout_no_wrap(dir, theme::font(11.0), theme::FAINT);
+                    painter.galley(egui::Pos2::new(x, rect.center().y - galley.size().y / 2.0), galley.clone(), theme::FAINT);
+                    x += galley.size().x;
+                }
+            }
+            painter.text(egui::Pos2::new(x, rect.center().y), Align2::LEFT_CENTER, name, theme::font(11.5), theme::TEXT);
+            if response.clicked() {
+                opened = Some(row.path.clone());
+            }
+        }
+        let path = row.path.clone();
+        response.context_menu(|ui| {
+            if ui.button(strings::WORKSPACE_OPEN_EXTERNAL).clicked() {
+                open_external(&self.root, &path);
+                ui.close_menu();
+            }
+            if ui.button(strings::WORKSPACE_REVEAL).clicked() {
+                reveal_in_explorer(&self.root, &path);
+                ui.close_menu();
+            }
+            if ui.button(strings::WORKSPACE_RENAME).clicked() {
+                self.prompt = Some(Prompt { kind: PromptKind::Rename(path.clone()), text: path.clone(), focus: true });
+                ui.close_menu();
+            }
+            if ui.button(strings::WORKSPACE_DELETE).clicked() {
+                self.prompt = Some(Prompt { kind: PromptKind::Delete(path.clone()), text: String::new(), focus: false });
+                ui.close_menu();
+            }
+        });
+        opened
+    }
 
     fn files_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
@@ -909,6 +1064,13 @@ impl Workspace {
                 self.busy = true;
                 self.send(Request::Files);
             }
+            if ui.add(theme::ghost_button(strings::WORKSPACE_COUNT_LINES)).clicked() {
+                self.busy = true;
+                self.send(Request::CountLines);
+            }
+            if let Some((files, lines)) = self.line_count {
+                ui.label(RichText::new(strings::workspace_line_count(files, lines)).color(theme::ACCENT).font(theme::font(11.0)));
+            }
         });
         ui.add(
             egui::TextEdit::singleline(&mut self.file_filter)
@@ -916,72 +1078,41 @@ impl Workspace {
                 .hint_text(strings::WORKSPACE_FILE_FILTER)
                 .desired_width(f32::INFINITY),
         );
-        let mut matches: Vec<(i32, &String)> = self
-            .files
-            .iter()
-            .filter_map(|path| crate::profiles::fuzzy_score(&self.file_filter, path).map(|score| (score, path)))
-            .collect();
-        matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-        const ROW_HEIGHT: f32 = 20.0;
-        let list_height = (ui.available_height() * 0.45).clamp(100.0, 320.0);
+        let searching = !self.file_filter.trim().is_empty();
+        // A search lists the ranked hits flat; an empty filter shows the tree.
+        let rows: Vec<FileRow> = if searching {
+            let mut matches: Vec<(i32, &String)> = self
+                .files
+                .iter()
+                .filter_map(|path| crate::profiles::fuzzy_score(&self.file_filter, path).map(|score| (score, path)))
+                .collect();
+            matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+            matches
+                .iter()
+                .take(400)
+                .map(|(_, path)| {
+                    let (dir, name) = match path.rfind('/') {
+                        Some(index) => (&path[..index + 1], &path[index + 1..]),
+                        None => ("", path.as_str()),
+                    };
+                    FileRow { depth: 0, name: display(name, 120), dir: Some(display(dir, 120)), path: (*path).clone(), folder: false }
+                })
+                .collect()
+        } else {
+            self.file_tree()
+        };
+        // The list fills the panel when no preview is open, and always ends on
+        // a whole row: a height that is not a multiple of the row height cut
+        // the last row in half.
+        let room = if self.file_preview.is_some() { ui.available_height() * 0.45 } else { ui.available_height() };
+        let list_height = (room / FILE_ROW_HEIGHT).floor().max(1.0) * FILE_ROW_HEIGHT;
         let mut open_file: Option<String> = None;
         ScrollArea::vertical().id_salt("workspace-files").max_height(list_height).auto_shrink([false, false]).show(ui, |ui| {
-            for (_, path) in matches.iter().take(400) {
-                let width = ui.available_width();
-                let (rect, response) = ui.allocate_exact_size(Vec2::new(width, ROW_HEIGHT), Sense::click());
-                let painter = ui.painter_at(rect);
-                if response.hovered() {
-                    painter.rect_filled(rect, 0.0, theme::TAB_HOVER_BG);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for row in &rows {
+                if let Some(path) = self.file_row(ui, row) {
+                    open_file = Some(path);
                 }
-                let (dir, name) = match path.rfind('/') {
-                    Some(index) => (&path[..index + 1], &path[index + 1..]),
-                    None => ("", path.as_str()),
-                };
-                let name = display(name, 80);
-                let dir = display(dir, 80);
-                let (icon, icon_color) = crate::file_icons::for_file(&name);
-                painter.text(
-                    egui::Pos2::new(rect.min.x + 4.0, rect.center().y),
-                    Align2::LEFT_CENTER,
-                    icon,
-                    theme::icon_font(13.0),
-                    icon_color,
-                );
-                let mut x = rect.min.x + 24.0;
-                if !dir.is_empty() {
-                    let galley = painter.layout_no_wrap(dir.to_owned(), theme::font(11.0), theme::FAINT);
-                    painter.galley(egui::Pos2::new(x, rect.center().y - galley.size().y / 2.0), galley.clone(), theme::FAINT);
-                    x += galley.size().x;
-                }
-                painter.text(
-                    egui::Pos2::new(x, rect.center().y),
-                    Align2::LEFT_CENTER,
-                    name,
-                    theme::font(11.5),
-                    theme::TEXT,
-                );
-                if response.clicked() {
-                    open_file = Some(path.to_string());
-                }
-                let path = (*path).clone();
-                response.context_menu(|ui| {
-                    if ui.button(strings::WORKSPACE_OPEN_EXTERNAL).clicked() {
-                        open_external(&self.root, &path);
-                        ui.close_menu();
-                    }
-                    if ui.button(strings::WORKSPACE_REVEAL).clicked() {
-                        reveal_in_explorer(&self.root, &path);
-                        ui.close_menu();
-                    }
-                    if ui.button(strings::WORKSPACE_RENAME).clicked() {
-                        self.prompt = Some(Prompt { kind: PromptKind::Rename(path.clone()), text: path.clone(), focus: true });
-                        ui.close_menu();
-                    }
-                    if ui.button(strings::WORKSPACE_DELETE).clicked() {
-                        self.prompt = Some(Prompt { kind: PromptKind::Delete(path.clone()), text: String::new(), focus: false });
-                        ui.close_menu();
-                    }
-                });
             }
         });
         if let Some(path) = open_file {
@@ -992,17 +1123,19 @@ impl Workspace {
             ui.add_space(2.0);
             theme::hairline(ui);
             ui.label(RichText::new(&path).color(theme::DIM).font(theme::field_font(11.0)));
-            let height = (ui.available_height() * 0.5).clamp(80.0, 320.0);
+            // The preview ends on a whole line and takes the space the list
+            // leaves: a height that is not a multiple of the line height cut
+            // the last line in half, and the old half-of-the-rest cap left the
+            // panel empty below (minus a hair, so no sliver shows).
+            let line = ui.fonts(|f| f.row_height(&theme::field_font(11.0)));
+            let room = (ui.available_height() - 6.0).max(line);
+            let height = (room / line).floor().max(1.0) * line - 1.0;
+            let markdown = path.ends_with(".md") || path.ends_with(".markdown");
             ScrollArea::vertical().id_salt("workspace-file-preview").max_height(height).auto_shrink([false, false]).show(ui, |ui| {
-                for (index, line) in text.lines().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("{:>4}", index + 1))
-                                .color(theme::FAINT)
-                                .font(theme::field_font(10.5)),
-                        );
-                        ui.label(RichText::new(line).color(theme::DIM).font(theme::field_font(11.0)));
-                    });
+                if markdown {
+                    markdown_view(ui, &text);
+                } else {
+                    code_view(ui, &text);
                 }
                 if truncated {
                     ui.label(RichText::new(strings::WORKSPACE_FILE_TRUNCATED).color(theme::STATUS_YELLOW).font(theme::font(11.0)));
@@ -1058,6 +1191,16 @@ enum Row {
     File { change: Change },
 }
 
+/// One row of the file browser: a folder (click folds it) or a file. `dir` is
+/// the leading path shown when the rows come from a search, not from a tree.
+struct FileRow {
+    depth: usize,
+    name: String,
+    dir: Option<String>,
+    path: String,
+    folder: bool,
+}
+
 /// Graph colours by commit section: not-yet-pushed commits are VS Code blue,
 /// already-pushed history the owner's pale pink (#D488B4), incoming purple.
 fn section_color(section: git::Section) -> egui::Color32 {
@@ -1068,10 +1211,181 @@ fn section_color(section: git::Section) -> egui::Color32 {
     }
 }
 
-/// One patch line: added and removed lines get a full-width tinted band with
-/// the line colour on top, as in the reference diff view — colouring only the
-/// text is easy to miss.
-fn patch_line(ui: &mut egui::Ui, line: &str) {
+/// File text with a line-number gutter; long lines wrap inside the panel.
+fn code_view(ui: &mut egui::Ui, text: &str) {
+    ui.spacing_mut().item_spacing.y = 0.0;
+    // Painted by hand, like the diff: a label in a grid cell does not wrap, so
+    // long lines ran off the panel edge.
+    for (index, line) in text.lines().enumerate() {
+        let width = ui.available_width();
+        let galley = ui.painter().layout(line.to_owned(), theme::field_font(11.0), theme::DIM, (width - GUTTER - 4.0).max(40.0));
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, galley.size().y), Sense::hover());
+        ui.painter().text(
+            egui::Pos2::new(rect.min.x + GUTTER - 8.0, rect.min.y + 1.0),
+            Align2::RIGHT_TOP,
+            (index + 1).to_string(),
+            theme::field_font(10.5),
+            theme::FAINT,
+        );
+        ui.painter().galley(egui::Pos2::new(rect.min.x + GUTTER, rect.min.y), galley, theme::DIM);
+    }
+}
+
+/// A small Markdown view: headings, lists, quotes, code fences, rules and
+/// tables (the tables are the point — a `.md` used to show its pipes). Inline
+/// marks are left as they are.
+fn markdown_view(ui: &mut egui::Ui, text: &str) {
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let plain = line.trim();
+        if plain.is_empty() {
+            ui.add_space(6.0);
+            continue;
+        }
+        if plain.starts_with("```") {
+            let mut code = Vec::new();
+            for next in lines.by_ref() {
+                if next.trim_start().starts_with("```") {
+                    break;
+                }
+                code.push(next.to_owned());
+            }
+            for line in &code {
+                ui.label(RichText::new(line).color(theme::DIM).font(theme::field_font(11.0)));
+            }
+            continue;
+        }
+        if plain.starts_with('#') {
+            let level = plain.chars().take_while(|c| *c == '#').count().min(6);
+            let title = plain[level..].trim().trim_end_matches('#').trim();
+            let size = match level {
+                1 => 15.0,
+                2 => 13.5,
+                _ => 12.5,
+            };
+            ui.add_space(6.0);
+            ui.label(RichText::new(title).color(theme::TEXT).font(theme::title_font(size)));
+            ui.add_space(2.0);
+            continue;
+        }
+        if plain == "---" || plain == "***" || plain == "___" {
+            theme::hairline(ui);
+            ui.add_space(4.0);
+            continue;
+        }
+        if is_table_row(plain) && lines.peek().is_some_and(|next| is_table_separator(next)) {
+            let mut rows = vec![table_cells(plain)];
+            lines.next();
+            while let Some(next) = lines.peek() {
+                if !is_table_row(next) {
+                    break;
+                }
+                let row = lines.next().unwrap_or_default();
+                rows.push(table_cells(row));
+            }
+            table_view(ui, &rows);
+            ui.add_space(6.0);
+            continue;
+        }
+        if let Some(rest) = plain.strip_prefix("> ") {
+            let width = ui.available_width();
+            ui.label(inline_job(&format!("│ {rest}"), 11.5, theme::FAINT, width));
+            continue;
+        }
+        let width = ui.available_width();
+        let bullet = plain.strip_prefix("- ").or_else(|| plain.strip_prefix("* ")).or_else(|| plain.strip_prefix("+ "));
+        match bullet {
+            Some(rest) => ui.label(inline_job(&format!("• {rest}"), 11.5, theme::DIM, width)),
+            None => ui.label(inline_job(plain, 11.5, theme::DIM, width)),
+        };
+    }
+}
+
+/// Inline Markdown of the panel: `code` spans get a chip, **bold** a brighter
+/// tone. Anything else is left as written.
+fn inline_job(text: &str, size: f32, colour: egui::Color32, width: f32) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let plain = TextFormat { font_id: theme::font(size), color: colour, ..Default::default() };
+    let bold = TextFormat { font_id: theme::font(size), color: theme::TEXT, extra_letter_spacing: 0.2, ..Default::default() };
+    let code = TextFormat { font_id: theme::field_font(size - 0.5), color: theme::TEXT, background: theme::TAB_ACTIVE_BG, ..Default::default() };
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = width;
+    let mut rest = text;
+    while !rest.is_empty() {
+        let bold_at = rest.find("**").map(|at| (at, "**", &bold));
+        let code_at = rest.find('`').map(|at| (at, "`", &code));
+        let Some((at, marker, format)) = [bold_at, code_at].into_iter().flatten().min_by_key(|(at, _, _)| *at) else {
+            job.append(rest, 0.0, plain);
+            break;
+        };
+        if at > 0 {
+            job.append(&rest[..at], 0.0, plain.clone());
+        }
+        let after = &rest[at + marker.len()..];
+        match after.find(marker) {
+            Some(end) => {
+                job.append(&after[..end], 0.0, format.clone());
+                rest = &after[end + marker.len()..];
+            }
+            None => {
+                job.append(&rest[at..], 0.0, plain);
+                break;
+            }
+        }
+    }
+    job
+}
+
+fn is_table_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() > 2
+}
+
+fn is_table_separator(line: &str) -> bool {
+    is_table_row(line)
+        && table_cells(line).iter().all(|cell| {
+            let cell = cell.trim_matches(':');
+            !cell.is_empty() && cell.chars().all(|c| c == '-')
+        })
+}
+
+fn table_cells(line: &str) -> Vec<String> {
+    line.trim().trim_matches('|').split('|').map(|cell| cell.trim().to_owned()).collect()
+}
+
+/// Table cells are painted by hand so every column wraps inside the panel; a
+/// grid of labels would run past its edge.
+fn table_view(ui: &mut egui::Ui, rows: &[Vec<String>]) {
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    let width = ui.available_width();
+    let gap = 10.0;
+    let column = ((width - gap * (columns - 1) as f32) / columns as f32).max(40.0);
+    for (index, row) in rows.iter().enumerate() {
+        let colour = if index == 0 { theme::TEXT } else { theme::DIM };
+        let galleys: Vec<_> = (0..columns)
+            .map(|cell| {
+                let text = row.get(cell).cloned().unwrap_or_default();
+                ui.painter().layout_job(inline_job(&text, 11.5, colour, column))
+            })
+            .collect();
+        let height = galleys.iter().map(|galley| galley.size().y).fold(0.0, f32::max).max(14.0);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+        if index == 0 {
+            ui.painter().rect_filled(rect, 0.0, theme::TAB_ACTIVE_BG);
+        }
+        for (cell, galley) in galleys.into_iter().enumerate() {
+            let x = rect.min.x + cell as f32 * (column + gap);
+            ui.painter().galley(egui::Pos2::new(x, rect.min.y), galley, colour);
+        }
+        theme::hairline(ui);
+    }
+}
+
+/// One patch line: a right-aligned file line number in the gutter, then the
+/// patch line itself, with the change band behind both — as in the reference
+/// diff view. Added and removed lines get a full-width tinted band with the
+/// line colour on top; colouring only the text is easy to miss.
+fn patch_line(ui: &mut egui::Ui, line: &str, number: Option<u64>) {
     // The bands must tile: any item spacing would show as a gap between lines.
     ui.spacing_mut().item_spacing.y = 0.0;
     let (band, colour) = if line.starts_with('+') && !line.starts_with("+++") {
@@ -1083,15 +1397,84 @@ fn patch_line(ui: &mut egui::Ui, line: &str) {
     } else {
         (None, theme::DIM)
     };
-    let galley = ui.painter().layout(line.to_owned(), theme::field_font(11.0), colour, ui.available_width());
     let width = ui.available_width();
+    let galley = ui.painter().layout(line.to_owned(), theme::field_font(11.0), colour, (width - GUTTER - 4.0).max(40.0));
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, galley.size().y), Sense::hover());
     if let Some(band) = band {
         // Half-pixel bleed: two bands sharing a fractional edge would blend
         // with the background where they meet and read as a torn line.
         ui.painter().rect_filled(rect.expand2(Vec2::new(0.0, 0.5)), 0.0, band);
     }
-    ui.painter().galley(rect.min, galley, colour);
+    if let Some(number) = number {
+        ui.painter().text(
+            egui::Pos2::new(rect.min.x + GUTTER - 8.0, rect.min.y + 1.0),
+            Align2::RIGHT_TOP,
+            number.to_string(),
+            theme::field_font(10.5),
+            theme::FAINT,
+        );
+    }
+    ui.painter().galley(egui::Pos2::new(rect.min.x + GUTTER, rect.min.y), galley, colour);
+}
+
+/// File line numbers of a patch: the old number for removals, the new one for
+/// additions and context, reset by every `@@` header.
+#[derive(Default)]
+struct PatchNumbers {
+    old: u64,
+    new: u64,
+    started: bool,
+}
+
+impl PatchNumbers {
+    fn line(&mut self, line: &str) -> Option<u64> {
+        if line.starts_with("@@") {
+            if let Some((old, new)) = parse_hunk(line) {
+                self.old = old;
+                self.new = new;
+                self.started = true;
+            }
+            return None;
+        }
+        let header = line.starts_with("diff --git")
+            || line.starts_with("index ")
+            || line.starts_with("---")
+            || line.starts_with("+++")
+            || line.starts_with("new file")
+            || line.starts_with("deleted file")
+            || line.starts_with("old mode")
+            || line.starts_with("new mode")
+            || line.starts_with("similarity")
+            || line.starts_with("rename ")
+            || line.starts_with("copy ")
+            || line.starts_with("\\ No newline");
+        if header || !self.started {
+            return None;
+        }
+        if line.starts_with('+') {
+            let number = self.new;
+            self.new += 1;
+            return Some(number);
+        }
+        if line.starts_with('-') {
+            let number = self.old;
+            self.old += 1;
+            return Some(number);
+        }
+        let number = self.new;
+        self.old += 1;
+        self.new += 1;
+        Some(number)
+    }
+}
+
+/// `@@ -1494,6 +1481,34 @@ impl AnvilApp {` -> (1494, 1481).
+fn parse_hunk(line: &str) -> Option<(u64, u64)> {
+    let mut parts = line.strip_prefix("@@")?.split_whitespace();
+    let old = parts.next()?.strip_prefix('-')?;
+    let new = parts.next()?.strip_prefix('+')?;
+    let number = |text: &str| text.split(',').next()?.parse::<u64>().ok();
+    Some((number(old)?, number(new)?))
 }
 
 /// Untrusted names, subjects and bodies may contain control or bidirectional
@@ -1159,6 +1542,24 @@ fn elide(painter: &egui::Painter, text: &str, font: egui::FontId, max_width: f32
     }
     out.push('…');
     out
+}
+
+/// Elides the *front* of a path so the folder closest to the file stays
+/// readable: `…/egui-default-fonts/`.
+fn elide_front(painter: &egui::Painter, text: &str, font: egui::FontId, max_width: f32) -> String {
+    let measure = |value: &str| painter.layout_no_wrap(value.to_owned(), font.clone(), egui::Color32::WHITE).size().x;
+    if measure(text) <= max_width {
+        return text.to_owned();
+    }
+    let mut tail = String::new();
+    for ch in text.chars().rev() {
+        tail.insert(0, ch);
+        if measure(&format!("…{tail}")) > max_width {
+            tail.remove(0);
+            break;
+        }
+    }
+    format!("…{tail}")
 }
 
 /// VS Code's ref colours: local branch (charts.blue), remote (charts.purple).
@@ -1294,6 +1695,31 @@ fn spawn_worker() -> (Sender<Request>, Receiver<Response>) {
                         Err(e) => send(Response::Error(e)),
                     },
                     None => send(Response::Files(Vec::new())),
+                },
+                Request::CountLines => match &root {
+                    Some(root) => match git::ls_files(root) {
+                        Ok(files) => {
+                            let mut lines = 0u64;
+                            let mut counted = 0usize;
+                            for path in &files {
+                                let Ok(full) = git::resolve_path(root, path) else { continue };
+                                let Ok(meta) = std::fs::metadata(&full) else { continue };
+                                // Huge and binary files would only slow the walk down.
+                                if !meta.is_file() || meta.len() > MAX_COUNTED_FILE {
+                                    continue;
+                                }
+                                let Ok(bytes) = std::fs::read(&full) else { continue };
+                                if bytes.iter().take(8192).any(|byte| *byte == 0) {
+                                    continue;
+                                }
+                                lines += bytes.iter().filter(|byte| **byte == b'\n').count() as u64;
+                                counted += 1;
+                            }
+                            send(Response::LineCount { files: counted, lines });
+                        }
+                        Err(e) => send(Response::Error(e)),
+                    },
+                    None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
                 },
                 Request::ReadFile { path } => match &root {
                     Some(root) => match git::read_file(root, &path, 512 * 1024) {
@@ -1546,5 +1972,72 @@ mod tests {
             .filter(|text| text.contains("of ScrollArea"))
             .collect();
         assert!(clashes.is_empty(), "two panes shared widget ids: {clashes:?}");
+    }
+
+    #[test]
+    fn patch_numbers_follow_the_hunks() {
+        let mut numbers = PatchNumbers::default();
+        let seen: Vec<Option<u64>> = [
+            "diff --git a/x b/x",
+            "index 111..222 100644",
+            "--- a/x",
+            "+++ b/x",
+            "@@ -10,3 +10,4 @@ fn main() {",
+            " let a = 1;",
+            "-let b = 2;",
+            "+let b = 3;",
+            "+let c = 4;",
+        ]
+        .iter()
+        .map(|line| numbers.line(line))
+        .collect();
+        assert_eq!(
+            seen,
+            vec![None, None, None, None, None, Some(10), Some(11), Some(11), Some(12)],
+            "context takes the new number, removals the old one"
+        );
+    }
+
+    #[test]
+    fn the_file_tree_starts_folded_and_follows_expanded_folders() {
+        let mut workspace = Workspace {
+            files: vec![
+                "Cargo.toml".to_owned(),
+                "src/app.rs".to_owned(),
+                "src/term/render.rs".to_owned(),
+                "tests/git.rs".to_owned(),
+            ],
+            ..Default::default()
+        };
+        let shape = |rows: Vec<FileRow>| rows.iter().map(|row| (row.depth, row.name.clone(), row.folder)).collect::<Vec<_>>();
+        // The tree starts folded: only the top level shows.
+        assert_eq!(
+            shape(workspace.file_tree()),
+            vec![(0, "Cargo.toml".to_owned(), false), (0, "src".to_owned(), true), (0, "tests".to_owned(), true)]
+        );
+        // Opening `src` reveals its own entries, the folders inside it stay folded.
+        workspace.file_expanded.insert("src".to_owned());
+        assert_eq!(
+            shape(workspace.file_tree()),
+            vec![
+                (0, "Cargo.toml".to_owned(), false),
+                (0, "src".to_owned(), true),
+                (1, "app.rs".to_owned(), false),
+                (1, "term".to_owned(), true),
+                (0, "tests".to_owned(), true),
+            ]
+        );
+        workspace.file_expanded.insert("src/term".to_owned());
+        assert_eq!(
+            shape(workspace.file_tree()),
+            vec![
+                (0, "Cargo.toml".to_owned(), false),
+                (0, "src".to_owned(), true),
+                (1, "app.rs".to_owned(), false),
+                (1, "term".to_owned(), true),
+                (2, "render.rs".to_owned(), false),
+                (0, "tests".to_owned(), true),
+            ]
+        );
     }
 }

@@ -133,6 +133,12 @@ pub fn workspace_changes_tab(count: usize) -> String {
     }
 }
 pub const WORKSPACE_NO_UPSTREAM: &str = "нет upstream";
+/// "Посчитать строки" toolbar button.
+pub const WORKSPACE_COUNT_LINES: &str = "Посчитать строки";
+/// Result of the line count: files and total lines.
+pub fn workspace_line_count(files: usize, lines: u64) -> String {
+    format!("{lines} строк · {files} файлов")
+}
 /// Toast after Ctrl+= / Ctrl+- / Ctrl+0; steps of one zoom collapse into one.
 pub const ZOOM_TOAST_PREFIX: &str = "Размер текста";
 pub fn zoom_toast(size: f32) -> String {
