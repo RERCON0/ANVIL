@@ -72,6 +72,7 @@ pub struct FrameEnv<'a> {
     pub copy_on_select: bool,
     pub min_pane_width: f32,
     pub min_pane_height: f32,
+    pub fallbacks_loaded: bool,
 }
 
 /// Actions a tab asks the application to perform.
@@ -86,6 +87,8 @@ pub enum TabAction {
     Clipboard(String),
     Pane(PaneId, PaneCommand),
     Bell,
+    /// A glyph outside the installed fonts appeared: load the system fallbacks.
+    NeedsFallbacks,
 }
 
 pub struct Tab {
@@ -201,6 +204,7 @@ impl Tab {
                 right_click: env.right_click,
                 paste_on_middle: env.paste_on_middle,
                 copy_on_select: env.copy_on_select,
+                fallbacks_loaded: env.fallbacks_loaded,
             };
             match &mut entry.content {
                 PaneContent::Live(pane) => {
@@ -210,6 +214,9 @@ impl Tab {
                     }
                     for command in output.commands {
                         actions.push(TabAction::Pane(*id, command));
+                    }
+                    if output.needs_fallbacks {
+                        actions.push(TabAction::NeedsFallbacks);
                     }
                     for event in pane.drain_events() {
                         match event {
@@ -241,7 +248,7 @@ impl Tab {
                         Pos2::new(pane_rect.min.x + theme::PANE_PADDING, pane_rect.min.y + theme::PANE_PADDING),
                         Align2::LEFT_TOP,
                         &*message,
-                        FontId::proportional(13.0),
+                        theme::font(12.5),
                         theme::TAB_TEXT,
                     );
                     let button = Rect::from_min_size(
@@ -251,7 +258,7 @@ impl Tab {
                     let response = ui.interact(button, ui.id().with(("pane-error-close", id)), Sense::click());
                     let fill = if response.hovered() { theme::TAB_ACTIVE_BG } else { theme::TAB_HOVER_BG };
                     painter.rect_filled(button, 0.0, fill);
-                    painter.text(button.center(), Align2::CENTER_CENTER, strings::PANE_CLOSE, FontId::proportional(13.0), theme::TAB_ACTIVE_TEXT);
+                    painter.text(button.center(), Align2::CENTER_CENTER, strings::PANE_CLOSE, theme::font(12.5), theme::TAB_ACTIVE_TEXT);
                     if response.clicked() {
                         actions.push(TabAction::ClosePane(*id));
                     }

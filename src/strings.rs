@@ -87,6 +87,7 @@ pub const SETTINGS_CLAUDE_CONNECTED: &str = "Подключён";
 pub const SETTINGS_CLAUDE_NOT_CONNECTED: &str = "Не подключён";
 pub const SETTINGS_CLAUDE_DECLINED: &str = "Строка статуса не подключена: вы выбрали оставить свою команду";
 pub const SETTINGS_CUSTOM_PROFILE: &str = "Пользовательский профиль";
+pub const SETTINGS_NO_PROFILES: &str = "Пользовательских профилей нет";
 pub const SETTINGS_APPLY_HINT: &str = "Изменения применяются сразу и сохраняются в config.json";
 pub const SETTINGS_HOTKEYS_HINT: &str = "Редактирование клавиш — только в config.json";
 

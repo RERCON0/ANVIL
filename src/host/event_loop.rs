@@ -120,8 +120,9 @@ impl ApplicationHandler<UserEvent> for Host {
             let _ = proxy.lock().send_event(UserEvent::Repaint(info.delay));
         });
         egui.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
-        theme::apply(&egui.egui_ctx);
+        // Fonts first: the style below references the "ui" families they install.
         self.app.on_start(&egui.egui_ctx);
+        theme::apply(&egui.egui_ctx);
         gl.window.set_ime_allowed(true);
         self.gl = Some(gl);
         self.egui = Some(egui);

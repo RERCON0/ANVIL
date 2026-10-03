@@ -97,6 +97,8 @@ pub struct AnvilApp {
     frame_ms: f32,
     started: Instant,
     first_frame_logged: bool,
+    /// The heavy system fallback fonts (symbols/emoji/CJK) are installed.
+    fallbacks_loaded: bool,
 }
 
 impl Default for AnvilApp {
@@ -146,6 +148,7 @@ impl AnvilApp {
             frame_ms: 0.0,
             started: Instant::now(),
             first_frame_logged: false,
+            fallbacks_loaded: false,
         };
         if let Some(notice) = notice {
             app.toast(notice);
@@ -178,7 +181,7 @@ impl AnvilApp {
     }
 
     pub fn on_start(&mut self, ctx: &egui::Context) {
-        let report = fonts::install(ctx, &self.config.font.family, &fonts::registry_font_entries());
+        let report = fonts::install(ctx, &self.config.font.family, &fonts::registry_font_entries(), false);
         for missing in &report.missing {
             log::info!("font not found: {missing}");
         }
@@ -319,6 +322,7 @@ impl AnvilApp {
             copy_on_select: self.config.terminal.copy_on_select,
             min_pane_width: cell_w * 8.0,
             min_pane_height: cell_h * 3.0,
+            fallbacks_loaded: self.fallbacks_loaded,
         };
         let actions = match self.tabs.get_mut(self.active) {
             Some(tab) => tab.show(ui, rect, &env),
@@ -406,8 +410,24 @@ impl AnvilApp {
                     self.toast(strings::BELL.to_owned());
                 }
             }
+            TabAction::NeedsFallbacks => self.load_fallbacks(ctx),
         }
         self.mark_session_dirty();
+    }
+
+    /// Installs the system fallback fonts the first time a glyph needs them.
+    /// They cost ~100 MB of working set, so panes start without them.
+    fn load_fallbacks(&mut self, ctx: &egui::Context) {
+        if self.fallbacks_loaded {
+            return;
+        }
+        self.fallbacks_loaded = true;
+        let report = fonts::install(ctx, &self.config.font.family, &fonts::registry_font_entries(), true);
+        for missing in &report.missing {
+            log::info!("font not found: {missing}");
+        }
+        log::info!("system fallback fonts installed");
+        ctx.request_repaint();
     }
 
     fn apply_pane_command(&mut self, id: PaneId, command: PaneCommand, ctx: &egui::Context) {
@@ -1066,7 +1086,7 @@ impl AnvilApp {
             self.toast(strings::UNKNOWN_HOTKEYS.to_owned());
         }
         if family_changed {
-            let report = fonts::install(&ctx, &self.config.font.family, &fonts::registry_font_entries());
+            let report = fonts::install(&ctx, &self.config.font.family, &fonts::registry_font_entries(), self.fallbacks_loaded);
             for missing in report.missing {
                 log::info!("font not found: {missing}");
             }
@@ -1305,7 +1325,7 @@ impl AnvilApp {
             .show(ctx, |ui| {
                 for toast in &self.ui.toasts {
                     egui::Frame::popup(ui.style()).fill(theme::TAB_ACTIVE_BG).show(ui, |ui| {
-                        ui.label(egui::RichText::new(&toast.text).color(theme::TAB_ACTIVE_TEXT).size(12.0));
+                        ui.label(egui::RichText::new(&toast.text).color(theme::TEXT).font(theme::font(12.0)));
                     });
                 }
             });

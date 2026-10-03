@@ -41,6 +41,7 @@ pub fn show(ctx: &egui::Context, picker: &mut PickerState, profiles: &[(String, 
             }
             let field = ui.add(
                 egui::TextEdit::singleline(&mut picker.filter)
+                    .font(crate::theme::field_font(13.0))
                     .hint_text(strings::PICKER_FILTER)
                     .desired_width(f32::INFINITY),
             );
@@ -59,7 +60,7 @@ pub fn show(ctx: &egui::Context, picker: &mut PickerState, profiles: &[(String, 
                 for (rank, (_, index)) in matches.iter().enumerate() {
                     let (id, name) = &profiles[*index];
                     let selected = rank == picker.selected;
-                    let response = ui.selectable_label(selected, name);
+                    let response = ui.selectable_label(selected, egui::RichText::new(name).font(crate::theme::font(13.0)));
                     if response.clicked() {
                         outcome = PickerOutcome::Selected(id.clone());
                     }

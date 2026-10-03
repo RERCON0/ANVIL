@@ -97,7 +97,7 @@ pub fn show(
             Pos2::new(row.min.x + 14.0 + 11.0, row.min.y + 17.0),
             Align2::CENTER_CENTER,
             (index + 1).to_string(),
-            FontId::proportional(12.0),
+            theme::field_font(12.0),
             number_color,
         );
         if tab.activity {
@@ -105,12 +105,13 @@ pub fn show(
         }
         let text_color = if tab.active { theme::TAB_ACTIVE_TEXT } else { theme::TAB_TEXT };
         let title_rect = Rect::from_min_size(Pos2::new(row.min.x + 36.0, row.min.y), Vec2::new(row.width() - 58.0, theme::TAB_ROW_HEIGHT));
-        let title = elide(&painter, &tab.title, FontId::proportional(13.0), title_rect.width());
+        let title_font = theme::font(12.5);
+        let title = elide(&painter, &tab.title, title_font.clone(), title_rect.width());
         painter.with_clip_rect(title_rect).text(
             Pos2::new(title_rect.min.x, title_rect.center().y),
             Align2::LEFT_CENTER,
             title,
-            FontId::proportional(13.0),
+            title_font,
             text_color,
         );
         if let Some(record) = &tab.claude {
@@ -122,7 +123,7 @@ pub fn show(
         if response.hovered() {
             let close = ui.interact(close_rect, ui.id().with(("tab-close", index)), Sense::click());
             let color = if close.hovered() { theme::TAB_ACTIVE_TEXT } else { theme::TAB_TEXT };
-            painter.text(close_rect.center(), Align2::CENTER_CENTER, "×", FontId::proportional(14.0), color);
+            painter.text(close_rect.center(), Align2::CENTER_CENTER, "×", theme::font(14.0), color);
             if close.clicked() {
                 actions.push(TabbarAction::Close(index));
             }
@@ -190,14 +191,14 @@ pub fn show(
     let plus_rect = Rect::from_min_size(Pos2::new(rect.min.x + 8.0, y + 8.0), Vec2::new(28.0, 24.0));
     let plus = ui.interact(plus_rect, ui.id().with("tab-new"), Sense::click());
     let plus_color = if plus.hovered() { theme::ICON_HOVER } else { theme::ICON };
-    painter.text(plus_rect.center(), Align2::CENTER_CENTER, "+", FontId::proportional(17.0), plus_color);
+    painter.text(plus_rect.center(), Align2::CENTER_CENTER, "+", theme::font(17.0), plus_color);
     if plus.on_hover_text(strings::TAB_NEW).clicked() {
         actions.push(TabbarAction::NewTab);
     }
     let profile_rect = Rect::from_min_size(Pos2::new(rect.min.x + 44.0, y + 8.0), Vec2::new(28.0, 24.0));
     let profile = ui.interact(profile_rect, ui.id().with("tab-profiles"), Sense::click());
     let profile_color = if profile.hovered() { theme::ICON_HOVER } else { theme::ICON };
-    painter.text(profile_rect.center(), Align2::CENTER_CENTER, "❯", FontId::proportional(13.0), profile_color);
+    painter.text(profile_rect.center(), Align2::CENTER_CENTER, "»", theme::font(14.0), profile_color);
     if profile.on_hover_text(strings::TAB_PROFILES).clicked() {
         actions.push(TabbarAction::Profiles);
     }
@@ -211,8 +212,8 @@ pub fn show(
     painter.text(
         Pos2::new(settings_rect.min.x + 10.0, settings_rect.center().y),
         Align2::LEFT_CENTER,
-        format!("⚙  {}", strings::TAB_SETTINGS),
-        FontId::proportional(13.0),
+        format!("› {}", strings::TAB_SETTINGS),
+        theme::font(12.5),
         settings_color,
     );
     if settings.clicked() {

@@ -83,6 +83,8 @@ pub struct ViewInput<'a> {
     pub right_click: RightClick,
     pub paste_on_middle: bool,
     pub copy_on_select: bool,
+    /// System fallback fonts are already installed.
+    pub fallbacks_loaded: bool,
 }
 
 pub struct ViewOutput {
@@ -91,6 +93,8 @@ pub struct ViewOutput {
     /// Where the IME candidate window should appear.
     pub cursor_rect: Option<Rect>,
     pub commands: Vec<PaneCommand>,
+    /// A character showed up that no installed font can draw.
+    pub needs_fallbacks: bool,
 }
 
 impl TerminalView {
@@ -489,7 +493,12 @@ impl TerminalView {
             }
         }
 
-        ViewOutput { pressed: response.is_pointer_button_down_on(), cursor_rect, commands }
+        let needs_fallbacks = !input.fallbacks_loaded
+            && frame
+                .rows
+                .iter()
+                .any(|row| row.iter().any(|cell| !cell.in_primary_font && !cell.spacer && cell.ch != ' '));
+        ViewOutput { pressed: response.is_pointer_button_down_on(), cursor_rect, commands, needs_fallbacks }
     }
 
     /// Recomputes the current match and scrolls it into view.

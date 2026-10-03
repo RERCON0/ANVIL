@@ -1,6 +1,6 @@
 //! Title bar of the borderless window and its invisible resize borders.
 
-use egui::{Align2, Color32, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, Vec2};
+use egui::{Align2, Color32, CursorIcon, Pos2, Rect, Sense, Stroke, Vec2};
 
 use crate::chrome::edges::{edge_at, Edge};
 use crate::host::WindowCommand;
@@ -29,7 +29,7 @@ pub fn title_bar(ui: &mut egui::Ui, rect: Rect, maximized: bool, commands: &mut 
         Pos2::new(rect.min.x + 12.0, rect.center().y),
         Align2::LEFT_CENTER,
         strings::APP_TITLE,
-        FontId::proportional(13.0),
+        theme::title_font(12.5),
         theme::TITLE_TEXT,
     );
     painter.hline(rect.x_range(), rect.max.y - 0.5, Stroke::new(1.0, theme::BORDER));
@@ -51,7 +51,7 @@ pub fn title_bar(ui: &mut egui::Ui, rect: Rect, maximized: bool, commands: &mut 
             Button::Maximize => ("□", strings::WINDOW_MAXIMIZE),
             Button::Close => ("×", strings::WINDOW_CLOSE),
         };
-        painter.text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(14.0), color);
+        painter.text(r.center(), Align2::CENTER_CENTER, label, theme::font(14.0), color);
         let _ = response.clone().on_hover_text(tooltip);
         if response.clicked() {
             commands.push(match kind {

@@ -143,9 +143,14 @@ pub struct FontReport {
     pub missing: Vec<String>,
 }
 
-/// Installs the terminal family (`term*`), the fallbacks and Segoe UI for the
-/// interface. Call again after the font family changes in the settings.
-pub fn install(ctx: &egui::Context, family: &str, entries: &[(String, String)]) -> FontReport {
+/// Installs the terminal family (`term*`) and the interface font, which is the
+/// bundled Cascadia Mono — the same "Terminal Native" look as SNATCH/BEAT/
+/// STRIKE. Call again after the font family changes in the settings.
+///
+/// `fallbacks` loads the heavy system fallbacks (`seguisym`, `seguiemj`,
+/// `msyh`): they cost ~100 MB of working set, so the app starts without them
+/// and re-installs once a character the primary font cannot draw shows up.
+pub fn install(ctx: &egui::Context, family: &str, entries: &[(String, String)], fallbacks: bool) -> FontReport {
     let dir = fonts_dir();
     let mut report = FontReport::default();
     let mut defs = FontDefinitions::default();
@@ -166,17 +171,20 @@ pub fn install(ctx: &egui::Context, family: &str, entries: &[(String, String)]) 
     defs.font_data.insert("term-bold-italic".into(), face(load(&files.bold_italic), &regular));
     defs.font_data.insert("term-cascadia".into(), FontData::from_static(CASCADIA));
 
-    let mut fallbacks = Vec::new();
-    for (name, file) in [("fallback-symbols", "seguisym.ttf"), ("fallback-emoji", "seguiemj.ttf"), ("fallback-cjk", "msyh.ttc")] {
-        match std::fs::read(dir.join(file)) {
-            Ok(bytes) => {
-                defs.font_data.insert(name.into(), FontData::from_owned(bytes));
-                fallbacks.push(name.to_owned());
+    let mut extra: Vec<String> = Vec::new();
+    if fallbacks {
+        for (name, file) in [("fallback-symbols", "seguisym.ttf"), ("fallback-emoji", "seguiemj.ttf"), ("fallback-cjk", "msyh.ttc")] {
+            match std::fs::read(dir.join(file)) {
+                Ok(bytes) => {
+                    defs.font_data.insert(name.into(), FontData::from_owned(bytes));
+                    extra.push(name.to_owned());
+                }
+                Err(_) => report.missing.push(file.to_owned()),
             }
-            Err(_) => report.missing.push(file.to_owned()),
         }
     }
-    fallbacks.push("term-cascadia".into());
+    let mut fallbacks_list = extra.clone();
+    fallbacks_list.push("term-cascadia".into());
 
     for (fam, first) in [
         ("term", "term-regular"),
@@ -185,21 +193,29 @@ pub fn install(ctx: &egui::Context, family: &str, entries: &[(String, String)]) 
         ("term-bold-italic", "term-bold-italic"),
     ] {
         let mut list = vec![first.to_owned()];
-        list.extend(fallbacks.iter().cloned());
+        list.extend(fallbacks_list.iter().cloned());
         defs.families.insert(FontFamily::Name(fam.into()), list);
     }
     defs.families.insert(FontFamily::Name("term-primary".into()), vec!["term-regular".into()]);
 
-    if let Ok(bytes) = std::fs::read(dir.join("segoeui.ttf")) {
-        defs.font_data.insert("ui".into(), FontData::from_owned(bytes));
-        defs.families.entry(FontFamily::Proportional).or_default().insert(0, "ui".into());
-    } else {
-        report.missing.push("segoeui.ttf".into());
+    // Interface font: bundled Cascadia Mono, with egui's defaults behind it for
+    // glyphs Cascadia does not have. Three nudged faces, as in SNATCH: body
+    // sits a touch lower, buttons/fields and titles sit on their own baseline.
+    let ui = |name: &str, y_offset: f32| {
+        let data = FontData::from_static(CASCADIA).tweak(egui::FontTweak { y_offset_factor: y_offset, ..Default::default() });
+        (name.to_owned(), data)
+    };
+    for (name, data) in [ui("ui", 0.15), ui("ui-tight", 0.0), ui("ui-title", -0.08)] {
+        defs.font_data.insert(name.clone(), data);
     }
-    for name in &fallbacks {
-        defs.families.entry(FontFamily::Proportional).or_default().push(name.clone());
+    let default_proportional = defs.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    for name in ["ui", "ui-tight", "ui-title"] {
+        let mut list = vec![name.to_owned()];
+        list.extend(default_proportional.iter().cloned());
+        defs.families.insert(FontFamily::Name(name.into()), list);
     }
-    defs.families.entry(FontFamily::Monospace).or_default().insert(0, "term-regular".into());
+    defs.families.entry(FontFamily::Proportional).or_default().insert(0, "ui".into());
+    defs.families.entry(FontFamily::Monospace).or_default().insert(0, "ui-tight".into());
     ctx.set_fonts(defs);
     report
 }
