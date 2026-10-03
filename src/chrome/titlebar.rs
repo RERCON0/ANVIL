@@ -44,25 +44,15 @@ pub fn title_bar(ui: &mut egui::Ui, rect: Rect, maximized: bool, commands: &mut 
             painter.rect_filled(r, 0.0, if kind == Button::Close { theme::CLOSE_HOVER } else { theme::WINDOW_BUTTON_HOVER });
         }
         let color = if hovered && kind == Button::Close { Color32::WHITE } else { theme::WINDOW_ICON };
-        let stroke = Stroke::new(1.0, color);
-        let c = r.center();
-        match kind {
-            Button::Minimize => {
-                painter.hline((c.x - 5.0)..=(c.x + 5.0), c.y, stroke);
-            }
-            Button::Maximize if maximized => {
-                painter.rect_stroke(Rect::from_min_size(c + Vec2::new(-3.0, -5.0), Vec2::splat(8.0)), 0.0, stroke);
-                painter.rect_filled(Rect::from_min_size(c + Vec2::new(-5.0, -3.0), Vec2::splat(8.0)), 0.0, theme::CHROME_BG);
-                painter.rect_stroke(Rect::from_min_size(c + Vec2::new(-5.0, -3.0), Vec2::splat(8.0)), 0.0, stroke);
-            }
-            Button::Maximize => {
-                painter.rect_stroke(Rect::from_center_size(c, Vec2::splat(10.0)), 0.0, stroke);
-            }
-            Button::Close => {
-                painter.line_segment([c + Vec2::new(-5.0, -5.0), c + Vec2::new(5.0, 5.0)], stroke);
-                painter.line_segment([c + Vec2::new(-5.0, 5.0), c + Vec2::new(5.0, -5.0)], stroke);
-            }
-        }
+        // Plain glyphs, as in the owner's other apps: they need no icon font.
+        let (label, tooltip) = match kind {
+            Button::Minimize => ("─", strings::WINDOW_MINIMIZE),
+            Button::Maximize if maximized => ("❐", strings::WINDOW_MAXIMIZE),
+            Button::Maximize => ("□", strings::WINDOW_MAXIMIZE),
+            Button::Close => ("×", strings::WINDOW_CLOSE),
+        };
+        painter.text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(14.0), color);
+        let _ = response.clone().on_hover_text(tooltip);
         if response.clicked() {
             commands.push(match kind {
                 Button::Minimize => WindowCommand::Minimize,
