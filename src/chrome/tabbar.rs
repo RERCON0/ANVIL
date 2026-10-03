@@ -118,15 +118,14 @@ pub fn show(
             paint_claude_line(&painter, row, record);
         }
 
-        // Close button on hover.
+        // Close button: the row's own response owns the click (a nested widget
+        // registered later would never win the press), so hit-test by position.
         let close_rect = Rect::from_min_size(Pos2::new(row.max.x - 22.0, row.min.y + 8.0), Vec2::splat(18.0));
+        let pointer = ui.input(|i| i.pointer.hover_pos());
+        let close_hovered = response.hovered() && pointer.is_some_and(|pos| close_rect.contains(pos));
         if response.hovered() {
-            let close = ui.interact(close_rect, ui.id().with(("tab-close", index)), Sense::click());
-            let color = if close.hovered() { theme::TAB_ACTIVE_TEXT } else { theme::TAB_TEXT };
+            let color = if close_hovered { theme::TAB_ACTIVE_TEXT } else { theme::TAB_TEXT };
             painter.text(close_rect.center(), Align2::CENTER_CENTER, "×", theme::font(14.0), color);
-            if close.clicked() {
-                actions.push(TabbarAction::Close(index));
-            }
         }
 
         if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle)) && response.hovered() {
@@ -134,12 +133,15 @@ pub fn show(
         }
         if response.double_clicked() {
             state.rename = Some(RenameEdit { tab: index, text: tab.title.clone(), focus: true });
-        }
-        if response.drag_started() {
+        } else if response.drag_started() {
             state.drag_from = Some(index);
-        }
-        if response.clicked() && state.drag_from.is_none() {
-            actions.push(TabbarAction::Select(index));
+        } else if response.clicked() && state.drag_from.is_none() {
+            let clicked_close = response.interact_pointer_pos().is_some_and(|pos| close_rect.contains(pos));
+            if clicked_close {
+                actions.push(TabbarAction::Close(index));
+            } else {
+                actions.push(TabbarAction::Select(index));
+            }
         }
         response.context_menu(|ui| {
             if ui.button(strings::TAB_RENAME).clicked() {

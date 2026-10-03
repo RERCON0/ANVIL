@@ -1,4 +1,6 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// GUI exe: no console window, in debug as well (as in SNATCH). Panics and
+// everything else go to %APPDATA%\anvil\anvil.log.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 fn main() {
     let dir = anvil::config::app_dir();

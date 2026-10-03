@@ -145,7 +145,15 @@ impl ApplicationHandler<UserEvent> for Host {
                 self.redraw(event_loop);
                 return;
             }
-            WindowEvent::Resized(size) => self.gl.as_ref().expect("window").resize(*size),
+            WindowEvent::Resized(size) => {
+                let gl = self.gl.as_ref().expect("window");
+                gl.resize(*size);
+                self.app.window_geometry(*size, gl.window.outer_position().ok(), gl.window.is_maximized());
+            }
+            WindowEvent::Moved(position) => {
+                let gl = self.gl.as_ref().expect("window");
+                self.app.window_geometry(gl.window.inner_size(), Some(*position), gl.window.is_maximized());
+            }
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::Focused(focused) => self.app.window_focus_changed(*focused),
             WindowEvent::KeyboardInput { event: key, .. } if key.state == ElementState::Pressed => {

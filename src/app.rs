@@ -83,7 +83,9 @@ pub struct AnvilApp {
     settings: crate::settings_ui::SettingsState,
     session: SessionState,
     session_dirty: Option<Instant>,
+    /// Last geometry while not maximized, plus the maximized flag.
     window_state: Option<WindowState>,
+    window_maximized: bool,
     status_dir: PathBuf,
     run_dir: Option<PathBuf>,
     repaint: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -117,6 +119,7 @@ impl AnvilApp {
         let palette = scheme_palette(&config);
         let status_dir = status_dir();
         let session = SessionState::load(&SessionState::path());
+        let session_window = session.window;
         let mut app = AnvilApp {
             config,
             config_mtime,
@@ -134,7 +137,8 @@ impl AnvilApp {
             settings: crate::settings_ui::SettingsState::default(),
             session,
             session_dirty: None,
-            window_state: None,
+            window_state: session_window.map(|w| WindowState { maximized: false, ..w }),
+            window_maximized: session_window.map(|w| w.maximized).unwrap_or(false),
             status_dir,
             run_dir: None,
             repaint: None,
@@ -169,11 +173,13 @@ impl AnvilApp {
             .with_visible(false)
             .with_min_inner_size(winit::dpi::LogicalSize::new(640.0, 400.0))
             .with_window_icon(window_icon());
-        if let Some(window) = &self.session.window {
-            // Saved straight from `inner_size`/`outer_position`: physical units.
+        if let Some(window) = self.session.window {
+            // Saved straight from `inner_size`/`outer_position` of the
+            // *restored* (not maximized) window: physical units.
             attributes = attributes
                 .with_inner_size(winit::dpi::PhysicalSize::new(window.width, window.height))
-                .with_position(winit::dpi::PhysicalPosition::new(window.x, window.y));
+                .with_position(winit::dpi::PhysicalPosition::new(window.x, window.y))
+                .with_maximized(self.window_maximized);
         } else {
             attributes = attributes.with_inner_size(winit::dpi::LogicalSize::new(1100.0, 640.0));
         }
@@ -486,6 +492,28 @@ impl AnvilApp {
         }
     }
 
+    /// Called by the host on every resize/move: keeps the restore geometry
+    /// (the non-maximized one) and the maximized flag for the session file.
+    pub fn window_geometry(
+        &mut self,
+        size: winit::dpi::PhysicalSize<u32>,
+        position: Option<winit::dpi::PhysicalPosition<i32>>,
+        maximized: bool,
+    ) {
+        self.window_maximized = maximized;
+        if maximized {
+            return;
+        }
+        let previous = self.window_state;
+        self.window_state = Some(WindowState {
+            x: position.map(|p| p.x).or(previous.map(|w| w.x)).unwrap_or(0),
+            y: position.map(|p| p.y).or(previous.map(|w| w.y)).unwrap_or(0),
+            width: size.width,
+            height: size.height,
+            maximized: false,
+        });
+    }
+
     pub fn window_focus_changed(&mut self, focused: bool) {
         if let Some(pane) = self.focused_pane() {
             if pane.term.lock().mode().contains(TermMode::FOCUS_IN_OUT) {
@@ -637,15 +665,7 @@ impl AnvilApp {
 
     pub fn on_exit(&mut self, window: Option<&Window>) {
         if let Some(window) = window {
-            let size = window.inner_size();
-            let position = window.outer_position().ok();
-            self.window_state = Some(WindowState {
-                x: position.map(|p| p.x).unwrap_or(0),
-                y: position.map(|p| p.y).unwrap_or(0),
-                width: size.width,
-                height: size.height,
-                maximized: window.is_maximized(),
-            });
+            self.window_geometry(window.inner_size(), window.outer_position().ok(), window.is_maximized());
         }
         self.save_session();
         for tab in &mut self.tabs {
@@ -1178,7 +1198,8 @@ impl AnvilApp {
         };
         self.session.tabs = states;
         self.session.active_tab = self.active;
-        if let Some(window) = self.window_state {
+        if let Some(mut window) = self.window_state {
+            window.maximized = self.window_maximized;
             self.session.window = Some(window);
         }
         let _ = self.session.save(&SessionState::path());
