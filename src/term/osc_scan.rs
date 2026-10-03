@@ -165,8 +165,8 @@ mod tests {
 
     #[test]
     fn iterm_current_dir_with_bel() {
-        let out = scan(&[b"prompt\x1b]1337;CurrentDir=C:\\Users\\rerco\\Desktop\x07$ "]);
-        assert_eq!(out, Some(PathBuf::from("C:\\Users\\rerco\\Desktop")));
+        let out = scan(&[b"prompt\x1b]1337;CurrentDir=C:\\Work\\proj\x07$ "]);
+        assert_eq!(out, Some(PathBuf::from("C:\\Work\\proj")));
     }
 
     #[test]

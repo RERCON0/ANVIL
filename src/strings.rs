@@ -8,6 +8,7 @@ pub const CONFIG_UNREADABLE: &str = "Не удалось прочитать conf
 pub const UNKNOWN_HOTKEYS: &str = "В config.json есть неизвестные горячие клавиши";
 pub const CONPTY_MISSING: &str = "Не найден conpty.dll — возможны артефакты ввода в omp и opencode";
 pub const CLAUDE_SETTINGS_BROKEN: &str = "settings.json Claude Code повреждён — статус не подключён";
+pub const CLAUDE_SETTINGS_CHANGED: &str = "settings.json изменился во время настройки — статус не подключён";
 pub const BELL: &str = "Сигнал";
 pub const WINDOW_MINIMIZE: &str = "Свернуть";
 pub const WINDOW_MAXIMIZE: &str = "Развернуть / восстановить";
