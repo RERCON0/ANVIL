@@ -1,0 +1,72 @@
+[package]
+name = "anvil"
+version = "0.1.0"
+edition = "2021"
+description = "ANVIL — native terminal for Windows by rercon prod."
+license = "GPL-3.0-or-later"
+build = "build.rs"
+
+[lib]
+name = "anvil"
+path = "src/lib.rs"
+
+[[bin]]
+name = "anvil"
+path = "src/main.rs"
+
+[[bin]]
+name = "anvil-claude-status"
+path = "src/bin/anvil-claude-status.rs"
+
+[[bin]]
+name = "anvil-probe"
+path = "src/bin/anvil-probe.rs"
+test = false
+
+[dependencies]
+egui = { version = "0.29", default-features = false, features = ["default_fonts"] }
+egui_glow = { version = "0.29", features = ["winit", "clipboard", "links"] }
+winit = { version = "0.30.5", default-features = false, features = ["rwh_06"] }
+glutin = "0.32"
+glutin-winit = "0.5"
+glow = "0.14"
+alacritty_terminal = "0.26"
+polling = "3.8"
+arboard = { version = "3", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+log = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+# Examples only: the icon generator writes PNG and ICO files.
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+
+[build-dependencies]
+embed-resource = "3"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
+codegen-units = 1
+
+[profile.release.package.epaint]
+opt-level = 2
+[profile.release.package.egui]
+opt-level = 2
+[profile.release.package.alacritty_terminal]
+opt-level = 3
+[profile.release.package.vte]
+opt-level = 3
