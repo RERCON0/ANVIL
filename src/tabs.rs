@@ -187,6 +187,13 @@ impl Tab {
                     galley,
                     theme::TAB_TEXT,
                 );
+                if response.hovered() {
+                    if let Some(preview) = self.panes.get(&id).and_then(PaneEntry::live).map(screen_tail) {
+                        if !preview.trim().is_empty() {
+                            let _ = response.clone().on_hover_text(preview);
+                        }
+                    }
+                }
                 if response.clicked() {
                     actions.push(TabAction::RestoreCollapsed(id));
                 }
@@ -369,6 +376,31 @@ impl Tab {
         }
         actions
     }
+}
+
+/// The last few non-empty screen lines of a pane, for the collapsed-chip hover.
+fn screen_tail(pane: &Pane) -> String {
+    const LINES: usize = 14;
+    let term = pane.term.lock();
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = None;
+    for cell in term.renderable_content().display_iter {
+        if current != Some(cell.point.line) {
+            lines.push(String::new());
+            current = Some(cell.point.line);
+        }
+        if let Some(line) = lines.last_mut() {
+            line.push(cell.c);
+        }
+    }
+    for line in &mut lines {
+        *line = line.trim_end().to_owned();
+    }
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    let start = lines.len().saturating_sub(LINES);
+    lines[start..].join("\n")
 }
 
 fn tree_rect(rect: Rect) -> crate::layout::split_tree::Rect {
