@@ -1091,6 +1091,9 @@ impl AnvilApp {
                 if let Some(width) = pane_state.workspace_width {
                     entry.workspace.width = crate::workspace::clamp_width(width);
                 }
+                if let Some(tab) = &pane_state.workspace_tab {
+                    entry.workspace.tab = crate::workspace::PanelTab::parse(tab);
+                }
                 entries.insert(id, entry);
                 order.push(id);
                 id
@@ -1114,8 +1117,9 @@ impl AnvilApp {
                     cwd: entry.cwd(),
                     workspace_open: entry.workspace.open,
                     workspace_width: Some(entry.workspace.width),
+                    workspace_tab: Some(entry.workspace.tab.as_str().to_owned()),
                 })
-                .unwrap_or(PaneState { profile_id: String::new(), cwd: None, workspace_open: false, workspace_width: None })
+                .unwrap_or(PaneState { profile_id: String::new(), cwd: None, workspace_open: false, workspace_width: None, workspace_tab: None })
         };
         let focused = tab.tree.panes().iter().position(|id| *id == tab.focused).unwrap_or(0);
         TabState {

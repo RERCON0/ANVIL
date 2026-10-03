@@ -60,6 +60,11 @@ pub fn title_font(size: f32) -> FontId {
     FontId::new(size, egui::FontFamily::Name("ui-title".into()))
 }
 
+/// File-type icon glyphs (Seti).
+pub fn icon_font(size: f32) -> FontId {
+    FontId::new(size, egui::FontFamily::Name("icons".into()))
+}
+
 /// Dark control visuals, written into both egui style buckets by `apply`.
 fn visuals() -> egui::Visuals {
     let mut v = egui::Visuals::dark();

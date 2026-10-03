@@ -265,6 +265,170 @@ fn apply_numstat(changes: &mut [Change], stats: &HashMap<String, (u32, u32)>, st
     }
 }
 
+/// Where a commit belongs relative to the upstream branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Section {
+    /// Not pushed yet.
+    Outgoing,
+    /// On the remote, not merged locally.
+    Incoming,
+    /// Already in both.
+    History,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Commit {
+    pub hash: String,
+    pub short: String,
+    pub parents: Vec<String>,
+    pub author: String,
+    pub subject: String,
+    pub refs: Vec<String>,
+    /// Committer time, unix seconds.
+    pub time: i64,
+    pub section: Section,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommitLog {
+    pub commits: Vec<Commit>,
+    pub upstream: Option<String>,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommitDetail {
+    pub files: Vec<(char, String, u32, u32)>,
+    pub patch: String,
+    pub header: String,
+}
+
+/// Upstream ref of the current branch: the configured one, else `origin/<branch>`.
+pub fn upstream(root: &Path) -> Option<String> {
+    if let Ok(text) = run_git(root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]) {
+        let text = text.trim();
+        if !text.is_empty() {
+            return Some(text.to_owned());
+        }
+    }
+    let branch = run_git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+    let branch = branch.trim();
+    if branch.is_empty() || branch == "HEAD" {
+        return None;
+    }
+    run_git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/remotes/origin/{branch}")]).ok()?;
+    Some(format!("origin/{branch}"))
+}
+
+fn rev_list_set(root: &Path, args: &[&str]) -> std::collections::HashSet<String> {
+    let mut full: Vec<&str> = vec!["rev-list", "--max-count=200"];
+    full.extend(args.iter().copied());
+    run_git(root, &full)
+        .map(|text| text.lines().map(|line| line.trim().to_owned()).filter(|line| !line.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// Recent commits of HEAD (and the upstream), marked with their section.
+pub fn log(root: &Path) -> Result<CommitLog, String> {
+    const MAX_COMMITS: usize = 80;
+    let upstream = upstream(root);
+    let (outgoing, incoming) = match &upstream {
+        Some(upstream) => (
+            rev_list_set(root, &[&format!("{upstream}..HEAD")]),
+            rev_list_set(root, &[&format!("HEAD..{upstream}")]),
+        ),
+        None => (rev_list_set(root, &["HEAD", "--not", "--remotes"]), Default::default()),
+    };
+    let format = "%H\x1f%h\x1f%P\x1f%an\x1f%ct\x1f%D\x1f%s\x1e".to_owned();
+    let revs: Vec<&str> = match &upstream {
+        Some(upstream) => vec!["HEAD", upstream],
+        None => vec!["HEAD"],
+    };
+    let mut args: Vec<String> = vec![
+        "log".to_owned(),
+        format!("--max-count={MAX_COMMITS}"),
+        "--topo-order".to_owned(),
+        format!("--pretty=format:{format}"),
+    ];
+    args.extend(revs.iter().map(|rev| (*rev).to_owned()));
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let text = run_git(root, &arg_refs)?;
+    let mut commits = Vec::new();
+    for record in text.split('\u{1e}') {
+        let record = record.trim_start_matches(['\n', '\r']);
+        if record.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = record.split('\u{1f}').collect();
+        if fields.len() < 7 || fields[0].is_empty() {
+            continue;
+        }
+        let hash = fields[0].to_owned();
+        commits.push(Commit {
+            hash: hash.clone(),
+            short: fields[1].to_owned(),
+            parents: fields[2].split(' ').filter(|p| !p.is_empty()).map(str::to_owned).collect(),
+            author: fields[3].to_owned(),
+            time: fields[4].parse().unwrap_or(0),
+            refs: fields[5].split(',').map(|r| r.trim().to_owned()).filter(|r| !r.is_empty()).collect(),
+            subject: fields[6].to_owned(),
+            section: if outgoing.contains(&hash) {
+                Section::Outgoing
+            } else if incoming.contains(&hash) {
+                Section::Incoming
+            } else {
+                Section::History
+            },
+        });
+    }
+    let truncated = commits.len() >= MAX_COMMITS;
+    Ok(CommitLog { commits, upstream, truncated })
+}
+
+/// Files and patch of one commit (first parent, as in VS Code's history view).
+pub fn commit_detail(root: &Path, hash: &str) -> Result<CommitDetail, String> {
+    let name_status = run_git_bytes(root, &["show", "--no-color", "--format=", "--name-status", "-z", hash])?;
+    let numstat = run_git_bytes(root, &["show", "--no-color", "--format=", "--numstat", "-z", hash])?;
+    let stats = parse_numstat(&numstat);
+    let mut files = Vec::new();
+    let mut records = name_status.split(|b| *b == 0).peekable();
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
+        let text = String::from_utf8_lossy(record);
+        let mut parts = text.splitn(2, '\t');
+        let status = parts.next().unwrap_or("").chars().next().unwrap_or('M');
+        let path = match parts.next() {
+            Some(path) => path.to_owned(),
+            None => continue,
+        };
+        // Renames/copies carry the old path as the next NUL-separated record.
+        if status == 'R' || status == 'C' {
+            let _ = records.next();
+        }
+        let (additions, deletions) = stats.get(&path).copied().unwrap_or((0, 0));
+        files.push((status, path, additions, deletions));
+    }
+    let header = run_git(root, &["show", "--no-patch", "--format=%H%n%an <%ae>%n%ci%n%s%n%b", hash]).unwrap_or_default();
+    let patch = run_git(root, &["show", "--no-color", "--no-ext-diff", "--unified=3", "--format=", "-m", "--first-parent", hash])
+        .unwrap_or_default();
+    Ok(CommitDetail { files, patch, header })
+}
+
+/// Russian relative time from a unix timestamp.
+pub fn relative_time(now_secs: i64, then_secs: i64) -> String {
+    let delta = (now_secs - then_secs).max(0);
+    match delta {
+        0..=59 => "только что".to_owned(),
+        60..=3599 => format!("{} мин назад", delta / 60),
+        3600..=86_399 => format!("{} ч назад", delta / 3600),
+        86_400..=2_591_999 => format!("{} дн назад", delta / 86_400),
+        2_592_000..=31_535_999 => format!("{} мес назад", delta / 2_592_000),
+        _ => format!("{} г назад", delta / 31_536_000),
+    }
+}
+
 /// Unified diff of one file (worktree and index sides, empty parts dropped).
 pub fn diff(root: &Path, path: &str, staged: bool) -> String {
     let mut args = vec!["diff", "--no-ext-diff", "--no-color", "--unified=3"];
@@ -354,6 +518,180 @@ pub fn ai_commit_message(root: &Path, command: Option<&str>, prompt: &str) -> Re
         return Err(if stderr.trim().is_empty() { "CLI вернул пустое сообщение".to_owned() } else { stderr.trim().to_owned() });
     }
     Ok(message.chars().take(200).collect())
+}
+
+/// Tracked plus untracked-but-not-ignored files, sorted.
+pub fn ls_files(root: &Path) -> Result<Vec<String>, String> {
+    let bytes = run_git_bytes(root, &["ls-files", "-z", "--deduplicate", "--cached", "--others", "--exclude-standard"])?;
+    let mut files: Vec<String> = bytes
+        .split(|b| *b == 0)
+        .filter(|record| !record.is_empty())
+        .map(|record| String::from_utf8_lossy(record).into_owned())
+        .collect();
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+/// Reads a repository file (UTF-8, lossy) up to `max_bytes`; the bool reports truncation.
+pub fn read_file(root: &Path, path: &str, max_bytes: usize) -> Result<(String, bool), String> {
+    let full = root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let bytes = std::fs::read(&full).map_err(|e| format!("{path}: {e}"))?;
+    let truncated = bytes.len() > max_bytes;
+    let slice = &bytes[..bytes.len().min(max_bytes)];
+    Ok((String::from_utf8_lossy(slice).into_owned(), truncated))
+}
+
+/// One hunk of a unified diff.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hunk {
+    pub header: String,
+    /// ` `, `-` and `+` lines, without the trailing newline.
+    pub lines: Vec<String>,
+}
+
+/// One file's part of a unified diff.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileDiff {
+    pub path: String,
+    /// `diff --git` / `---` / `+++` lines, used to rebuild a patch.
+    pub header: Vec<String>,
+    pub hunks: Vec<Hunk>,
+    pub staged: bool,
+}
+
+/// Splits a unified diff into files and hunks.
+pub fn parse_diff(text: &str, staged: bool) -> Vec<FileDiff> {
+    let mut files: Vec<FileDiff> = Vec::new();
+    let mut current: Option<FileDiff> = None;
+    let mut hunk: Option<Hunk> = None;
+    let flush_hunk = |file: &mut Option<FileDiff>, hunk: &mut Option<Hunk>| {
+        if let (Some(file), Some(hunk)) = (file.as_mut(), hunk.take()) {
+            file.hunks.push(hunk);
+        }
+    };
+    for line in text.lines() {
+        if line.starts_with("diff --git ") {
+            flush_hunk(&mut current, &mut hunk);
+            if let Some(file) = current.take() {
+                files.push(file);
+            }
+            current = Some(FileDiff { path: path_from_diff_header(line), header: vec![line.to_owned()], hunks: Vec::new(), staged });
+            continue;
+        }
+        let Some(file) = current.as_mut() else { continue };
+        if line.starts_with("@@") {
+            flush_hunk(&mut current, &mut hunk);
+            hunk = Some(Hunk { header: line.to_owned(), lines: Vec::new() });
+        } else if hunk.is_some() {
+            if line.starts_with('\\') {
+                continue; // "\ No newline at end of file"
+            }
+            if let Some(hunk) = hunk.as_mut() {
+                hunk.lines.push(line.to_owned());
+            }
+        } else {
+            file.header.push(line.to_owned());
+        }
+    }
+    flush_hunk(&mut current, &mut hunk);
+    if let Some(file) = current.take() {
+        files.push(file);
+    }
+    files
+}
+
+fn path_from_diff_header(line: &str) -> String {
+    // `diff --git a/dir/file b/dir/file` — take the b-side, falling back to a-side.
+    let rest = line.strip_prefix("diff --git ").unwrap_or(line);
+    if let Some(index) = rest.rfind(" b/") {
+        return rest[index + 3..].to_owned();
+    }
+    rest.split_whitespace().last().unwrap_or("").trim_start_matches("a/").to_owned()
+}
+
+/// Rebuilds a patch containing only the selected hunks (all when empty).
+pub fn hunk_patch(file: &FileDiff, selection: &[usize]) -> String {
+    let mut out = String::new();
+    for line in &file.header {
+        out.push_str(line);
+        out.push('\n');
+    }
+    for (index, hunk) in file.hunks.iter().enumerate() {
+        if !selection.is_empty() && !selection.contains(&index) {
+            continue;
+        }
+        out.push_str(&hunk.header);
+        out.push('\n');
+        for line in &hunk.lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Applies selected hunks to the index (`staged = false`) or takes them back
+/// out of it (`staged = true`), by piping the rebuilt patch to `git apply`.
+pub fn apply_hunks(root: &Path, file: &FileDiff, selection: &[usize], from_index: bool) -> Result<(), String> {
+    use std::io::Write;
+    let patch = hunk_patch(file, selection);
+    if patch.trim().is_empty() {
+        return Ok(());
+    }
+    let mut command = Command::new("git");
+    command
+        .args(["apply", "--cached", "--whitespace=nowarn"])
+        .args(if from_index { vec!["--reverse"] } else { vec![] })
+        .arg("-")
+        .current_dir(root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = command.spawn().map_err(|e| format!("git apply: {e}"))?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| "git apply: no stdin".to_owned())?
+        .write_all(patch.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
+/// Fetches and prunes the default remote.
+pub fn fetch(root: &Path) -> Result<String, String> {
+    let remote = run_git(root, &["remote"]).unwrap_or_default();
+    let remote = remote.lines().next().unwrap_or("origin").trim().to_owned();
+    let remote = if remote.is_empty() { "origin".to_owned() } else { remote };
+    run_git(root, &["fetch", "--no-tags", "--quiet", "--prune", &remote]).map(|_| strings_fetch_done(&remote))
+}
+
+fn strings_fetch_done(remote: &str) -> String {
+    format!("fetch {remote}")
+}
+
+/// Pushes the current branch, setting the upstream when it has none.
+pub fn push(root: &Path) -> Result<String, String> {
+    let branch = run_git(root, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim().to_owned();
+    if branch.is_empty() || branch == "HEAD" {
+        return Err("нет текущей ветки".to_owned());
+    }
+    if upstream(root).is_none() {
+        run_git(root, &["push", "--porcelain", "--set-upstream", "origin", &format!("refs/heads/{branch}:refs/heads/{branch}")])?;
+    } else {
+        run_git(root, &["push", "--porcelain"])?;
+    }
+    Ok(branch)
 }
 
 /// The prompt sent to the AI CLI, built from the diff and recent subjects.
@@ -457,6 +795,65 @@ mod tests {
         let (program, args) = ai_command("my-cli --fast", "p").unwrap();
         assert_eq!((program.as_str(), args), ("my-cli", vec!["--fast".to_owned(), "p".to_owned()]));
         assert_eq!(ai_command("   ", "p"), None);
+    }
+
+    const SAMPLE_DIFF: &str = "diff --git a/src/main.rs b/src/main.rs\n\
+index 111..222 100644\n\
+--- a/src/main.rs\n\
++++ b/src/main.rs\n\
+@@ -1,3 +1,4 @@\n\
+ fn main() {\n\
+-    old();\n\
++    new();\n\
++    extra();\n\
+ }\n\
+@@ -10,2 +11,2 @@\n\
+ ctx();\n\
+-older();\n\
++newer();\n";
+
+    #[test]
+    fn parses_diff_into_files_and_hunks() {
+        let files = parse_diff(SAMPLE_DIFF, false);
+        assert_eq!(files.len(), 1);
+        let file = &files[0];
+        assert_eq!(file.path, "src/main.rs");
+        assert_eq!(file.header.len(), 4, "diff/index/---/+++ lines");
+        assert_eq!(file.hunks.len(), 2);
+        assert_eq!(file.hunks[0].header, "@@ -1,3 +1,4 @@");
+        assert_eq!(file.hunks[0].lines.len(), 5);
+        assert_eq!(file.hunks[1].lines.len(), 3);
+    }
+
+    #[test]
+    fn hunk_patch_selects_only_requested_hunks() {
+        let files = parse_diff(SAMPLE_DIFF, false);
+        let all = hunk_patch(&files[0], &[]);
+        assert!(all.contains("@@ -1,3 +1,4 @@") && all.contains("@@ -10,2 +11,2 @@"));
+        let second = hunk_patch(&files[0], &[1]);
+        assert!(!second.contains("@@ -1,3 +1,4 @@"));
+        assert!(second.contains("@@ -10,2 +11,2 @@"));
+        assert!(second.starts_with("diff --git a/src/main.rs b/src/main.rs"));
+        assert!(second.ends_with("+newer();\n"));
+    }
+
+    #[test]
+    fn multi_file_diff_splits_paths() {
+        let text = format!("{SAMPLE_DIFF}diff --git a/other.txt b/other.txt\n--- a/other.txt\n+++ b/other.txt\n@@ -1 +1 @@\n-a\n+b\n");
+        let files = parse_diff(&text, true);
+        assert_eq!(files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), vec!["src/main.rs", "other.txt"]);
+        assert!(files[1].staged);
+    }
+
+    #[test]
+    fn relative_time_is_russian() {
+        let now = 1_800_000_000;
+        assert_eq!(relative_time(now, now), "только что");
+        assert_eq!(relative_time(now, now - 120), "2 мин назад");
+        assert_eq!(relative_time(now, now - 7200), "2 ч назад");
+        assert_eq!(relative_time(now, now - 3 * 86_400), "3 дн назад");
+        assert_eq!(relative_time(now, now - 60 * 86_400), "2 мес назад");
+        assert_eq!(relative_time(now, now - 800 * 86_400), "2 г назад");
     }
 
     #[test]

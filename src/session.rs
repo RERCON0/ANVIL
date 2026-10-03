@@ -55,6 +55,9 @@ pub struct PaneState {
     pub workspace_open: bool,
     #[serde(default)]
     pub workspace_width: Option<f32>,
+    /// Active workspace tab: "changes", "commits" or "files".
+    #[serde(default)]
+    pub workspace_tab: Option<String>,
 }
 
 impl SessionState {
@@ -117,6 +120,7 @@ mod tests {
             cwd: cwd.map(PathBuf::from),
             workspace_open: false,
             workspace_width: None,
+            workspace_tab: None,
         }
     }
 

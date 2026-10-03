@@ -82,6 +82,36 @@ fn detects_reads_stages_and_commits() {
 }
 
 #[test]
+fn stages_and_unstages_a_single_hunk() {
+    let Some(dir) = repo() else { return };
+    let root = git::find_root(dir.path()).expect("root");
+    // Two far-apart edits in one file produce two separate hunks.
+    let mut lines: Vec<String> = (1..=40).map(|index| format!("line {index}")).collect();
+    std::fs::write(dir.path().join("big.txt"), lines.join("\n") + "\n").unwrap();
+    run(dir.path(), &["add", "big.txt"]);
+    run(dir.path(), &["commit", "--quiet", "-m", "add big.txt"]);
+    lines[1] = "FIRST change".into();
+    lines[29] = "SECOND change".into();
+    std::fs::write(dir.path().join("big.txt"), lines.join("\n") + "\n").unwrap();
+
+    let diff = git::diff(&root, "big.txt", false);
+    let files = git::parse_diff(&diff, false);
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].hunks.len(), 2, "two hunks expected: {diff}");
+
+    git::apply_hunks(&root, &files[0], &[0], false).expect("stage the first hunk");
+    let staged = git::diff(&root, "big.txt", true);
+    assert!(staged.contains("+FIRST change"), "{staged}");
+    assert!(!staged.contains("SECOND change"), "only one hunk is staged: {staged}");
+
+    let staged_files = git::parse_diff(&staged, true);
+    git::apply_hunks(&root, &staged_files[0], &[], true).expect("take the hunk back");
+    assert!(git::diff(&root, "big.txt", true).trim().is_empty(), "index is clean again");
+    let unstaged = git::diff(&root, "big.txt", false);
+    assert!(unstaged.contains("+FIRST change") && unstaged.contains("+SECOND change"));
+}
+
+#[test]
 fn non_repository_is_reported_as_such() {
     let dir = tempfile::tempdir().unwrap();
     let nested = dir.path().join("no-repo");

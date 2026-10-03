@@ -260,6 +260,26 @@ impl Tab {
                             },
                         }
                     }
+                    // Per-pane panel toggle, revealed while hovering the pane.
+                    let hovered = ui.input(|i| i.pointer.hover_pos()).is_some_and(|pos| pane_rect.contains(pos));
+                    if hovered && !entry.workspace.open {
+                        let button = Rect::from_min_size(
+                            Pos2::new(pane_rect.right() - 26.0, pane_rect.top() + 4.0),
+                            Vec2::splat(22.0),
+                        );
+                        let response = ui.interact(button, ui.id().with(("workspace-toggle", *id)), Sense::click());
+                        let painter = ui.painter_at(button);
+                        let color = if response.hovered() { theme::ICON_HOVER } else { theme::ICON };
+                        if response.hovered() {
+                            painter.rect_filled(button, 0.0, theme::TAB_HOVER_BG);
+                        }
+                        painter.text(button.center(), Align2::CENTER_CENTER, "≡", theme::font(14.0), color);
+                        let _ = response.clone().on_hover_text(strings::WORKSPACE_TOGGLE_HINT);
+                        if response.clicked() {
+                            entry.workspace.open = true;
+                            entry.workspace.refresh_soon();
+                        }
+                    }
                     if let Some(panel_rect) = panel_rect {
                         let cwd = cwd.clone().or_else(|| entry.start_cwd.clone());
                         if let Some(cwd) = cwd {

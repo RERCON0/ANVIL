@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use egui::{FontData, FontDefinitions, FontFamily, FontId};
 
 const CASCADIA: &[u8] = include_bytes!("../fonts/CascadiaMono-Light.ttf");
+/// Seti UI file icons (MIT, see fonts/seti-LICENSE.txt).
+const SETI: &[u8] = include_bytes!("../fonts/seti.ttf");
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FontFiles {
@@ -216,6 +218,10 @@ pub fn install(ctx: &egui::Context, family: &str, entries: &[(String, String)], 
     }
     defs.families.entry(FontFamily::Proportional).or_default().insert(0, "ui".into());
     defs.families.entry(FontFamily::Monospace).or_default().insert(0, "ui-tight".into());
+
+    // File-type icons (Seti): private-use codepoints, so a dedicated family.
+    defs.font_data.insert("seti".into(), FontData::from_static(SETI));
+    defs.families.insert(FontFamily::Name("icons".into()), vec!["seti".to_owned()]);
     ctx.set_fonts(defs);
     report
 }

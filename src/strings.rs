@@ -116,6 +116,46 @@ pub const WORKSPACE_COMMIT: &str = "Зафиксировать";
 pub const WORKSPACE_AI: &str = "AI-сообщение";
 pub const WORKSPACE_DIFF_STAGED: &str = "Индекс/дерево";
 pub const WORKSPACE_TOGGLE_HINT: &str = "Панель git";
+pub const WORKSPACE_TAB_CHANGES: &str = "Изменения";
+pub const WORKSPACE_TAB_COMMITS: &str = "коммиты";
+pub const WORKSPACE_TAB_FILES: &str = "Файлы";
+pub const WORKSPACE_COMMITS_TITLE: &str = "КОММИТЫ";
+pub const WORKSPACE_PUBLISH: &str = "Опубликовать";
+pub const WORKSPACE_TRUNCATED: &str = "последние 80";
+pub const WORKSPACE_NO_COMMITS: &str = "коммитов нет";
+
+pub fn workspace_changes_tab(count: usize) -> String {
+    if count == 0 {
+        WORKSPACE_TAB_CHANGES.to_owned()
+    } else {
+        format!("{WORKSPACE_TAB_CHANGES} {count}")
+    }
+}
+pub const WORKSPACE_NO_UPSTREAM: &str = "нет upstream";
+pub const WORKSPACE_SECTION_OUTGOING: &str = "ИСХОДЯЩИЕ";
+pub const WORKSPACE_SECTION_INCOMING: &str = "ВХОДЯЩИЕ";
+pub const WORKSPACE_SECTION_HISTORY: &str = "ИСТОРИЯ";
+pub const WORKSPACE_BACK: &str = "‹ назад";
+pub const WORKSPACE_COPY_HASH: &str = "Копировать хеш";
+pub const WORKSPACE_COPY_PATCH: &str = "Копировать патч";
+pub const WORKSPACE_NEW_FILE: &str = "Новый файл";
+pub const WORKSPACE_NEW_FOLDER: &str = "Новая папка";
+pub const WORKSPACE_RENAME: &str = "Переименовать";
+pub const WORKSPACE_DELETE: &str = "Удалить";
+pub const WORKSPACE_OPEN_EXTERNAL: &str = "Открыть в системе";
+pub const WORKSPACE_REVEAL: &str = "Показать в проводнике";
+pub const WORKSPACE_FILE_FILTER: &str = "Фильтр файлов";
+pub const WORKSPACE_FILE_TRUNCATED: &str = "… файл показан не полностью";
+pub const WORKSPACE_PUSH_HINT: &str = "Отправить в origin";
+pub const WORKSPACE_FETCH_HINT: &str = "Забрать изменения из origin";
+
+pub fn workspace_pushed(branch: &str) -> String {
+    format!("push {branch} — готово")
+}
+
+pub fn workspace_fetch_done(what: &str) -> String {
+    format!("{what} — готово")
+}
 
 pub fn workspace_staged(staged: usize, unstaged: usize) -> String {
     format!("в индексе {staged} · изменено {unstaged}")

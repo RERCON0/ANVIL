@@ -22,6 +22,7 @@ Copy-Item (Join-Path $release 'OpenConsole.exe') $stage
 Copy-Item (Join-Path $root 'LICENSE') $stage
 Copy-Item (Join-Path $root 'vendor\conpty\LICENSE') (Join-Path $stage 'LICENSES\conpty-MIT.txt')
 Copy-Item (Join-Path $root 'fonts\OFL-notice.txt') (Join-Path $stage 'LICENSES\CascadiaMono-OFL.txt')
+Copy-Item (Join-Path $root 'fonts\seti-LICENSE.txt') (Join-Path $stage 'LICENSES\SetiUI-MIT.txt')
 
 $zip = Join-Path $dist "anvil-$version-x64.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
