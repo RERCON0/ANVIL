@@ -41,6 +41,68 @@ pub struct GlyphCache {
     known: HashMap<char, bool>,
 }
 
+/// True for the Block Elements range (U+2580..=U+259F), which is drawn as
+/// cell-sized geometry instead of a font glyph.
+pub fn is_block_element(ch: char) -> bool {
+    ('\u{2580}'..='\u{259F}').contains(&ch)
+}
+
+/// Cell-sized shapes for the block elements: the font's own glyph sits inside
+/// its em box, so rows and columns of them leave seams and ASCII art (the
+/// Claude Code mascot, meters, bars) falls apart instead of forming a picture.
+pub fn block_shape(ch: char, rect: Rect, color: Color32) -> Option<egui::Shape> {
+    let fill = |x: f32, y: f32, w: f32, h: f32| {
+        egui::Shape::rect_filled(Rect::from_min_size(rect.min + Vec2::new(x, y), Vec2::new(w, h)), 0.0, color)
+    };
+    let (w, h) = (rect.width(), rect.height());
+    let (hx, hy) = (w / 2.0, h / 2.0);
+    let (ex, ey) = (w / 8.0, h / 8.0);
+    Some(match ch {
+        '\u{2580}' => fill(0.0, 0.0, w, hy),                       // ▀
+        '\u{2581}' => fill(0.0, h - ey, w, ey),                    // ▁
+        '\u{2582}' => fill(0.0, h - 2.0 * ey, w, 2.0 * ey),        // ▂
+        '\u{2583}' => fill(0.0, h - 3.0 * ey, w, 3.0 * ey),        // ▃
+        '\u{2584}' => fill(0.0, hy, w, hy),                        // ▄
+        '\u{2585}' => fill(0.0, h - 5.0 * ey, w, 5.0 * ey),        // ▅
+        '\u{2586}' => fill(0.0, h - 6.0 * ey, w, 6.0 * ey),        // ▆
+        '\u{2587}' => fill(0.0, h - 7.0 * ey, w, 7.0 * ey),        // ▇
+        '\u{2588}' => fill(0.0, 0.0, w, h),                        // █
+        '\u{2589}' => fill(0.0, 0.0, 7.0 * ex, h),                 // ▉
+        '\u{258A}' => fill(0.0, 0.0, 6.0 * ex, h),                 // ▊
+        '\u{258B}' => fill(0.0, 0.0, 5.0 * ex, h),                 // ▋
+        '\u{258C}' => fill(0.0, 0.0, hx, h),                       // ▌
+        '\u{258D}' => fill(0.0, 0.0, 3.0 * ex, h),                 // ▍
+        '\u{258E}' => fill(0.0, 0.0, 2.0 * ex, h),                 // ▎
+        '\u{258F}' => fill(0.0, 0.0, ex, h),                       // ▏
+        '\u{2590}' => fill(hx, 0.0, hx, h),                        // ▐
+        '\u{2591}' | '\u{2592}' | '\u{2593}' => {                  // ░▒▓
+            let alpha = match ch {
+                '\u{2591}' => 0.25,
+                '\u{2592}' => 0.5,
+                _ => 0.75,
+            };
+            egui::Shape::rect_filled(
+                rect,
+                0.0,
+                Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), (alpha * 255.0) as u8),
+            )
+        }
+        '\u{2594}' => fill(0.0, 0.0, w, ey),                       // ▔
+        '\u{2595}' => fill(w - ex, 0.0, ex, h),                    // ▕
+        '\u{2596}' => fill(0.0, hy, hx, hy),                       // ▖
+        '\u{2597}' => fill(hx, hy, hx, hy),                        // ▗
+        '\u{2598}' => fill(0.0, 0.0, hx, hy),                      // ▘
+        '\u{2599}' => egui::Shape::Vec(vec![fill(0.0, 0.0, hx, hy), fill(0.0, hy, w, hy)]), // ▙
+        '\u{259A}' => egui::Shape::Vec(vec![fill(0.0, 0.0, hx, hy), fill(hx, hy, hx, hy)]), // ▚
+        '\u{259B}' => egui::Shape::Vec(vec![fill(0.0, 0.0, w, hy), fill(0.0, hy, hx, hy)]), // ▛
+        '\u{259C}' => egui::Shape::Vec(vec![fill(0.0, 0.0, w, hy), fill(hx, hy, hx, hy)]),  // ▜
+        '\u{259D}' => fill(hx, 0.0, hx, hy),                       // ▝
+        '\u{259E}' => egui::Shape::Vec(vec![fill(hx, 0.0, hx, hy), fill(0.0, hy, hx, hy)]), // ▞
+        '\u{259F}' => egui::Shape::Vec(vec![fill(hx, 0.0, hx, hy), fill(0.0, hy, w, hy)]),  // ▟
+        _ => return None,
+    })
+}
+
 impl GlyphCache {
     pub fn in_primary(&mut self, c: char, has_glyph: &mut dyn FnMut(char) -> bool) -> bool {
         c.is_ascii() || *self.known.entry(c).or_insert_with(|| has_glyph(c))
@@ -191,12 +253,18 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
             let font = opt.fonts.for_style(s.bold, s.italic).clone();
             let span = cell_rect(r, run.col, run.cells);
             if run.standalone {
-                let galley = painter.layout_no_wrap(run.text.clone(), font, s.fg);
-                let pos = Pos2::new(
-                    span.min.x + ((span.width() - galley.size().x) / 2.0).max(0.0),
-                    span.min.y + (ch - galley.size().y) / 2.0,
-                );
-                painter.with_clip_rect(span).galley(pos, galley, s.fg);
+                let mut chars = run.text.chars();
+                let block = chars.next().filter(|_| chars.next().is_none()).and_then(|ch| block_shape(ch, span, s.fg));
+                if let Some(shape) = block {
+                    painter.add(shape);
+                } else {
+                    let galley = painter.layout_no_wrap(run.text.clone(), font, s.fg);
+                    let pos = Pos2::new(
+                        span.min.x + ((span.width() - galley.size().x) / 2.0).max(0.0),
+                        span.min.y + (ch - galley.size().y) / 2.0,
+                    );
+                    painter.with_clip_rect(span).galley(pos, galley, s.fg);
+                }
             } else {
                 let format = TextFormat {
                     font_id: font,
@@ -299,5 +367,18 @@ mod tests {
         assert!(!cache.in_primary('↺', &mut has));
         assert!(!cache.in_primary('↺', &mut has));
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn block_elements_fill_their_cell() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(8.0, 16.0));
+        let bounds = |ch: char| block_shape(ch, rect, Color32::WHITE).expect("block").visual_bounding_rect();
+        assert_eq!(bounds('\u{2588}'), rect, "a full block covers the whole cell");
+        assert_eq!(bounds('\u{2580}'), Rect::from_min_size(Pos2::ZERO, Vec2::new(8.0, 8.0)), "upper half");
+        assert_eq!(bounds('\u{2590}'), Rect::from_min_size(Pos2::new(4.0, 0.0), Vec2::new(4.0, 16.0)), "right half");
+        assert_eq!(bounds('\u{259D}'), Rect::from_min_size(Pos2::new(4.0, 0.0), Vec2::new(4.0, 8.0)), "upper right quadrant");
+        assert_eq!(bounds('\u{259B}'), Rect::from_min_size(Pos2::ZERO, Vec2::new(8.0, 16.0)), "three quadrants reach every edge");
+        assert!(block_shape('A', rect, Color32::WHITE).is_none(), "letters stay with the font");
+        assert!(block_shape('\u{2500}', rect, Color32::WHITE).is_none(), "box drawing stays with the font");
     }
 }

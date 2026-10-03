@@ -18,6 +18,8 @@ pub const TAB_NUMBER: Color32 = Color32::from_rgb(0x4c, 0x4c, 0x4c);
 pub const TITLE_TEXT: Color32 = Color32::from_rgb(0xa3, 0xa3, 0xa3);
 pub const WINDOW_ICON: Color32 = Color32::from_rgb(0x8a, 0x8a, 0x8a);
 pub const WINDOW_BUTTON_HOVER: Color32 = Color32::from_rgb(0x1f, 0x1f, 0x1f);
+/// Unfocused panes are darkened by this much, as in the reference terminal.
+pub const PANE_DIM: Color32 = Color32::from_black_alpha(64);
 pub const CLOSE_HOVER: Color32 = Color32::from_rgb(0xc4, 0x2b, 0x1c);
 pub const ICON: Color32 = Color32::from_rgb(0x62, 0x62, 0x62);
 pub const ICON_HOVER: Color32 = Color32::from_rgb(0xb6, 0xb6, 0xb6);

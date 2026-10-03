@@ -692,22 +692,9 @@ impl AnvilApp {
                     self.clear_pane(id);
                 }
             }
-            Action::ZoomIn => {
-                if let Some(view) = self.focused_view_mut() {
-                    view.zoom(1.0);
-                }
-            }
-            Action::ZoomOut => {
-                if let Some(view) = self.focused_view_mut() {
-                    view.zoom(-1.0);
-                }
-            }
-            Action::ResetZoom => {
-                let size = self.config.font.size;
-                if let Some(view) = self.focused_view_mut() {
-                    view.font_size = size;
-                }
-            }
+            Action::ZoomIn => self.zoom_text(1.0, ctx),
+            Action::ZoomOut => self.zoom_text(-1.0, ctx),
+            Action::ResetZoom => self.zoom_text(0.0, ctx),
             Action::PreviousWord => self.write_focused(b"\x1b[1;5D".to_vec()),
             Action::NextWord => self.write_focused(b"\x1b[1;5C".to_vec()),
             Action::DeletePreviousWord => self.write_focused(b"\x17".to_vec()),
@@ -1493,6 +1480,34 @@ impl AnvilApp {
     }
 
     // ---- overlays --------------------------------------------------------
+
+    /// Ctrl+= / Ctrl+- / Ctrl+0 resize the text of the focused terminal, or the
+    /// font-size setting itself while the settings page is up; either way the
+    /// new size is shown, so the change cannot go unnoticed.
+    fn zoom_text(&mut self, delta: f32, ctx: &egui::Context) {
+        let configured = self.config.font.size;
+        let size = if self.settings_open {
+            let size = if delta == 0.0 {
+                Config::default().font.size
+            } else {
+                (configured + delta.signum()).clamp(crate::term::view::MIN_FONT_SIZE, crate::term::view::MAX_FONT_SIZE)
+            };
+            self.config.font.size = size;
+            let next = self.config.clone();
+            self.apply_config(ctx.clone(), next, true);
+            size
+        } else {
+            let Some(view) = self.focused_view_mut() else { return };
+            if delta == 0.0 {
+                view.font_size = configured;
+            } else {
+                view.zoom(delta.signum());
+            }
+            view.font_size
+        };
+        self.ui.toasts.retain(|toast| !toast.text.starts_with(strings::ZOOM_TOAST_PREFIX));
+        self.toast(strings::zoom_toast(size));
+    }
 
     fn toast(&mut self, text: String) {
         self.ui.toasts.push(Toast { text, at: Instant::now() });

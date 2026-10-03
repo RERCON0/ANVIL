@@ -236,7 +236,7 @@ pub fn text_runs(row: &[RenderCell]) -> Vec<TextRun> {
         if cell.spacer {
             continue;
         }
-        let standalone = cell.wide || !cell.in_primary_font || cell.combining.is_some();
+        let standalone = cell.wide || !cell.in_primary_font || cell.combining.is_some() || crate::term::render::is_block_element(cell.ch);
         if standalone {
             flush(&mut current, &mut runs);
             let mut text = cell.ch.to_string();
@@ -372,6 +372,13 @@ mod tests {
     fn leading_spaces_do_not_start_a_run() {
         let runs = text_runs(&row("   $ ls", style(Color32::WHITE)));
         assert_eq!((runs[0].col, runs[0].text.as_str()), (3, "$ ls"));
+    }
+
+    #[test]
+    fn block_elements_are_standalone() {
+        let runs = text_runs(&row("a█b", style(Color32::WHITE)));
+        let shape: Vec<_> = runs.iter().map(|run| (run.col, run.text.as_str(), run.standalone)).collect();
+        assert_eq!(shape, vec![(0, "a", false), (1, "█", true), (2, "b", false)]);
     }
 
     #[test]

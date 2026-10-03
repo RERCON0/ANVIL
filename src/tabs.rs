@@ -248,6 +248,11 @@ impl Tab {
                         (*pane_rect, None)
                     };
                     let output = entry.view.show(ui, terminal_rect, pane, &input);
+                    // The pane that is not focused is dimmed so the eye lands on
+                    // the one being typed into.
+                    if focused != *id {
+                        ui.painter().rect_filled(terminal_rect, 0.0, theme::PANE_DIM);
+                    }
                     if focused == *id {
                         self.ime_area = output.cursor_rect;
                     }

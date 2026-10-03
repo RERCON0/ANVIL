@@ -133,6 +133,11 @@ pub fn workspace_changes_tab(count: usize) -> String {
     }
 }
 pub const WORKSPACE_NO_UPSTREAM: &str = "нет upstream";
+/// Toast after Ctrl+= / Ctrl+- / Ctrl+0; steps of one zoom collapse into one.
+pub const ZOOM_TOAST_PREFIX: &str = "Размер текста";
+pub fn zoom_toast(size: f32) -> String {
+    format!("{ZOOM_TOAST_PREFIX}: {size:.0}")
+}
 pub const WORKSPACE_SECTION_OUTGOING: &str = "ИСХОДЯЩИЕ";
 pub const WORKSPACE_SECTION_INCOMING: &str = "ВХОДЯЩИЕ";
 pub const WORKSPACE_SECTION_HISTORY: &str = "ИСТОРИЯ";
