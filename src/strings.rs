@@ -81,6 +81,9 @@ pub const SETTINGS_COMMAND: &str = "Команда";
 pub const SETTINGS_ARGS: &str = "Аргументы";
 pub const SETTINGS_CWD: &str = "Папка";
 pub const SETTINGS_OPEN_CONFIG: &str = "Открыть config.json";
+pub const SETTINGS_WORKSPACE: &str = "Панель git";
+pub const SETTINGS_AI_COMMAND: &str = "AI-команда коммита";
+pub const SETTINGS_AI_HINT: &str = "claude / opencode / codex / gemini / aider, пусто — определить из процесса";
 pub const SETTINGS_CLAUDE: &str = "Claude Code";
 pub const SETTINGS_CLAUDE_ENABLED: &str = "Статус Claude Code";
 pub const SETTINGS_CLAUDE_CONNECTED: &str = "Подключён";
@@ -97,6 +100,34 @@ pub fn claude_replace_question(command: &str) -> String {
 }
 pub const CLAUDE_REPLACE: &str = "Заменить";
 pub const CLAUDE_KEEP: &str = "Оставить";
+
+// Workspace panel (git).
+pub const WORKSPACE_NO_REPO: &str = "не репозиторий";
+pub const WORKSPACE_NO_REPO_HINT: &str = "В этой папке нет git-репозитория.";
+pub const WORKSPACE_CLOSE: &str = "Свернуть панель";
+pub const WORKSPACE_REFRESH: &str = "Обновить";
+pub const WORKSPACE_STAGE: &str = "Стейджить";
+pub const WORKSPACE_UNSTAGE: &str = "Убрать";
+pub const WORKSPACE_STAGE_ALL: &str = "Стейджить всё";
+pub const WORKSPACE_UNSTAGE_ALL: &str = "Убрать всё";
+pub const WORKSPACE_DIFF_SIDE: &str = "Индекс / рабочее дерево";
+pub const WORKSPACE_COMMIT_HINT: &str = "Сообщение коммита (Ctrl+Enter)";
+pub const WORKSPACE_COMMIT: &str = "Зафиксировать";
+pub const WORKSPACE_AI: &str = "AI-сообщение";
+pub const WORKSPACE_DIFF_STAGED: &str = "Индекс/дерево";
+pub const WORKSPACE_TOGGLE_HINT: &str = "Панель git";
+
+pub fn workspace_staged(staged: usize, unstaged: usize) -> String {
+    format!("в индексе {staged} · изменено {unstaged}")
+}
+
+pub fn workspace_committed(hash: &str) -> String {
+    format!("Коммит {hash}")
+}
+
+pub fn workspace_ai(command: &str) -> String {
+    format!("AI: {command}")
+}
 
 // Profile picker.
 pub const PICKER_FILTER: &str = "Фильтр";

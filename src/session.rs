@@ -50,6 +50,11 @@ pub struct PaneState {
     pub profile_id: String,
     #[serde(default)]
     pub cwd: Option<PathBuf>,
+    /// Workspace (git) panel of this pane.
+    #[serde(default)]
+    pub workspace_open: bool,
+    #[serde(default)]
+    pub workspace_width: Option<f32>,
 }
 
 impl SessionState {
@@ -107,7 +112,12 @@ mod tests {
     use super::*;
 
     fn pane(profile: &str, cwd: Option<&str>) -> PaneState {
-        PaneState { profile_id: profile.into(), cwd: cwd.map(PathBuf::from) }
+        PaneState {
+            profile_id: profile.into(),
+            cwd: cwd.map(PathBuf::from),
+            workspace_open: false,
+            workspace_width: None,
+        }
     }
 
     fn sample() -> SessionState {

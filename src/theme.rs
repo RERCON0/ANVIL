@@ -128,7 +128,9 @@ pub fn apply(ctx: &egui::Context) {
         style.spacing.scroll = egui::style::ScrollStyle { foreground_color: true, ..egui::style::ScrollStyle::solid() };
         let mut text = style.text_styles.clone();
         text.insert(egui::TextStyle::Body, font(13.0));
-        text.insert(egui::TextStyle::Button, font(12.5));
+        // Buttons and fields use the un-nudged face, otherwise the +0.15em
+        // body baseline pushes the label below the button's centre line.
+        text.insert(egui::TextStyle::Button, field_font(12.5));
         text.insert(egui::TextStyle::Small, font(12.0));
         text.insert(egui::TextStyle::Monospace, font(13.0));
         text.insert(egui::TextStyle::Heading, title_font(14.0));
@@ -186,12 +188,12 @@ pub fn kv_row(ui: &mut egui::Ui, label: &str, value: &str, value_color: Color32)
 
 /// Border-only button: hairline stroke, no fill (see `visuals`).
 pub fn ghost_button(text: impl Into<String>) -> Button<'static> {
-    Button::new(RichText::new(text.into()).color(TEXT).font(font(12.5)))
+    Button::new(RichText::new(text.into()).color(TEXT).font(field_font(12.5)))
 }
 
 /// The primary action: accent text and stroke, transparent fill.
 pub fn accent_button(text: impl Into<String>) -> Button<'static> {
-    Button::new(RichText::new(text.into()).color(ACCENT).font(font(12.5)))
+    Button::new(RichText::new(text.into()).color(ACCENT).font(field_font(12.5)))
         .stroke(Stroke::new(1.0, ACCENT))
         .fill(Color32::TRANSPARENT)
 }

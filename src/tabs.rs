@@ -21,6 +21,10 @@ const COLLAPSED_STRIP_HEIGHT: f32 = 24.0;
 pub struct PaneEntry {
     pub content: PaneContent,
     pub view: TerminalView,
+    pub workspace: crate::workspace::Workspace,
+    /// Folder the pane was started in; the workspace panel uses it until the
+    /// shell reports a live directory over OSC.
+    pub start_cwd: Option<std::path::PathBuf>,
     pub profile_id: String,
     pub profile_name: String,
     pub title: String,
@@ -73,6 +77,8 @@ pub struct FrameEnv<'a> {
     pub min_pane_width: f32,
     pub min_pane_height: f32,
     pub fallbacks_loaded: bool,
+    /// CLI for the AI commit message (config or auto-detected), if any.
+    pub ai_command: Option<String>,
 }
 
 /// Actions a tab asks the application to perform.
@@ -103,6 +109,11 @@ pub struct Tab {
 }
 
 impl Tab {
+    /// The focused pane's workspace panel (open/closed).
+    pub fn workspace_mut(&mut self) -> Option<&mut crate::workspace::Workspace> {
+        self.panes.get_mut(&self.focused).map(|entry| &mut entry.workspace)
+    }
+
     pub fn new(tree: SplitTree, panes: HashMap<PaneId, PaneEntry>, focused: PaneId) -> Tab {
         Tab { tree, panes, focused, maximized: None, collapsed: Vec::new(), custom_title: None, has_activity: false }
     }
@@ -208,7 +219,19 @@ impl Tab {
             };
             match &mut entry.content {
                 PaneContent::Live(pane) => {
-                    let output = entry.view.show(ui, *pane_rect, pane, &input);
+                    let cwd = pane.current_dir();
+                    let (terminal_rect, panel_rect) = if entry.workspace.open {
+                        let width = crate::workspace::clamp_width(entry.workspace.width)
+                            .min((pane_rect.width() - 140.0).max(crate::workspace::MIN_WIDTH));
+                        let split = pane_rect.max.x - width;
+                        (
+                            Rect::from_min_max(pane_rect.min, Pos2::new(split, pane_rect.max.y)),
+                            Some(Rect::from_min_max(Pos2::new(split, pane_rect.min.y), pane_rect.max)),
+                        )
+                    } else {
+                        (*pane_rect, None)
+                    };
+                    let output = entry.view.show(ui, terminal_rect, pane, &input);
                     if output.pressed {
                         actions.push(TabAction::Focus(*id));
                     }
@@ -235,6 +258,32 @@ impl Tab {
                                     entry.exited = true;
                                 }
                             },
+                        }
+                    }
+                    if let Some(panel_rect) = panel_rect {
+                        let cwd = cwd.clone().or_else(|| entry.start_cwd.clone());
+                        if let Some(cwd) = cwd {
+                            entry.workspace.poll(cwd);
+                            if entry.workspace.absorb() {
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                        let actions = entry.workspace.show(ui, panel_rect, env.ai_command.as_deref());
+                        for action in actions {
+                            match action {
+                                crate::workspace::WorkspaceAction::Close => entry.workspace.open = false,
+                            }
+                        }
+                        let handle = Rect::from_min_size(
+                            Pos2::new(panel_rect.min.x - 3.0, panel_rect.min.y),
+                            Vec2::new(6.0, panel_rect.height()),
+                        );
+                        let response = ui.interact(handle, ui.id().with(("workspace-handle", *id)), Sense::click_and_drag());
+                        if response.hovered() || response.dragged() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                        }
+                        if response.dragged() {
+                            entry.workspace.width = crate::workspace::clamp_width(entry.workspace.width - response.drag_delta().x);
                         }
                     }
                     if !env.active && pane.take_output_flag() {

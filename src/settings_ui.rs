@@ -226,6 +226,20 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, cx: &mut SettingsContext, state: &mut
                 profile_editor(ui, state, cx, &mut outcome);
             }
 
+            // ---- workspace --------------------------------------------------
+            theme::section(ui, strings::SETTINGS_WORKSPACE);
+            theme::tag(ui, strings::SETTINGS_AI_COMMAND);
+            let mut ai = cx.config.workspace.ai_commit_command.clone().unwrap_or_default();
+            if ui
+                .add(egui::TextEdit::singleline(&mut ai).font(theme::field_font(13.0)).desired_width(320.0))
+                .changed()
+            {
+                let trimmed = ai.trim().to_owned();
+                cx.config.workspace.ai_commit_command = (!trimmed.is_empty()).then_some(trimmed);
+                outcome.changed = true;
+            }
+            ui.label(RichText::new(strings::SETTINGS_AI_HINT).color(theme::FAINT).font(theme::font(11.5)));
+
             // ---- hotkeys ----------------------------------------------------
             theme::section(ui, strings::SETTINGS_HOTKEYS);
             ui.label(RichText::new(strings::SETTINGS_HOTKEYS_HINT).color(theme::FAINT).font(theme::font(11.5)));

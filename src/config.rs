@@ -24,6 +24,15 @@ pub struct Config {
     pub hotkeys: BTreeMap<String, Vec<String>>,
     pub claude_status: ClaudeStatusConfig,
     pub restore_session: bool,
+    pub workspace: WorkspaceConfig,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WorkspaceConfig {
+    /// CLI that writes the commit message (claude, opencode, codex, gemini,
+    /// aider or a full command line). None: detect the CLI running in the pane.
+    pub ai_commit_command: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -122,6 +131,7 @@ impl Default for Config {
             hotkeys: BTreeMap::new(),
             claude_status: ClaudeStatusConfig::default(),
             restore_session: true,
+            workspace: WorkspaceConfig::default(),
         }
     }
 }

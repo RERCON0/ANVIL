@@ -99,6 +99,7 @@ pub enum Action {
     DeleteNextWord,
     DeleteLine,
     Search,
+    ToggleWorkspace,
     ScrollToTop,
     ScrollToBottom,
     ScrollPageUp,
@@ -146,6 +147,7 @@ const SIMPLE_ACTIONS: &[(&str, Action)] = &[
     ("delete-next-word", Action::DeleteNextWord),
     ("delete-line", Action::DeleteLine),
     ("search", Action::Search),
+    ("toggle-workspace", Action::ToggleWorkspace),
     ("scroll-to-top", Action::ScrollToTop),
     ("scroll-to-bottom", Action::ScrollToBottom),
     ("scroll-page-up", Action::ScrollPageUp),
@@ -199,6 +201,7 @@ impl Action {
                 | Action::DeleteNextWord
                 | Action::DeleteLine
                 | Action::Search
+                | Action::ToggleWorkspace
                 | Action::ScrollToTop
                 | Action::ScrollToBottom
                 | Action::ScrollPageUp
@@ -260,6 +263,7 @@ pub const DEFAULT_BINDINGS: &[(&str, &[&str])] = &[
     ("delete-next-word", &["Ctrl-Delete"]),
     ("delete-line", &["Ctrl-Shift-Backspace"]),
     ("search", &["Ctrl-Shift-F"]),
+    ("toggle-workspace", &["Ctrl-Shift-G"]),
     ("scroll-to-top", &["Ctrl-PageUp"]),
     ("scroll-to-bottom", &["Ctrl-PageDown"]),
     ("scroll-page-up", &["Alt-PageUp"]),

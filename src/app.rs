@@ -329,6 +329,7 @@ impl AnvilApp {
             min_pane_width: cell_w * 8.0,
             min_pane_height: cell_h * 3.0,
             fallbacks_loaded: self.fallbacks_loaded,
+            ai_command: self.ai_command(),
         };
         let actions = match self.tabs.get_mut(self.active) {
             Some(tab) => tab.show(ui, rect, &env),
@@ -651,6 +652,14 @@ impl AnvilApp {
                     view.search.focus_requested = true;
                 }
             }
+            Action::ToggleWorkspace => {
+                if let Some(workspace) = self.tabs.get_mut(self.active).and_then(Tab::workspace_mut) {
+                    workspace.open = !workspace.open;
+                    if workspace.open {
+                        workspace.refresh_soon();
+                    }
+                }
+            }
             Action::ScrollToTop => self.scroll_focused(Scroll::Top),
             Action::ScrollToBottom => self.scroll_focused(Scroll::Bottom),
             Action::ScrollPageUp => self.scroll_focused(Scroll::PageUp),
@@ -692,6 +701,23 @@ impl AnvilApp {
 
     fn pane(&self, id: PaneId) -> Option<&Pane> {
         self.tabs.get(self.active).and_then(|t| t.pane(id)).and_then(PaneEntry::live)
+    }
+
+    /// CLI for AI commit messages: the configured one, else the AI CLI found
+    /// in the focused pane's process tree (claude, opencode, codex, …).
+    fn ai_command(&self) -> Option<String> {
+        if let Some(command) = self.config.workspace.ai_commit_command.clone() {
+            return Some(command);
+        }
+        let pane = self.focused_pane()?;
+        for candidate in ["claude", "opencode", "codex", "gemini", "aider"] {
+            if crate::procs::has_descendant_named(&self.proc_snapshot, pane.shell_pid, &format!("{candidate}.exe"))
+                || crate::procs::has_descendant_named(&self.proc_snapshot, pane.shell_pid, candidate)
+            {
+                return Some(candidate.to_owned());
+            }
+        }
+        None
     }
 
     fn focused_cwd(&self) -> Option<PathBuf> {
@@ -911,9 +937,12 @@ impl AnvilApp {
         };
         let repaint = self.repaint.clone().unwrap_or_else(|| Arc::new(|| {}));
         let view = TerminalView::new(self.config.font.size);
+        let start_cwd = options.cwd.clone();
         let base = PaneEntry {
             content: PaneContent::Error(String::new()),
             view,
+            workspace: crate::workspace::Workspace::default(),
+            start_cwd,
             profile_id: profile.id.clone(),
             profile_name: profile.name.clone(),
             title: String::new(),
@@ -1057,7 +1086,11 @@ impl AnvilApp {
                     .cloned()
                     .unwrap_or_else(|| self.default_profile());
                 let cwd = session::usable_cwd(pane_state.cwd.as_deref());
-                let entry = self.spawn_entry(id, &profile, cwd);
+                let mut entry = self.spawn_entry(id, &profile, cwd);
+                entry.workspace.open = pane_state.workspace_open;
+                if let Some(width) = pane_state.workspace_width {
+                    entry.workspace.width = crate::workspace::clamp_width(width);
+                }
                 entries.insert(id, entry);
                 order.push(id);
                 id
@@ -1076,8 +1109,13 @@ impl AnvilApp {
     fn tab_state(&self, tab: &Tab) -> TabState {
         let describe = |id: PaneId| {
             tab.pane(id)
-                .map(|entry| PaneState { profile_id: entry.profile_id.clone(), cwd: entry.cwd() })
-                .unwrap_or(PaneState { profile_id: String::new(), cwd: None })
+                .map(|entry| PaneState {
+                    profile_id: entry.profile_id.clone(),
+                    cwd: entry.cwd(),
+                    workspace_open: entry.workspace.open,
+                    workspace_width: Some(entry.workspace.width),
+                })
+                .unwrap_or(PaneState { profile_id: String::new(), cwd: None, workspace_open: false, workspace_width: None })
         };
         let focused = tab.tree.panes().iter().position(|id| *id == tab.focused).unwrap_or(0);
         TabState {
