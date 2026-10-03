@@ -213,6 +213,14 @@ impl Config {
         }
     }
 
+    /// Reload for the live watcher: a read or parse failure (an editor may be
+    /// mid-write) leaves the active configuration alone and never quarantines
+    /// the file; only startup treats a broken file as corruption.
+    pub fn load_for_reload(path: &Path) -> Result<Config, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        serde_json::from_str::<Config>(&text).map_err(|e| e.to_string())
+    }
+
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let text = serde_json::to_string_pretty(&self.to_minimal_json()).map_err(io::Error::other)?;
         atomic_write(path, format!("{text}\n").as_bytes())

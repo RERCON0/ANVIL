@@ -29,6 +29,11 @@ pub struct Row {
     pub segments: Vec<Segment>,
 }
 
+/// Caps that keep a hostile history (thousands of parents/lanes) from stalling
+/// the UI thread; deeper graphs render approximately, as the fork did.
+const MAX_LANES: usize = 32;
+const MAX_PARENTS: usize = 8;
+
 /// Lane geometry for every commit, in the order they are displayed.
 pub fn compute(commits: &[Commit]) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::with_capacity(commits.len());
@@ -56,7 +61,12 @@ pub fn compute(commits: &[Commit]) -> Vec<Row> {
                 lanes[lane] = if merged == Some(lane) || merged.is_none() { Some(parent) } else { None };
             }
         }
-        for parent in other_parents {
+        // Bound the fan-out: an octopus merge with thousands of parents would
+        // otherwise stall the UI thread while lanes are cloned per commit.
+        for parent in other_parents.iter().take(MAX_PARENTS - 1) {
+            if lanes.len() >= MAX_LANES {
+                break;
+            }
             if !lanes.iter().any(|hash| hash.as_deref() == Some(parent.as_str())) {
                 match lanes.iter().position(Option::is_none) {
                     Some(free) => lanes[free] = Some(parent.clone()),

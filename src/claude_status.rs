@@ -67,15 +67,20 @@ fn bar(pct: f64) -> String {
     format!("{}{}", "▓".repeat(filled), "░".repeat(10 - filled))
 }
 
-fn resets_in(resets_at_secs: f64, now_ms: i64) -> String {
-    let left = ((resets_at_secs * 1000.0) as i64 - now_ms).max(0);
+/// `↺ 2ч5м`, or None when the timestamp is not a plausible unix time.
+fn resets_in(resets_at_secs: f64, now_ms: i64) -> Option<String> {
+    if !(1_000_000_000.0..=4_000_000_000.0).contains(&resets_at_secs) {
+        return None;
+    }
+    let left = ((resets_at_secs * 1000.0) as i64 - now_ms).clamp(0, 7 * 86_400_000);
     let h = left / 3_600_000;
     let m = (left % 3_600_000) / 60_000;
-    if h > 0 {
-        format!("{h}ч{m}м")
-    } else {
-        format!("{m}м")
-    }
+    Some(if h > 0 { format!("{h}ч{m}м") } else { format!("{m}м") })
+}
+
+/// Percentages outside 0-100 (a broken or hostile payload) are clamped.
+fn clamp_pct(pct: f64) -> f64 {
+    pct.clamp(0.0, 100.0)
 }
 
 /// Last path component, accepting `/` and `\` and ignoring trailing separators
@@ -98,19 +103,21 @@ pub fn format_line(p: &Payload, branch: Option<&str>, now_ms: i64) -> String {
         let color = if branch == "main" || branch == "master" { RED } else { GREEN };
         parts.push(format!("{color}{branch}{RESET}"));
     }
-    if let Some(ctx) = p.context_pct {
+    if let Some(ctx) = p.context_pct.map(clamp_pct) {
         let c = heat(ctx);
         parts.push(format!("{c}{}{RESET} {c}{}%{RESET}", bar(ctx), js_round(ctx)));
     }
-    if let Some(five) = p.five_hour_pct {
+    if let Some(five) = p.five_hour_pct.map(clamp_pct) {
         let c = heat(five);
         let mut text = format!("5h: {c}{}%{RESET}", js_round(five));
-        if let (true, Some(resets)) = (five >= 60.0, p.five_hour_resets_at) {
-            text.push_str(&format!(" {DIM}↺ {}{RESET}", resets_in(resets, now_ms)));
+        if five >= 60.0 {
+            if let Some(reset) = p.five_hour_resets_at.and_then(|resets| resets_in(resets, now_ms)) {
+                text.push_str(&format!(" {DIM}↺ {reset}{RESET}"));
+            }
         }
         parts.push(text);
     }
-    if let Some(week) = p.seven_day_pct {
+    if let Some(week) = p.seven_day_pct.map(clamp_pct) {
         parts.push(format!("7d: {}{}%{RESET}", heat(week), js_round(week)));
     }
     if let Some(agent) = &p.agent {

@@ -4,14 +4,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use egui::{Align2, FontId, Pos2, Rect, Sense, Vec2};
 
 use crate::claude_status::StatusRecord;
 use crate::config::RightClick;
 use crate::layout::split_tree::{Anchor, Dir, PaneId, SplitTree};
 use crate::strings;
-use crate::term::pane::{Pane, PaneEvent};
+use crate::term::pane::Pane;
 use crate::term::style::Palette;
 use crate::term::view::{PaneCommand, TerminalView, ViewInput};
 use crate::theme;
@@ -106,6 +105,8 @@ pub struct Tab {
     pub collapsed: Vec<(PaneId, Anchor)>,
     pub custom_title: Option<String>,
     pub has_activity: bool,
+    /// Cursor rectangle of the focused pane, for the IME candidate window.
+    pub ime_area: Option<Rect>,
 }
 
 impl Tab {
@@ -115,7 +116,16 @@ impl Tab {
     }
 
     pub fn new(tree: SplitTree, panes: HashMap<PaneId, PaneEntry>, focused: PaneId) -> Tab {
-        Tab { tree, panes, focused, maximized: None, collapsed: Vec::new(), custom_title: None, has_activity: false }
+        Tab {
+            tree,
+            panes,
+            focused,
+            maximized: None,
+            collapsed: Vec::new(),
+            custom_title: None,
+            has_activity: false,
+            ime_area: None,
+        }
     }
 
     /// The title shown in the tab list: custom, else the focused pane's.
@@ -212,7 +222,6 @@ impl Tab {
                 .collect(),
         };
 
-        let mut activity = false;
         for (id, pane_rect) in &visible {
             let Some(entry) = self.panes.get_mut(id) else { continue };
             let input = ViewInput {
@@ -239,6 +248,9 @@ impl Tab {
                         (*pane_rect, None)
                     };
                     let output = entry.view.show(ui, terminal_rect, pane, &input);
+                    if focused == *id {
+                        self.ime_area = output.cursor_rect;
+                    }
                     if output.pressed {
                         actions.push(TabAction::Focus(*id));
                     }
@@ -248,25 +260,8 @@ impl Tab {
                     if output.needs_fallbacks {
                         actions.push(TabAction::NeedsFallbacks);
                     }
-                    for event in pane.drain_events() {
-                        match event {
-                            PaneEvent::Title(title) => entry.title = title,
-                            PaneEvent::ResetTitle => entry.title = entry.profile_name.clone(),
-                            PaneEvent::Clipboard(text) => actions.push(TabAction::Clipboard(text)),
-                            PaneEvent::Bell => actions.push(TabAction::Bell),
-                            PaneEvent::CursorBlinkingChange => entry.view.app_blink = true,
-                            PaneEvent::Exited(code) => match code {
-                                Some(0) => actions.push(TabAction::ClosePane(*id)),
-                                other => {
-                                    let message = format!("\r\n\x1b[90m{}\x1b[0m\r\n", strings::process_exited(other));
-                                    let mut term = pane.term.lock();
-                                    let mut processor: Processor<StdSyncHandler> = Processor::new();
-                                    processor.advance(&mut *term, message.as_bytes());
-                                    entry.exited = true;
-                                }
-                            },
-                        }
-                    }
+                    // Pane events and the output flag are pumped for every pane
+                    // by AnvilApp::poll_panes, not only for the visible tab.
                     // Per-pane panel toggle, revealed while hovering the pane.
                     let hovered = ui.input(|i| i.pointer.hover_pos()).is_some_and(|pos| pane_rect.contains(pos));
                     if hovered && !entry.workspace.open {
@@ -313,9 +308,6 @@ impl Tab {
                             entry.workspace.width = crate::workspace::clamp_width(entry.workspace.width - response.drag_delta().x);
                         }
                     }
-                    if !env.active && pane.take_output_flag() {
-                        activity = true;
-                    }
                 }
                 PaneContent::Error(message) => {
                     let painter = ui.painter_at(*pane_rect);
@@ -340,9 +332,6 @@ impl Tab {
                     }
                 }
             }
-        }
-        if activity {
-            self.has_activity = true;
         }
 
         if self.maximized.is_none() {

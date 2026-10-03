@@ -214,6 +214,15 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, cx: &mut SettingsContext, state: &mut
                 if cx.config.default_profile == removed.id {
                     cx.config.default_profile = "git-bash".into();
                 }
+                // Keep the editor pointing at the same profile it was editing.
+                match state.editing {
+                    Some(editing) if editing == index => {
+                        state.editing = None;
+                        state.adding = false;
+                    }
+                    Some(editing) if editing > index => state.editing = Some(editing - 1),
+                    _ => {}
+                }
                 outcome.changed = true;
             }
             if !state.adding && state.editing.is_none() && ui.add(theme::ghost_button(strings::SETTINGS_ADD)).clicked() {
@@ -293,9 +302,9 @@ fn profile_editor(ui: &mut egui::Ui, state: &mut SettingsState, cx: &mut Setting
     theme::tag(ui, strings::SETTINGS_COMMAND);
     ui.add(egui::TextEdit::singleline(&mut draft.command).font(theme::field_font(13.0)).desired_width(520.0));
     theme::tag(ui, strings::SETTINGS_ARGS);
-    let mut args = draft.args.join(" ");
+    let mut args = join_args(&draft.args);
     if ui.add(egui::TextEdit::singleline(&mut args).font(theme::field_font(13.0)).desired_width(420.0)).changed() {
-        draft.args = args.split_whitespace().map(str::to_owned).collect();
+        draft.args = split_args(&args);
     }
     theme::tag(ui, strings::SETTINGS_CWD);
     let mut cwd = draft.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
@@ -311,8 +320,8 @@ fn profile_editor(ui: &mut egui::Ui, state: &mut SettingsState, cx: &mut Setting
             if draft.id.is_empty() {
                 draft.id = unique_profile_id(cx.config, &draft.name);
             }
-            match state.editing {
-                Some(index) => cx.config.profiles[index] = draft.clone(),
+            match state.editing.and_then(|index| cx.config.profiles.get_mut(index)) {
+                Some(slot) => *slot = draft.clone(),
                 None => cx.config.profiles.push(draft.clone()),
             }
             state.adding = false;
@@ -325,6 +334,37 @@ fn profile_editor(ui: &mut egui::Ui, state: &mut SettingsState, cx: &mut Setting
         }
     });
     ui.add_space(4.0);
+}
+
+/// Quotes arguments that contain spaces, so the text field round-trips an
+/// argument list instead of silently splitting `-File "C:\My Scripts\x.ps1"`.
+fn join_args(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| if arg.contains(' ') || arg.contains('"') { format!("\"{}\"", arg.replace('"', "'")) } else { arg.clone() })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Splits on whitespace, keeping quoted runs together (quotes are dropped).
+fn split_args(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for ch in text.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 fn unique_profile_id(config: &Config, name: &str) -> String {
@@ -345,6 +385,7 @@ fn unique_profile_id(config: &Config, name: &str) -> String {
     id
 }
 
+
 /// Opens a file with the shell (config.json in its default editor).
 pub fn open_path(path: &Path) {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
@@ -355,5 +396,20 @@ pub fn open_path(path: &Path) {
     // SAFETY: NUL-terminated strings; no output parameters are used.
     unsafe {
         ShellExecuteW(std::ptr::null_mut(), operation.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arguments_round_trip_through_the_text_field() {
+        let args = vec!["-NoLogo".to_owned(), "-File".to_owned(), r"C:\My Scripts\start.ps1".to_owned()];
+        let text = join_args(&args);
+        assert_eq!(text, r#"-NoLogo -File "C:\My Scripts\start.ps1""#);
+        assert_eq!(split_args(&text), args);
+        assert_eq!(split_args("  -a   -b  "), vec!["-a".to_owned(), "-b".to_owned()]);
+        assert_eq!(split_args(""), Vec::<String>::new());
     }
 }

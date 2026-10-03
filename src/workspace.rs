@@ -6,7 +6,7 @@
 //! and consumes responses, so the UI never blocks on the repository.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,7 +32,9 @@ pub enum Request {
     CommitDetail { hash: String },
     Files,
     ReadFile { path: String },
-    ApplyHunks { path: String, indices: Vec<usize>, from_index: bool },
+    /// `header` is the `@@ … @@` line the user saw; the worker refuses to apply
+    /// when the freshly generated diff no longer has it at `index`.
+    ApplyHunks { path: String, index: usize, header: String, from_index: bool },
     Fetch,
     Push,
     WritePath { path: String, folder: bool },
@@ -41,7 +43,8 @@ pub enum Request {
 }
 
 pub enum Response {
-    Status(Status),
+    /// Status plus the resolved repository root (None: not a repository).
+    Status(Status, Option<PathBuf>),
     Diff { path: String, files: Vec<FileDiff>, text: String, staged: bool },
     Refreshed,
     Committed(String),
@@ -192,8 +195,9 @@ impl Workspace {
         for response in responses {
             repaint = true;
             match response {
-                Response::Status(status) => {
+                Response::Status(status, root) => {
                     self.busy = false;
+                    self.root = root;
                     self.status = status;
                     self.selected.retain(|path| self.status.changes.iter().any(|change| &change.path == path));
                     if let Some(path) = self.diff_path.clone() {
@@ -507,7 +511,7 @@ impl Workspace {
             // One compact line: subject, refs, then time and hash on the right.
             let graph_width = row.lane_count as f32 * LANE_WIDTH;
             let text_x = rect.min.x + graph_width + 7.0;
-            let time_text = git::relative_time(now, commit.time);
+            let time_text = crate::strings::relative_time(now, commit.time);
             let time_galley = painter.layout_no_wrap(time_text.clone(), theme::font(10.0), theme::FAINT);
             let hash_galley = painter.layout_no_wrap(commit.short.clone(), theme::field_font(10.0), theme::FAINT);
             let right_width = time_galley.size().x + hash_galley.size().x + 12.0;
@@ -524,7 +528,7 @@ impl Workspace {
             );
             let mut badge_x = text_x;
             for reference in &commit.refs {
-                let name = reference.strip_prefix("HEAD -> ").unwrap_or(reference).to_owned();
+                let name = display(reference.strip_prefix("HEAD -> ").unwrap_or(reference), 40);
                 let colour = ref_color(&name);
                 let galley = painter.layout_no_wrap(name, theme::field_font(10.0), theme::CHROME_BG);
                 let badge = Rect::from_min_size(
@@ -539,7 +543,7 @@ impl Workspace {
                 badge_x = badge.max.x + 4.0;
             }
             let subject_limit = (rect.max.x - right_width - 8.0 - badge_x).max(40.0);
-            let subject = elide(&painter, &commit.subject, theme::font(12.0), subject_limit);
+            let subject = elide(&painter, &display(&commit.subject, 200), theme::font(12.0), subject_limit);
             painter.text(
                 egui::Pos2::new(badge_x, mid),
                 Align2::LEFT_CENTER,
@@ -591,7 +595,7 @@ impl Workspace {
             }
         });
         if commit {
-            let prompt = self.prompt.take().expect("prompt");
+            let Some(prompt) = self.prompt.take() else { return };
             let text = prompt.text.trim().to_owned();
             match prompt.kind {
                 PromptKind::NewFile if !text.is_empty() => {
@@ -667,7 +671,7 @@ impl Workspace {
                     match row {
                         Row::Folder { path, depth, count } => {
                             let collapsed = self.collapsed.contains(&path);
-                            let name = path.rsplit('/').next().unwrap_or(&path);
+                            let name = display(path.rsplit('/').next().unwrap_or(&path), 40);
                             let caret = if collapsed { "▸" } else { "▾" };
                             painter.text(
                                 egui::Pos2::new(rect.min.x + depth as f32 * INDENT, rect.center().y),
@@ -714,7 +718,7 @@ impl Workspace {
                             painter.text(
                                 egui::Pos2::new(box_x + 48.0, rect.center().y),
                                 Align2::LEFT_CENTER,
-                                change.file_name(),
+                                display(change.file_name(), 60),
                                 theme::font(12.0),
                                 theme::TEXT,
                             );
@@ -773,7 +777,7 @@ impl Workspace {
         ui.add_space(4.0);
         theme::hairline(ui);
         ui.horizontal(|ui| {
-            ui.label(RichText::new(&path).color(theme::DIM).font(theme::field_font(11.5)));
+            ui.label(RichText::new(display(&path, 120)).color(theme::DIM).font(theme::field_font(11.5)));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.add(theme::ghost_button(strings::WORKSPACE_DIFF_STAGED)).clicked() {
                     self.diff_text.clear();
@@ -783,16 +787,17 @@ impl Workspace {
                 }
             });
         });
-        let mut hunks_to_apply: Option<(usize, bool)> = None;
+        let mut hunks_to_apply: Option<(usize, String, bool)> = None;
         {
             let ui = &mut *ui;
             let mut hunk_index = 0;
             for line in self.diff_text.lines() {
                 if line.starts_with("@@") {
                     let label = if self.diff_from_index { "◂" } else { "▸" };
+                    let header = line.to_owned();
                     ui.horizontal(|ui| {
                         if ui.add(theme::ghost_button(label)).clicked() {
-                            hunks_to_apply = Some((hunk_index, self.diff_from_index));
+                            hunks_to_apply = Some((hunk_index, header.clone(), self.diff_from_index));
                         }
                         ui.label(RichText::new(line).color(theme::STATUS_YELLOW).font(theme::field_font(11.0)));
                     });
@@ -809,9 +814,9 @@ impl Workspace {
                 ui.label(RichText::new(line).color(colour).font(theme::field_font(11.0)));
             }
         }
-        if let Some((index, from_index)) = hunks_to_apply {
+        if let Some((index, header, from_index)) = hunks_to_apply {
             self.busy = true;
-            self.send(Request::ApplyHunks { path, indices: vec![index], from_index });
+            self.send(Request::ApplyHunks { path, index, header, from_index });
         }
     }
 
@@ -842,10 +847,10 @@ impl Workspace {
         let full_hash = lines.next().unwrap_or("").to_owned();
         let author = lines.next().unwrap_or("").to_owned();
         let date = lines.next().unwrap_or("").to_owned();
-        let subject = lines.next().unwrap_or("").to_owned();
-        let body: String = lines.collect::<Vec<_>>().join("\n");
+        let subject = display(lines.next().unwrap_or(""), 300);
+        let body: String = display(&lines.collect::<Vec<_>>().join("\n"), 2000);
         ui.label(RichText::new(subject).color(theme::TEXT).font(theme::font(12.5)));
-        ui.label(RichText::new(format!("{author} · {date}")).color(theme::FAINT).font(theme::font(10.5)));
+        ui.label(RichText::new(format!("{} · {}", display(&author, 80), display(&date, 40))).color(theme::FAINT).font(theme::font(10.5)));
         ui.label(RichText::new(full_hash).color(theme::FAINT).font(theme::field_font(10.5)));
         if !body.trim().is_empty() {
             ui.label(RichText::new(body.trim()).color(theme::DIM).font(theme::font(11.0)));
@@ -854,7 +859,7 @@ impl Workspace {
         for (status, path, additions, deletions) in &detail.files {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(status.to_string()).color(status_color(*status)).font(theme::field_font(11.5)));
-                ui.label(RichText::new(path).color(theme::TEXT).font(theme::font(11.5)));
+                ui.label(RichText::new(display(path, 120)).color(theme::TEXT).font(theme::font(11.5)));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(RichText::new(format!("+{additions} −{deletions}")).color(theme::FAINT).font(theme::field_font(10.5)));
                 });
@@ -919,7 +924,9 @@ impl Workspace {
                     Some(index) => (&path[..index + 1], &path[index + 1..]),
                     None => ("", path.as_str()),
                 };
-                let (icon, icon_color) = crate::file_icons::for_file(name);
+                let name = display(name, 80);
+                let dir = display(dir, 80);
+                let (icon, icon_color) = crate::file_icons::for_file(&name);
                 painter.text(
                     egui::Pos2::new(rect.min.x + 4.0, rect.center().y),
                     Align2::LEFT_CENTER,
@@ -1048,6 +1055,30 @@ fn section_color(section: git::Section) -> egui::Color32 {
     }
 }
 
+/// Untrusted names, subjects and bodies may contain control or bidirectional
+/// characters: they would break the fixed row grid or spoof a file extension,
+/// so they are stripped and bounded before painting.
+fn display(text: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(text.len().min(max_chars * 4));
+    let mut count = 0;
+    for ch in text.chars() {
+        if ch.is_control() || is_format_control(ch) {
+            continue;
+        }
+        if count >= max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+        count += 1;
+    }
+    out
+}
+
+fn is_format_control(ch: char) -> bool {
+    matches!(ch, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+}
+
 /// Truncates text to `max_width` with an ellipsis.
 fn elide(painter: &egui::Painter, text: &str, font: egui::FontId, max_width: f32) -> String {
     let measure = |value: &str| painter.layout_no_wrap(value.to_owned(), font.clone(), egui::Color32::WHITE).size().x;
@@ -1132,10 +1163,10 @@ fn spawn_worker() -> (Sender<Request>, Receiver<Response>) {
                     }
                     match &root {
                         Some(root) => match git::status(root) {
-                            Ok(status) => send(Response::Status(status)),
+                            Ok(status) => send(Response::Status(status, Some(root.clone()))),
                             Err(e) => send(Response::Error(e)),
                         },
-                        None => send(Response::Status(Status::default())),
+                        None => send(Response::Status(Status::default(), None)),
                     }
                 }
                 Request::Diff { path } => match &root {
@@ -1209,15 +1240,21 @@ fn spawn_worker() -> (Sender<Request>, Receiver<Response>) {
                     },
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
                 },
-                Request::ApplyHunks { path, indices, from_index } => match &root {
+                Request::ApplyHunks { path, index, header, from_index } => match &root {
                     Some(root) => {
                         let text = git::diff(root, &path, from_index);
                         let files = git::parse_diff(&text, from_index);
                         let result = files
                             .iter()
                             .find(|file| file.path == path)
-                            .ok_or_else(|| "нет изменений для этого файла".to_owned())
-                            .and_then(|file| git::apply_hunks(root, file, &indices, from_index));
+                            .ok_or_else(|| strings::WORKSPACE_NO_CHANGES_FOR_FILE.to_owned())
+                            .and_then(|file| match file.hunks.get(index) {
+                                // The file may have changed since it was shown:
+                                // apply only the hunk the user actually saw.
+                                Some(hunk) if hunk.header == header => git::apply_hunks(root, file, &[index], from_index),
+                                Some(_) => Err(strings::WORKSPACE_DIFF_STALE.to_owned()),
+                                None => Err(strings::WORKSPACE_DIFF_STALE.to_owned()),
+                            });
                         match result {
                             Ok(()) => send(Response::Applied),
                             Err(e) => send(Response::Error(e)),
@@ -1266,28 +1303,8 @@ fn spawn_worker() -> (Sender<Request>, Receiver<Response>) {
     (request_tx, response_rx)
 }
 
-/// Rejects absolute paths and `..` so file operations stay inside the repo.
-fn safe_path(root: &PathBuf, path: &str) -> Result<PathBuf, String> {
-    let clean = path.replace('\\', "/");
-    if clean.starts_with('/') || clean.contains(':') {
-        return Err("нужен путь внутри репозитория".to_owned());
-    }
-    let mut full = root.clone();
-    for part in clean.split('/') {
-        match part {
-            "" | "." => continue,
-            ".." => return Err("нужен путь внутри репозитория".to_owned()),
-            part => full.push(part),
-        }
-    }
-    if !full.starts_with(root) {
-        return Err("нужен путь внутри репозитория".to_owned());
-    }
-    Ok(full)
-}
-
-fn write_path(root: &PathBuf, path: &str, folder: bool) -> Result<(), String> {
-    let full = safe_path(root, path)?;
+fn write_path(root: &Path, path: &str, folder: bool) -> Result<(), String> {
+    let full = git::resolve_path(root, path)?;
     if folder {
         std::fs::create_dir_all(&full).map_err(|e| e.to_string())
     } else {
@@ -1295,23 +1312,23 @@ fn write_path(root: &PathBuf, path: &str, folder: bool) -> Result<(), String> {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         if full.exists() {
-            return Err("файл уже существует".to_owned());
+            return Err(strings::WORKSPACE_FILE_EXISTS.to_owned());
         }
         std::fs::write(&full, "").map_err(|e| e.to_string())
     }
 }
 
-fn rename_path(root: &PathBuf, from: &str, to: &str) -> Result<(), String> {
-    let from = safe_path(root, from)?;
-    let to = safe_path(root, to)?;
+fn rename_path(root: &Path, from: &str, to: &str) -> Result<(), String> {
+    let from = git::resolve_path(root, from)?;
+    let to = git::resolve_path(root, to)?;
     if !from.exists() {
-        return Err("нет такого файла".to_owned());
+        return Err(strings::WORKSPACE_NO_SUCH_FILE.to_owned());
     }
     std::fs::rename(&from, &to).map_err(|e| e.to_string())
 }
 
-fn delete_path(root: &PathBuf, path: &str) -> Result<(), String> {
-    let full = safe_path(root, path)?;
+fn delete_path(root: &Path, path: &str) -> Result<(), String> {
+    let full = git::resolve_path(root, path)?;
     if full.is_dir() {
         std::fs::remove_dir_all(&full).map_err(|e| e.to_string())
     } else {

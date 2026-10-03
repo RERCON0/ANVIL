@@ -79,25 +79,146 @@ impl Status {
     }
 }
 
+/// Hard limits for every `git` child: a hung fetch, a credential prompt or a
+/// huge output must never pin the panel's worker thread forever.
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const GIT_TIMEOUT_NETWORK: std::time::Duration = std::time::Duration::from_secs(120);
+const GIT_MAX_OUTPUT: usize = 8 * 1024 * 1024;
+
 /// Runs `git` in `root` and returns stdout; stderr becomes the error text.
 pub fn run_git(root: &Path, args: &[&str]) -> Result<String, String> {
+    run_git_timeout(root, args, GIT_TIMEOUT).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
+pub fn run_git_timeout(root: &Path, args: &[&str], timeout: std::time::Duration) -> Result<Vec<u8>, String> {
+    run_git_capped(root, args, timeout, GIT_MAX_OUTPUT)
+}
+
+/// Spawns `git` with prompts disabled, literal pathspecs and a hard deadline.
+fn run_git_capped(root: &Path, args: &[&str], timeout: std::time::Duration, max_bytes: usize) -> Result<Vec<u8>, String> {
     let mut command = Command::new("git");
     command
         .args(args)
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Never let git ask a human: no terminal prompts, no GUI helpers, and
+        // treat every path we pass as a literal, not a pathspec pattern.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env("GIT_ASKPASS", "")
+        .env("GIT_LITERAL_PATHSPECS", "1");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let output = command.output().map_err(|e| format!("git: {e}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    let mut child = command.spawn().map_err(|e| format!("git: {e}"))?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let reader = |mut stream: Box<dyn std::io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if buffer.len() < max_bytes {
+                            let room = max_bytes - buffer.len();
+                            buffer.extend_from_slice(&chunk[..n.min(room)]);
+                        }
+                    }
+                }
+            }
+            buffer
+        })
+    };
+    let stdout_reader = reader(Box::new(stdout));
+    let stderr_reader = reader(Box::new(stderr));
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("git {} не ответил за {} с", args.first().copied().unwrap_or(""), timeout.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(e) => return Err(format!("git: {e}")),
+        }
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if status.success() {
+        Ok(stdout)
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        Err(String::from_utf8_lossy(&stderr).trim().to_owned())
+    }
+}
+
+/// True for a full object id (sha-1 or sha-256) — the only hashes ever passed
+/// back to `git`, so a crafted log record cannot smuggle an option.
+pub fn is_object_hash(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+const NUL: char = '\0';
+
+/// Resolves a repository-relative path and proves it stays inside `root`.
+///
+/// Rejects absolute/UNC/ADS forms, `.`/`..` after Win32 trailing-dot/space
+/// normalization (`".. "` resolves to `..` on Windows), reserved device names
+/// and control characters, then canonicalizes the deepest existing ancestor to
+/// catch symlinks and junctions pointing outside the repository.
+pub fn resolve_path(root: &Path, path: &str) -> Result<PathBuf, String> {
+    let inside = crate::strings::WORKSPACE_PATH_INSIDE_REPO;
+    let clean = path.replace('\\', "/");
+    if clean.is_empty() || clean.starts_with('/') || clean.contains(':') || clean.contains('~') {
+        return Err(inside.to_owned());
+    }
+    let mut full = root.to_path_buf();
+    for part in clean.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        let trimmed = part.trim_end_matches(['.', ' ']);
+        if trimmed.is_empty() || trimmed == ".." || part != trimmed {
+            return Err(inside.to_owned());
+        }
+        if part.contains(['<', '>', '"', '|', '?', '*']) || part.chars().any(char::is_control) {
+            return Err(inside.to_owned());
+        }
+        let stem = part.split('.').next().unwrap_or(part).to_ascii_uppercase();
+        if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "LPT1" | "LPT2" | "LPT3") {
+            return Err(inside.to_owned());
+        }
+        full.push(part);
+    }
+    if full == root {
+        return Err(inside.to_owned());
+    }
+    let canonical_root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+    let mut probe = full.clone();
+    loop {
+        match std::fs::canonicalize(&probe) {
+            Ok(canonical) => {
+                if canonical == canonical_root || !canonical.starts_with(&canonical_root) {
+                    return Err(inside.to_owned());
+                }
+                return Ok(full);
+            }
+            Err(_) => {
+                if !probe.pop() {
+                    return Err(inside.to_owned());
+                }
+            }
+        }
     }
 }
 
@@ -125,24 +246,7 @@ pub fn status(root: &Path) -> Result<Status, String> {
 }
 
 fn run_git_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let mut command = Command::new("git");
-    command
-        .args(args)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
-    let output = command.output().map_err(|e| format!("git: {e}"))?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
-    }
+    run_git_capped(root, args, GIT_TIMEOUT, GIT_MAX_OUTPUT)
 }
 
 /// Parses `status --porcelain=v2 --branch -z`.
@@ -255,12 +359,15 @@ pub fn parse_numstat(bytes: &[u8]) -> HashMap<String, (u32, u32)> {
 
 fn apply_numstat(changes: &mut [Change], stats: &HashMap<String, (u32, u32)>, staged: bool) {
     for change in changes.iter_mut() {
-        if staged != change.staged() {
+        // A file can be modified on both sides at once; each side contributes
+        // its own counts (the staged-only entry stays untouched by worktree stats).
+        let applies = if staged { change.staged() } else { change.unstaged() };
+        if !applies {
             continue;
         }
         if let Some((additions, deletions)) = stats.get(&change.path) {
-            change.additions = *additions;
-            change.deletions = *deletions;
+            change.additions += additions;
+            change.deletions += deletions;
         }
     }
 }
@@ -360,7 +467,10 @@ pub fn log(root: &Path) -> Result<CommitLog, String> {
             continue;
         }
         let fields: Vec<&str> = record.split('\u{1f}').collect();
-        if fields.len() < 7 || fields[0].is_empty() {
+        // A commit subject may itself contain the record/field separators; only
+        // records whose hash is a real object id are trusted, so a crafted
+        // subject cannot inject a "hash" that later reaches git as an option.
+        if fields.len() < 7 || !is_object_hash(fields[0]) || fields.iter().any(|field| field.contains(NUL)) {
             continue;
         }
         let hash = fields[0].to_owned();
@@ -387,46 +497,50 @@ pub fn log(root: &Path) -> Result<CommitLog, String> {
 
 /// Files and patch of one commit (first parent, as in VS Code's history view).
 pub fn commit_detail(root: &Path, hash: &str) -> Result<CommitDetail, String> {
-    let name_status = run_git_bytes(root, &["show", "--no-color", "--format=", "--name-status", "-z", hash])?;
-    let numstat = run_git_bytes(root, &["show", "--no-color", "--format=", "--numstat", "-z", hash])?;
+    if !is_object_hash(hash) {
+        return Err(crate::strings::WORKSPACE_NO_SUCH_FILE.to_owned());
+    }
+    // `--end-of-options` keeps a revision from ever being read as an option.
+    let base: Vec<&str> = vec!["show", "--no-color", "--format=", "--end-of-options", hash];
+    let name_status = run_git_bytes(root, &base.iter().copied().chain(["--name-status", "-z"]).collect::<Vec<_>>())?;
+    let numstat = run_git_bytes(root, &base.iter().copied().chain(["--numstat", "-z"]).collect::<Vec<_>>())?;
     let stats = parse_numstat(&numstat);
     let mut files = Vec::new();
-    let mut records = name_status.split(|b| *b == 0).peekable();
+    let mut records = name_status.split(|b| *b == 0).filter(|record| !record.is_empty());
     while let Some(record) = records.next() {
-        if record.is_empty() {
-            continue;
-        }
         let text = String::from_utf8_lossy(record);
-        let mut parts = text.splitn(2, '\t');
-        let status = parts.next().unwrap_or("").chars().next().unwrap_or('M');
-        let path = match parts.next() {
-            Some(path) => path.to_owned(),
-            None => continue,
+        // `-z` separates fields with NUL: "STATUS[<tab>PATH]" and, for
+        // renames/copies, the old and the new path as two more fields.
+        let (status_field, inline_path) = match text.split_once('\t') {
+            Some((status, path)) => (status.to_owned(), Some(path.to_owned())),
+            None => (text.into_owned(), None),
         };
-        // Renames/copies carry the old path as the next NUL-separated record.
-        if status == 'R' || status == 'C' {
-            let _ = records.next();
-        }
+        let status = status_field.chars().next().unwrap_or('M');
+        let first = match inline_path {
+            Some(path) => path,
+            None => match records.next() {
+                Some(path) => String::from_utf8_lossy(path).into_owned(),
+                None => break,
+            },
+        };
+        let path = if status == 'R' || status == 'C' {
+            match records.next() {
+                Some(new_path) => String::from_utf8_lossy(new_path).into_owned(),
+                None => first,
+            }
+        } else {
+            first
+        };
         let (additions, deletions) = stats.get(&path).copied().unwrap_or((0, 0));
         files.push((status, path, additions, deletions));
     }
-    let header = run_git(root, &["show", "--no-patch", "--format=%H%n%an <%ae>%n%ci%n%s%n%b", hash]).unwrap_or_default();
-    let patch = run_git(root, &["show", "--no-color", "--no-ext-diff", "--unified=3", "--format=", "-m", "--first-parent", hash])
-        .unwrap_or_default();
+    let header = run_git(root, &["show", "--no-patch", "--end-of-options", "--format=%H%n%an <%ae>%n%ci%n%s%n%b", hash]).unwrap_or_default();
+    let patch = run_git(
+        root,
+        &["show", "--no-color", "--no-ext-diff", "--end-of-options", "--unified=3", "--format=", "-m", "--first-parent", hash],
+    )
+    .unwrap_or_default();
     Ok(CommitDetail { files, patch, header })
-}
-
-/// Russian relative time from a unix timestamp.
-pub fn relative_time(now_secs: i64, then_secs: i64) -> String {
-    let delta = (now_secs - then_secs).max(0);
-    match delta {
-        0..=59 => "только что".to_owned(),
-        60..=3599 => format!("{} мин назад", delta / 60),
-        3600..=86_399 => format!("{} ч назад", delta / 3600),
-        86_400..=2_591_999 => format!("{} дн назад", delta / 86_400),
-        2_592_000..=31_535_999 => format!("{} мес назад", delta / 2_592_000),
-        _ => format!("{} г назад", delta / 31_536_000),
-    }
 }
 
 /// Unified diff of one file (worktree and index sides, empty parts dropped).
@@ -490,7 +604,7 @@ pub fn ai_command(spec: &str, prompt: &str) -> Option<(String, Vec<String>)> {
 /// Asks the given CLI (or the auto-detected one) for a one-line commit message.
 pub fn ai_commit_message(root: &Path, command: Option<&str>, prompt: &str) -> Result<String, String> {
     let spec = command.unwrap_or("");
-    let (program, args) = ai_command(spec, prompt).ok_or_else(|| "не выбрана AI-команда".to_owned())?;
+    let (program, args) = ai_command(spec, prompt).ok_or_else(|| crate::strings::WORKSPACE_NO_AI_COMMAND.to_owned())?;
     let mut invocation = Command::new(&program);
     invocation
         .args(&args)
@@ -515,7 +629,8 @@ pub fn ai_commit_message(root: &Path, command: Option<&str>, prompt: &str) -> Re
         .to_owned();
     if message.is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(if stderr.trim().is_empty() { "CLI вернул пустое сообщение".to_owned() } else { stderr.trim().to_owned() });
+        let fallback = crate::strings::WORKSPACE_AI_EMPTY.to_owned();
+        return Err(if stderr.trim().is_empty() { fallback } else { stderr.trim().to_owned() });
     }
     Ok(message.chars().take(200).collect())
 }
@@ -533,13 +648,21 @@ pub fn ls_files(root: &Path) -> Result<Vec<String>, String> {
     Ok(files)
 }
 
-/// Reads a repository file (UTF-8, lossy) up to `max_bytes`; the bool reports truncation.
+/// Reads a repository file (UTF-8, lossy) up to `max_bytes`; the bool reports
+/// truncation. The path is validated first and the cap is applied while
+/// reading, so a huge file cannot be allocated to memory.
 pub fn read_file(root: &Path, path: &str, max_bytes: usize) -> Result<(String, bool), String> {
-    let full = root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
-    let bytes = std::fs::read(&full).map_err(|e| format!("{path}: {e}"))?;
-    let truncated = bytes.len() > max_bytes;
-    let slice = &bytes[..bytes.len().min(max_bytes)];
-    Ok((String::from_utf8_lossy(slice).into_owned(), truncated))
+    use std::io::Read;
+    let full = resolve_path(root, path)?;
+    let mut file = std::fs::File::open(&full).map_err(|e| format!("{path}: {e}"))?;
+    let mut buffer = Vec::with_capacity(max_bytes.min(64 * 1024));
+    file.by_ref()
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut buffer)
+        .map_err(|e| format!("{path}: {e}"))?;
+    let truncated = buffer.len() > max_bytes;
+    buffer.truncate(max_bytes);
+    Ok((String::from_utf8_lossy(&buffer).into_owned(), truncated))
 }
 
 /// One hunk of a unified diff.
@@ -584,13 +707,17 @@ pub fn parse_diff(text: &str, staged: bool) -> Vec<FileDiff> {
             flush_hunk(&mut current, &mut hunk);
             hunk = Some(Hunk { header: line.to_owned(), lines: Vec::new() });
         } else if hunk.is_some() {
-            if line.starts_with('\\') {
-                continue; // "\ No newline at end of file"
-            }
+            // "\ No newline at end of file" markers are kept: the rebuilt patch
+            // must carry them or `git apply` rejects (or silently alters) the file.
             if let Some(hunk) = hunk.as_mut() {
                 hunk.lines.push(line.to_owned());
             }
         } else {
+            // The b-side of the +++ line is authoritative for the file name
+            // (the diff --git line is ambiguous when a path contains " b/").
+            if let Some(path) = line.strip_prefix("+++ b/") {
+                file.path = path.to_owned();
+            }
             file.header.push(line.to_owned());
         }
     }
@@ -668,12 +795,25 @@ pub fn apply_hunks(root: &Path, file: &FileDiff, selection: &[usize], from_index
     }
 }
 
-/// Fetches and prunes the default remote.
+/// Fetches and prunes the remote of the current branch (git resolves it).
 pub fn fetch(root: &Path) -> Result<String, String> {
-    let remote = run_git(root, &["remote"]).unwrap_or_default();
-    let remote = remote.lines().next().unwrap_or("origin").trim().to_owned();
+    let remote = run_git(root, &["config", "--get", "branch", &format!("{}.remote", current_branch(root)?)])
+        .map(|text| text.trim().to_owned())
+        .unwrap_or_default();
     let remote = if remote.is_empty() { "origin".to_owned() } else { remote };
-    run_git(root, &["fetch", "--no-tags", "--quiet", "--prune", &remote]).map(|_| strings_fetch_done(&remote))
+    if remote.starts_with('-') {
+        return Err(crate::strings::WORKSPACE_PATH_INSIDE_REPO.to_owned());
+    }
+    run_git_timeout(root, &["fetch", "--no-tags", "--quiet", "--prune", "--", &remote], GIT_TIMEOUT_NETWORK)
+        .map(|_| strings_fetch_done(&remote))
+}
+
+fn current_branch(root: &Path) -> Result<String, String> {
+    let branch = run_git(root, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim().to_owned();
+    if branch.is_empty() || branch == "HEAD" {
+        return Err(crate::strings::WORKSPACE_NO_BRANCH.to_owned());
+    }
+    Ok(branch)
 }
 
 fn strings_fetch_done(remote: &str) -> String {
@@ -682,14 +822,15 @@ fn strings_fetch_done(remote: &str) -> String {
 
 /// Pushes the current branch, setting the upstream when it has none.
 pub fn push(root: &Path) -> Result<String, String> {
-    let branch = run_git(root, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim().to_owned();
-    if branch.is_empty() || branch == "HEAD" {
-        return Err("нет текущей ветки".to_owned());
-    }
+    let branch = current_branch(root)?;
     if upstream(root).is_none() {
-        run_git(root, &["push", "--porcelain", "--set-upstream", "origin", &format!("refs/heads/{branch}:refs/heads/{branch}")])?;
+        run_git_timeout(
+            root,
+            &["push", "--porcelain", "--set-upstream", "origin", &format!("refs/heads/{branch}:refs/heads/{branch}")],
+            GIT_TIMEOUT_NETWORK,
+        )?;
     } else {
-        run_git(root, &["push", "--porcelain"])?;
+        run_git_timeout(root, &["push", "--porcelain"], GIT_TIMEOUT_NETWORK)?;
     }
     Ok(branch)
 }
@@ -780,6 +921,11 @@ mod tests {
         apply_numstat(&mut changes, &stats, false);
         assert_eq!((changes[0].additions, changes[0].deletions), (12, 3));
         assert_eq!((changes[1].additions, changes[1].deletions), (0, 0), "staged entry untouched");
+        // A file touched on both sides gets both counts.
+        let mut both = vec![Change { path: "src/main.rs".into(), index: 'M', worktree: 'M', ..Default::default() }];
+        apply_numstat(&mut both, &stats, true);
+        apply_numstat(&mut both, &stats, false);
+        assert_eq!((both[0].additions, both[0].deletions), (24, 6));
     }
 
     #[test]
@@ -846,14 +992,77 @@ index 111..222 100644\n\
     }
 
     #[test]
-    fn relative_time_is_russian() {
-        let now = 1_800_000_000;
-        assert_eq!(relative_time(now, now), "только что");
-        assert_eq!(relative_time(now, now - 120), "2 мин назад");
-        assert_eq!(relative_time(now, now - 7200), "2 ч назад");
-        assert_eq!(relative_time(now, now - 3 * 86_400), "3 дн назад");
-        assert_eq!(relative_time(now, now - 60 * 86_400), "2 мес назад");
-        assert_eq!(relative_time(now, now - 800 * 86_400), "2 г назад");
+    fn object_hashes_only() {
+        assert!(is_object_hash("0123456789abcdef0123456789abcdef01234567"));
+        assert!(!is_object_hash("--output=C:/x"));
+        assert!(!is_object_hash("0123456789abcdef0123456789abcdef0123456"));
+        assert!(!is_object_hash("0123456789abcdef0123456789abcdef0123456g"));
+    }
+
+    #[test]
+    fn log_rejects_records_whose_hash_is_not_an_object_id() {
+        // A subject carrying the record separator would otherwise inject a
+        // second, attacker-chosen "commit" whose hash reaches git show.
+        let mut raw = Vec::new();
+        for record in [
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{1f}a\u{1f}\u{1f}me\u{1f}1\u{1f}\u{1f}ok",
+            "subj\u{1e}--output=C:/pwn\u{1f}x\u{1f}\u{1f}m\u{1f}1\u{1f}\u{1f}evil",
+        ] {
+            raw.extend_from_slice(record.as_bytes());
+            raw.push(0x1e);
+        }
+        let text = String::from_utf8(raw).unwrap();
+        let mut commits = Vec::new();
+        for record in text.split('\u{1e}') {
+            let record = record.trim_start_matches(['\n', '\r']);
+            if record.is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = record.split('\u{1f}').collect();
+            if fields.len() < 7 || !is_object_hash(fields[0]) {
+                continue;
+            }
+            commits.push(fields[0].to_owned());
+        }
+        assert_eq!(commits, vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()]);
+    }
+
+    #[test]
+    fn pathspec_magic_in_a_file_name_survives_as_a_literal_path() {
+        // The worker sets GIT_LITERAL_PATHSPECS=1, so a name like this is a path,
+        // not a pattern; what must hold locally is that the path is unchanged.
+        let files = parse_diff("diff --git a/:(glob)* b/:(glob)*\n--- a/:(glob)*\n+++ b/:(glob)*\n@@ -1 +1 @@\n-a\n+b\n", false);
+        assert_eq!(files[0].path, ":(glob)*");
+    }
+
+    #[test]
+    fn path_with_b_slash_uses_the_plus_line() {
+        let files = parse_diff("diff --git a/foo b/bar.txt b/foo b/bar.txt\n--- a/foo b/bar.txt\n+++ b/foo b/bar.txt\n@@ -1 +1 @@\n-a\n+b\n", false);
+        assert_eq!(files[0].path, "foo b/bar.txt");
+    }
+
+    #[test]
+    fn no_newline_marker_survives_a_patch_round_trip() {
+        let text = "diff --git a/x.txt b/x.txt\n--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n";
+        let files = parse_diff(text, false);
+        assert_eq!(files[0].hunks[0].lines.len(), 4, "both markers are kept");
+        let patch = hunk_patch(&files[0], &[]);
+        assert!(patch.contains("\\ No newline at end of file"));
+        assert_eq!(patch, text, "the rebuilt patch is byte-identical");
+    }
+
+    #[test]
+    fn resolve_path_rejects_escapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("a.txt"), "x").unwrap();
+        assert!(resolve_path(root, "sub/a.txt").is_ok());
+        for bad in [".. ", "...", "sub/.. ", "sub/../..", "/abs", "C:/x", "\\\\server\\share", "sub/CON", "sub/a.txt:stream", "a\u{0}b", "sub/ a. "] {
+            assert!(resolve_path(root, bad).is_err(), "{bad:?} must be rejected");
+        }
+        assert!(resolve_path(root, "").is_err());
+        assert!(resolve_path(root, ".").is_err(), "the root itself is not a file target");
     }
 
     #[test]

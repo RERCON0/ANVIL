@@ -147,6 +147,36 @@ fn tracks_reported_working_directory() {
     assert_eq!(pane.current_dir(), Some(PathBuf::from("C:\\Windows")));
 }
 
+/// Benchmark (run with `cargo test --test conpty -- --ignored --nocapture`):
+/// how fast the ConPTY -> Term pipeline swallows a two-million-line flood.
+/// Measures the whole pane path, not the shell's own speed.
+#[test]
+#[ignore = "benchmark: run explicitly"]
+fn flood_throughput_benchmark() {
+    let start = Instant::now();
+    let pane = spawn("cmd.exe", &["/c", "for /L %i in (1,1,2000000) do @echo %i"]);
+    let mut code = None;
+    let deadline = Instant::now() + Duration::from_secs(600);
+    while Instant::now() < deadline {
+        for event in pane.drain_events() {
+            if let PaneEvent::Exited(status) = event {
+                code = Some(status);
+            }
+        }
+        if code.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let elapsed = start.elapsed();
+    let text = screen_text(&pane);
+    println!(
+        "flood: {elapsed:?} to exit ({code:?}); last line on screen: {}",
+        text.contains("1999999") || text.contains("2000000")
+    );
+    assert!(code.is_some(), "the flood must finish, timed out after {elapsed:?}");
+}
+
 /// Closing a pane while it floods output must not block the UI thread.
 #[test]
 fn dropping_a_busy_pane_does_not_hang() {

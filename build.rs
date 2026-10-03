@@ -5,8 +5,13 @@ fn main() {
     println!("cargo:rerun-if-changed=vendor/conpty/x64/OpenConsole.exe");
     println!("cargo:rerun-if-changed=icons/anvil.rc");
     println!("cargo:rerun-if-changed=icons/anvil.ico");
-    copy_conpty();
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        // Only x64 has a vendored ConPTY; other architectures would silently
+        // fall back to the system one and reintroduce the documented input bugs.
+        let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        if arch != "x86_64" {
+            panic!("ANVIL ships a vendored x64 ConPTY; the {arch} Windows target is not supported");
+        }
         if Path::new("icons/anvil.ico").exists() {
             embed_resource::compile_for("icons/anvil.rc", ["anvil"], embed_resource::NONE)
                 .manifest_optional()
@@ -15,6 +20,7 @@ fn main() {
             println!("cargo:warning=icons/anvil.ico missing, run `cargo run --example gen_icons`");
         }
     }
+    copy_conpty();
 }
 
 /// Puts the bundled ConPTY next to the binaries (target/<profile>/) and the
@@ -31,15 +37,18 @@ fn copy_conpty() {
         for name in ["conpty.dll", "OpenConsole.exe"] {
             let src = Path::new("vendor/conpty/x64").join(name);
             let dst = dir.join(name);
-            let same = matches!(
-                (std::fs::metadata(&src), std::fs::metadata(&dst)),
-                (Ok(a), Ok(b)) if a.len() == b.len()
-            );
-            if !same {
-                if let Err(e) = std::fs::copy(&src, &dst) {
+            // Compare the contents, not just the sizes: a same-length update of
+            // the vendored runtime must be re-copied.
+            if std::fs::read(&src).ok() == std::fs::read(&dst).ok() {
+                continue;
+            }
+            match std::fs::copy(&src, &dst) {
+                Ok(_) => {}
+                Err(e) if dst.exists() => {
                     // The old copy may be in use by a running ANVIL or test.
-                    println!("cargo:warning=could not copy {}: {e}", src.display());
+                    println!("cargo:warning=could not replace {}: {e}", dst.display());
                 }
+                Err(e) => panic!("cannot copy {} next to the binaries: {e}", src.display()),
             }
         }
     }

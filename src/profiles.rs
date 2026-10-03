@@ -72,6 +72,42 @@ pub fn parse_wsl_list(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Runs a probe command with a deadline: a stopped WSL service must not delay
+/// the first frame. Output is read from temp files, so a large listing cannot
+/// block the pipe while we wait.
+#[cfg(windows)]
+fn run_bounded(command: &mut std::process::Command, timeout: std::time::Duration) -> Option<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = command.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stdout.read_to_end(&mut buffer);
+        buffer
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(_) => {
+                let _ = reader.join();
+                return None;
+            }
+        }
+    };
+    let stdout = reader.join().ok()?;
+    Some(std::process::Output { status, stdout, stderr: Vec::new() })
+}
+
 /// Subsequence match, case-insensitive. Higher is better; None = no match.
 pub fn fuzzy_score(query: &str, candidate: &str) -> Option<i32> {
     let q: Vec<char> = query.to_lowercase().chars().filter(|c| !c.is_whitespace()).collect();
@@ -187,13 +223,14 @@ pub fn detect_builtin() -> Vec<Profile> {
         kind: ProfileKind::Cmd,
     });
 
-    let wsl = std::process::Command::new("wsl.exe")
-        .args(["-l", "-q"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
-    if let Ok(output) = wsl {
+    if let Some(output) = run_bounded(
+        std::process::Command::new("wsl.exe")
+            .args(["-l", "-q"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+        std::time::Duration::from_secs(2),
+    ) {
         if output.status.success() {
             for distro in parse_wsl_list(&output.stdout) {
                 out.push(Profile {

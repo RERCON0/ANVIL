@@ -22,9 +22,18 @@ pub enum Plan {
     Broken(String),
 }
 
-/// True when the command runs an ANVIL status binary, whatever its path.
+/// True when the command actually runs an ANVIL status binary: the first token
+/// (unquoted or quoted) must be a path whose file name is the helper. A
+/// substring mention such as `echo anvil-claude-status` is foreign, so it takes
+/// the confirm/decline path instead of being silently replaced.
 pub fn is_anvil_status_command(command: &str) -> bool {
-    command.to_ascii_lowercase().contains("anvil-claude-status")
+    let trimmed = command.trim();
+    let first_token = match trimmed.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(""),
+        None => trimmed.split_whitespace().next().unwrap_or(""),
+    };
+    let file_name = first_token.rsplit(['/', '\\']).next().unwrap_or("").to_ascii_lowercase();
+    file_name == "anvil-claude-status.exe" || file_name == "anvil-claude-status"
 }
 
 /// `"C:/.../anvil-claude-status.exe"` with forward slashes and quotes, so it
@@ -112,15 +121,27 @@ pub fn uninstall(settings: &str, ours: &str, previous: Option<&Value>) -> Result
     Ok(Some(render(map)))
 }
 
-/// Copies settings.json to settings.json.anvil-backup unless a backup exists.
+/// Copies settings.json to settings.json.anvil-backup once. The backup is
+/// created exclusively, so two ANVIL windows cannot overwrite the first copy
+/// (and with it the recovery of the user's original command).
 pub fn backup_once(settings_path: &Path) -> std::io::Result<()> {
+    use std::io::Write;
     let mut backup = settings_path.as_os_str().to_os_string();
     backup.push(".anvil-backup");
     let backup = PathBuf::from(backup);
-    if settings_path.exists() && !backup.exists() {
-        std::fs::copy(settings_path, &backup)?;
+    if !settings_path.exists() {
+        return Ok(());
     }
-    Ok(())
+    let bytes = match std::fs::read(settings_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&backup) {
+        Ok(mut file) => file.write_all(&bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -130,7 +151,7 @@ mod tests {
     const OURS: &str = "\"C:/Tools/ANVIL/anvil-claude-status.exe\"";
     const OWNER: &str = r#"{
   "hooks": {"Stop": []},
-  "statusLine": {"type": "command", "command": "node \"C:/Users/rerco/.claude/statusline.mjs\""},
+  "statusLine": {"type": "command", "command": "node \"C:/Tools/cc/statusline.mjs\""},
   "model": "opus"
 }"#;
 
@@ -153,9 +174,9 @@ mod tests {
         assert_eq!(plan(Some(r#"{"model":"opus"}"#), OURS, None), Plan::Install);
         assert_eq!(
             plan(Some(OWNER), OURS, None),
-            Plan::AskReplace { current: "node \"C:/Users/rerco/.claude/statusline.mjs\"".into() }
+            Plan::AskReplace { current: "node \"C:/Tools/cc/statusline.mjs\"".into() }
         );
-        assert_eq!(plan(Some(OWNER), OURS, Some("node \"C:/Users/rerco/.claude/statusline.mjs\"")), Plan::Declined);
+        assert_eq!(plan(Some(OWNER), OURS, Some("node \"C:/Tools/cc/statusline.mjs\"")), Plan::Declined);
         let stale = r#"{"statusLine":{"type":"command","command":"\"C:/build/anvil-claude-status.exe\""}}"#;
         assert_eq!(plan(Some(stale), OURS, None), Plan::Update, "another ANVIL build updates silently");
         let (installed, _) = install(Some(OWNER), OURS).unwrap();
@@ -170,7 +191,7 @@ mod tests {
         let keys: Vec<String> = parse_object(&text).unwrap().keys().cloned().collect();
         assert_eq!(keys, vec!["hooks", "statusLine", "model"]);
         assert_eq!(parse_object(&text).unwrap()["statusLine"]["command"], OURS);
-        assert_eq!(previous.unwrap()["command"], "node \"C:/Users/rerco/.claude/statusline.mjs\"");
+        assert_eq!(previous.unwrap()["command"], "node \"C:/Tools/cc/statusline.mjs\"");
         let (fresh, none) = install(None, OURS).unwrap();
         assert_eq!(fresh, format!("{{\n  \"statusLine\": {{\n    \"type\": \"command\",\n    \"command\": {}\n  }}\n}}\n", serde_json::to_string(OURS).unwrap()));
         assert!(none.is_none());

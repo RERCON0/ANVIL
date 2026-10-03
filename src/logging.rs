@@ -63,6 +63,13 @@ impl log::Log for FileLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
+        // The terminal stack logs raw terminal bytes (vte's unhandled OSC
+        // payloads) and profile environment values; neither may ever reach the
+        // log file.
+        let target = record.target();
+        if target.starts_with("vte") || target.starts_with("alacritty_terminal") {
+            return;
+        }
         let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
         let line = format!("{ms} {:<5} {}: {}", record.level(), record.target(), record.args());
         let _ = self.write_line(&line);

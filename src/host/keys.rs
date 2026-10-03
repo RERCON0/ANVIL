@@ -109,11 +109,30 @@ pub fn chord(event: &KeyEvent, state: ModifiersState) -> Option<Chord> {
     Some(Chord { mods: mods(state), key: key_name(code)? })
 }
 
+/// Navigation and editing keys as winit reports them *logically*: with NumLock
+/// off the numpad sends these instead of printable digits, and the physical
+/// key alone cannot identify them.
+fn logical_key_name(event: &KeyEvent) -> Option<KeyName> {
+    match event.logical_key {
+        Key::Named(winit::keyboard::NamedKey::ArrowLeft) => Some(KeyName::Left),
+        Key::Named(winit::keyboard::NamedKey::ArrowRight) => Some(KeyName::Right),
+        Key::Named(winit::keyboard::NamedKey::ArrowUp) => Some(KeyName::Up),
+        Key::Named(winit::keyboard::NamedKey::ArrowDown) => Some(KeyName::Down),
+        Key::Named(winit::keyboard::NamedKey::Home) => Some(KeyName::Home),
+        Key::Named(winit::keyboard::NamedKey::End) => Some(KeyName::End),
+        Key::Named(winit::keyboard::NamedKey::PageUp) => Some(KeyName::PageUp),
+        Key::Named(winit::keyboard::NamedKey::PageDown) => Some(KeyName::PageDown),
+        Key::Named(winit::keyboard::NamedKey::Insert) => Some(KeyName::Insert),
+        Key::Named(winit::keyboard::NamedKey::Delete) => Some(KeyName::Delete),
+        _ => None,
+    }
+}
+
 pub fn key_press(event: &KeyEvent, state: ModifiersState) -> KeyPress {
     let m = mods(state);
     let key = match event.physical_key {
-        PhysicalKey::Code(code) => key_name(code),
-        PhysicalKey::Unidentified(_) => None,
+        PhysicalKey::Code(code) => key_name(code).or_else(|| logical_key_name(event)),
+        PhysicalKey::Unidentified(_) => logical_key_name(event),
     };
     let text = event.text.as_ref().map(|t| t.to_string());
     let unmodified = match event.key_without_modifiers() {

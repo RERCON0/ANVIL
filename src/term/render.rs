@@ -91,7 +91,13 @@ pub fn snapshot<L: EventListener>(
         let flags = cell.flags;
         rows[row as usize].push(RenderCell {
             ch: cell.c,
-            combining: cell.zerowidth().map(|z| z.iter().collect::<String>().into_boxed_str()),
+            // An empty slice means "extra data" (a hyperlink, a custom underline
+            // colour), not combining marks: treating it as one would make every
+            // such cell its own standalone text run.
+            combining: cell
+                .zerowidth()
+                .filter(|marks| !marks.is_empty())
+                .map(|marks| marks.iter().collect::<String>().into_boxed_str()),
             style: cell_style(cell.fg, cell.bg, flags, colors, palette),
             wide: flags.contains(Flags::WIDE_CHAR),
             spacer: flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),

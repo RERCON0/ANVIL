@@ -149,6 +149,28 @@ pub const WORKSPACE_FILE_TRUNCATED: &str = "… файл показан не п�
 pub const WORKSPACE_PUSH_HINT: &str = "Отправить в origin";
 pub const WORKSPACE_FETCH_HINT: &str = "Забрать изменения из origin";
 
+pub const WORKSPACE_NO_BRANCH: &str = "нет текущей ветки";
+pub const WORKSPACE_NO_AI_COMMAND: &str = "не выбрана AI-команда";
+pub const WORKSPACE_AI_EMPTY: &str = "CLI вернул пустое сообщение";
+pub const WORKSPACE_NO_CHANGES_FOR_FILE: &str = "нет изменений для этого файла";
+pub const WORKSPACE_PATH_INSIDE_REPO: &str = "нужен путь внутри репозитория";
+pub const WORKSPACE_FILE_EXISTS: &str = "файл уже существует";
+pub const WORKSPACE_NO_SUCH_FILE: &str = "нет такого файла";
+pub const WORKSPACE_DIFF_STALE: &str = "файл изменился — обновите панель";
+
+/// Russian relative time of a unix timestamp, as the commit list shows it.
+pub fn relative_time(now_secs: i64, then_secs: i64) -> String {
+    let delta = (now_secs - then_secs).max(0);
+    match delta {
+        0..=59 => "только что".to_owned(),
+        60..=3599 => format!("{} мин назад", delta / 60),
+        3600..=86_399 => format!("{} ч назад", delta / 3600),
+        86_400..=2_591_999 => format!("{} дн назад", delta / 86_400),
+        2_592_000..=31_535_999 => format!("{} мес назад", delta / 2_592_000),
+        _ => format!("{} г назад", delta / 31_536_000),
+    }
+}
+
 pub fn workspace_pushed(branch: &str) -> String {
     format!("push {branch} — готово")
 }
@@ -172,3 +194,19 @@ pub fn workspace_ai(command: &str) -> String {
 // Profile picker.
 pub const PICKER_FILTER: &str = "Фильтр";
 pub const PICKER_EMPTY: &str = "Ничего не найдено";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_time_is_russian() {
+        let now = 1_800_000_000;
+        assert_eq!(relative_time(now, now), "только что");
+        assert_eq!(relative_time(now, now - 120), "2 мин назад");
+        assert_eq!(relative_time(now, now - 7200), "2 ч назад");
+        assert_eq!(relative_time(now, now - 3 * 86_400), "3 дн назад");
+        assert_eq!(relative_time(now, now - 60 * 86_400), "2 мес назад");
+        assert_eq!(relative_time(now, now - 800 * 86_400), "2 г назад");
+    }
+}

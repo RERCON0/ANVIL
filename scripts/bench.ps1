@@ -1,4 +1,5 @@
-# Measures the acceptance numbers of stage 1. Results belong in docs/BENCH.md.
+# Measures the acceptance numbers of stage 1. Record the printed numbers in your
+# own notes (they are not part of this repository).
 # Usage: powershell -ExecutionPolicy Bypass -File scripts\bench.ps1
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
@@ -39,7 +40,7 @@ if ($firstFrameMs) { Write-Host "first frame (log)            : $firstFrameMs ms
 Write-Host "working set                  : $workingSetMb MB"
 Write-Host "idle CPU over 30 s           : $idleCpu %"
 Write-Host ''
-Write-Host 'Manual steps for the rest (record them in docs/BENCH.md):'
+Write-Host 'Manual steps for the rest (record the numbers yourself):'
 Write-Host '  * open 3 tabs with 3 panes each (Ctrl+Shift+T, Ctrl+Shift+S, Ctrl+Shift+D)'
 Write-Host '    and re-run: (Get-Process anvil).WorkingSet64 / 1MB'
 Write-Host '  * in a pane run: time seq 1 2000000   (must finish < 5 s, window responsive)'

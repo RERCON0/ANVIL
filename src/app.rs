@@ -28,6 +28,9 @@ use crate::layout::split_tree::{Dir, PaneId, SplitTree};
 use crate::profiles::{self, Profile};
 use crate::session::{self, PaneState, SessionState, TabState, WindowState};
 use crate::strings;
+use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+use crate::term::pane::PaneEvent;
 use crate::tabs::{FrameEnv, PaneContent, PaneEntry, Tab, TabAction};
 use crate::term::input::{encode, InputModes, KeyPress};
 use crate::term::pane::{Pane, SpawnOptions};
@@ -226,6 +229,7 @@ impl AnvilApp {
         let started = Instant::now();
         let mut commands = Vec::new();
         self.check_config(ctx);
+        self.poll_panes(ctx);
         self.poll_statuses();
         self.expire_toasts();
         resize_borders(ctx, maximized, &mut commands);
@@ -255,6 +259,7 @@ impl AnvilApp {
                 }
 
                 if self.settings_open {
+                    self.ime_area = None;
                     self.show_settings(ui, area);
                 } else {
                     self.show_active_tab(ui, area, ctx);
@@ -282,6 +287,9 @@ impl AnvilApp {
                 theme::ACCENT,
             );
         }
+        // The config watcher and the Claude status poll are periodic: keep a
+        // 1 Hz tick alive so they run even when nothing else asks for a frame.
+        ctx.request_repaint_after(Duration::from_millis(1000));
         self.frame_ms = started.elapsed().as_secs_f32() * 1000.0;
         if !self.first_frame_logged {
             self.first_frame_logged = true;
@@ -314,6 +322,52 @@ impl AnvilApp {
 
     // ---- frame helpers -------------------------------------------------
 
+    /// Drains pane events and output flags for *every* pane of every tab, so
+    /// background tabs still deliver clipboard requests, titles, exits and the
+    /// activity dot instead of growing an unconsumed queue.
+    fn poll_panes(&mut self, ctx: &egui::Context) {
+        let active = self.active;
+        let mut close: Vec<(usize, PaneId)> = Vec::new();
+        let mut bells = 0usize;
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            for (id, entry) in tab.panes.iter_mut() {
+                let PaneContent::Live(pane) = &mut entry.content else { continue };
+                for event in pane.drain_events() {
+                    match event {
+                        PaneEvent::Title(title) => entry.title = title,
+                        PaneEvent::ResetTitle => entry.title = entry.profile_name.clone(),
+                        PaneEvent::Clipboard(text) => ctx.copy_text(text),
+                        PaneEvent::Bell => bells += 1,
+                        PaneEvent::CursorBlinkingChange => {
+                            // A state notification: read the effective style, so a
+                            // steady cursor does not start blinking forever.
+                            entry.view.app_blink = pane.term.lock().cursor_style().blinking;
+                        }
+                        PaneEvent::Exited(code) => match code {
+                            Some(0) => close.push((index, *id)),
+                            other => {
+                                let message = format!("\r\n\x1b[90m{}\x1b[0m\r\n", strings::process_exited(other));
+                                let mut term = pane.term.lock();
+                                let mut processor: Processor<StdSyncHandler> = Processor::new();
+                                processor.advance(&mut *term, message.as_bytes());
+                                entry.exited = true;
+                            }
+                        },
+                    }
+                }
+                if index != active && pane.take_output_flag() {
+                    tab.has_activity = true;
+                }
+            }
+        }
+        if bells > 0 && self.config.terminal.bell == Bell::Visual {
+            self.toast(strings::BELL.to_owned());
+        }
+        for (index, id) in close {
+            self.close_pane_in(index, id);
+        }
+    }
+
     fn show_active_tab(&mut self, ui: &mut egui::Ui, rect: Rect, ctx: &egui::Context) {
         self.last_tab_area = rect;
         let cursor = &self.config.terminal.cursor;
@@ -342,14 +396,20 @@ impl AnvilApp {
             if tab.has_activity {
                 tab.has_activity = false;
             }
+            // The IME candidate window follows the focused pane's cursor.
+            self.ime_area = tab.ime_area;
         }
     }
 
     fn show_settings(&mut self, ui: &mut egui::Ui, rect: Rect) {
         let rows = self.keymap.describe();
+        // Edit a copy: apply_config must compare the new values against the
+        // configuration that is actually in effect, or nothing would ever
+        // re-install fonts, switch the palette or rebuild the profile list.
+        let mut next = self.config.clone();
         let outcome = {
             let mut context = crate::settings_ui::SettingsContext {
-                config: &mut self.config,
+                config: &mut next,
                 keymap_rows: rows,
                 profiles: self.profiles.iter().map(|p| (p.id.clone(), p.name.clone())).collect(),
                 fonts: font_families(),
@@ -358,12 +418,14 @@ impl AnvilApp {
         };
         if outcome.open_config {
             let path = Config::path();
-            let _ = self.config.save(&path);
+            if let Err(e) = self.config.save(&path) {
+                log::warn!("cannot save {}: {e}", path.display());
+            }
             self.config_mtime = file_mtime(&path);
             crate::settings_ui::open_path(&path);
         }
         if outcome.changed {
-            self.apply_config(ui.ctx().clone(), self.config.clone());
+            self.apply_config(ui.ctx().clone(), next, true);
         }
     }
 
@@ -502,7 +564,9 @@ impl AnvilApp {
         maximized: bool,
     ) {
         self.window_maximized = maximized;
-        if maximized {
+        // Minimized windows report a zero size (and an off-screen position);
+        // keeping those would destroy the stored restore bounds.
+        if maximized || size.width == 0 || size.height == 0 {
             return;
         }
         let previous = self.window_state;
@@ -787,12 +851,16 @@ impl AnvilApp {
     }
 
     fn close_pane(&mut self, id: PaneId) {
-        let last = self.tabs.get(self.active).is_some_and(|t| t.panes.len() <= 1);
+        self.close_pane_in(self.active, id);
+    }
+
+    fn close_pane_in(&mut self, index: usize, id: PaneId) {
+        let last = self.tabs.get(index).is_some_and(|t| t.panes.len() <= 1);
         if last {
-            self.close_tab(self.active);
+            self.close_tab(index);
             return;
         }
-        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+        let Some(tab) = self.tabs.get_mut(index) else { return };
         let anchor = tab.tree.remove(id);
         tab.panes.remove(&id);
         tab.collapsed.retain(|(pane, _)| *pane != id);
@@ -1131,13 +1199,30 @@ impl AnvilApp {
 
     // ---- config, fonts, session -----------------------------------------
 
-    fn apply_config(&mut self, ctx: egui::Context, config: Config) {
+    /// Applies a configuration. `save` is set for edits made in the settings
+    /// page (they must persist); external reloads never write the file back.
+    fn apply_config(&mut self, ctx: egui::Context, config: Config, save: bool) {
         let family_changed = config.font.family != self.config.font.family;
         let scheme_changed = config.color_scheme != self.config.color_scheme;
+        let profiles_changed = config.profiles != self.config.profiles || config.default_profile != self.config.default_profile;
         let claude_disabled = self.config.claude_status.enabled && !config.claude_status.enabled;
+        let claude_enabled = !self.config.claude_status.enabled && config.claude_status.enabled;
         self.config = config;
+        if profiles_changed {
+            self.profiles = self.build_profiles();
+        }
         if claude_disabled {
             self.disable_claude();
+        } else if claude_enabled {
+            self.setup_claude();
+        }
+        if save {
+            let path = Config::path();
+            if let Err(e) = self.config.save(&path) {
+                log::warn!("cannot save {}: {e}", path.display());
+            } else {
+                self.config_mtime = file_mtime(&path);
+            }
         }
         let (keymap, problems) = Keymap::with_overrides(&self.config.hotkeys);
         self.keymap = keymap;
@@ -1183,12 +1268,17 @@ impl AnvilApp {
         if mtime == self.config_mtime {
             return;
         }
-        self.config_mtime = mtime;
-        let outcome = Config::load(&path);
-        if let Some(notice) = outcome.notice {
-            self.toast(notice);
+        match Config::load_for_reload(&path) {
+            Ok(config) => {
+                self.config_mtime = mtime;
+                self.apply_config(ctx.clone(), config, false);
+            }
+            Err(e) => {
+                // Keep the active configuration and retry: the file may be
+                // half-written by an editor right now.
+                log::warn!("config.json not reloaded: {e}");
+            }
         }
-        self.apply_config(ctx.clone(), outcome.config);
     }
 
     fn build_profiles(&self) -> Vec<Profile> {
@@ -1244,7 +1334,9 @@ impl AnvilApp {
             window.maximized = self.window_maximized;
             self.session.window = Some(window);
         }
-        let _ = self.session.save(&SessionState::path());
+        if let Err(e) = self.session.save(&SessionState::path()) {
+            log::warn!("cannot save the session: {e}");
+        }
     }
 
     // ---- Claude status ---------------------------------------------------
@@ -1254,6 +1346,11 @@ impl AnvilApp {
             return;
         }
         let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) else { return };
+        // Never write a statusLine that cannot run: the helper ships beside us.
+        if !exe_dir.join("anvil-claude-status.exe").is_file() {
+            log::warn!("anvil-claude-status.exe is missing next to the executable; status line not installed");
+            return;
+        }
         let ours = claude_setup::status_command(&exe_dir);
         let claude_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
         let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
@@ -1285,21 +1382,38 @@ impl AnvilApp {
     /// `keep_previous` is set when only our own command's path changes: the
     /// saved original status line must survive such an update.
     fn install_claude(&mut self, path: &Path, ours: &str, keep_previous: bool) -> std::io::Result<()> {
-        let _ = claude_setup::backup_once(path);
-        let fresh = std::fs::read_to_string(path).ok();
-        match claude_setup::install(fresh.as_deref(), ours) {
-            Ok((text, previous)) => {
-                crate::fsutil::atomic_write(path, text.as_bytes())?;
-                if !keep_previous {
-                    self.config.claude_status.previous_status_line = previous;
+        claude_setup::backup_once(path)?;
+        // Only a genuinely missing file may become a fresh settings object; an
+        // unreadable one must be left alone.
+        let fresh = match std::fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        // Claude Code rewrites this file; re-check on the fresh contents that
+        // the statusLine is still ours (or absent) before touching it.
+        if let Some(text) = &fresh {
+            match claude_setup::plan(Some(text), ours, self.config.claude_status.declined_command.as_deref()) {
+                Plan::Install | Plan::Update => {}
+                Plan::AlreadyInstalled => return Ok(()),
+                Plan::AskReplace { .. } | Plan::Declined | Plan::Broken(_) => {
+                    log::warn!("{} changed before the statusLine update; leaving it alone", path.display());
+                    self.toast(strings::CLAUDE_SETTINGS_CHANGED.to_owned());
+                    return Ok(());
                 }
-                let config_path = Config::path();
-                let _ = self.config.save(&config_path);
-                self.config_mtime = file_mtime(&config_path);
-                Ok(())
             }
-            Err(e) => Err(std::io::Error::other(e)),
         }
+        let (text, previous) = claude_setup::install(fresh.as_deref(), ours).map_err(std::io::Error::other)?;
+        crate::fsutil::atomic_write(path, text.as_bytes())?;
+        if !keep_previous {
+            self.config.claude_status.previous_status_line = previous;
+        }
+        let config_path = Config::path();
+        if let Err(e) = self.config.save(&config_path) {
+            log::warn!("cannot save {}: {e}", config_path.display());
+        }
+        self.config_mtime = file_mtime(&config_path);
+        Ok(())
     }
 
     fn disable_claude(&mut self) {
@@ -1312,11 +1426,16 @@ impl AnvilApp {
         match claude_setup::uninstall(&fresh, &ours, self.config.claude_status.previous_status_line.as_ref()) {
             Ok(Some(text)) => {
                 if let Err(e) = crate::fsutil::atomic_write(&path, text.as_bytes()) {
+                    // Keep the saved original: a later disable must be able to retry.
                     log::warn!("cannot restore {}: {e}", path.display());
+                    self.toast(strings::CLAUDE_SETTINGS_CHANGED.to_owned());
+                    return;
                 }
                 self.config.claude_status.previous_status_line = None;
                 let config_path = Config::path();
-                let _ = self.config.save(&config_path);
+                if let Err(e) = self.config.save(&config_path) {
+                    log::warn!("cannot save {}: {e}", config_path.display());
+                }
                 self.config_mtime = file_mtime(&config_path);
             }
             Ok(None) => {}
@@ -1355,7 +1474,10 @@ impl AnvilApp {
                     _ => {}
                 }
                 if entry.claude.is_some() {
-                    let alive = crate::procs::has_descendant_named(snapshot, shell_pid, "claude.exe");
+                    let alive = crate::procs::has_descendant_named(snapshot, shell_pid, "claude.exe")
+                        // A stale snapshot must not delete a live pane's status:
+                        // re-check with a fresh one before deciding it is gone.
+                        || crate::procs::has_descendant_named(&crate::procs::snapshot(), shell_pid, "claude.exe");
                     entry.has_claude = alive;
                     if !alive {
                         entry.claude = None;
@@ -1437,7 +1559,9 @@ impl AnvilApp {
                 } else if let Some(current) = dialog.command().map(str::to_owned) {
                     self.config.claude_status.declined_command = Some(current);
                     let config_path = Config::path();
-                    let _ = self.config.save(&config_path);
+                    if let Err(e) = self.config.save(&config_path) {
+                    log::warn!("cannot save {}: {e}", config_path.display());
+                }
                     self.config_mtime = file_mtime(&config_path);
                 }
             }

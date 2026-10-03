@@ -244,6 +244,23 @@ mod tests {
         .collect()
     }
 
+    /// Every symbol the chrome paints must exist in the interface font chain,
+    /// otherwise a button renders as an invisible box (epaint's warning).
+    #[test]
+    fn ui_glyphs_are_available() {
+        let ctx = egui::Context::default();
+        install(&ctx, "Consolas", &registry_font_entries(), false);
+        // Fonts become available with the first frame.
+        let _ = ctx.run(Default::default(), |_| {});
+        // Exactly the symbols src/strings.rs and the chrome paint.
+        let used = "≡×↑↓▸▾◂⟳‹›·—…−─□»↺▓░";
+        let missing: Vec<char> = used
+            .chars()
+            .filter(|c| !ctx.fonts(|fonts| fonts.has_glyph(&FontId::new(13.0, FontFamily::Name("ui".into())), *c)))
+            .collect();
+        assert!(missing.is_empty(), "glyphs missing from the ui family: {missing:?}");
+    }
+
     #[test]
     fn finds_all_four_faces() {
         let f = match_family(&entries(), "consolas", Path::new("C:\\Windows\\Fonts"));

@@ -74,6 +74,11 @@ pub struct TerminalView {
     last_reported_cell: Option<(usize, usize)>,
     /// Cell under the pointer (used for wheel reports).
     hover_cell: Option<(usize, usize)>,
+    /// A press report was sent for this pane: only then do we report motion
+    /// and release, so clicks in other panes are never broadcast here.
+    press_reported: bool,
+    /// OSC 8 links of the last painted rows: (row, first column, end column, uri).
+    last_links: Vec<(usize, usize, usize, String)>,
 }
 
 pub struct ViewInput<'a> {
@@ -114,6 +119,8 @@ impl TerminalView {
             last_rows: Vec::new(),
             last_reported_cell: None,
             hover_cell: None,
+            press_reported: false,
+            last_links: Vec::new(),
         }
     }
 
@@ -179,7 +186,13 @@ impl TerminalView {
         let primary_released = ui.input(|i| i.pointer.primary_released());
         let dragging = response.dragged();
 
-        if primary_pressed {
+        // The scrollback bar owns presses on its track (drags there must not
+        // start a text selection).
+        let bar_zone = Rect::from_min_max(Pos2::new(rect.max.x - 6.0, rect.min.y), rect.max);
+        let bar_active = pane.term.lock().grid().history_size() > 0;
+        if primary_pressed && pointer.is_some_and(|pos| bar_zone.contains(pos) && bar_active) {
+            // Handled by the scrollbar widget later in this frame.
+        } else if primary_pressed {
             if let Some(pos) = pointer {
                 let (col, row) = clamp_cell(pos);
                 let point = viewport_to_point(display_offset, Point::new(row, Column(col)));
@@ -188,6 +201,7 @@ impl TerminalView {
                 } else if app_mouse {
                     if let Some(bytes) = mouse::encode_report(MouseButton::Left, MouseAction::Press, col, row, mods, modes) {
                         pane.write(bytes);
+                        self.press_reported = true;
                     }
                     self.selecting = false;
                 } else {
@@ -212,9 +226,10 @@ impl TerminalView {
             if let Some(pos) = pointer {
                 let (col, row) = clamp_cell(pos);
                 if app_mouse {
-                    if mouse::wants_report(MouseAction::Motion, true, modes) {
+                    if self.press_reported && mouse::wants_report(MouseAction::Motion, true, modes) {
                         if let Some(bytes) = mouse::encode_report(MouseButton::Left, MouseAction::Motion, col, row, mods, modes) {
                             pane.write(bytes);
+                            self.last_reported_cell = Some((col, row));
                         }
                     }
                 } else if self.selecting {
@@ -230,8 +245,11 @@ impl TerminalView {
             if let Some(pos) = pointer {
                 let (col, row) = clamp_cell(pos);
                 if app_mouse {
-                    if let Some(bytes) = mouse::encode_report(MouseButton::Left, MouseAction::Release, col, row, mods, modes) {
-                        pane.write(bytes);
+                    if self.press_reported {
+                        if let Some(bytes) = mouse::encode_report(MouseButton::Left, MouseAction::Release, col, row, mods, modes) {
+                            pane.write(bytes);
+                        }
+                        self.press_reported = false;
                     }
                 } else if self.selecting {
                     self.selecting = false;
@@ -254,7 +272,8 @@ impl TerminalView {
         }
 
         self.hover_cell = if hovered { pointer.map(clamp_cell) } else { None };
-        if let (true, Some((col, row))) = (app_mouse && hovered, self.hover_cell) {
+        let any_button_down = ui.input(|i| i.pointer.any_down());
+        if let (true, Some((col, row))) = (app_mouse && hovered && !any_button_down, self.hover_cell) {
             if mouse::wants_report(MouseAction::Motion, false, modes) && self.last_reported_cell != Some((col, row)) {
                 if let Some(bytes) = mouse::encode_report(MouseButton::NoButton, MouseAction::Motion, col, row, mods, modes) {
                     pane.write(bytes);
@@ -276,8 +295,8 @@ impl TerminalView {
         if hovered && ui.input(|i| i.pointer.secondary_pressed()) {
             self.right_press_at = Some(Instant::now());
         }
-        if ui.input(|i| i.pointer.secondary_released()) {
-            let short = self.right_press_at.take().is_some_and(|t| t.elapsed().as_millis() < RIGHT_CLICK_MENU_MS);
+        if let Some(pressed_at) = self.right_press_at.take().filter(|_| ui.input(|i| i.pointer.secondary_released())) {
+            let short = pressed_at.elapsed().as_millis() < RIGHT_CLICK_MENU_MS;
             if short {
                 match input.right_click {
                     RightClick::Paste => commands.push(PaneCommand::Paste),
@@ -382,6 +401,27 @@ impl TerminalView {
                 (text, cols)
             })
             .collect();
+        // OSC 8 targets per row, so Ctrl+click works on hyperlinked labels too.
+        self.last_links.clear();
+        for (row, cells) in frame.rows.iter().enumerate() {
+            let mut run: Option<(usize, String)> = None;
+            for (col, cell) in cells.iter().enumerate() {
+                let uri = cell.hyperlink.as_deref().map(str::to_owned).filter(|value| !value.is_empty());
+                let continues = matches!((&run, &uri), (Some((_, current)), Some(next)) if current == next);
+                if continues {
+                    continue;
+                }
+                if let Some((start, current)) = run.take() {
+                    self.last_links.push((row, start, col, current));
+                }
+                if let Some(next) = uri {
+                    run = Some((col, next));
+                }
+            }
+            if let Some((start, current)) = run.take() {
+                self.last_links.push((row, start, cells.len(), current));
+            }
+        }
 
         let cursor_on = if (input.cursor_blink || self.app_blink) && input.focused {
             let elapsed = self.blink_epoch.elapsed().as_millis();
@@ -411,16 +451,31 @@ impl TerminalView {
             let _ = url;
         }
 
-        // Scrollback bar.
-        if frame.display_offset > 0 && frame.history_size > 0 {
+        // Scrollback bar: painted when scrolled, draggable to move the view.
+        if frame.history_size > 0 {
             let track = Rect::from_min_max(Pos2::new(rect.max.x - 6.0, rect.min.y), rect.max);
-            let visible = frame.lines as f32 / (frame.lines + frame.history_size) as f32;
-            let top = 1.0 - (frame.display_offset + frame.lines) as f32 / (frame.lines + frame.history_size) as f32;
-            let thumb = Rect::from_min_size(
-                Pos2::new(track.min.x, track.min.y + top * track.height()),
-                Vec2::new(track.width(), (visible * track.height()).max(12.0)),
-            );
-            painter.rect_filled(thumb, 0.0, theme::DIVIDER_HOVER);
+            let response = ui.interact(track, ui.id().with(("scrollbar", pane.id)), Sense::click_and_drag());
+            let active = frame.display_offset > 0 || response.hovered() || response.dragged();
+            if active {
+                let visible = frame.lines as f32 / (frame.lines + frame.history_size) as f32;
+                let top = 1.0 - (frame.display_offset + frame.lines) as f32 / (frame.lines + frame.history_size) as f32;
+                let thumb = Rect::from_min_size(
+                    Pos2::new(track.min.x, track.min.y + top * track.height()),
+                    Vec2::new(track.width(), (visible * track.height()).max(12.0)),
+                );
+                painter.rect_filled(thumb, 0.0, theme::DIVIDER_HOVER);
+            }
+            if response.dragged() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let total = (frame.lines + frame.history_size) as f32;
+                    let fraction = ((pos.y - track.min.y) / track.height()).clamp(0.0, 1.0);
+                    let target = ((1.0 - fraction) * total - frame.lines as f32).round().max(0.0) as i32;
+                    let delta = target - frame.display_offset as i32;
+                    if delta != 0 {
+                        pane.term.lock().scroll_display(Scroll::Delta(delta));
+                    }
+                }
+            }
         }
 
         let cursor_rect = frame.cursor.map(|c| {
@@ -442,6 +497,10 @@ impl TerminalView {
                         let field = ui.add(
                             egui::TextEdit::singleline(&mut self.search.query)
                                 .hint_text(strings::SEARCH_PLACEHOLDER)
+                                // Enter navigates; the default single-line
+                                // behaviour would drop the focus and route the
+                                // next keystrokes to the shell.
+                                .return_key(None)
                                 .desired_width(150.0),
                         );
                         if self.search.focus_requested {
@@ -452,7 +511,7 @@ impl TerminalView {
                             self.search.current = None;
                         }
                         if self.search.error {
-                            field.surrender_focus();
+                            // Keep the field focused: the user is mid-expression.
                             ui.colored_label(egui::Color32::from_rgb(0xf9, 0x26, 0x72), "!");
                         }
                         if ui.selectable_label(self.search.case_sensitive, "Aa").on_hover_text(strings::SEARCH_CASE).clicked() {
@@ -485,7 +544,7 @@ impl TerminalView {
                 });
             });
             if nav_next || nav_prev {
-                self.search_step(pane, nav_next, columns as usize, display_offset);
+                self.search_step(pane, nav_next, display_offset);
             }
             if close {
                 self.search.open = false;
@@ -502,7 +561,7 @@ impl TerminalView {
     }
 
     /// Recomputes the current match and scrolls it into view.
-    fn search_step(&mut self, pane: &Pane, forward: bool, columns: usize, display_offset: usize) {
+    fn search_step(&mut self, pane: &Pane, forward: bool, display_offset: usize) {
         if self.search.query.is_empty() {
             return;
         }
@@ -514,33 +573,46 @@ impl TerminalView {
         self.search.error = false;
         let mut term = pane.term.lock();
         let lines = term.screen_lines();
+        let total_columns = term.columns().max(1);
+        let history = term.grid().history_size() as i32;
+        let last_line = lines as i32 - 1;
         let origin = match self.search.current {
             Some((row, _, end)) if forward => {
-                Point::new(Line(row as i32 - display_offset as i32), Column(end.min(columns.saturating_sub(1))))
+                let line = (row as i32 - display_offset as i32).clamp(-history, last_line);
+                Point::new(Line(line), Column(end.min(total_columns - 1)))
             }
-            Some((row, start, _)) => Point::new(Line(row as i32 - display_offset as i32), Column(start)),
-            // The search bar never keeps a stale match, so this arm only guards odd states.
+            Some((row, start, _)) => {
+                // Step one cell back so the current match is not returned again.
+                let line = (row as i32 - display_offset as i32).clamp(-history, last_line);
+                match start.checked_sub(1) {
+                    Some(col) => Point::new(Line(line), Column(col)),
+                    None => Point::new(Line((line - 1).max(-history)), Column(total_columns - 1)),
+                }
+            }
             None => {
                 let cursor = term.grid().cursor.point;
-                Point::new(Line(cursor.line.0 + if forward { 0 } else { 1 }), cursor.column)
+                Point::new(Line(cursor.line.0.clamp(-history, last_line)), Column(cursor.column.0.min(total_columns - 1)))
             }
         };
         let direction = if forward { Direction::Right } else { Direction::Left };
         let found = term.search_next(&mut regex, origin, direction, Side::Left, None).or_else(|| {
             let wrap = if forward {
-                Point::new(Line(-(term.grid().history_size() as i32)), Column(0))
+                Point::new(Line(-history), Column(0))
             } else {
-                Point::new(Line(term.screen_lines() as i32 - 1), Column(columns.saturating_sub(1)))
+                Point::new(Line(last_line), Column(total_columns - 1))
             };
             term.search_next(&mut regex, wrap, direction, Side::Left, None)
         });
         if let Some(found) = found {
-            if let Some(row) = alacritty_terminal::term::point_to_viewport(display_offset, *found.start()) {
+            term.scroll_to_point(*found.start());
+            // The offset may have changed with the scroll: convert afterwards so
+            // the highlight lands on the row the user now sees.
+            let offset = term.grid().display_offset();
+            if let Some(row) = alacritty_terminal::term::point_to_viewport(offset, *found.start()) {
                 if row.line < lines {
                     self.search.current = Some((row.line, found.start().column.0, found.end().column.0 + 1));
                 }
             }
-            term.scroll_to_point(*found.start());
         }
     }
 
@@ -550,6 +622,15 @@ impl TerminalView {
     }
 
     fn link_span(&self, row: usize, col: usize) -> Option<(String, usize, usize)> {
+        if let Some((_, start, end, uri)) = self
+            .last_links
+            .iter()
+            .find(|(link_row, start, end, _)| *link_row == row && (*start..*end).contains(&col))
+        {
+            if links::is_openable(uri) {
+                return Some((uri.clone(), *start, *end));
+            }
+        }
         let (text, cols) = self.last_rows.get(row)?;
         let mut start = 0;
         while let Some(offset) = find_scheme(text, start) {
