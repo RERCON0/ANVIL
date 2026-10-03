@@ -1,0 +1,293 @@
+//! Vertical tab list on the left: numbers, titles, the Claude badge, activity
+//! dots, drag & drop, rename in place and the buttons under the list.
+
+use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
+
+use crate::claude_status::{js_round, StatusRecord};
+use crate::strings;
+use crate::theme;
+
+#[derive(Default)]
+pub struct TabbarState {
+    pub rename: Option<RenameEdit>,
+    drag_from: Option<usize>,
+    hover_index: Option<usize>,
+}
+
+pub struct RenameEdit {
+    pub tab: usize,
+    pub text: String,
+    pub focus: bool,
+}
+
+pub struct TabInfo {
+    pub title: String,
+    pub active: bool,
+    pub activity: bool,
+    pub claude: Option<StatusRecord>,
+}
+
+pub enum TabbarAction {
+    Select(usize),
+    Close(usize),
+    Duplicate(usize),
+    CloseOthers(usize),
+    Rename(usize, String),
+    Move(usize, usize),
+    NewTab,
+    Profiles,
+    Settings,
+}
+
+pub fn show(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    state: &mut TabbarState,
+    tabs: &[TabInfo],
+    settings_open: bool,
+) -> Vec<TabbarAction> {
+    let mut actions = Vec::new();
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, theme::CHROME_BG);
+    let mut y = rect.min.y;
+    state.hover_index = None;
+
+    for (index, tab) in tabs.iter().enumerate() {
+        let height = theme::TAB_ROW_HEIGHT + if tab.claude.is_some() { theme::CLAUDE_ROW_HEIGHT } else { 0.0 };
+        let row = Rect::from_min_size(Pos2::new(rect.min.x, y), Vec2::new(rect.width(), height));
+        y += height;
+        if row.max.y > rect.max.y {
+            break;
+        }
+        let response = ui.interact(row, ui.id().with(("tab", index)), Sense::click_and_drag());
+        if response.hovered() {
+            state.hover_index = Some(index);
+        }
+        if tab.active {
+            painter.rect_filled(row, 0.0, theme::TAB_ACTIVE_BG);
+        } else if response.hovered() {
+            painter.rect_filled(row, 0.0, theme::TAB_HOVER_BG);
+        }
+
+        if let Some(rename) = state.rename.as_mut().filter(|rename| rename.tab == index) {
+            let field_rect = Rect::from_min_size(Pos2::new(row.min.x + 30.0, row.min.y + 4.0), Vec2::new(row.width() - 40.0, row.height() - 8.0));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(field_rect), |ui| {
+                let field = ui.add(egui::TextEdit::singleline(&mut rename.text).desired_width(field_rect.width()));
+                if rename.focus {
+                    field.request_focus();
+                    rename.focus = false;
+                }
+                let commit = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                if commit {
+                    actions.push(TabbarAction::Rename(index, rename.text.trim().to_owned()));
+                }
+                if escape {
+                    actions.push(TabbarAction::Rename(index, tab.title.clone()));
+                }
+            });
+            if !actions.is_empty() {
+                state.rename = None;
+            }
+            continue;
+        }
+
+        let number_color = if tab.active { theme::TAB_ACTIVE_NUMBER } else { theme::TAB_NUMBER };
+        painter.text(
+            Pos2::new(row.min.x + 14.0 + 11.0, row.min.y + 17.0),
+            Align2::CENTER_CENTER,
+            (index + 1).to_string(),
+            FontId::proportional(12.0),
+            number_color,
+        );
+        if tab.activity {
+            painter.circle_filled(Pos2::new(row.min.x + 7.0, row.min.y + 17.0), 2.0, theme::ACCENT);
+        }
+        let text_color = if tab.active { theme::TAB_ACTIVE_TEXT } else { theme::TAB_TEXT };
+        let title_rect = Rect::from_min_size(Pos2::new(row.min.x + 36.0, row.min.y), Vec2::new(row.width() - 58.0, theme::TAB_ROW_HEIGHT));
+        let title = elide(&painter, &tab.title, FontId::proportional(13.0), title_rect.width());
+        painter.with_clip_rect(title_rect).text(
+            Pos2::new(title_rect.min.x, title_rect.center().y),
+            Align2::LEFT_CENTER,
+            title,
+            FontId::proportional(13.0),
+            text_color,
+        );
+        if let Some(record) = &tab.claude {
+            paint_claude_line(&painter, row, record);
+        }
+
+        // Close button on hover.
+        let close_rect = Rect::from_min_size(Pos2::new(row.max.x - 22.0, row.min.y + 8.0), Vec2::splat(18.0));
+        if response.hovered() {
+            let close = ui.interact(close_rect, ui.id().with(("tab-close", index)), Sense::click());
+            let color = if close.hovered() { theme::TAB_ACTIVE_TEXT } else { theme::TAB_TEXT };
+            painter.text(close_rect.center(), Align2::CENTER_CENTER, "×", FontId::proportional(14.0), color);
+            if close.clicked() {
+                actions.push(TabbarAction::Close(index));
+            }
+        }
+
+        if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle)) && response.hovered() {
+            actions.push(TabbarAction::Close(index));
+        }
+        if response.double_clicked() {
+            state.rename = Some(RenameEdit { tab: index, text: tab.title.clone(), focus: true });
+        }
+        if response.drag_started() {
+            state.drag_from = Some(index);
+        }
+        if response.clicked() && state.drag_from.is_none() {
+            actions.push(TabbarAction::Select(index));
+        }
+        response.context_menu(|ui| {
+            if ui.button(strings::TAB_RENAME).clicked() {
+                state.rename = Some(RenameEdit { tab: index, text: tab.title.clone(), focus: true });
+                ui.close_menu();
+            }
+            if ui.button(strings::TAB_DUPLICATE).clicked() {
+                actions.push(TabbarAction::Duplicate(index));
+                ui.close_menu();
+            }
+            if ui.button(strings::TAB_CLOSE).clicked() {
+                actions.push(TabbarAction::Close(index));
+                ui.close_menu();
+            }
+            if ui.button(strings::TAB_CLOSE_OTHERS).clicked() {
+                actions.push(TabbarAction::CloseOthers(index));
+                ui.close_menu();
+            }
+        });
+    }
+
+    // Drag & drop reordering.
+    if let Some(from) = state.drag_from {
+        if ui.input(|i| i.pointer.any_released()) {
+            if let Some(to) = state.hover_index {
+                if from != to {
+                    actions.push(TabbarAction::Move(from, to));
+                }
+            }
+            state.drag_from = None;
+        } else if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+            let target = tabs
+                .iter()
+                .enumerate()
+                .find(|(index, tab)| {
+                    let height = theme::TAB_ROW_HEIGHT + if tab.claude.is_some() { theme::CLAUDE_ROW_HEIGHT } else { 0.0 };
+                    let top = rect.min.y + (0..*index).map(|i| row_height(&tabs[i])).sum::<f32>();
+                    pos.y >= top && pos.y < top + height
+                })
+                .map(|(index, _)| index);
+            if let Some(target) = target {
+                state.hover_index = Some(target);
+            }
+        }
+    }
+
+    // Buttons under the list.
+    let y = y.max(rect.min.y);
+    let plus_rect = Rect::from_min_size(Pos2::new(rect.min.x + 8.0, y + 8.0), Vec2::new(28.0, 24.0));
+    let plus = ui.interact(plus_rect, ui.id().with("tab-new"), Sense::click());
+    let plus_color = if plus.hovered() { theme::ICON_HOVER } else { theme::ICON };
+    painter.text(plus_rect.center(), Align2::CENTER_CENTER, "+", FontId::proportional(17.0), plus_color);
+    if plus.on_hover_text(strings::TAB_NEW).clicked() {
+        actions.push(TabbarAction::NewTab);
+    }
+    let profile_rect = Rect::from_min_size(Pos2::new(rect.min.x + 44.0, y + 8.0), Vec2::new(28.0, 24.0));
+    let profile = ui.interact(profile_rect, ui.id().with("tab-profiles"), Sense::click());
+    let profile_color = if profile.hovered() { theme::ICON_HOVER } else { theme::ICON };
+    painter.text(profile_rect.center(), Align2::CENTER_CENTER, "❯", FontId::proportional(13.0), profile_color);
+    if profile.on_hover_text(strings::TAB_PROFILES).clicked() {
+        actions.push(TabbarAction::Profiles);
+    }
+
+    let settings_rect = Rect::from_min_size(Pos2::new(rect.min.x + 8.0, rect.max.y - 30.0), Vec2::new(rect.width() - 16.0, 24.0));
+    let settings = ui.interact(settings_rect, ui.id().with("tab-settings"), Sense::click());
+    if settings_open {
+        painter.rect_filled(settings_rect, 0.0, theme::TAB_ACTIVE_BG);
+    }
+    let settings_color = if settings_open || settings.hovered() { theme::ICON_HOVER } else { theme::ICON };
+    painter.text(
+        Pos2::new(settings_rect.min.x + 10.0, settings_rect.center().y),
+        Align2::LEFT_CENTER,
+        format!("⚙  {}", strings::TAB_SETTINGS),
+        FontId::proportional(13.0),
+        settings_color,
+    );
+    if settings.clicked() {
+        actions.push(TabbarAction::Settings);
+    }
+    actions
+}
+
+fn row_height(tab: &TabInfo) -> f32 {
+    theme::TAB_ROW_HEIGHT + if tab.claude.is_some() { theme::CLAUDE_ROW_HEIGHT } else { 0.0 }
+}
+
+fn elide(painter: &egui::Painter, text: &str, font: FontId, max_width: f32) -> String {
+    let measure = |s: &str| painter.layout_no_wrap(s.to_owned(), font.clone(), Color32::WHITE).size().x;
+    if measure(text) <= max_width {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    for ch in text.chars() {
+        let mut candidate = out.clone();
+        candidate.push(ch);
+        candidate.push('…');
+        if measure(&candidate) > max_width {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+/// The Claude badge line: `Opus 5 · ▓▓▓▓░░░░░░ 37% · 5h 17% · 7d 64%` with the
+/// percentage colours of the Hardcore scheme.
+fn paint_claude_line(painter: &egui::Painter, row: Rect, record: &StatusRecord) {
+    let mut x = row.min.x + 36.0;
+    let y = row.min.y + theme::TAB_ROW_HEIGHT + theme::CLAUDE_ROW_HEIGHT / 2.0;
+    let font = FontId::proportional(11.0);
+    let mut parts: Vec<(String, Color32)> = Vec::new();
+    if let Some(model) = &record.model {
+        parts.push((model.clone(), theme::TAB_TEXT));
+    }
+    if let Some(pct) = record.context_pct {
+        let filled = js_round(pct / 10.0).clamp(0, 10) as usize;
+        let bar = format!("{}{} {}%", "▓".repeat(filled), "░".repeat(10 - filled), js_round(pct));
+        parts.push((bar, threshold_color(pct)));
+    }
+    if let Some(pct) = record.five_hour_pct {
+        parts.push((format!("5h {}", js_round(pct)), threshold_color(pct)));
+    }
+    if let Some(pct) = record.seven_day_pct {
+        parts.push((format!("7d {}", js_round(pct)), threshold_color(pct)));
+    }
+    if let Some(agent) = &record.agent {
+        parts.push((agent.clone(), theme::TAB_TEXT));
+    }
+    let limit = row.max.x - 10.0;
+    for (index, (text, color)) in parts.iter().enumerate() {
+        let prefix = if index == 0 { "" } else { " · " };
+        let chunk = format!("{prefix}{text}");
+        let galley = painter.layout_no_wrap(chunk, font.clone(), *color);
+        let width = galley.size().x;
+        if x + width > limit {
+            break;
+        }
+        painter.galley(Pos2::new(x, y - galley.size().y / 2.0), galley, *color);
+        x += width;
+    }
+}
+
+fn threshold_color(pct: f64) -> Color32 {
+    if pct >= 85.0 {
+        theme::STATUS_RED
+    } else if pct >= 60.0 {
+        theme::STATUS_YELLOW
+    } else {
+        theme::STATUS_GREEN
+    }
+}
