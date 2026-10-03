@@ -290,7 +290,7 @@ impl Tab {
                                 ui.ctx().request_repaint();
                             }
                         }
-                        let actions = entry.workspace.show(ui, panel_rect, env.ai_command.as_deref());
+                        let actions = entry.workspace.show(ui, panel_rect, *id, env.ai_command.as_deref());
                         for action in actions {
                             match action {
                                 crate::workspace::WorkspaceAction::Close => entry.workspace.open = false,

@@ -12,7 +12,45 @@ use crate::config::{Config, CursorShapeConfig, ProfileConfig, RightClick};
 use crate::strings;
 use crate::theme;
 
+
+/// Settings pages, one per entry of the vertical nav (as in the reference
+/// settings screen): appearance, terminal, profiles, the git panel, hotkeys
+/// and the Claude Code switch.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum SettingsSection {
+    #[default]
+    Appearance,
+    Terminal,
+    Profiles,
+    Workspace,
+    Hotkeys,
+    Claude,
+}
+
+impl SettingsSection {
+    const ALL: [SettingsSection; 6] = [
+        SettingsSection::Appearance,
+        SettingsSection::Terminal,
+        SettingsSection::Profiles,
+        SettingsSection::Workspace,
+        SettingsSection::Hotkeys,
+        SettingsSection::Claude,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            SettingsSection::Appearance => strings::SETTINGS_APPEARANCE,
+            SettingsSection::Terminal => strings::SETTINGS_TERMINAL,
+            SettingsSection::Profiles => strings::SETTINGS_PROFILES,
+            SettingsSection::Workspace => strings::SETTINGS_WORKSPACE,
+            SettingsSection::Hotkeys => strings::SETTINGS_HOTKEYS,
+            SettingsSection::Claude => strings::SETTINGS_CLAUDE,
+        }
+    }
+}
+
 pub struct SettingsState {
+    pub section: SettingsSection,
     pub editing: Option<usize>,
     pub adding: bool,
     pub draft: ProfileConfig,
@@ -20,7 +58,7 @@ pub struct SettingsState {
 
 impl Default for SettingsState {
     fn default() -> Self {
-        SettingsState { editing: None, adding: false, draft: draft_profile() }
+        SettingsState { section: SettingsSection::default(), editing: None, adding: false, draft: draft_profile() }
     }
 }
 
@@ -50,242 +88,289 @@ fn draft_profile() -> ProfileConfig {
 pub fn show(ui: &mut egui::Ui, rect: Rect, cx: &mut SettingsContext, state: &mut SettingsState) -> SettingsOutcome {
     let mut outcome = SettingsOutcome { changed: false, open_config: false };
     ui.painter_at(rect).rect_filled(rect, 0.0, theme::CHROME_BG);
-    ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink2(Vec2::new(18.0, 12.0))), |ui| {
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.label(RichText::new(strings::TAB_SETTINGS).color(theme::TEXT).font(theme::title_font(15.0)));
-            ui.label(RichText::new(strings::SETTINGS_APPLY_HINT).color(theme::FAINT).font(theme::font(11.5)));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink2(Vec2::new(18.0, 12.0))).id_salt("settings-page"), |ui| {
+        ui.label(RichText::new(strings::TAB_SETTINGS).color(theme::TEXT).font(theme::title_font(15.0)));
+        ui.label(RichText::new(strings::SETTINGS_APPLY_HINT).color(theme::FAINT).font(theme::font(11.5)));
+        ui.add_space(10.0);
 
-            // ---- appearance -------------------------------------------------
-            theme::section(ui, strings::SETTINGS_APPEARANCE);
-            theme::tag(ui, strings::SETTINGS_FONT);
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("font-family")
-                    .width(220.0)
-                    .selected_text(RichText::new(cx.config.font.family.clone()).font(theme::field_font(13.0)))
-                    .show_ui(ui, |ui| {
-                        for family in &cx.fonts {
-                            if ui.selectable_label(*family == cx.config.font.family, family).clicked() {
-                                cx.config.font.family = family.clone();
-                                outcome.changed = true;
-                            }
-                        }
-                    });
-                let mut family = cx.config.font.family.clone();
-                if ui
-                    .add(egui::TextEdit::singleline(&mut family).font(theme::field_font(13.0)).desired_width(180.0))
-                    .changed()
-                {
-                    cx.config.font.family = family;
-                    outcome.changed = true;
+        // One section at a time: the list on the left, its rows on the right.
+        let body = ui.available_rect_before_wrap();
+        let nav_width = 172.0_f32.min(body.width() * 0.4);
+        let nav_rect = Rect::from_min_size(body.min, Vec2::new(nav_width, body.height()));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(nav_rect).id_salt("settings-nav"), |ui| {
+            for section in SettingsSection::ALL {
+                let selected = state.section == section;
+                let (row, response) = ui.allocate_exact_size(Vec2::new(nav_rect.width(), 26.0), Sense::click());
+                if selected {
+                    ui.painter().rect_filled(row, 0.0, theme::TAB_ACTIVE_BG);
+                    ui.painter().rect_stroke(row, 0.0, Stroke::new(1.0, theme::LINE));
+                } else if response.hovered() {
+                    ui.painter().rect_filled(row, 0.0, theme::TAB_HOVER_BG);
+                }
+                let color = if selected { theme::ACCENT } else { theme::DIM };
+                ui.painter().text(
+                    egui::Pos2::new(row.min.x + 10.0, row.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    section.title(),
+                    theme::font(12.5),
+                    color,
+                );
+                if response.clicked() {
+                    state.section = section;
+                }
+            }
+        });
+
+        let content_rect = Rect::from_min_max(egui::Pos2::new(nav_rect.max.x + 18.0, body.min.y), body.max);
+        ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect).id_salt("settings-content"), |ui| {
+            egui::ScrollArea::vertical().id_salt("settings-section").auto_shrink([false, false]).show(ui, |ui| {
+                match state.section {
+                    SettingsSection::Appearance => section_appearance(ui, cx, &mut outcome),
+                    SettingsSection::Terminal => section_terminal(ui, cx, &mut outcome),
+                    SettingsSection::Profiles => section_profiles(ui, cx, state, &mut outcome),
+                    SettingsSection::Workspace => section_git(ui, cx, &mut outcome),
+                    SettingsSection::Hotkeys => section_hotkeys(ui, cx, &mut outcome),
+                    SettingsSection::Claude => section_claude(ui, cx, &mut outcome),
                 }
             });
-            theme::tag(ui, strings::SETTINGS_FONT_SIZE);
-            outcome.changed |= theme::stepper_f32(ui, &mut cx.config.font.size, 6.0, 48.0, 1.0);
-            theme::tag(ui, strings::SETTINGS_SCHEME);
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("color-scheme")
-                    .width(220.0)
-                    .selected_text(RichText::new(cx.config.color_scheme.clone()).font(theme::field_font(13.0)))
-                    .show_ui(ui, |ui| {
-                        let names = crate::app::scheme_names(cx.config);
-                        for name in &names {
-                            if ui.selectable_label(*name == cx.config.color_scheme, name).clicked() {
-                                cx.config.color_scheme = name.clone();
-                                outcome.changed = true;
-                            }
-                        }
-                    });
-                let palette = crate::app::scheme_palette(cx.config);
-                let (response, painter) = ui.allocate_painter(Vec2::new(16.0 * 15.0 + 2.0, 15.0), Sense::hover());
-                painter.rect_stroke(response.rect, 0.0, Stroke::new(1.0, theme::LINE));
-                for (index, color) in palette.ansi.iter().enumerate() {
-                    let cell = Rect::from_min_size(
-                        response.rect.min + Vec2::new(1.0 + index as f32 * 15.0, 1.0),
-                        Vec2::new(14.0, 13.0),
-                    );
-                    painter.rect_filled(cell, 0.0, *color);
-                }
-            });
-
-            // ---- terminal ---------------------------------------------------
-            theme::section(ui, strings::SETTINGS_TERMINAL);
-            theme::tag(ui, strings::SETTINGS_SCROLLBACK);
-            outcome.changed |= theme::stepper(ui, &mut cx.config.terminal.scrollback, 0, 1_000_000, 1000);
-            theme::tag(ui, strings::SETTINGS_CURSOR);
-            ui.horizontal(|ui| {
-                for (shape, label) in [
-                    (CursorShapeConfig::Block, strings::CURSOR_BLOCK),
-                    (CursorShapeConfig::Bar, strings::CURSOR_BAR),
-                    (CursorShapeConfig::Underline, strings::CURSOR_UNDERLINE),
-                ] {
-                    if theme::choice(ui, label, cx.config.terminal.cursor.shape == shape).clicked() {
-                        cx.config.terminal.cursor.shape = shape;
-                        outcome.changed = true;
-                    }
-                }
-                ui.add_space(10.0);
-                let blink = cx.config.terminal.cursor.blink;
-                if theme::choice(ui, strings::SETTINGS_BLINK, blink).clicked() {
-                    cx.config.terminal.cursor.blink = !blink;
-                    outcome.changed = true;
-                }
-            });
-            theme::tag(ui, strings::SETTINGS_RIGHT_CLICK);
-            ui.horizontal(|ui| {
-                for (mode, label) in [
-                    (RightClick::Clipboard, strings::RIGHT_CLICK_CLIPBOARD),
-                    (RightClick::Paste, strings::RIGHT_CLICK_PASTE),
-                    (RightClick::Menu, strings::RIGHT_CLICK_MENU),
-                ] {
-                    if theme::choice(ui, label, cx.config.terminal.right_click == mode).clicked() {
-                        cx.config.terminal.right_click = mode;
-                        outcome.changed = true;
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                let middle = cx.config.terminal.paste_on_middle_click;
-                if theme::choice(ui, strings::SETTINGS_MIDDLE_CLICK, middle).clicked() {
-                    cx.config.terminal.paste_on_middle_click = !middle;
-                    outcome.changed = true;
-                }
-                ui.add_space(10.0);
-                let copy = cx.config.terminal.copy_on_select;
-                if theme::choice(ui, strings::SETTINGS_COPY_ON_SELECT, copy).clicked() {
-                    cx.config.terminal.copy_on_select = !copy;
-                    outcome.changed = true;
-                }
-            });
-            theme::tag(ui, strings::SETTINGS_WORD_SEPARATORS);
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut cx.config.terminal.word_separators)
-                        .font(theme::field_font(13.0))
-                        .desired_width(260.0),
-                )
-                .changed()
-            {
-                outcome.changed = true;
-            }
-
-            // ---- profiles ---------------------------------------------------
-            theme::section(ui, strings::SETTINGS_PROFILES);
-            theme::tag(ui, strings::SETTINGS_DEFAULT_PROFILE);
-            egui::ComboBox::from_id_salt("default-profile")
-                .width(260.0)
-                .selected_text(RichText::new(cx.config.default_profile.clone()).font(theme::field_font(13.0)))
-                .show_ui(ui, |ui| {
-                    for (id, name) in &cx.profiles {
-                        if ui.selectable_label(*id == cx.config.default_profile, name).clicked() {
-                            cx.config.default_profile = id.clone();
-                            outcome.changed = true;
-                        }
-                    }
-                    for profile in cx.config.profiles.iter() {
-                        if ui.selectable_label(profile.id == cx.config.default_profile, &profile.name).clicked() {
-                            cx.config.default_profile = profile.id.clone();
-                            outcome.changed = true;
-                        }
-                    }
-                });
-            if cx.config.profiles.is_empty() && !state.adding {
-                ui.label(RichText::new(strings::SETTINGS_NO_PROFILES).color(theme::FAINT).font(theme::font(12.0)));
-            }
-            let mut delete: Option<usize> = None;
-            for (index, profile) in cx.config.profiles.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(&profile.name).color(theme::TEXT).font(theme::font(12.5)));
-                    ui.label(RichText::new(&profile.command).color(theme::FAINT).font(theme::field_font(12.0)));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.add(theme::ghost_button(strings::SETTINGS_DELETE)).clicked() {
-                            delete = Some(index);
-                        }
-                        if ui.add(theme::ghost_button(strings::SETTINGS_EDIT)).clicked() {
-                            state.editing = Some(index);
-                            state.adding = false;
-                            state.draft = profile.clone();
-                        }
-                    });
-                });
-                theme::hairline(ui);
-            }
-            if let Some(index) = delete {
-                let removed = cx.config.profiles.remove(index);
-                if cx.config.default_profile == removed.id {
-                    cx.config.default_profile = "git-bash".into();
-                }
-                // Keep the editor pointing at the same profile it was editing.
-                match state.editing {
-                    Some(editing) if editing == index => {
-                        state.editing = None;
-                        state.adding = false;
-                    }
-                    Some(editing) if editing > index => state.editing = Some(editing - 1),
-                    _ => {}
-                }
-                outcome.changed = true;
-            }
-            if !state.adding && state.editing.is_none() && ui.add(theme::ghost_button(strings::SETTINGS_ADD)).clicked() {
-                state.adding = true;
-                state.editing = None;
-                state.draft = draft_profile();
-            }
-            if state.adding || state.editing.is_some() {
-                ui.add_space(6.0);
-                profile_editor(ui, state, cx, &mut outcome);
-            }
-
-            // ---- workspace --------------------------------------------------
-            theme::section(ui, strings::SETTINGS_WORKSPACE);
-            theme::tag(ui, strings::SETTINGS_AI_COMMAND);
-            let mut ai = cx.config.workspace.ai_commit_command.clone().unwrap_or_default();
-            if ui
-                .add(egui::TextEdit::singleline(&mut ai).font(theme::field_font(13.0)).desired_width(320.0))
-                .changed()
-            {
-                let trimmed = ai.trim().to_owned();
-                cx.config.workspace.ai_commit_command = (!trimmed.is_empty()).then_some(trimmed);
-                outcome.changed = true;
-            }
-            ui.label(RichText::new(strings::SETTINGS_AI_HINT).color(theme::FAINT).font(theme::font(11.5)));
-
-            // ---- hotkeys ----------------------------------------------------
-            theme::section(ui, strings::SETTINGS_HOTKEYS);
-            ui.label(RichText::new(strings::SETTINGS_HOTKEYS_HINT).color(theme::FAINT).font(theme::font(11.5)));
-            ui.add_space(2.0);
-            for (action, chords) in &cx.keymap_rows {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(action).color(theme::DIM).font(theme::font(12.0)));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new(chords.join(", ")).color(theme::TEXT).font(theme::field_font(12.0)));
-                    });
-                });
-                theme::hairline(ui);
-            }
-            ui.add_space(6.0);
-            if ui.add(theme::ghost_button(strings::SETTINGS_OPEN_CONFIG)).clicked() {
-                outcome.open_config = true;
-            }
-
-            // ---- Claude Code ------------------------------------------------
-            theme::section(ui, strings::SETTINGS_CLAUDE);
-            let enabled = cx.config.claude_status.enabled;
-            if theme::choice(ui, strings::SETTINGS_CLAUDE_ENABLED, enabled).clicked() {
-                cx.config.claude_status.enabled = !enabled;
-                outcome.changed = true;
-            }
-            let state_text = if cx.config.claude_status.declined_command.is_some() {
-                RichText::new(strings::SETTINGS_CLAUDE_DECLINED).color(theme::STATUS_YELLOW)
-            } else if enabled {
-                RichText::new(strings::SETTINGS_CLAUDE_CONNECTED).color(theme::STATUS_GREEN)
-            } else {
-                RichText::new(strings::SETTINGS_CLAUDE_NOT_CONNECTED).color(theme::DIM)
-            };
-            ui.label(state_text.font(theme::font(12.0)));
-            ui.add_space(12.0);
         });
     });
     outcome
+}
+
+fn section_appearance(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut SettingsOutcome) {
+    theme::section(ui, strings::SETTINGS_APPEARANCE);
+    theme::tag(ui, strings::SETTINGS_FONT);
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("font-family")
+            .width(220.0)
+            .selected_text(RichText::new(cx.config.font.family.clone()).font(theme::field_font(13.0)))
+            .show_ui(ui, |ui| {
+                for family in &cx.fonts {
+                    if ui.selectable_label(*family == cx.config.font.family, family).clicked() {
+                        cx.config.font.family = family.clone();
+                        outcome.changed = true;
+                    }
+                }
+            });
+        let mut family = cx.config.font.family.clone();
+        if ui
+            .add(egui::TextEdit::singleline(&mut family).font(theme::field_font(13.0)).desired_width(180.0))
+            .changed()
+        {
+            cx.config.font.family = family;
+            outcome.changed = true;
+        }
+    });
+    theme::tag(ui, strings::SETTINGS_FONT_SIZE);
+    outcome.changed |= theme::stepper_f32(ui, &mut cx.config.font.size, 6.0, 48.0, 1.0);
+    theme::tag(ui, strings::SETTINGS_SCHEME);
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("color-scheme")
+            .width(220.0)
+            .selected_text(RichText::new(cx.config.color_scheme.clone()).font(theme::field_font(13.0)))
+            .show_ui(ui, |ui| {
+                let names = crate::app::scheme_names(cx.config);
+                for name in &names {
+                    if ui.selectable_label(*name == cx.config.color_scheme, name).clicked() {
+                        cx.config.color_scheme = name.clone();
+                        outcome.changed = true;
+                    }
+                }
+            });
+        let palette = crate::app::scheme_palette(cx.config);
+        let (response, painter) = ui.allocate_painter(Vec2::new(16.0 * 15.0 + 2.0, 15.0), Sense::hover());
+        painter.rect_stroke(response.rect, 0.0, Stroke::new(1.0, theme::LINE));
+        for (index, color) in palette.ansi.iter().enumerate() {
+            let cell = Rect::from_min_size(
+                response.rect.min + Vec2::new(1.0 + index as f32 * 15.0, 1.0),
+                Vec2::new(14.0, 13.0),
+            );
+            painter.rect_filled(cell, 0.0, *color);
+        }
+    });
+}
+
+fn section_terminal(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut SettingsOutcome) {
+    theme::section(ui, strings::SETTINGS_TERMINAL);
+    theme::tag(ui, strings::SETTINGS_SCROLLBACK);
+    outcome.changed |= theme::stepper(ui, &mut cx.config.terminal.scrollback, 0, 1_000_000, 1000);
+    theme::tag(ui, strings::SETTINGS_CURSOR);
+    ui.horizontal(|ui| {
+        for (shape, label) in [
+            (CursorShapeConfig::Block, strings::CURSOR_BLOCK),
+            (CursorShapeConfig::Bar, strings::CURSOR_BAR),
+            (CursorShapeConfig::Underline, strings::CURSOR_UNDERLINE),
+        ] {
+            if theme::choice(ui, label, cx.config.terminal.cursor.shape == shape).clicked() {
+                cx.config.terminal.cursor.shape = shape;
+                outcome.changed = true;
+            }
+        }
+        ui.add_space(10.0);
+        let blink = cx.config.terminal.cursor.blink;
+        if theme::choice(ui, strings::SETTINGS_BLINK, blink).clicked() {
+            cx.config.terminal.cursor.blink = !blink;
+            outcome.changed = true;
+        }
+    });
+    theme::tag(ui, strings::SETTINGS_RIGHT_CLICK);
+    ui.horizontal(|ui| {
+        for (mode, label) in [
+            (RightClick::Clipboard, strings::RIGHT_CLICK_CLIPBOARD),
+            (RightClick::Paste, strings::RIGHT_CLICK_PASTE),
+            (RightClick::Menu, strings::RIGHT_CLICK_MENU),
+        ] {
+            if theme::choice(ui, label, cx.config.terminal.right_click == mode).clicked() {
+                cx.config.terminal.right_click = mode;
+                outcome.changed = true;
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        let middle = cx.config.terminal.paste_on_middle_click;
+        if theme::choice(ui, strings::SETTINGS_MIDDLE_CLICK, middle).clicked() {
+            cx.config.terminal.paste_on_middle_click = !middle;
+            outcome.changed = true;
+        }
+        ui.add_space(10.0);
+        let copy = cx.config.terminal.copy_on_select;
+        if theme::choice(ui, strings::SETTINGS_COPY_ON_SELECT, copy).clicked() {
+            cx.config.terminal.copy_on_select = !copy;
+            outcome.changed = true;
+        }
+    });
+    theme::tag(ui, strings::SETTINGS_WORD_SEPARATORS);
+    if ui
+        .add(
+            egui::TextEdit::singleline(&mut cx.config.terminal.word_separators)
+                .font(theme::field_font(13.0))
+                .desired_width(260.0),
+        )
+        .changed()
+    {
+        outcome.changed = true;
+    }
+}
+
+fn section_profiles(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut SettingsState, outcome: &mut SettingsOutcome) {
+    theme::section(ui, strings::SETTINGS_PROFILES);
+    theme::tag(ui, strings::SETTINGS_DEFAULT_PROFILE);
+    egui::ComboBox::from_id_salt("default-profile")
+        .width(260.0)
+        .selected_text(RichText::new(cx.config.default_profile.clone()).font(theme::field_font(13.0)))
+        .show_ui(ui, |ui| {
+            for (id, name) in &cx.profiles {
+                if ui.selectable_label(*id == cx.config.default_profile, name).clicked() {
+                    cx.config.default_profile = id.clone();
+                    outcome.changed = true;
+                }
+            }
+            for profile in cx.config.profiles.iter() {
+                if ui.selectable_label(profile.id == cx.config.default_profile, &profile.name).clicked() {
+                    cx.config.default_profile = profile.id.clone();
+                    outcome.changed = true;
+                }
+            }
+        });
+    if cx.config.profiles.is_empty() && !state.adding {
+        ui.label(RichText::new(strings::SETTINGS_NO_PROFILES).color(theme::FAINT).font(theme::font(12.0)));
+    }
+    let mut delete: Option<usize> = None;
+    for (index, profile) in cx.config.profiles.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&profile.name).color(theme::TEXT).font(theme::font(12.5)));
+            ui.label(RichText::new(&profile.command).color(theme::FAINT).font(theme::field_font(12.0)));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add(theme::ghost_button(strings::SETTINGS_DELETE)).clicked() {
+                    delete = Some(index);
+                }
+                if ui.add(theme::ghost_button(strings::SETTINGS_EDIT)).clicked() {
+                    state.editing = Some(index);
+                    state.adding = false;
+                    state.draft = profile.clone();
+                }
+            });
+        });
+        theme::hairline(ui);
+    }
+    if let Some(index) = delete {
+        let removed = cx.config.profiles.remove(index);
+        if cx.config.default_profile == removed.id {
+            cx.config.default_profile = "git-bash".into();
+        }
+        // Keep the editor pointing at the same profile it was editing.
+        match state.editing {
+            Some(editing) if editing == index => {
+                state.editing = None;
+                state.adding = false;
+            }
+            Some(editing) if editing > index => state.editing = Some(editing - 1),
+            _ => {}
+        }
+        outcome.changed = true;
+    }
+    if !state.adding && state.editing.is_none() && ui.add(theme::ghost_button(strings::SETTINGS_ADD)).clicked() {
+        state.adding = true;
+        state.editing = None;
+        state.draft = draft_profile();
+    }
+    if state.adding || state.editing.is_some() {
+        ui.add_space(6.0);
+        profile_editor(ui, state, cx, outcome);
+    }
+}
+
+fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut SettingsOutcome) {
+    theme::section(ui, strings::SETTINGS_WORKSPACE);
+    theme::tag(ui, strings::SETTINGS_AI_COMMAND);
+    let mut ai = cx.config.workspace.ai_commit_command.clone().unwrap_or_default();
+    if ui
+        .add(egui::TextEdit::singleline(&mut ai).font(theme::field_font(13.0)).desired_width(320.0))
+        .changed()
+    {
+        let trimmed = ai.trim().to_owned();
+        cx.config.workspace.ai_commit_command = (!trimmed.is_empty()).then_some(trimmed);
+        outcome.changed = true;
+    }
+    ui.label(RichText::new(strings::SETTINGS_AI_HINT).color(theme::FAINT).font(theme::font(11.5)));
+}
+
+fn section_hotkeys(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut SettingsOutcome) {
+    theme::section(ui, strings::SETTINGS_HOTKEYS);
+    ui.label(RichText::new(strings::SETTINGS_HOTKEYS_HINT).color(theme::FAINT).font(theme::font(11.5)));
+    ui.add_space(2.0);
+    for (action, chords) in &cx.keymap_rows {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(action).color(theme::DIM).font(theme::font(12.0)));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(RichText::new(chords.join(", ")).color(theme::TEXT).font(theme::field_font(12.0)));
+            });
+        });
+        theme::hairline(ui);
+    }
+    ui.add_space(6.0);
+    if ui.add(theme::ghost_button(strings::SETTINGS_OPEN_CONFIG)).clicked() {
+        outcome.open_config = true;
+    }
+}
+
+fn section_claude(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut SettingsOutcome) {
+    theme::section(ui, strings::SETTINGS_CLAUDE);
+    let enabled = cx.config.claude_status.enabled;
+    if theme::choice(ui, strings::SETTINGS_CLAUDE_ENABLED, enabled).clicked() {
+        cx.config.claude_status.enabled = !enabled;
+        outcome.changed = true;
+    }
+    let state_text = if cx.config.claude_status.declined_command.is_some() {
+        RichText::new(strings::SETTINGS_CLAUDE_DECLINED).color(theme::STATUS_YELLOW)
+    } else if enabled {
+        RichText::new(strings::SETTINGS_CLAUDE_CONNECTED).color(theme::STATUS_GREEN)
+    } else {
+        RichText::new(strings::SETTINGS_CLAUDE_NOT_CONNECTED).color(theme::DIM)
+    };
+    ui.label(state_text.font(theme::font(12.0)));
+    ui.add_space(12.0);
 }
 
 /// Inline editor for one custom profile.

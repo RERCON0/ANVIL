@@ -21,6 +21,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1500);
 pub const MIN_WIDTH: f32 = 300.0;
 pub const MAX_WIDTH: f32 = 800.0;
 const LANE_WIDTH: f32 = 11.0;
+/// Room the commit subject keeps even when a row is crowded with ref chips.
+const MIN_SUBJECT_WIDTH: f32 = 72.0;
 
 pub enum Request {
     Refresh { cwd: PathBuf },
@@ -295,14 +297,17 @@ impl Workspace {
     }
 
     /// Draws the panel; returns actions the app must handle.
-    pub fn show(&mut self, ui: &mut egui::Ui, rect: Rect, ai_command: Option<&str>) -> Vec<WorkspaceAction> {
+    pub fn show(&mut self, ui: &mut egui::Ui, rect: Rect, pane: crate::layout::split_tree::PaneId, ai_command: Option<&str>) -> Vec<WorkspaceAction> {
         self.ai_command = ai_command.map(str::to_owned);
         let mut actions = Vec::new();
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, theme::LIFT);
         painter.vline(rect.min.x + 0.5, rect.y_range(), Stroke::new(1.0, theme::LINE));
         let inner = rect.shrink2(Vec2::new(10.0, 8.0));
-        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+        // Every pane has its own panel with its own widgets: without the pane
+        // in the salt two panels share one id, and egui paints a clash overlay
+        // over them (and their scroll state is shared).
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner).id_salt(("workspace-panel", pane)), |ui| {
             // Two modes only: the changes view keeps commits in the same
             // column (one scroll), the file browser is separate.
             ui.horizontal(|ui| {
@@ -555,22 +560,26 @@ impl Workspace {
                     egui::Pos2::new(badge_x, mid - 7.0),
                     Vec2::new(galley.size().x + 10.0, 14.0),
                 );
-                if badge.max.x > rect.max.x - right_width - 10.0 {
+                // A chip is only worth drawing while the subject keeps room to
+                // the left of the time and hash column.
+                if badge.max.x > rect.max.x - right_width - 10.0 - MIN_SUBJECT_WIDTH {
                     break;
                 }
                 painter.rect_filled(badge, egui::Rounding::same(3.0), colour);
                 painter.galley(egui::Pos2::new(badge.min.x + 5.0, badge.min.y + 1.0), galley, theme::CHROME_BG);
                 badge_x = badge.max.x + 4.0;
             }
-            let subject_limit = (rect.max.x - right_width - 8.0 - badge_x).max(40.0);
-            let subject = elide(&painter, &display(&commit.subject, 200), theme::font(12.0), subject_limit);
-            painter.text(
-                egui::Pos2::new(badge_x, mid),
-                Align2::LEFT_CENTER,
-                subject,
-                theme::font(12.0),
-                theme::TEXT,
-            );
+            let subject_limit = rect.max.x - right_width - 8.0 - badge_x;
+            if subject_limit > 16.0 {
+                let subject = elide(&painter, &display(&commit.subject, 200), theme::font(12.0), subject_limit);
+                painter.text(
+                    egui::Pos2::new(badge_x, mid),
+                    Align2::LEFT_CENTER,
+                    subject,
+                    theme::font(12.0),
+                    theme::TEXT,
+                );
+            }
             if response.hovered() {
                 let tooltip = format!("{}\n{} · {}\n{}", commit.subject, commit.author, commit.short, time_text);
                 let _ = response.clone().on_hover_text(tooltip);
@@ -1065,13 +1074,13 @@ enum Row {
     File { change: Change },
 }
 
-/// Graph colours by commit section. The owner wants commits in the pale pink
-/// of their reference (#D488B4) rather than the saturated magenta; only the
-/// incoming ones stay purple, so the sections are told apart by their headers.
+/// Graph colours by commit section: not-yet-pushed commits are VS Code blue,
+/// already-pushed history the owner's pale pink (#D488B4), incoming purple.
 fn section_color(section: git::Section) -> egui::Color32 {
     match section {
+        git::Section::Outgoing => egui::Color32::from_rgb(0x59, 0xA4, 0xF9),
         git::Section::Incoming => egui::Color32::from_rgb(0xB1, 0x80, 0xD7),
-        git::Section::Outgoing | git::Section::History => egui::Color32::from_rgb(0xD4, 0x88, 0xB4),
+        git::Section::History => egui::Color32::from_rgb(0xD4, 0x88, 0xB4),
     }
 }
 
@@ -1405,5 +1414,104 @@ mod tests {
         assert!(workspace.selected.is_empty() && workspace.file_preview.is_none());
         let requests: Vec<Request> = request_rx.try_iter().collect();
         assert!(requests.iter().any(|request| matches!(request, Request::Log)), "the new repository must be read again");
+    }
+
+    fn changed_file(path: &str) -> git::Change {
+        git::Change {
+            path: path.to_owned(),
+            original_path: None,
+            index: '.',
+            worktree: 'M',
+            untracked: false,
+            unmerged: false,
+            additions: 3,
+            deletions: 1,
+        }
+    }
+
+    fn shape_text(shape: &egui::Shape) -> Option<String> {
+        match shape {
+            egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(shape_text),
+            _ => None,
+        }
+    }
+
+    fn panel_frame(workspace: &mut Workspace, tab: PanelTab, pane: crate::layout::split_tree::PaneId, rect: egui::Rect) -> Vec<egui::Shape> {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        workspace.tab = tab;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(900.0, 700.0))),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = workspace.show(ui, rect, pane, None);
+            });
+        });
+        output.shapes.into_iter().map(|clipped| clipped.shape).collect()
+    }
+
+    /// Two widgets sharing one id make egui paint a red clash overlay over the
+    /// panel (and share the widget state behind it).
+    #[test]
+    fn the_panel_does_not_clash_widget_ids() {
+        let commits = vec![commit("0123456789", git::Section::Outgoing), commit("9876543210", git::Section::History)];
+        let mut workspace = Workspace {
+            status: Status {
+                branch: "main".to_owned(),
+                upstream: Some("origin/main".to_owned()),
+                ahead: 1,
+                behind: 0,
+                changes: vec![changed_file("src/lib.rs"), changed_file("README.md")],
+                additions: 6,
+                deletions: 2,
+            },
+            graph: graph::compute(&commits),
+            log: CommitLog { commits, upstream: Some("origin/main".to_owned()), truncated: false },
+            ..Default::default()
+        };
+        for tab in [PanelTab::Changes, PanelTab::Files] {
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(900.0, 700.0));
+            let shapes = panel_frame(&mut workspace, tab, 1, rect);
+            let clashes: Vec<String> = shapes.iter().filter_map(shape_text).filter(|text| text.contains("of ScrollArea")).collect();
+            assert!(clashes.is_empty(), "egui reported an id clash in the {tab:?} tab: {clashes:?}");
+        }
+
+    }
+
+    /// Two panes live under one ui, each with its own panel: without the pane
+    /// in the id salt both panels share every widget id, egui paints a red
+    /// clash overlay over them and their scroll state is shared.
+    #[test]
+    fn two_panes_do_not_clash_widget_ids() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(900.0, 700.0))),
+            ..Default::default()
+        };
+        let panel = |path: &str| Workspace {
+            status: Status { branch: "main".to_owned(), changes: vec![changed_file(path)], additions: 3, deletions: 1, ..Default::default() },
+            ..Default::default()
+        };
+        let mut left = panel("src/lib.rs");
+        let mut right = panel("README.md");
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let left_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(400.0, 700.0));
+                let right_rect = egui::Rect::from_min_size(egui::Pos2::new(500.0, 0.0), egui::Vec2::new(380.0, 700.0));
+                let _ = left.show(ui, left_rect, 1, None);
+                let _ = right.show(ui, right_rect, 2, None);
+            });
+        });
+        let clashes: Vec<String> = output
+            .shapes
+            .into_iter()
+            .filter_map(|clipped| shape_text(&clipped.shape))
+            .filter(|text| text.contains("of ScrollArea"))
+            .collect();
+        assert!(clashes.is_empty(), "two panes shared widget ids: {clashes:?}");
     }
 }

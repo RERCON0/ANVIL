@@ -201,13 +201,15 @@ pub fn install(ctx: &egui::Context, family: &str, entries: &[(String, String)], 
     defs.families.insert(FontFamily::Name("term-primary".into()), vec!["term-regular".into()]);
 
     // Interface font: bundled Cascadia Mono, with egui's defaults behind it for
-    // glyphs Cascadia does not have. Three nudged faces, as in SNATCH: body
-    // sits a touch lower, buttons/fields and titles sit on their own baseline.
+    // glyphs Cascadia does not have. Body and field text must share one
+    // baseline: rows mix labels with chips, dots and field values, and any
+    // nudge on the body face leaves the text hanging below them. Titles sit a
+    // hair higher.
     let ui = |name: &str, y_offset: f32| {
         let data = FontData::from_static(CASCADIA).tweak(egui::FontTweak { y_offset_factor: y_offset, ..Default::default() });
         (name.to_owned(), data)
     };
-    for (name, data) in [ui("ui", 0.15), ui("ui-tight", 0.0), ui("ui-title", -0.08)] {
+    for (name, data) in [ui("ui", 0.0), ui("ui-tight", 0.0), ui("ui-title", -0.08)] {
         defs.font_data.insert(name.clone(), data);
     }
     let default_proportional = defs.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();

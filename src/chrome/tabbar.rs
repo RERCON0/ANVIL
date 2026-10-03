@@ -93,13 +93,11 @@ pub fn show(
         }
 
         let number_color = if tab.active { theme::TAB_ACTIVE_NUMBER } else { theme::TAB_NUMBER };
-        // The body face, not the field face: `ui-tight` has no vertical tweak,
-        // so the digit would sit on a different baseline than the title.
         painter.text(
             Pos2::new(row.min.x + 14.0 + 11.0, row.min.y + 17.0),
             Align2::CENTER_CENTER,
             (index + 1).to_string(),
-            theme::font(12.0),
+            theme::field_font(12.0),
             number_color,
         );
         if tab.activity {
