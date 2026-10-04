@@ -60,6 +60,10 @@ fn trust_digest_ignores_routine_keys_and_tracks_program_runners() {
     run(root, &["config", "branch.main.merge", "refs/heads/main"]);
     run(root, &["config", "remote.origin.url", "."]);
     run(root, &["config", "core.editor", "notepad"]);
+    run(root, &["config", "submodule.lib.url", "https://example.com/lib"]);
+    run(root, &["config", "submodule.lib.active", "true"]);
+    run(root, &["config", "submodule.lib.update", "checkout"]);
+    run(root, &["config", "protocol.ext.allow", "never"]);
     let after_routine = git::repository_stamp(root).expect("stamp");
     assert_eq!(clean, after_routine, "tracking keys are not a configuration change");
     // A filter command is not routine: it runs on status, diff and add.
@@ -70,6 +74,218 @@ fn trust_digest_ignores_routine_keys_and_tracks_program_runners() {
     assert!(!git::trust_approved(root, &hazardous), "a filter needs approval");
     git::remember_trust(root, hazardous.clone());
     assert!(git::trust_approved(root, &hazardous), "the process remembers the approval");
+}
+
+#[test]
+fn trust_tracks_transport_values_and_custom_submodule_updates() {
+    let Some(dir) = repo() else { return };
+    for (key, value) in [
+        ("protocol.ext.allow", "always"),
+        ("url.ext::command.insteadOf", "https://example.com/"),
+        ("url.fd::0.pushInsteadOf", "https://example.com/"),
+        ("remote.origin.vcs", "custom-helper"),
+        ("remote.origin.url", "ext::command"),
+        ("remote.origin.pushurl", "fd::0"),
+        ("submodule.lib.update", "!command"),
+    ] {
+        run(dir.path(), &["config", key, value]);
+        let stamp = git::repository_stamp(dir.path()).expect("transport stamp");
+        assert!(stamp.hazards().iter().any(|hazard| hazard.eq_ignore_ascii_case(key)), "{key}");
+        assert!(!git::trust_approved(dir.path(), &stamp), "{key} needs approval");
+        run(dir.path(), &["config", "--unset", key]);
+    }
+    for value in ["checkout", "merge", "rebase", "none"] {
+        run(dir.path(), &["config", "submodule.lib.update", value]);
+        assert!(git::repository_stamp(dir.path()).unwrap().is_hazard_free(), "{value} is ordinary metadata");
+    }
+}
+
+fn quoted_config(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+#[test]
+fn nested_local_includes_and_created_include_revoke_old_approval() {
+    let Some(dir) = repo() else { return };
+    let root = dir.path();
+    let includes = root.join("include space");
+    std::fs::create_dir(&includes).unwrap();
+    let first = includes.join("first # file.cfg");
+    std::fs::write(&first, "[include] path = \"sec\"\\\r\nond.cfg # an unmatched comment quote: \"\r\n").unwrap();
+    run(root, &["config", "include.path", "../include space/first # file.cfg"]);
+    run(root, &["config", "--add", "include.path", "../include space/../include space/first # file.cfg"]);
+    let before = git::repository_stamp(root).expect("missing nested include");
+    git::remember_trust(root, before.clone());
+    assert!(git::trust_approved(root, &before));
+    std::fs::write(includes.join("second.cfg"), "[filter \"nested\"]\n clean = changed-command\n").unwrap();
+    assert!(!git::trust_approved(root, &before), "a stale stamp must not authorize commands");
+    let created = git::repository_stamp(root).expect("created nested include");
+    assert!(created.hazards().iter().any(|key| key == "filter.nested.clean"));
+    assert_eq!(created.hazards().iter().filter(|key| key.as_str() == "filter.nested.clean").count(), 1);
+    assert!(!git::trust_approved(root, &created), "creation must revoke the remembered digest");
+    git::remember_trust(root, created.clone());
+    std::fs::write(includes.join("second.cfg"), "[filter \"nested\"]\n clean = another-command\n").unwrap();
+    let changed = git::repository_stamp(root).unwrap();
+    assert_ne!(created, changed);
+    assert!(!git::trust_approved(root, &changed));
+}
+
+#[test]
+fn network_gitfiles_and_commondir_are_rejected_by_all_command_routes() {
+    let Some(dir) = repo() else { return };
+    let fake = dir.path().join("nested");
+    std::fs::create_dir(&fake).unwrap();
+    for target in [
+        "//127.0.0.1/ANVIL-denied/config",
+        r"\\?\UNC\127.0.0.1\ANVIL-denied\config",
+        r"\\.\GLOBALROOT\Device\Mup\127.0.0.1\ANVIL-denied",
+        "https://example.invalid/git",
+    ] {
+        std::fs::write(fake.join(".git"), format!("gitdir: {target}\n")).unwrap();
+        let error = git::repository_identity(&fake).unwrap_err();
+        assert!(error.contains("сетевые"), "{error}");
+        assert!(git::find_root(&fake).is_none());
+        assert!(git::run_git(&fake, &["config", "--list"]).unwrap_err().contains("сетевые"));
+        assert!(git::status(&fake).unwrap_err().contains("сетевые"));
+        assert!(git::commit(&fake, "must not run".to_owned()).unwrap_err().contains("сетевые"));
+        assert!(git::resolve_path(Path::new(target), "tracked.txt").unwrap_err().contains("сетевые"));
+    }
+    std::fs::write(dir.path().join(".git/commondir"), "//127.0.0.1/ANVIL-denied/common\n").unwrap();
+    assert!(git::repository_stamp(dir.path()).unwrap_err().contains("сетевые"));
+}
+
+#[test]
+fn network_includes_and_external_attributes_are_rejected_before_git_reads_them() {
+    let Some(dir) = repo() else { return };
+    let config = dir.path().join(".git/config");
+    let original = std::fs::read_to_string(&config).unwrap();
+    for (section, key) in [("include", "path"), ("includeIf \"onbranch:never-selected\"", "path"), ("core", "attributesFile")] {
+        for target in ["//127.0.0.1/ANVIL-denied/file", r"\\?\UNC\127.0.0.1\ANVIL-denied\file", "file://example.invalid/file"] {
+            std::fs::write(&config, format!("{original}\n[{section}]\n {key} = {}\n", quoted_config(target))).unwrap();
+            assert!(git::repository_identity(dir.path()).unwrap_err().contains("сетевые"));
+            assert!(git::run_git(dir.path(), &["config", "--includes", "--list"]).unwrap_err().contains("сетевые"));
+        }
+    }
+}
+
+#[test]
+fn worktree_submodule_and_empty_repositories_have_routine_metadata() {
+    let Some(dir) = repo() else { return };
+    let worktree = tempfile::tempdir().unwrap();
+    let path = worktree.path().join("tree");
+    run(dir.path(), &["worktree", "add", "--quiet", "--detach", path.to_str().unwrap()]);
+    let identity = git::repository_identity(&path).unwrap().unwrap();
+    assert_eq!(identity.root.canonicalize().unwrap(), path.canonicalize().unwrap());
+    assert!(identity.stamp.is_hazard_free());
+    assert!(!git::status(&path).unwrap().branch.is_empty());
+    let Some(module) = repo() else { return };
+    run(dir.path(), &["-c", "protocol.file.allow=always", "submodule", "add", "--quiet", module.path().to_str().unwrap(), "module"]);
+    assert!(git::repository_identity(dir.path()).unwrap().unwrap().stamp.is_hazard_free());
+    assert!(git::repository_identity(&dir.path().join("module")).unwrap().unwrap().stamp.is_hazard_free());
+    let empty = tempfile::tempdir().unwrap();
+    run(empty.path(), &["init", "--quiet"]);
+    assert!(git::repository_identity(empty.path()).unwrap().unwrap().stamp.is_hazard_free());
+    assert!(git::status(empty.path()).unwrap().head_oid.is_none());
+    assert!(git::log(empty.path()).unwrap().commits.is_empty());
+}
+
+#[test]
+fn global_conditional_missing_sources_and_config_read_races_revoke_approval() {
+    const CHILD: &str = "ANVIL_TRUST_GUARD_TEST_CHILD";
+    // Never touch the real profile: the body runs only in the child process
+    // that was given an isolated HOME and its own global/system config files.
+    let isolated_child = std::env::var_os(CHILD).is_some()
+        && std::env::var_os("GIT_CONFIG_GLOBAL").is_some()
+        && std::env::var_os("HOME").is_some();
+    if !isolated_child {
+        let isolated = tempfile::tempdir().unwrap();
+        let global = isolated.path().join("global.cfg");
+        let system = isolated.path().join("system.cfg");
+        std::fs::write(&global, "").unwrap();
+        std::fs::write(&system, "").unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact", "global_conditional_missing_sources_and_config_read_races_revoke_approval", "--nocapture"])
+            .env(CHILD, "1").env("GIT_CONFIG_GLOBAL", &global).env("GIT_CONFIG_SYSTEM", &system)
+            .env("HOME", isolated.path()).env("XDG_CONFIG_HOME", isolated.path().join(".config"))
+            .env("GIT_TRACE2_EVENT", isolated.path().join("trace.json"));
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            child.creation_flags(0x0800_0000);
+        }
+        let output = child.output().unwrap();
+        assert!(
+            output.status.success(),
+            "isolated child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    let Some(dir) = repo() else { return };
+    let root = dir.path();
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+    std::fs::write(home.join("tilde.cfg"), "[filter \"tilde\"]\n clean = tilde-command\n").unwrap();
+    run(root, &["config", "include.path", "~/tilde.cfg"]);
+    assert!(git::repository_stamp(root).unwrap().hazards().iter().any(|key| key == "filter.tilde.clean"));
+    run(root, &["config", "--unset", "include.path"]);
+    let global = std::path::PathBuf::from(std::env::var_os("GIT_CONFIG_GLOBAL").unwrap());
+    let condition = root.join(".git").to_string_lossy().replace('\\', "/");
+    let injected = root.join("injected.cfg");
+    std::fs::write(&global, format!("[includeIf {}]\n path = {}\n", quoted_config(&format!("gitdir:{condition}")), quoted_config(injected.to_str().unwrap()))).unwrap();
+    run(root, &["config", "filter.approved.clean", "old-command"]);
+    let initial = git::repository_stamp(root).unwrap();
+    git::remember_trust(root, initial.clone());
+    assert!(git::trust_approved(root, &initial));
+    std::fs::write(&global, format!("[user]\n name = unrelated global edit\n[includeIf {}]\n path = {}\n", quoted_config(&format!("gitdir:{condition}")), quoted_config(injected.to_str().unwrap()))).unwrap();
+    let routine = git::repository_stamp(root).unwrap();
+    assert_eq!(initial, routine, "unrelated user configuration does not change hazards");
+    assert!(git::trust_approved(root, &routine));
+    std::fs::write(&injected, "[filter \"injected\"]\n clean = hostile-command\n").unwrap();
+    let changed = git::repository_stamp(root).unwrap();
+    assert!(changed.hazards().iter().any(|key| key == "filter.injected.clean"));
+    assert!(!git::trust_approved(root, &changed), "a missing global include target must have been watched");
+    std::fs::remove_file(&injected).unwrap();
+    let trace = std::path::PathBuf::from(std::env::var_os("GIT_TRACE2_EVENT").unwrap());
+    let config = root.join(".git/config");
+    for iteration in 0..12 {
+        run(root, &["config", "filter.approved.clean", &format!("old-{iteration}")]);
+        let old = git::repository_stamp(root).unwrap();
+        git::remember_trust(root, old);
+        run(root, &["config", "user.name", &format!("invalidate-{iteration}")]);
+        let mut replacement = std::fs::read_to_string(&config).unwrap();
+        replacement = replacement.replace(&format!("old-{iteration}"), &format!("new-command-{iteration}"));
+        std::fs::write(&trace, "").unwrap();
+        let trace_reader = trace.clone();
+        let replacement_path = config.clone();
+        let writer = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline {
+                if std::fs::read_to_string(&trace_reader).unwrap_or_default().contains("\"event\":\"exit\"") {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            // Best effort: if the real git process never reported, the write
+            // still lands and the final assertion holds.
+            std::fs::write(&replacement_path, replacement).unwrap();
+        });
+        let _ = git::repository_stamp(root); // a racing read may conservatively fail
+        writer.join().unwrap();
+        let current = git::repository_stamp(root).unwrap();
+        assert!(!git::trust_approved(root, &current), "a racing config output must not inherit a newer stat");
+    }
+    // Creating the global config itself must revoke an approval, exactly like
+    // creating a file that it includes.
+    std::fs::remove_file(&global).unwrap();
+    let without_global = git::repository_stamp(root).unwrap();
+    git::remember_trust(root, without_global.clone());
+    assert!(git::trust_approved(root, &without_global), "removing the include chain leaves the rest valid");
+    std::fs::write(&global, format!("[includeIf {}]\n path = {}\n", quoted_config(&format!("gitdir:{condition}")), quoted_config(injected.to_str().unwrap()))).unwrap();
+    std::fs::write(&injected, "[filter \"later\"]\n clean = later-command\n").unwrap();
+    let recreated = git::repository_stamp(root).unwrap();
+    assert!(recreated.hazards().iter().any(|key| key == "filter.later.clean"), "{:?}", recreated.hazards());
+    assert!(!git::trust_approved(root, &recreated), "a recreated include chain needs a new approval");
 }
 
 #[test]
@@ -266,22 +482,38 @@ fn fetch_uses_the_remote_of_the_current_branch() {
     assert_eq!(git::fetch(&root), Ok("fetch upstream".to_owned()));
 }
 
-/// The AI CLI used to run inside the repository, where it loads the
-/// repository's own agent config (`.claude/settings.json` hooks, an
-/// `opencode.json` MCP server): a cloned repository could run code on a
-/// button press. It runs in the given neutral folder, with a deadline.
+/// Each generation owns a fresh neutral folder and removes it before returning;
+/// planted config cannot survive into another request. Custom commands still
+/// observe the same isolation and deadline as safe built-in profiles.
 #[test]
 fn ai_message_runs_outside_the_repository_with_a_deadline() {
     let probe = env!("CARGO_BIN_EXE_anvil-probe");
-    let work = tempfile::tempdir().unwrap();
-    let message = git::ai_commit_message(work.path(), Some(&format!("{probe} pwd")), "prompt", Duration::from_secs(20))
-        .expect("the probe answers");
-    assert_eq!(Path::new(&message).canonicalize().unwrap(), work.path().canonicalize().unwrap());
+    let command = format!("\"{probe}\" pwd");
+    let first = git::ai_commit_message(Some(&command), "prompt", Duration::from_secs(20)).expect("the probe answers");
+    let second = git::ai_commit_message(Some(&command), "prompt", Duration::from_secs(20)).expect("the probe answers again");
+    assert_ne!(first, second, "requests never reuse a config directory");
+    assert!(!Path::new(&first).exists(), "first generation directory is removed");
+    assert!(!Path::new(&second).exists(), "second generation directory is removed");
 
     let started = Instant::now();
-    let hung = git::ai_commit_message(work.path(), Some(&format!("{probe} sleep")), "prompt", Duration::from_millis(500));
+    let hung = git::ai_commit_message(Some(&format!("\"{probe}\" sleep")), "prompt", Duration::from_millis(500));
     assert!(hung.is_err(), "a CLI that never answers is an error, got {hung:?}");
     assert!(started.elapsed() < Duration::from_secs(10), "the deadline holds: {:?}", started.elapsed());
+}
+
+#[test]
+fn built_in_executable_paths_cannot_bypass_commit_safety() {
+    for command in [
+        "\"C:\\Program Files\\Claude\\claude.exe\" --dangerously-skip-permissions",
+        "\"C:\\npm install\\codex.cmd\" exec --dangerously-bypass-approvals-and-sandbox",
+        "gemini --yolo",
+        "aider --yes-always",
+        "opencode run --auto",
+        "node \"C:\\npm install\\node_modules\\@google\\gemini-cli\\bundle\\gemini.js\" --yolo",
+    ] {
+        let error = git::ai_commit_message(Some(command), "injected diff", Duration::from_secs(1)).unwrap_err();
+        assert!(error.contains("AI:"), "unsafe options are refused before starting {command}: {error}");
+    }
 }
 
 /// "Stage all" passed every path on the command line (os error 206 past

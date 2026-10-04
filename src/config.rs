@@ -109,11 +109,13 @@ pub struct TerminalConfig {
     pub right_click: RightClick,
     pub paste_on_middle_click: bool,
     pub copy_on_select: bool,
+    /// Allow applications to write the OS clipboard through OSC 52.
+    pub allow_osc52: bool,
     pub word_separators: String,
     pub bell: Bell,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ClaudeStatusConfig {
     pub enabled: bool,
@@ -121,6 +123,9 @@ pub struct ClaudeStatusConfig {
     pub declined_command: Option<String>,
     /// The statusLine value ANVIL replaced (None: there was none).
     pub previous_status_line: Option<Value>,
+    /// Exact helper command installed with consent, including its original path.
+    pub installed_command: Option<String>,
+    pub installed_settings_path: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -161,15 +166,10 @@ impl Default for TerminalConfig {
             right_click: RightClick::Clipboard,
             paste_on_middle_click: true,
             copy_on_select: false,
+            allow_osc52: false,
             word_separators: " ()[]{}'\"".into(),
             bell: Bell::Off,
         }
-    }
-}
-
-impl Default for ClaudeStatusConfig {
-    fn default() -> Self {
-        ClaudeStatusConfig { enabled: true, declined_command: None, previous_status_line: None }
     }
 }
 
@@ -306,7 +306,8 @@ mod tests {
         assert_eq!(c.font.family, "Consolas");
         assert_eq!(c.terminal.right_click, RightClick::Menu);
         assert_eq!(c.terminal.scrollback, 25_000);
-        assert!(c.claude_status.enabled);
+        assert!(!c.claude_status.enabled);
+        assert!(!c.terminal.allow_osc52);
     }
 
     /// A hand-edited size went straight into the font atlas: 0 or 1e9 points

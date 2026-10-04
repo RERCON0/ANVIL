@@ -74,39 +74,44 @@ pub fn parse_wsl_list(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// Runs a probe command with a deadline: a stopped WSL service must not delay
-/// the first frame. Output is read from temp files, so a large listing cannot
-/// block the pipe while we wait.
+/// File-backed output never waits for EOF from an inherited descendant pipe.
 #[cfg(windows)]
 fn run_bounded(command: &mut std::process::Command, timeout: std::time::Duration) -> Option<std::process::Output> {
-    use std::io::Read;
+    use std::io::{Read, Seek};
     use std::process::Stdio;
-    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!("anvil-wsl-{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let mut output = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path).ok()?;
+    let cleanup = Cleanup(path.clone());
+    command.stdout(Stdio::from(output.try_clone().ok()?)).stderr(Stdio::null());
     let mut child = command.spawn().ok()?;
-    let mut stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = stdout.read_to_end(&mut buffer);
-        buffer
-    });
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
                 return None;
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
             Err(_) => {
-                let _ = reader.join();
+                let _ = child.kill();
                 return None;
             }
         }
     };
-    let stdout = reader.join().ok()?;
+    output.rewind().ok()?;
+    let mut stdout = Vec::new();
+    output.by_ref().take(1024 * 1024).read_to_end(&mut stdout).ok()?;
+    drop(output);
+    drop(cleanup);
     Some(std::process::Output { status, stdout, stderr: Vec::new() })
 }
 
@@ -168,9 +173,7 @@ fn registry_string(root: windows_sys::Win32::System::Registry::HKEY, subkey: &st
 /// Shells installed on this machine, in menu order.
 #[cfg(windows)]
 pub fn detect_builtin() -> Vec<Profile> {
-    use std::os::windows::process::CommandExt;
     use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
-    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
     let env_path = |var: &str| std::env::var_os(var).map(PathBuf::from);
     let mut out = Vec::new();
@@ -225,29 +228,38 @@ pub fn detect_builtin() -> Vec<Profile> {
         kind: ProfileKind::Cmd,
     });
 
-    if let Some(output) = run_bounded(
+    out
+}
+
+/// WSL profiles are probed only on the application worker.
+#[cfg(windows)]
+pub fn detect_wsl() -> Vec<Profile> {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+    let output = run_bounded(
         std::process::Command::new("wsl.exe")
             .args(["-l", "-q"])
             .creation_flags(CREATE_NO_WINDOW)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null()),
+            .stdin(std::process::Stdio::null()),
         std::time::Duration::from_secs(2),
-    ) {
-        if output.status.success() {
-            for distro in parse_wsl_list(&output.stdout) {
-                out.push(Profile {
-                    id: format!("wsl-{distro}"),
-                    name: format!("WSL: {distro}"),
-                    command: "wsl.exe".into(),
-                    args: vec!["-d".into(), distro.clone()],
-                    cwd: None,
-                    env: BTreeMap::new(),
-                    kind: ProfileKind::Wsl,
-                });
-            }
-        }
+    );
+    output.filter(|output| output.status.success())
+        .map(|output| parse_wsl_list(&output.stdout).into_iter().map(|distro| wsl_profile(&distro)).collect())
+        .unwrap_or_default()
+}
+
+/// Known saved WSL IDs can launch without waiting for discovery. Never restore
+/// a WSL pane as a different shell merely because discovery is still loading.
+pub fn wsl_profile(distro: &str) -> Profile {
+    Profile {
+        id: format!("wsl-{distro}"),
+        name: format!("WSL: {distro}"),
+        command: "wsl.exe".into(),
+        args: vec!["-d".into(), distro.into()],
+        cwd: None,
+        env: BTreeMap::new(),
+        kind: ProfileKind::Wsl,
     }
-    out
 }
 
 /// How a path dropped on a pane of `profile` is quoted. A custom profile is
@@ -328,6 +340,33 @@ mod tests {
         let bytes: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
         assert_eq!(parse_wsl_list(&bytes), vec!["Ubuntu".to_owned(), "Debian".to_owned()]);
         assert!(parse_wsl_list(&[]).is_empty());
+    }
+
+    #[test]
+    fn saved_wsl_profile_keeps_its_distribution_without_discovery() {
+        let profile = wsl_profile("Ubuntu Dev");
+        assert_eq!(profile.id, "wsl-Ubuntu Dev");
+        assert_eq!(profile.command, "wsl.exe");
+        assert_eq!(profile.args, ["-d", "Ubuntu Dev"]);
+        assert_eq!(profile.kind, ProfileKind::Wsl);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn probe_deadline_does_not_join_inherited_output() {
+        use std::os::windows::process::CommandExt;
+        use std::time::{Duration, Instant};
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+        let started = Instant::now();
+        let result = run_bounded(
+            std::process::Command::new("cmd.exe")
+                .args(["/d", "/c", "ping -n 6 127.0.0.1"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(std::process::Stdio::null()),
+            Duration::from_millis(150),
+        );
+        assert!(result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2), "timeout must not wait for the ping descendant's output handle");
     }
 
     #[test]

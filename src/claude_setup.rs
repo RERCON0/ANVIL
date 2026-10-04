@@ -9,10 +9,9 @@ use serde_json::{Map, Value};
 pub enum Plan {
     /// statusLine already runs our command.
     AlreadyInstalled,
-    /// No statusLine (or no file): install without asking.
+    /// No statusLine (or no file): installation requires confirmation.
     Install,
-    /// Our own status command from another build (debug/release path):
-    /// point it at this binary silently, keeping the saved original.
+    /// Our status command from another build: updating requires confirmation.
     Update,
     /// Another command is configured: ask once before replacing it.
     AskReplace { current: String },
@@ -121,27 +120,84 @@ pub fn uninstall(settings: &str, ours: &str, previous: Option<&Value>) -> Result
     Ok(Some(render(map)))
 }
 
-/// Copies settings.json to settings.json.anvil-backup once. The backup is
-/// created exclusively, so two ANVIL windows cannot overwrite the first copy
-/// (and with it the recovery of the user's original command).
-pub fn backup_once(settings_path: &Path) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut backup = settings_path.as_os_str().to_os_string();
-    backup.push(".anvil-backup");
-    let backup = PathBuf::from(backup);
-    if !settings_path.exists() {
-        return Ok(());
-    }
-    let bytes = match std::fs::read(settings_path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
+/// Applies consent to the document shown to the user, preserving atomic writes.
+/// On Windows the snapshot handle denies in-place writers but allows rename,
+/// which is necessary for atomic replacement. Recheck the path before staging;
+/// Windows does not offer a filesystem compare-and-swap, so another program's
+/// atomic rename after that check remains an unavoidable race.
+pub fn write_confirmed(path: &Path, expected: Option<&str>, replacement: &str) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    let Some(expected) = expected else {
+        return create_confirmed(path, replacement.as_bytes());
     };
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(&backup) {
-        Ok(mut file) => file.write_all(&bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e),
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
     }
+    let mut file = options.open(path)?;
+    let mut current = String::new();
+    file.read_to_string(&mut current)?;
+    if current != expected {
+        return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "Claude settings changed after confirmation"));
+    }
+    let mut backup = path.as_os_str().to_os_string();
+    backup.push(".anvil-backup");
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(PathBuf::from(backup)) {
+        Ok(mut backup) => {
+            backup.write_all(current.as_bytes())?;
+            backup.sync_all()?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    // Detect an editor replacing the pathname while we held the old snapshot.
+    if std::fs::read_to_string(path)? != expected {
+        return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "Claude settings changed after confirmation"));
+    }
+    crate::fsutil::atomic_write(path, replacement.as_bytes())
+}
+
+/// Missing-file consent publishes a complete synced file without overwriting
+/// anything created while the dialog was open. No empty target is reserved.
+fn create_confirmed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut name = path.file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "settings path has no filename"))?
+        .to_os_string();
+    name.push(format!(".anvil-{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    let staged = path.with_file_name(name);
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&staged)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+            let source: Vec<u16> = staged.as_os_str().encode_wide().chain(Some(0)).collect();
+            let target: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            // No REPLACE_EXISTING: a concurrently created target wins.
+            // SAFETY: both buffers are valid NUL-terminated paths.
+            if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), 0) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        #[cfg(not(windows))]
+        std::fs::hard_link(&staged, path)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&staged);
+    result
 }
 
 #[cfg(test)]
@@ -178,7 +234,7 @@ mod tests {
         );
         assert_eq!(plan(Some(OWNER), OURS, Some("node \"C:/Tools/cc/statusline.mjs\"")), Plan::Declined);
         let stale = r#"{"statusLine":{"type":"command","command":"\"C:/build/anvil-claude-status.exe\""}}"#;
-        assert_eq!(plan(Some(stale), OURS, None), Plan::Update, "another ANVIL build updates silently");
+        assert_eq!(plan(Some(stale), OURS, None), Plan::Update, "a moved helper requires explicit update consent");
         let (installed, _) = install(Some(OWNER), OURS).unwrap();
         assert_eq!(plan(Some(&installed), OURS, None), Plan::AlreadyInstalled);
         assert!(matches!(plan(Some("{ broken"), OURS, None), Plan::Broken(_)));
@@ -193,7 +249,9 @@ mod tests {
         assert_eq!(parse_object(&text).unwrap()["statusLine"]["command"], OURS);
         assert_eq!(previous.unwrap()["command"], "node \"C:/Tools/cc/statusline.mjs\"");
         let (fresh, none) = install(None, OURS).unwrap();
-        assert_eq!(fresh, format!("{{\n  \"statusLine\": {{\n    \"type\": \"command\",\n    \"command\": {}\n  }}\n}}\n", serde_json::to_string(OURS).unwrap()));
+        let fresh = parse_object(&fresh).unwrap();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh["statusLine"], serde_json::json!({ "type": "command", "command": OURS }));
         assert!(none.is_none());
     }
 
@@ -212,13 +270,22 @@ mod tests {
     }
 
     #[test]
-    fn backup_is_made_once() {
+    fn consent_rejects_concurrent_changes_and_keeps_first_backup() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
-        std::fs::write(&path, "first").unwrap();
-        backup_once(&path).unwrap();
-        std::fs::write(&path, "second").unwrap();
-        backup_once(&path).unwrap();
-        assert_eq!(std::fs::read_to_string(dir.path().join("settings.json.anvil-backup")).unwrap(), "first");
+        std::fs::write(&path, OWNER).unwrap();
+        let (installed, _) = install(Some(OWNER), OURS).unwrap();
+        write_confirmed(&path, Some(OWNER), &installed).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), installed);
+        let changed = r#"{"model":"user-change"}"#;
+        std::fs::write(&path, changed).unwrap();
+        assert!(write_confirmed(&path, Some(&installed), OWNER).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+        write_confirmed(&path, Some(changed), OWNER).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.path().join("settings.json.anvil-backup")).unwrap(), OWNER);
+        assert!(write_confirmed(&path, None, "{}").is_err(), "missing-file consent cannot overwrite a newly created file");
+        let missing = dir.path().join("new/settings.json");
+        write_confirmed(&missing, None, &installed).unwrap();
+        assert_eq!(std::fs::read_to_string(missing).unwrap(), installed);
     }
 }

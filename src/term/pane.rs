@@ -142,6 +142,7 @@ pub struct SpawnOptions {
     pub cell_height: u16,
     pub scrollback: usize,
     pub word_separators: String,
+    pub allow_osc52: bool,
     pub palette: Palette,
     /// Default cursor shape from the config; applications may override it.
     pub cursor_style: CursorStyle,
@@ -196,7 +197,7 @@ impl Pane {
             scrolling_history: opts.scrollback,
             semantic_escape_chars: opts.word_separators,
             kitty_keyboard: false,
-            osc52: Osc52::OnlyCopy,
+            osc52: osc52_policy(opts.allow_osc52),
             default_cursor_style: opts.cursor_style,
             ..Config::default()
         };
@@ -249,17 +250,19 @@ impl Pane {
     /// new applications see (a running application's own DECSCUSR request
     /// still wins until it resets to the default), the scrollback length and
     /// the word separators of double-click selection.
-    pub fn set_options(&self, style: CursorStyle, scrollback: usize, word_separators: &str) {
+    pub fn set_options(&self, style: CursorStyle, scrollback: usize, word_separators: &str, allow_osc52: bool) {
         let mut config = self.config.lock().unwrap_or_else(|e| e.into_inner());
         if config.default_cursor_style == style
             && config.scrolling_history == scrollback
             && config.semantic_escape_chars == word_separators
+            && config.osc52 == osc52_policy(allow_osc52)
         {
             return;
         }
         config.default_cursor_style = style;
         config.scrolling_history = scrollback;
         config.semantic_escape_chars = word_separators.to_owned();
+        config.osc52 = osc52_policy(allow_osc52);
         self.term.lock().set_options(config.clone());
     }
 
@@ -307,6 +310,10 @@ pub fn clip_title(title: String) -> String {
     }
 }
 
+fn osc52_policy(allowed: bool) -> Osc52 {
+    if allowed { Osc52::OnlyCopy } else { Osc52::Disabled }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +325,33 @@ mod tests {
         let long = "заголовок ".repeat(10_000);
         assert_eq!(clip_title(long).chars().count(), MAX_TITLE_CHARS);
         assert_eq!(clip_title("short".to_owned()), "short");
+    }
+
+    #[test]
+    fn clipboard_output_is_ignored_until_opted_in() {
+        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+        #[derive(Clone)]
+        struct ClipboardSink(Sender<String>);
+        impl EventListener for ClipboardSink {
+            fn send_event(&self, event: Event) {
+                if let Event::ClipboardStore(_, text) = event {
+                    let _ = self.0.send(text);
+                }
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let mut config = Config { osc52: osc52_policy(false), ..Config::default() };
+        let mut term = Term::new(config.clone(), &GridSize { columns: 80, lines: 24 }, ClipboardSink(tx));
+        let mut parser: Processor<StdSyncHandler> = Processor::new();
+        parser.advance(&mut term, b"\x1b]52;c;cG9pc29u\x07");
+        assert!(rx.try_recv().is_err());
+        config.osc52 = osc52_policy(true);
+        term.set_options(config.clone());
+        parser.advance(&mut term, b"\x1b]52;c;YWxsb3dlZA==\x07");
+        assert_eq!(rx.try_recv().unwrap(), "allowed");
+        config.osc52 = osc52_policy(false);
+        term.set_options(config);
+        parser.advance(&mut term, b"\x1b]52;c;cG9pc29u\x07");
+        assert!(rx.try_recv().is_err());
     }
 }

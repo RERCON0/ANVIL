@@ -36,10 +36,16 @@ polling = "3.8"
 arboard = { version = "3", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml_ng = "0.10"
+json5 = "0.4"
+toml = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 log = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
+tempfile = "3"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",
@@ -61,7 +67,6 @@ windows = { version = "0.58", features = [
 windows-core = "0.58"
 
 [dev-dependencies]
-tempfile = "3"
 # Examples only: the icon generator writes PNG and ICO files.
 image = { version = "0.25", default-features = false, features = ["png", "ico"] }
 

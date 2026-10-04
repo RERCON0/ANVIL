@@ -127,39 +127,12 @@ pub fn format_line(p: &Payload, branch: Option<&str>, now_ms: i64) -> String {
 }
 
 /// `git rev-parse --abbrev-ref HEAD` in `dir`, killed after `timeout`.
+///
+/// Delegates to the guarded Git entry point so a crafted network gitfile or
+/// repository path can never be followed here either; the helper keeps its
+/// contract of answering with a branch name or `None`.
 pub fn git_branch(dir: &Path, timeout: Duration) -> Option<String> {
-    use std::process::{Command, Stdio};
-    let mut cmd = Command::new("git");
-    cmd.args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-    }
-    let mut child = cmd.spawn().ok()?;
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => break,
-            Ok(Some(_)) => return None,
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(_) => return None,
-        }
-    }
-    let mut out = String::new();
-    use std::io::Read;
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
-    let branch = out.trim().to_owned();
-    (!branch.is_empty()).then_some(branch)
+    crate::git::branch_at(dir, timeout)
 }
 
 /// What ANVIL shows on the tab. Written by anvil-claude-status, read by ANVIL.

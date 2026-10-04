@@ -82,6 +82,11 @@ pub struct AnvilApp {
     keymap: Keymap,
     palette: Palette,
     profiles: Vec<Profile>,
+    builtin_profiles: Vec<Profile>,
+    wsl_results: Option<std::sync::mpsc::Receiver<Vec<Profile>>>,
+    font_entries: Vec<(String, String)>,
+    font_families: Vec<String>,
+    ai_commands: HashMap<PaneId, String>,
     tabs: Vec<Tab>,
     active: usize,
     settings_open: bool,
@@ -144,6 +149,11 @@ impl AnvilApp {
             keymap,
             palette,
             profiles: Vec::new(),
+            builtin_profiles: Vec::new(),
+            wsl_results: None,
+            font_entries: Vec::new(),
+            font_families: Vec::new(),
+            ai_commands: HashMap::new(),
             tabs: Vec::new(),
             active: 0,
             settings_open: false,
@@ -205,12 +215,22 @@ impl AnvilApp {
     }
 
     pub fn on_start(&mut self, ctx: &egui::Context) {
-        let report = fonts::install(ctx, &self.config.font.family, &fonts::registry_font_entries(), false);
+        self.font_entries = fonts::registry_font_entries();
+        self.font_families = font_families(&self.font_entries);
+        let report = fonts::install(ctx, &self.config.font.family, &self.font_entries, false);
         for missing in &report.missing {
             log::info!("font not found: {missing}");
         }
         let c = ctx.clone();
         self.repaint = Some(Arc::new(move || c.request_repaint()));
+        self.builtin_profiles = profiles::detect_builtin();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.wsl_results = Some(rx);
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(profiles::detect_wsl());
+            repaint.request_repaint();
+        });
         self.profiles = self.build_profiles();
         let (dir, run_dir) = prepare_status_dir();
         self.status_dir = dir;
@@ -244,6 +264,7 @@ impl AnvilApp {
         let started = Instant::now();
         let mut commands = Vec::new();
         self.check_config(ctx);
+        self.absorb_wsl_profiles();
         self.poll_panes(ctx);
         self.poll_statuses();
         self.expire_toasts();
@@ -252,6 +273,9 @@ impl AnvilApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(theme::CHROME_BG))
             .show(ctx, |ui| {
+                if self.ui.dialog.is_some() {
+                    ui.disable();
+                }
                 let full = ui.max_rect();
                 let title = Rect::from_min_size(full.min, Vec2::new(full.width(), theme::TITLEBAR_HEIGHT));
                 title_bar(ui, title, maximized, &mut commands);
@@ -351,7 +375,11 @@ impl AnvilApp {
                     match event {
                         PaneEvent::Title(title) => entry.title = title,
                         PaneEvent::ResetTitle => entry.title = entry.profile_name.clone(),
-                        PaneEvent::Clipboard(text) => ctx.copy_text(text),
+                        PaneEvent::Clipboard(text) => {
+                            if self.config.terminal.allow_osc52 {
+                                ctx.copy_text(text);
+                            }
+                        }
                         PaneEvent::Bell => bells += 1,
                         PaneEvent::CursorBlinkingChange => {
                             // A state notification: read the effective style, so a
@@ -428,7 +456,7 @@ impl AnvilApp {
                 config: &mut next,
                 keymap_rows: rows,
                 profiles: self.profiles.iter().map(|p| (p.id.clone(), p.name.clone())).collect(),
-                fonts: font_families(),
+                fonts: &self.font_families,
             };
             crate::settings_ui::show(ui, rect, &mut context, &mut self.settings)
         };
@@ -442,6 +470,22 @@ impl AnvilApp {
         }
         if outcome.changed {
             self.apply_config(ui.ctx().clone(), next, true);
+        }
+        if outcome.refresh_fonts {
+            self.font_entries = fonts::registry_font_entries();
+            self.font_families = font_families(&self.font_entries);
+            fonts::install(ui.ctx(), &self.config.font.family, &self.font_entries, self.fallbacks_loaded);
+            for tab in &mut self.tabs {
+                for entry in tab.panes.values_mut() {
+                    entry.view.font_changed();
+                }
+            }
+        }
+        if outcome.install_claude {
+            self.setup_claude_explicit();
+        }
+        if outcome.restore_claude {
+            self.disable_claude();
         }
     }
 
@@ -507,7 +551,7 @@ impl AnvilApp {
             return;
         }
         self.fallbacks_loaded = true;
-        let report = fonts::install(ctx, &self.config.font.family, &fonts::registry_font_entries(), true);
+        let report = fonts::install(ctx, &self.config.font.family, &self.font_entries, true);
         for missing in &report.missing {
             log::info!("font not found: {missing}");
         }
@@ -539,6 +583,7 @@ impl AnvilApp {
     // ---- terminal input -------------------------------------------------
 
     pub fn send_key(&mut self, press: &KeyPress) {
+        if self.ui.dialog.is_some() { return; }
         // Ctrl or Alt alone is not "a key": it may start Ctrl+Shift+C on the
         // exit message.
         if !press.is_modifier_only() && self.tabs.get(self.active).is_some_and(Tab::focused_exited) {
@@ -564,6 +609,7 @@ impl AnvilApp {
     }
 
     pub fn send_text(&mut self, text: &str) {
+        if self.ui.dialog.is_some() { return; }
         if let Some(pane) = self.focused_pane() {
             pane.term.lock().scroll_display(Scroll::Bottom);
             pane.write(text.as_bytes().to_vec());
@@ -606,6 +652,7 @@ impl AnvilApp {
     }
 
     pub fn run_action(&mut self, action: &Action, ctx: &egui::Context) -> Vec<WindowCommand> {
+        if self.ui.dialog.is_some() { return Vec::new(); }
         let mut commands = Vec::new();
         match action {
             Action::NewTab => {
@@ -775,15 +822,8 @@ impl AnvilApp {
     /// CLI for AI commit messages: the configured one, else the AI CLI found
     /// in the focused pane's process tree (claude, opencode, codex, …).
     fn ai_command(&self) -> Option<String> {
-        let command = self.config.workspace.ai_commit_command.clone().or_else(|| {
-            let pane = self.focused_pane()?;
-            // Asked every frame: one walk, not one per candidate name.
-            let names = crate::procs::descendant_names(&self.proc_snapshot, pane.shell_pid);
-            ["claude", "opencode", "codex", "gemini", "aider"]
-                .into_iter()
-                .find(|candidate| names.contains(&format!("{candidate}.exe")) || names.contains(*candidate))
-                .map(str::to_owned)
-        })?;
+        let command = self.config.workspace.ai_commit_command.clone()
+            .or_else(|| self.focused_id().and_then(|id| self.ai_commands.get(&id).cloned()))?;
         match self.config.workspace.ai_commit_model.as_deref().filter(|model| !model.is_empty()) {
             Some(model) if command.trim() == "opencode" => Some(format!("opencode run --model {model}")),
             Some(model) if command.starts_with("opencode ") => Some(format!("{command} --model {model}")),
@@ -947,9 +987,24 @@ impl AnvilApp {
     }
 
     fn paste_clipboard(&mut self, id: PaneId) {
-        let Some(text) = self.clipboard_text() else { return };
+        if let Some(text) = self.clipboard_text() {
+            self.paste_text(id, text, false);
+        }
+    }
+
+    fn paste_text(&mut self, id: PaneId, text: String, confirmed: bool) {
+        if self.ui.dialog.is_some() {
+            return;
+        }
         let Some(pane) = self.pane(id) else { return };
         let bracketed = pane.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        if !confirmed && paste::needs_confirmation(&text, bracketed) {
+            self.ui.dialog = Some(DialogState::Paste { pane_id: id, text });
+            if let Some(repaint) = &self.repaint {
+                repaint();
+            }
+            return;
+        }
         let bytes = paste::prepare_paste(&text, bracketed);
         pane.term.lock().scroll_display(Scroll::Bottom);
         pane.write(bytes);
@@ -970,11 +1025,7 @@ impl AnvilApp {
             .iter()
             .find(|profile| profile.id == entry.profile_id)
             .map_or(paste::PathQuoting::Unix, profiles::path_quoting);
-        let Some(pane) = entry.live() else { return };
-        let bracketed = pane.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
-        let bytes = paste::prepare_paste(&paste::quote_path(&path.to_string_lossy(), quoting), bracketed);
-        pane.term.lock().scroll_display(Scroll::Bottom);
-        pane.write(bytes);
+        self.paste_text(id, paste::quote_path(&path.to_string_lossy(), quoting), false);
         self.focus_pane(id);
     }
 
@@ -1007,6 +1058,10 @@ impl AnvilApp {
     }
 
     fn spawn_entry(&mut self, id: PaneId, profile: &Profile, cwd: Option<PathBuf>) -> PaneEntry {
+        if profile.kind == profiles::ProfileKind::Wsl && !self.builtin_profiles.iter().any(|p| p.id == profile.id) {
+            self.builtin_profiles.push(profile.clone());
+            self.profiles = self.build_profiles();
+        }
         let version = env!("CARGO_PKG_VERSION");
         let env = profiles::pane_env(profile, id, Some(&self.status_dir), version, self.inherited_prompt_command.as_deref());
         let options = SpawnOptions {
@@ -1024,6 +1079,7 @@ impl AnvilApp {
             cell_height: 18,
             scrollback: self.config.terminal.scrollback,
             word_separators: self.config.terminal.word_separators.clone(),
+            allow_osc52: self.config.terminal.allow_osc52,
             palette: self.palette.clone(),
             cursor_style: cursor_style(&self.config.terminal.cursor),
         };
@@ -1180,6 +1236,7 @@ impl AnvilApp {
                     .iter()
                     .find(|p| p.id == pane_state.profile_id)
                     .cloned()
+                    .or_else(|| pane_state.profile_id.strip_prefix("wsl-").filter(|distro| !distro.is_empty()).map(profiles::wsl_profile))
                     .unwrap_or_else(|| self.default_profile());
                 let cwd = session::usable_cwd(pane_state.cwd.as_deref());
                 let mut entry = self.spawn_entry(id, &profile, cwd);
@@ -1235,11 +1292,17 @@ impl AnvilApp {
         let profiles_changed = config.profiles != self.config.profiles || config.default_profile != self.config.default_profile;
         let claude_disabled = self.config.claude_status.enabled && !config.claude_status.enabled;
         let claude_enabled = !self.config.claude_status.enabled && config.claude_status.enabled;
+        let previous_integration = claude_disabled.then(|| self.config.claude_status.clone());
         self.config = config;
         if profiles_changed {
             self.profiles = self.build_profiles();
         }
         if claude_disabled {
+            if let Some(previous) = previous_integration {
+                self.config.claude_status.previous_status_line = previous.previous_status_line;
+                self.config.claude_status.installed_command = previous.installed_command;
+                self.config.claude_status.installed_settings_path = previous.installed_settings_path;
+            }
             self.disable_claude();
         } else if claude_enabled {
             self.setup_claude();
@@ -1261,7 +1324,7 @@ impl AnvilApp {
             self.toast(strings::UNKNOWN_HOTKEYS.to_owned());
         }
         if family_changed {
-            let report = fonts::install(&ctx, &self.config.font.family, &fonts::registry_font_entries(), self.fallbacks_loaded);
+            let report = fonts::install(&ctx, &self.config.font.family, &self.font_entries, self.fallbacks_loaded);
             for missing in report.missing {
                 log::info!("font not found: {missing}");
             }
@@ -1284,7 +1347,7 @@ impl AnvilApp {
                     if scheme_changed {
                         pane.set_palette(palette.clone());
                     }
-                    pane.set_options(style, scrollback, &word_separators);
+                    pane.set_options(style, scrollback, &word_separators, self.config.terminal.allow_osc52);
                 }
             }
         }
@@ -1314,8 +1377,30 @@ impl AnvilApp {
         }
     }
 
+    fn absorb_wsl_profiles(&mut self) {
+        let Some(rx) = &self.wsl_results else { return };
+        match rx.try_recv() {
+            Ok(found) => {
+                for profile in found {
+                    if !self.builtin_profiles.iter().any(|p| p.id == profile.id) {
+                        self.builtin_profiles.push(profile);
+                    }
+                }
+                self.wsl_results = None;
+                self.profiles = self.build_profiles();
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.wsl_results = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
     fn build_profiles(&self) -> Vec<Profile> {
-        let mut profiles = profiles::detect_builtin();
+        let mut profiles = self.builtin_profiles.clone();
+        if let Some(distro) = self.config.default_profile.strip_prefix("wsl-").filter(|distro| !distro.is_empty()) {
+            if !profiles.iter().any(|profile| profile.id == self.config.default_profile) {
+                profiles.push(profiles::wsl_profile(distro));
+            }
+        }
         for custom in &self.config.profiles {
             let profile = Profile {
                 id: custom.id.clone(),
@@ -1377,97 +1462,106 @@ impl AnvilApp {
 
     // ---- Claude status ---------------------------------------------------
 
+    fn setup_claude_explicit(&mut self) {
+        self.config.claude_status.declined_command = None;
+        self.setup_claude();
+    }
+
+    /// Startup may inspect an existing opt-in, but never writes global settings.
     fn setup_claude(&mut self) {
-        if !self.config.claude_status.enabled {
+        if !self.config.claude_status.enabled || self.ui.dialog.is_some() {
             return;
         }
         let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) else { return };
-        // Never write a statusLine that cannot run: the helper ships beside us.
         if !exe_dir.join("anvil-claude-status.exe").is_file() {
-            log::warn!("anvil-claude-status.exe is missing next to the executable; status line not installed");
+            self.toast(strings::CLAUDE_HELPER_MISSING.to_owned());
             return;
         }
         let ours = claude_setup::status_command(&exe_dir);
         let claude_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
         let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
         let Some(path) = claude_setup::settings_path(claude_dir.as_deref(), home.as_deref()) else { return };
-        let settings = std::fs::read_to_string(&path).ok();
-        match claude_setup::plan(settings.as_deref(), &ours, self.config.claude_status.declined_command.as_deref()) {
-            Plan::Install => {
-                if let Err(e) = self.install_claude(&path, &ours, false) {
-                    log::warn!("cannot update {}: {e}", path.display());
-                }
+        if self.config.claude_status.installed_command.is_some()
+            && self.config.claude_status.installed_settings_path.as_ref().is_some_and(|installed| *installed != path)
+        {
+            self.toast(strings::CLAUDE_DIRECTORY_CHANGED.to_owned());
+            return;
+        }
+        let settings = match std::fs::read_to_string(&path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                log::warn!("cannot read {}: {e}", path.display());
+                self.toast(strings::CLAUDE_SETTINGS_BROKEN.to_owned());
+                return;
             }
+        };
+        let (current, keep_previous) = match claude_setup::plan(settings.as_deref(), &ours, self.config.claude_status.declined_command.as_deref()) {
+            Plan::Install => (String::new(), false),
             Plan::Update => {
-                if let Err(e) = self.install_claude(&path, &ours, true) {
-                    log::warn!("cannot update {}: {e}", path.display());
-                }
+                let current = settings.as_deref().and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                    .and_then(|value| value.get("statusLine")?.get("command")?.as_str().map(str::to_owned)).unwrap_or_default();
+                (current, true)
             }
-            Plan::AskReplace { current } => {
-                self.ui.dialog = Some(DialogState::claude_replace(current));
-            }
+            Plan::AskReplace { current } => (current, false),
             Plan::Broken(message) => {
                 log::warn!("{message}");
                 self.toast(strings::CLAUDE_SETTINGS_BROKEN.to_owned());
+                return;
             }
-            Plan::AlreadyInstalled | Plan::Declined => {}
+            Plan::AlreadyInstalled | Plan::Declined => return,
+        };
+        if self.config.claude_status.declined_command.as_deref() == Some(current.as_str()) {
+            return;
         }
+        self.ui.dialog = Some(DialogState::ClaudeInstall { path, expected: settings, ours, current, keep_previous });
     }
 
-    /// Re-reads settings.json right before writing: Claude Code rewrites it too.
-    /// `keep_previous` is set when only our own command's path changes: the
-    /// saved original status line must survive such an update.
-    fn install_claude(&mut self, path: &Path, ours: &str, keep_previous: bool) -> std::io::Result<()> {
-        claude_setup::backup_once(path)?;
-        // Only a genuinely missing file may become a fresh settings object; an
-        // unreadable one must be left alone.
-        let fresh = match std::fs::read_to_string(path) {
-            Ok(text) => Some(text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e),
-        };
-        // Claude Code rewrites this file; re-check on the fresh contents that
-        // the statusLine is still ours (or absent) before touching it.
-        if let Some(text) = &fresh {
-            match claude_setup::plan(Some(text), ours, self.config.claude_status.declined_command.as_deref()) {
-                Plan::Install | Plan::Update => {}
-                Plan::AlreadyInstalled => return Ok(()),
-                Plan::AskReplace { .. } | Plan::Declined | Plan::Broken(_) => {
-                    log::warn!("{} changed before the statusLine update; leaving it alone", path.display());
-                    self.toast(strings::CLAUDE_SETTINGS_CHANGED.to_owned());
-                    return Ok(());
-                }
-            }
+    fn install_claude(&mut self, path: &Path, ours: &str, expected: Option<&str>, keep_previous: bool) -> std::io::Result<()> {
+        if !Path::new(ours.trim_matches('"')).is_file() {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Claude helper was moved or removed before confirmation"));
         }
-        let (text, previous) = claude_setup::install(fresh.as_deref(), ours).map_err(std::io::Error::other)?;
-        crate::fsutil::atomic_write(path, text.as_bytes())?;
+        let (text, previous) = claude_setup::install(expected, ours).map_err(std::io::Error::other)?;
+        claude_setup::write_confirmed(path, expected, &text)?;
         if !keep_previous {
             self.config.claude_status.previous_status_line = previous;
         }
+        self.config.claude_status.installed_command = Some(ours.to_owned());
+        self.config.claude_status.installed_settings_path = Some(path.to_path_buf());
+        self.config.claude_status.declined_command = None;
         let config_path = Config::path();
-        if let Err(e) = self.config.save(&config_path) {
-            log::warn!("cannot save {}: {e}", config_path.display());
-        }
+        self.config.save(&config_path)?;
         self.config_mtime = file_mtime(&config_path);
         Ok(())
     }
 
     fn disable_claude(&mut self) {
-        let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) else { return };
-        let ours = claude_setup::status_command(&exe_dir);
+        // Consent belongs to the installed location, not today's executable or
+        // CLAUDE_CONFIG_DIR. Moving ANVIL must not prevent restoring the original.
         let claude_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
         let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
-        let Some(path) = claude_setup::settings_path(claude_dir.as_deref(), home.as_deref()) else { return };
+        let path = self.config.claude_status.installed_settings_path.clone()
+            .or_else(|| claude_setup::settings_path(claude_dir.as_deref(), home.as_deref()));
+        let Some(path) = path else { return };
         let Ok(fresh) = std::fs::read_to_string(&path) else { return };
+        let ours = self.config.claude_status.installed_command.clone().or_else(|| {
+            // Older opted-in configurations did not record their helper path.
+            serde_json::from_str::<serde_json::Value>(&fresh).ok()
+                .and_then(|value| value.get("statusLine")?.get("command")?.as_str().map(str::to_owned))
+                .filter(|command| claude_setup::is_anvil_status_command(command))
+        });
+        let Some(ours) = ours else { return };
         match claude_setup::uninstall(&fresh, &ours, self.config.claude_status.previous_status_line.as_ref()) {
             Ok(Some(text)) => {
-                if let Err(e) = crate::fsutil::atomic_write(&path, text.as_bytes()) {
+                if let Err(e) = claude_setup::write_confirmed(&path, Some(&fresh), &text) {
                     // Keep the saved original: a later disable must be able to retry.
                     log::warn!("cannot restore {}: {e}", path.display());
                     self.toast(strings::CLAUDE_SETTINGS_CHANGED.to_owned());
                     return;
                 }
                 self.config.claude_status.previous_status_line = None;
+                self.config.claude_status.installed_command = None;
+                self.config.claude_status.installed_settings_path = None;
                 let config_path = Config::path();
                 if let Err(e) = self.config.save(&config_path) {
                     log::warn!("cannot save {}: {e}", config_path.display());
@@ -1484,16 +1578,28 @@ impl AnvilApp {
             return;
         }
         self.last_status_poll = Instant::now();
-        if self.last_proc_poll.elapsed() >= Duration::from_secs(3) {
+        let polled_processes = self.last_proc_poll.elapsed() >= Duration::from_secs(3);
+        if polled_processes {
             self.last_proc_poll = Instant::now();
             self.proc_snapshot = crate::procs::snapshot();
+            self.ai_commands.clear();
+            for tab in &mut self.tabs {
+                for (id, entry) in &mut tab.panes {
+                    let Some(pane) = entry.live() else { continue };
+                    let names = crate::procs::detected_cli_names(&self.proc_snapshot, pane.shell_pid);
+                    let has_claude = names.contains("claude");
+                    if let Some(command) = ["claude", "opencode", "codex", "gemini", "aider"].into_iter().find(|name| names.contains(*name)) {
+                        self.ai_commands.insert(*id, command.to_owned());
+                    }
+                    entry.has_claude = has_claude;
+                }
+            }
         }
         let status_dir = self.status_dir.clone();
-        let snapshot = &self.proc_snapshot;
         for tab in &mut self.tabs {
             for entry in tab.panes.values_mut() {
-                let (pane_id, shell_pid) = match &entry.content {
-                    PaneContent::Live(pane) => (pane.id, pane.shell_pid),
+                let pane_id = match &entry.content {
+                    PaneContent::Live(pane) => pane.id,
                     PaneContent::Error(_) => continue,
                 };
                 let path = StatusRecord::file_path(&status_dir, &pane_id.to_string());
@@ -1509,17 +1615,10 @@ impl AnvilApp {
                     }
                     _ => {}
                 }
-                if entry.claude.is_some() {
-                    let alive = crate::procs::runs_claude(snapshot, shell_pid)
-                        // A stale snapshot must not delete a live pane's status:
-                        // re-check with a fresh one before deciding it is gone.
-                        || crate::procs::runs_claude(&crate::procs::snapshot(), shell_pid);
-                    entry.has_claude = alive;
-                    if !alive {
-                        entry.claude = None;
-                        entry.claude_mtime = None;
-                        let _ = std::fs::remove_file(&path);
-                    }
+                if polled_processes && entry.claude.is_some() && !entry.has_claude {
+                    entry.claude = None;
+                    entry.claude_mtime = None;
+                    let _ = std::fs::remove_file(&path);
                 }
             }
         }
@@ -1609,26 +1708,27 @@ impl AnvilApp {
             dialogs::DialogOutcome::None => {
                 self.ui.dialog = Some(dialog);
             }
-            dialogs::DialogOutcome::ClaudeReplace(accepted) => {
-                if accepted {
-                    let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) else { return };
-                    let ours = claude_setup::status_command(&exe_dir);
-                    let claude_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
-                    let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
-                    if let Some(path) = claude_setup::settings_path(claude_dir.as_deref(), home.as_deref()) {
-                        if let Err(e) = self.install_claude(&path, &ours, false) {
-                            log::warn!("cannot update {}: {e}", path.display());
-                        }
-                    }
-                } else if let Some(current) = dialog.command().map(str::to_owned) {
+            dialogs::DialogOutcome::Cancel => {
+                if let DialogState::ClaudeInstall { current, .. } = dialog {
                     self.config.claude_status.declined_command = Some(current);
-                    let config_path = Config::path();
-                    if let Err(e) = self.config.save(&config_path) {
-                    log::warn!("cannot save {}: {e}", config_path.display());
-                }
-                    self.config_mtime = file_mtime(&config_path);
+                    let path = Config::path();
+                    if let Err(e) = self.config.save(&path) {
+                        log::warn!("cannot save {}: {e}", path.display());
+                    }
+                    self.config_mtime = file_mtime(&path);
                 }
             }
+            dialogs::DialogOutcome::Accept => match dialog {
+                DialogState::Paste { pane_id, text } => self.paste_text(pane_id, text, true),
+                DialogState::ClaudeInstall { path, expected, ours, keep_previous, .. } => {
+                    if self.config.claude_status.enabled {
+                        if let Err(e) = self.install_claude(&path, &ours, expected.as_deref(), keep_previous) {
+                            log::warn!("cannot update {}: {e}", path.display());
+                            self.toast(strings::CLAUDE_SETTINGS_CHANGED.to_owned());
+                        }
+                    }
+                }
+            },
         }
     }
 }
@@ -1666,9 +1766,8 @@ pub fn scheme_names(config: &Config) -> Vec<String> {
     names
 }
 
-fn font_families() -> Vec<String> {
-    let mut families: Vec<String> = fonts::registry_font_entries()
-        .into_iter()
+fn font_families(entries: &[(String, String)]) -> Vec<String> {
+    let mut families: Vec<String> = entries.iter()
         .filter_map(|(name, _)| {
             let name = name
                 .trim_end_matches(" (TrueType)")

@@ -1,19 +1,39 @@
 //! Clipboard text -> bytes for the PTY.
 
-/// Line breaks become CR (what Enter sends). With bracketed paste on, every ESC
-/// is stripped so the text cannot close the bracket early (`ESC[201~`) or
-/// smuggle other sequences, then the text is wrapped in `ESC[200~`/`ESC[201~`.
+/// Removes control characters in both modes, retaining TAB and normalized
+/// line breaks. Only ANVIL's own bracket wrappers can contain ESC.
 pub fn prepare_paste(text: &str, bracketed: bool) -> Vec<u8> {
-    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
-    if !bracketed {
-        return normalized.into_bytes();
+    let mut out = Vec::with_capacity(text.len() + if bracketed { 12 } else { 0 });
+    if bracketed {
+        out.extend_from_slice(b"\x1b[200~");
     }
-    let body: String = normalized.chars().filter(|&c| c != '\x1b').collect();
-    let mut out = Vec::with_capacity(body.len() + 12);
-    out.extend_from_slice(b"\x1b[200~");
-    out.extend_from_slice(body.as_bytes());
-    out.extend_from_slice(b"\x1b[201~");
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push(b'\r');
+            }
+            '\n' => out.push(b'\r'),
+            '\t' => out.push(b'\t'),
+            c if c.is_control() => {}
+            c => {
+                let mut encoded = [0; 4];
+                out.extend_from_slice(c.encode_utf8(&mut encoded).as_bytes());
+            }
+        }
+    }
+    if bracketed {
+        out.extend_from_slice(b"\x1b[201~");
+    }
     out
+}
+
+/// Even a trailing Enter can execute a command without bracketed paste.
+pub fn needs_confirmation(text: &str, bracketed: bool) -> bool {
+    !bracketed && text.contains(['\r', '\n'])
 }
 
 /// How the pane's shell reads a quoted path.
@@ -82,6 +102,18 @@ mod tests {
             prepare_paste("x\x1b[201~rm -rf /\n", true),
             b"\x1b[200~x[201~rm -rf /\r\x1b[201~"
         );
+    }
+
+    #[test]
+    fn untrusted_controls_never_reach_either_paste_mode() {
+        let text = "привет\t\x00\x03\x08\x1b[201~\x7f\u{0085}ok";
+        assert_eq!(prepare_paste(text, false), "привет\t[201~ok".as_bytes());
+        assert_eq!(prepare_paste(text, true), "\x1b[200~привет\t[201~ok\x1b[201~".as_bytes());
+        for text in ["echo dangerous\n", "one\rtwo", "a\r\nb"] {
+            assert!(needs_confirmation(text, false));
+            assert!(!needs_confirmation(text, true));
+        }
+        assert!(!needs_confirmation("привет\tworld", false));
     }
 
     #[test]

@@ -107,12 +107,15 @@ pub struct SettingsContext<'a> {
     pub config: &'a mut Config,
     pub keymap_rows: Vec<(String, Vec<String>)>,
     pub profiles: Vec<(String, String)>,
-    pub fonts: Vec<String>,
+    pub fonts: &'a [String],
 }
 
 pub struct SettingsOutcome {
     pub changed: bool,
     pub open_config: bool,
+    pub refresh_fonts: bool,
+    pub install_claude: bool,
+    pub restore_claude: bool,
 }
 
 fn draft_profile() -> ProfileConfig {
@@ -127,7 +130,7 @@ fn draft_profile() -> ProfileConfig {
 }
 
 pub fn show(ui: &mut egui::Ui, rect: Rect, cx: &mut SettingsContext, state: &mut SettingsState) -> SettingsOutcome {
-    let mut outcome = SettingsOutcome { changed: false, open_config: false };
+    let mut outcome = SettingsOutcome { changed: false, open_config: false, refresh_fonts: false, install_claude: false, restore_claude: false };
     ui.painter_at(rect).rect_filled(rect, 0.0, theme::CHROME_BG);
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink2(Vec2::new(18.0, 12.0))).id_salt("settings-page"), |ui| {
         ui.label(RichText::new(strings::TAB_SETTINGS).color(theme::TEXT).font(theme::title_font(15.0)));
@@ -206,7 +209,7 @@ fn section_appearance(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut
             .width(220.0)
             .selected_text(RichText::new(cx.config.font.family.clone()).font(theme::field_font(13.0)))
             .show_ui(ui, |ui| {
-                for family in &cx.fonts {
+                for family in cx.fonts {
                     if ui.selectable_label(*family == cx.config.font.family, family).clicked() {
                         cx.config.font.family = family.clone();
                         outcome.changed = true;
@@ -217,6 +220,9 @@ fn section_appearance(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut
         if let Some(family) = font_family_field(ui, id, &cx.config.font.family) {
             cx.config.font.family = family;
             outcome.changed = true;
+        }
+        if ui.add(theme::ghost_button(strings::SETTINGS_FONT_REFRESH)).clicked() {
+            outcome.refresh_fonts = true;
         }
     });
     theme::tag(ui, strings::SETTINGS_FONT_SIZE);
@@ -297,6 +303,10 @@ fn section_terminal(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut S
             outcome.changed = true;
         }
     });
+    if theme::choice(ui, strings::SETTINGS_ALLOW_OSC52, cx.config.terminal.allow_osc52).clicked() {
+        cx.config.terminal.allow_osc52 = !cx.config.terminal.allow_osc52;
+        outcome.changed = true;
+    }
     theme::tag(ui, strings::SETTINGS_WORD_SEPARATORS);
     if ui
         .add(
@@ -473,15 +483,29 @@ fn section_claude(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut Set
     if theme::choice(ui, strings::SETTINGS_CLAUDE_ENABLED, enabled).clicked() {
         cx.config.claude_status.enabled = !enabled;
         outcome.changed = true;
+        outcome.install_claude = !enabled;
     }
     let state_text = if cx.config.claude_status.declined_command.is_some() {
         RichText::new(strings::SETTINGS_CLAUDE_DECLINED).color(theme::STATUS_YELLOW)
     } else if enabled {
-        RichText::new(strings::SETTINGS_CLAUDE_CONNECTED).color(theme::STATUS_GREEN)
+        RichText::new(if cx.config.claude_status.installed_command.is_some() {
+            strings::SETTINGS_CLAUDE_CONNECTED
+        } else {
+            strings::SETTINGS_CLAUDE_PENDING
+        }).color(theme::STATUS_GREEN)
     } else {
         RichText::new(strings::SETTINGS_CLAUDE_NOT_CONNECTED).color(theme::DIM)
     };
     ui.label(state_text.font(theme::font(12.0)));
+    ui.label(strings::SETTINGS_CLAUDE_GLOBAL_HINT);
+    if enabled && ui.add(theme::ghost_button(strings::SETTINGS_CLAUDE_INSTALL)).clicked() {
+        outcome.install_claude = true;
+    }
+    if !enabled && (cx.config.claude_status.installed_command.is_some() || cx.config.claude_status.previous_status_line.is_some())
+        && ui.add(theme::ghost_button(strings::SETTINGS_CLAUDE_RESTORE)).clicked()
+    {
+        outcome.restore_claude = true;
+    }
     ui.add_space(12.0);
 }
 

@@ -25,10 +25,12 @@ const LANE_WIDTH: f32 = 11.0;
 const MIN_SUBJECT_WIDTH: f32 = 72.0;
 /// Files larger than this are skipped by "Посчитать строки".
 const MAX_COUNTED_FILE: u64 = 4 * 1024 * 1024;
+const MAX_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
 /// Height of one file-browser row; the list height is a multiple of it.
 const FILE_ROW_HEIGHT: f32 = 20.0;
+const TEXT_ROW_HEIGHT: f32 = 18.0;
 /// Width of the line-number gutter of the diff views.
-const GUTTER: f32 = 36.0;
+const GUTTER: f32 = 64.0;
 /// The Seti folder glyph (U+E032, "folder" in the font) in the folder blue of
 /// the reference file tree.
 const FOLDER_ICON: (char, egui::Color32) = ('\u{e032}', egui::Color32::from_rgb(0x7B, 0xB3, 0xD9));
@@ -74,7 +76,7 @@ pub enum Response {
     Status(Status, Option<PathBuf>),
     TrustRequired { identity: Option<git::RepositoryIdentity>, error: Option<String> },
     Trusted(git::RepositoryIdentity),
-    Diff { path: String, files: Vec<FileDiff>, text: String, staged: bool },
+    Diff { path: String, files: Vec<FileDiff>, text: String, staged: bool, side: Option<bool> },
     Refreshed,
     Committed(String),
     AiMessage(Result<String, String>),
@@ -130,6 +132,8 @@ pub struct Prompt {
 struct CommitFile {
     path: String,
     patch: Option<Result<String, String>>,
+    rows: Vec<TextRow>,
+    wrapped: WrappedRows,
 }
 
 pub struct Workspace {
@@ -162,6 +166,18 @@ pub struct Workspace {
     pub file_filter: String,
     pub file_preview: Option<(String, String, bool)>,
     pub prompt: Option<Prompt>,
+    diff_rows: Vec<TextRow>,
+    diff_wrapped: WrappedRows,
+    diff_stamp: Option<DiffStamp>,
+    file_rows: Vec<FileRow>,
+    file_rows_dirty: bool,
+    files_loaded: bool,
+    cached_filter: String,
+    change_rows_cache: Vec<Row>,
+    changes_dirty: bool,
+    preview_rows: Vec<TextRow>,
+    preview_wrapped: WrappedRows,
+    markdown: MarkdownCache,
     ai_command: Option<String>,
     ai_generating: bool,
     trust_required: bool,
@@ -202,6 +218,18 @@ impl Default for Workspace {
             file_filter: String::new(),
             file_preview: None,
             prompt: None,
+            diff_rows: Vec::new(),
+            diff_wrapped: WrappedRows::default(),
+            diff_stamp: None,
+            file_rows: Vec::new(),
+            file_rows_dirty: true,
+            files_loaded: false,
+            cached_filter: String::new(),
+            change_rows_cache: Vec::new(),
+            changes_dirty: true,
+            preview_rows: Vec::new(),
+            preview_wrapped: WrappedRows::default(),
+            markdown: MarkdownCache::default(),
             ai_command: None,
             ai_generating: false,
             trust_required: false,
@@ -253,13 +281,24 @@ impl Workspace {
         self.diff_path = None;
         self.diff_text.clear();
         self.diff_files.clear();
+        self.diff_rows.clear();
+        self.diff_wrapped = WrappedRows::default();
+        self.diff_stamp = None;
         self.diff_side = None;
         self.detail = None;
         self.detail_file = None;
         self.files.clear();
+        self.files_loaded = false;
         self.file_expanded.clear();
         self.line_count = None;
         self.file_preview = None;
+        self.file_rows.clear();
+        self.file_rows_dirty = true;
+        self.change_rows_cache.clear();
+        self.changes_dirty = true;
+        self.preview_rows.clear();
+        self.preview_wrapped = WrappedRows::default();
+        self.markdown = MarkdownCache::default();
         self.log = CommitLog::default();
         self.graph.clear();
         self.prompt = None;
@@ -327,6 +366,9 @@ impl Workspace {
                 Response::Status(status, root) => {
                     self.busy = false;
                     let root_changed = self.root != root;
+                    let inventory_changed = root_changed || self.status.head_oid != status.head_oid
+                        || self.status.changes.iter().map(|change| (&change.path, &change.original_path))
+                            .ne(status.changes.iter().map(|change| (&change.path, &change.original_path)));
                     let commit_state_changed = root_changed || !self.log_status_seen
                         || self.status.head_oid != status.head_oid
                         || self.status.upstream_oid != status.upstream_oid
@@ -341,6 +383,7 @@ impl Workspace {
                     self.root = root;
                     self.trust_required = false;
                     self.pending_identity = None;
+                    self.changes_dirty |= self.status.changes != status.changes;
                     self.status = status;
                     self.selected.retain(|path| self.status.changes.iter().any(|change| &change.path == path));
                     if let Some(path) = self.diff_path.clone() {
@@ -348,27 +391,39 @@ impl Workspace {
                             self.diff_path = None;
                             self.diff_text.clear();
                             self.diff_files.clear();
+                            self.diff_rows.clear();
+                            self.diff_wrapped = WrappedRows::default();
+                            self.diff_stamp = None;
                         } else {
-                            self.send(Request::Diff { path, side: self.diff_side });
+                            let stamp = DiffStamp::read(self.root.as_deref(), &path, self.diff_side, &self.status);
+                            if self.diff_stamp.as_ref() != Some(&stamp) {
+                                self.diff_stamp = Some(stamp);
+                                self.send(Request::Diff { path, side: self.diff_side });
+                            }
                         }
                     }
                     if commit_state_changed && self.root.is_some() {
                         self.send(Request::Log);
                     }
-                    if root_changed || (self.tab == PanelTab::Files && self.files.is_empty()) {
+                    if inventory_changed || (self.tab == PanelTab::Files && !self.files_loaded) {
                         self.send(Request::Files);
                     }
                 }
-                Response::Diff { path, files, text, staged } => {
+                Response::Diff { path, files, text, staged, side } => {
                     self.busy = false;
-                    if self.diff_path.as_deref() == Some(path.as_str()) {
-                        self.diff_text = text;
-                        self.diff_files = files;
+                    if self.diff_path.as_deref() == Some(path.as_str()) && self.diff_side == side {
+                        if self.diff_text != text {
+                            self.diff_rows = text_rows(&text, true);
+                            self.diff_wrapped = WrappedRows::default();
+                            self.diff_text = text;
+                            self.diff_files = files;
+                        }
                         self.diff_from_index = staged;
                     }
                 }
                 Response::Refreshed | Response::Applied => {
                     self.busy = false;
+                    self.diff_stamp = None;
                     self.last_poll = Instant::now() - POLL_INTERVAL;
                     self.send(Request::Log);
                     if self.tab == PanelTab::Files {
@@ -405,12 +460,19 @@ impl Workspace {
                     if self.detail.as_ref().is_some_and(|(current, _)| current == &hash) {
                         if let Some(file) = self.detail_file.as_mut().filter(|file| file.path == path) {
                             file.patch = Some(patch);
+                            file.rows = file.patch.as_ref().and_then(|patch| patch.as_ref().ok())
+                                .map(|patch| text_rows(patch, true)).unwrap_or_default();
+                            file.wrapped = WrappedRows::default();
                         }
                     }
                 }
                 Response::Files(files) => {
                     self.busy = false;
-                    self.files = files;
+                    self.files_loaded = true;
+                    if self.files != files {
+                        self.files = files;
+                        self.file_rows_dirty = true;
+                    }
                 }
                 Response::LineCount { files, lines } => {
                     self.busy = false;
@@ -418,6 +480,11 @@ impl Workspace {
                 }
                 Response::FileText { path, text, truncated } => {
                     self.busy = false;
+                    if !self.file_preview.as_ref().is_some_and(|(old_path, old_text, _)| old_path == &path && old_text == &text) {
+                        self.preview_rows = if is_markdown(&path) { Vec::new() } else { text_rows(&text, false) };
+                        self.preview_wrapped = WrappedRows::default();
+                        self.markdown = MarkdownCache::default();
+                    }
                     self.file_preview = Some((path, text, truncated));
                 }
                 Response::Fetched(what) => {
@@ -891,23 +958,20 @@ impl Workspace {
         });
         const ROW_HEIGHT: f32 = 21.0;
         const INDENT: f32 = 12.0;
-        // Built once per frame and handed to the drawing closure.
-        let mut rows = Some(self.rows());
-        let count = rows.as_ref().map_or(0, Vec::len);
+        if self.changes_dirty {
+            self.change_rows_cache = self.rows();
+            self.changes_dirty = false;
+        }
+        let rows = std::mem::take(&mut self.change_rows_cache);
         // A long tree gets its own bounded scroll, short lists stay inline. The
         // bound is a share of the column, so the commit history below always
         // keeps room for its own scroll.
         let limit = (ui.available_height() * 0.45).clamp(ROW_HEIGHT * 3.0, 300.0);
-        let bounded = |ui: &mut egui::Ui, body: &mut dyn FnMut(&mut egui::Ui)| {
-            if count as f32 * (ROW_HEIGHT + ui.spacing().item_spacing.y) > limit {
-                ScrollArea::vertical().id_salt("workspace-changes").max_height(limit).auto_shrink([false, false]).show(ui, body);
-            } else {
-                body(ui);
-            }
-        };
-        {
-            bounded(ui, &mut |ui: &mut egui::Ui| {
-                for row in rows.take().unwrap_or_default() {
+        let spacing = ui.spacing().item_spacing.y;
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ScrollArea::vertical().id_salt("workspace-changes").max_height(limit).auto_shrink([false, true])
+            .show_rows(ui, ROW_HEIGHT, rows.len(), |ui, visible| {
+                for row in rows[visible].iter().cloned() {
                     let width = ui.available_width();
                     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, ROW_HEIGHT), Sense::click());
                     let painter = ui.painter_at(rect);
@@ -939,6 +1003,7 @@ impl Workspace {
                                 } else {
                                     self.collapsed.insert(path.clone());
                                 }
+                                self.changes_dirty = true;
                             }
                         }
                         Row::File { change } => {
@@ -1002,8 +1067,12 @@ impl Workspace {
                                     self.diff_path = Some(path.clone());
                                     self.diff_text.clear();
                                     self.diff_files.clear();
+                                    self.diff_rows.clear();
+                                    self.diff_stamp = None;
+                                    self.diff_wrapped = WrappedRows::default();
                                     self.diff_side = None;
                                     self.busy = true;
+                                    self.diff_stamp = Some(DiffStamp::read(self.root.as_deref(), &path, None, &self.status));
                                     self.send(Request::Diff { path, side: None });
                                 }
                             }
@@ -1011,7 +1080,8 @@ impl Workspace {
                     }
                 }
             });
-        }
+        ui.spacing_mut().item_spacing.y = spacing;
+        self.change_rows_cache = rows;
 
         if self.diff_path.is_some() {
             self.diff_view(ui);
@@ -1029,7 +1099,11 @@ impl Workspace {
                 if ui.add(theme::ghost_button(strings::WORKSPACE_DIFF_STAGED)).clicked() {
                     self.diff_text.clear();
                     self.diff_files.clear();
+                    self.diff_rows.clear();
+                    self.diff_wrapped = WrappedRows::default();
+                    self.diff_stamp = None;
                     self.diff_side = Some(!self.diff_from_index);
+                    self.diff_stamp = Some(DiffStamp::read(self.root.as_deref(), &path, self.diff_side, &self.status));
                     self.busy = true;
                     self.send(Request::Diff { path: path.clone(), side: self.diff_side });
                 }
@@ -1037,30 +1111,34 @@ impl Workspace {
         });
         let mut hunks_to_apply: Option<(usize, String, bool)> = None;
         let height = (ui.available_height() * 0.55).clamp(24.0, 300.0);
+        self.diff_wrapped.prepare(ui, &self.diff_text, &self.diff_rows);
+        let spacing = ui.spacing().item_spacing.y;
+        ui.spacing_mut().item_spacing.y = 0.0;
         ScrollArea::vertical()
             .id_salt(("workspace-diff", &path, self.diff_from_index))
             .max_height(height)
             .auto_shrink([false, true])
-            .show(ui, |ui| {
-                let mut hunk_index = 0;
-                let mut numbers = PatchNumbers::default();
-                for line in self.diff_text.lines() {
-                    let number = numbers.line(line);
-                    if line.starts_with("@@") {
+            .show_rows(ui, TEXT_ROW_HEIGHT, self.diff_wrapped.rows.len(), |ui, visible| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for index in visible {
+                    let row = &self.diff_wrapped.rows[index];
+                    let line = &self.diff_text[row.bytes.clone()];
+                    if let Some(hunk_index) = row.hunk {
+                        let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), TEXT_ROW_HEIGHT), Sense::click());
                         let label = if self.diff_from_index { "◂" } else { "▸" };
-                        let header = line.to_owned();
-                        ui.horizontal(|ui| {
-                            if ui.add(theme::ghost_button(label)).clicked() {
-                                hunks_to_apply = Some((hunk_index, header.clone(), self.diff_from_index));
+                        ui.painter().text(rect.left_center(), Align2::LEFT_CENTER, label, theme::font(12.0), theme::ACCENT);
+                        paint_text_row(ui, rect, line, None, theme::DIFF_HUNK);
+                        if response.clicked() {
+                            if let Some(header) = self.diff_rows.iter().find(|row| row.hunk == Some(hunk_index)) {
+                                hunks_to_apply = Some((hunk_index, self.diff_text[header.bytes.clone()].to_owned(), self.diff_from_index));
                             }
-                            ui.label(RichText::new(line).color(theme::DIFF_HUNK).font(theme::field_font(11.0)));
-                        });
-                        hunk_index += 1;
-                        continue;
+                        }
+                    } else {
+                        patch_line(ui, line, row.number, row.kind);
                     }
-                    patch_line(ui, line, number);
                 }
             });
+        ui.spacing_mut().item_spacing.y = spacing;
         if let Some((index, header, from_index)) = hunks_to_apply {
             self.busy = true;
             self.send(Request::ApplyHunks { path, index, header, from_index });
@@ -1070,14 +1148,14 @@ impl Workspace {
     /// Commit detail replaces the column while open.
     fn detail_view(&mut self, ui: &mut egui::Ui) -> bool {
         let Some((hash, detail)) = self.detail.take() else { return false };
-        let action = commit_detail_view(ui, &hash, &detail, self.detail_file.as_ref());
+        let action = commit_detail_view(ui, &hash, &detail, self.detail_file.as_mut());
         if matches!(action, Some(CommitDetailAction::Back)) && self.detail_file.is_none() {
             return true;
         }
         match action {
             Some(CommitDetailAction::Back) => self.detail_file = None,
             Some(CommitDetailAction::OpenFile(path)) => {
-                self.detail_file = Some(CommitFile { path: path.clone(), patch: None });
+                self.detail_file = Some(CommitFile { path: path.clone(), patch: None, rows: Vec::new(), wrapped: WrappedRows::default() });
                 self.busy = true;
                 self.send(Request::CommitDiff { hash: hash.clone(), path });
             }
@@ -1094,7 +1172,7 @@ enum CommitDetailAction {
 }
 
 /// The commit overview or one selected file; navigation stays outside the scroll.
-fn commit_detail_view(ui: &mut egui::Ui, hash: &str, detail: &git::CommitDetail, file: Option<&CommitFile>) -> Option<CommitDetailAction> {
+fn commit_detail_view(ui: &mut egui::Ui, hash: &str, detail: &git::CommitDetail, mut file: Option<&mut CommitFile>) -> Option<CommitDetailAction> {
     let mut action = None;
     ui.horizontal(|ui| {
         if ui.add(theme::ghost_button(strings::WORKSPACE_BACK)).clicked() {
@@ -1103,7 +1181,7 @@ fn commit_detail_view(ui: &mut egui::Ui, hash: &str, detail: &git::CommitDetail,
         if ui.add(theme::ghost_button(strings::WORKSPACE_COPY_HASH)).clicked() {
             copy_to_clipboard(hash);
         }
-        if let Some(file) = file {
+        if let Some(file) = file.as_ref() {
             let patch = file.patch.as_ref().and_then(|result| result.as_ref().ok());
             if ui.add_enabled(patch.is_some(), theme::ghost_button(strings::WORKSPACE_COPY_PATCH)).clicked() {
                 if let Some(patch) = patch {
@@ -1112,10 +1190,9 @@ fn commit_detail_view(ui: &mut egui::Ui, hash: &str, detail: &git::CommitDetail,
             }
         }
     });
-    if let Some(file) = file {
+    if let Some(file) = file.as_mut() {
         ui.label(RichText::new(display(&file.path, file.path.len())).color(theme::TEXT).font(theme::font(12.5)));
-        ScrollArea::vertical().id_salt(("workspace-commit-file", hash, &file.path)).auto_shrink([false, false]).show(ui, |ui| {
-            match &file.patch {
+        match &file.patch {
                 None => {
                     ui.horizontal(|ui| {
                         ui.add(egui::Spinner::new().size(14.0).color(theme::ACCENT));
@@ -1126,14 +1203,20 @@ fn commit_detail_view(ui: &mut egui::Ui, hash: &str, detail: &git::CommitDetail,
                     ui.label(RichText::new(error).color(theme::STATUS_RED));
                 }
                 Some(Ok(patch)) => {
-                    let mut numbers = PatchNumbers::default();
-                    for line in patch.lines() {
-                        let number = numbers.line(line);
-                        patch_line(ui, line, number);
-                    }
+                    file.wrapped.prepare(ui, patch, &file.rows);
+                    let spacing = ui.spacing().item_spacing.y;
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ScrollArea::vertical().id_salt(("workspace-commit-file", hash, &file.path)).auto_shrink([false, false])
+                        .show_rows(ui, TEXT_ROW_HEIGHT, file.wrapped.rows.len(), |ui, visible| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            for index in visible {
+                                let row = &file.wrapped.rows[index];
+                                patch_line(ui, &patch[row.bytes.clone()], row.number, row.kind);
+                            }
+                        });
+                    ui.spacing_mut().item_spacing.y = spacing;
                 }
-            }
-        });
+        }
         return action;
     }
     // The complete message and file list share the remaining viewport.
@@ -1203,6 +1286,33 @@ impl Workspace {
         rows
     }
 
+    fn update_file_rows(&mut self) {
+        if !self.file_rows_dirty && self.cached_filter == self.file_filter {
+            return;
+        }
+        self.file_rows = if self.file_filter.trim().is_empty() {
+            self.file_tree()
+        } else {
+            let mut matches: Vec<_> = self.files.iter()
+                .filter_map(|path| crate::profiles::fuzzy_score(&self.file_filter, path).map(|score| (score, path)))
+                .collect();
+            matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+            matches.into_iter().take(400).map(|(_, path)| {
+                let (dir, name) = path.rsplit_once('/').map_or(("", path.as_str()), |(dir, name)| (dir, name));
+                FileRow { depth: 0, name: display(name, 120), dir: Some(if dir.is_empty() { String::new() } else { format!("{}/", display(dir, 120)) }), path: path.clone(), folder: false }
+            }).collect()
+        };
+        self.cached_filter.clone_from(&self.file_filter);
+        self.file_rows_dirty = false;
+    }
+
+    fn toggle_file_folder(&mut self, path: &str) {
+        if !self.file_expanded.remove(path) {
+            self.file_expanded.insert(path.to_owned());
+        }
+        self.file_rows_dirty = true;
+    }
+
     /// One row of the file browser; returns the path to open when a file was
     /// clicked. Folders fold instead.
     fn file_row(&mut self, ui: &mut egui::Ui, row: &FileRow) -> Option<String> {
@@ -1241,11 +1351,7 @@ impl Workspace {
                 theme::TEXT,
             );
             if response.clicked() {
-                if self.file_expanded.contains(&row.path) {
-                    self.file_expanded.remove(&row.path);
-                } else {
-                    self.file_expanded.insert(row.path.clone());
-                }
+                self.toggle_file_folder(&row.path);
             }
         } else {
             let (icon, icon_color) = crate::file_icons::for_file(&row.name);
@@ -1324,43 +1430,29 @@ impl Workspace {
                 .hint_text(strings::WORKSPACE_FILE_FILTER)
                 .desired_width(f32::INFINITY),
         );
-        let searching = !self.file_filter.trim().is_empty();
-        // A search lists the ranked hits flat; an empty filter shows the tree.
-        let rows: Vec<FileRow> = if searching {
-            let mut matches: Vec<(i32, &String)> = self
-                .files
-                .iter()
-                .filter_map(|path| crate::profiles::fuzzy_score(&self.file_filter, path).map(|score| (score, path)))
-                .collect();
-            matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-            matches
-                .iter()
-                .take(400)
-                .map(|(_, path)| {
-                    let (dir, name) = match path.rfind('/') {
-                        Some(index) => (&path[..index + 1], &path[index + 1..]),
-                        None => ("", path.as_str()),
-                    };
-                    FileRow { depth: 0, name: display(name, 120), dir: Some(display(dir, 120)), path: (*path).clone(), folder: false }
-                })
-                .collect()
-        } else {
-            self.file_tree()
-        };
+        self.update_file_rows();
         // The list fills the panel when no preview is open, and always ends on
         // a whole row: a height that is not a multiple of the row height cut
         // the last row in half.
         let room = if self.file_preview.is_some() { ui.available_height() * 0.45 } else { ui.available_height() };
         let list_height = (room / FILE_ROW_HEIGHT).floor().max(1.0) * FILE_ROW_HEIGHT;
         let mut open_file: Option<String> = None;
-        ScrollArea::vertical().id_salt("workspace-files").max_height(list_height).auto_shrink([false, false]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            for row in &rows {
-                if let Some(path) = self.file_row(ui, row) {
-                    open_file = Some(path);
+        // Move the cache, not its contents: only visible rows are borrowed and
+        // actions retain the original path even after a long scroll.
+        let rows = std::mem::take(&mut self.file_rows);
+        let spacing = ui.spacing().item_spacing.y;
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ScrollArea::vertical().id_salt("workspace-files").max_height(list_height).auto_shrink([false, false])
+            .show_rows(ui, FILE_ROW_HEIGHT, rows.len(), |ui, visible| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for index in visible {
+                    if let Some(path) = self.file_row(ui, &rows[index]) {
+                        open_file = Some(path);
+                    }
                 }
-            }
-        });
+            });
+        ui.spacing_mut().item_spacing.y = spacing;
+        self.file_rows = rows;
         if let Some(path) = open_file {
             self.busy = true;
             self.send(Request::ReadFile { path });
@@ -1376,17 +1468,28 @@ impl Workspace {
             let line = ui.fonts(|f| f.row_height(&theme::field_font(11.0)));
             let room = (ui.available_height() - 6.0).max(line);
             let height = (room / line).floor().max(1.0) * line - 1.0;
-            let markdown = path.ends_with(".md") || path.ends_with(".markdown");
-            ScrollArea::vertical().id_salt("workspace-file-preview").max_height(height).auto_shrink([false, false]).show(ui, |ui| {
-                if markdown {
-                    markdown_view(ui, text);
-                } else {
-                    code_view(ui, text);
-                }
-                if *truncated {
-                    ui.label(RichText::new(strings::WORKSPACE_FILE_TRUNCATED).color(theme::STATUS_YELLOW).font(theme::font(11.0)));
-                }
-            });
+            let markdown = is_markdown(path);
+            if markdown {
+                self.markdown.prepare(ui, text);
+                self.markdown.show(ui, height, path);
+            } else {
+                self.preview_wrapped.prepare(ui, text, &self.preview_rows);
+                let spacing = ui.spacing().item_spacing.y;
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ScrollArea::vertical().id_salt(("workspace-file-preview", path)).max_height(height).auto_shrink([false, false])
+                    .show_rows(ui, TEXT_ROW_HEIGHT, self.preview_wrapped.rows.len(), |ui, visible| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for index in visible {
+                            let row = &self.preview_wrapped.rows[index];
+                            let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), TEXT_ROW_HEIGHT), Sense::hover());
+                            paint_text_row(ui, rect, &text[row.bytes.clone()], row.number, theme::DIM);
+                        }
+                    });
+                ui.spacing_mut().item_spacing.y = spacing;
+            }
+            if *truncated {
+                ui.label(RichText::new(strings::WORKSPACE_FILE_TRUNCATED).color(theme::STATUS_YELLOW).font(theme::font(11.0)));
+            }
         }
     }
 
@@ -1432,6 +1535,7 @@ pub enum WorkspaceAction {
     Close,
 }
 
+#[derive(Clone)]
 enum Row {
     Folder { path: String, depth: usize, count: usize },
     File { change: Change },
@@ -1447,6 +1551,112 @@ struct FileRow {
     folder: bool,
 }
 
+struct TextRow {
+    bytes: std::ops::Range<usize>,
+    number: Option<u64>,
+    hunk: Option<usize>,
+    kind: PatchKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PatchKind { Add, Remove, Hunk, Context }
+
+impl PatchKind {
+    fn of(line: &str) -> Self {
+        if line.starts_with('+') && !line.starts_with("+++") { Self::Add }
+        else if line.starts_with('-') && !line.starts_with("---") { Self::Remove }
+        else if line.starts_with("@@") { Self::Hunk }
+        else { Self::Context }
+    }
+}
+
+#[derive(Default)]
+struct WrappedRows {
+    key: Option<(u32, u32, usize)>,
+    fonts: Option<egui::epaint::text::Fonts>,
+    rows: Vec<TextRow>,
+}
+
+impl WrappedRows {
+    fn prepare(&mut self, ui: &egui::Ui, text: &str, source: &[TextRow]) {
+        let width = (ui.available_width() - GUTTER - 4.0 - ui.spacing().scroll.bar_width - ui.spacing().scroll.bar_outer_margin).max(20.0);
+        let fonts = ui.fonts(Clone::clone);
+        let atlas = fonts.texture_atlas();
+        let key = (width.to_bits(), ui.ctx().pixels_per_point().to_bits(), std::sync::Arc::as_ptr(&atlas) as usize);
+        if self.key == Some(key) { return; }
+        self.key = Some(key);
+        self.fonts = Some(fonts.clone());
+        self.rows.clear();
+        let font = theme::field_font(11.0);
+        let mut widths = std::collections::HashMap::new();
+        for row in source {
+            let mut start = row.bytes.start;
+            let mut used = 0.0;
+            let mut first = true;
+            for (offset, ch) in text[row.bytes.clone()].char_indices() {
+                let at = row.bytes.start + offset;
+                let advance = *widths.entry(ch).or_insert_with(|| {
+                    if ch == '\t' { fonts.glyph_width(&font, ' ') * 4.0 } else { fonts.glyph_width(&font, ch) }
+                });
+                if at > start && used + advance > width {
+                    self.rows.push(TextRow { bytes: start..at, number: if first { row.number } else { None }, hunk: if first { row.hunk } else { None }, kind: row.kind });
+                    first = false;
+                    start = at;
+                    used = 0.0;
+                }
+                used += advance;
+            }
+            self.rows.push(TextRow { bytes: start..row.bytes.end, number: if first { row.number } else { None }, hunk: if first { row.hunk } else { None }, kind: row.kind });
+        }
+    }
+}
+
+/// Byte ranges and gutter numbers are computed on response, never on scroll.
+fn text_rows(text: &str, patch: bool) -> Vec<TextRow> {
+    let mut numbers = PatchNumbers::default();
+    let mut offset = 0;
+    let mut hunk = 0;
+    text.split_inclusive('\n').enumerate().map(|(index, raw)| {
+        let line = raw.strip_suffix('\n').unwrap_or(raw);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let start = offset;
+        offset += raw.len();
+        let number = if patch { numbers.line(line) } else { Some(index as u64 + 1) };
+        let hunk_index = if patch && line.starts_with("@@") {
+            let index = hunk;
+            hunk += 1;
+            Some(index)
+        } else { None };
+        TextRow { bytes: start..start + line.len(), number, hunk: hunk_index, kind: if patch { PatchKind::of(line) } else { PatchKind::Context } }
+    }).collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DiffStamp {
+    root: Option<PathBuf>,
+    path: String,
+    side: Option<bool>,
+    head: Option<String>,
+    change: Option<Change>,
+    index: Option<(u64, Option<SystemTime>)>,
+    file: Option<(u64, Option<SystemTime>)>,
+}
+
+impl DiffStamp {
+    fn read(root: Option<&Path>, path: &str, side: Option<bool>, status: &Status) -> Self {
+        let stat = |full: Result<PathBuf, String>| {
+            full.ok().and_then(|full| std::fs::metadata(full).ok()).map(|meta| (meta.len(), meta.modified().ok()))
+        };
+        Self {
+            root: root.map(Path::to_owned), path: path.to_owned(), side,
+            head: status.head_oid.clone(),
+            change: status.changes.iter().find(|change| change.path == path).cloned(),
+            index: root.and_then(|root| stat(git::metadata_path(root, "index"))),
+            file: root.and_then(|root| stat(git::resolve_path(root, path))),
+        }
+    }
+}
+
 /// Graph colours by commit section: not-yet-pushed commits are VS Code blue,
 /// already-pushed history the owner's pale pink (#D488B4), incoming purple.
 fn section_color(section: git::Section) -> egui::Color32 {
@@ -1457,93 +1667,153 @@ fn section_color(section: git::Section) -> egui::Color32 {
     }
 }
 
-/// File text with a line-number gutter; long lines wrap inside the panel.
-fn code_view(ui: &mut egui::Ui, text: &str) {
-    ui.spacing_mut().item_spacing.y = 0.0;
-    // Painted by hand, like the diff: a label in a grid cell does not wrap, so
-    // long lines ran off the panel edge.
-    for (index, line) in text.lines().enumerate() {
-        let width = ui.available_width();
-        let galley = ui.painter().layout(line.to_owned(), theme::field_font(11.0), theme::DIM, (width - GUTTER - 4.0).max(40.0));
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, galley.size().y), Sense::hover());
-        ui.painter().text(
-            egui::Pos2::new(rect.min.x + GUTTER - 8.0, rect.min.y + 1.0),
-            Align2::RIGHT_TOP,
-            (index + 1).to_string(),
-            theme::field_font(10.5),
-            theme::FAINT,
-        );
-        ui.painter().galley(egui::Pos2::new(rect.min.x + GUTTER, rect.min.y), galley, theme::DIM);
+fn is_markdown(path: &str) -> bool {
+    path.ends_with(".md") || path.ends_with(".markdown")
+}
+
+/// Rich Markdown rows retain their laid-out cells, with cumulative heights for
+/// binary-searching the viewport. A table is split into rows, never one giant
+/// off-screen widget. The font atlas identity changes on font reinstalls.
+#[derive(Default)]
+struct MarkdownCache {
+    key: Option<(u32, u32, usize)>,
+    fonts: Option<egui::epaint::text::Fonts>,
+    rows: Vec<MarkdownRow>,
+    height: f32,
+}
+
+struct MarkdownRow {
+    top: f32,
+    height: f32,
+    cells: Vec<MarkdownCell>,
+    header: bool,
+    rule: bool,
+}
+
+struct MarkdownCell {
+    x: f32,
+    lines: Vec<std::sync::Arc<egui::Galley>>,
+}
+
+impl MarkdownCell {
+    fn new(x: f32, galley: std::sync::Arc<egui::Galley>) -> Self {
+        // A cached single-line paint object prevents egui from scanning every
+        // wrapped row of a huge paragraph during tessellation.
+        let lines = galley.rows.iter().map(|row| std::sync::Arc::new(egui::Galley {
+            job: galley.job.clone(),
+            rows: vec![row.clone()],
+            elided: true,
+            rect: row.rect,
+            mesh_bounds: row.visuals.mesh_bounds,
+            num_vertices: row.visuals.mesh.vertices.len(),
+            num_indices: row.visuals.mesh.indices.len(),
+            pixels_per_point: galley.pixels_per_point,
+        })).collect();
+        Self { x, lines }
+    }
+
+    fn visible(&self, top: f32, bottom: f32) -> std::ops::Range<usize> {
+        let start = self.lines.partition_point(|line| line.rows[0].rect.max.y <= top);
+        let end = self.lines.partition_point(|line| line.rows[0].rect.min.y < bottom);
+        start..end.max(start)
     }
 }
 
-/// A small Markdown view: headings, lists, quotes, code fences, rules and
-/// tables (the tables are the point — a `.md` used to show its pipes). Inline
-/// marks are left as they are.
-fn markdown_view(ui: &mut egui::Ui, text: &str) {
-    let mut lines = text.lines().peekable();
-    while let Some(line) = lines.next() {
-        let plain = line.trim();
-        if plain.is_empty() {
-            ui.add_space(6.0);
-            continue;
-        }
-        if plain.starts_with("```") {
-            let mut code = Vec::new();
-            for next in lines.by_ref() {
-                if next.trim_start().starts_with("```") {
-                    break;
+impl MarkdownCache {
+    fn push(&mut self, cells: Vec<(f32, std::sync::Arc<egui::Galley>)>, padding: f32, header: bool, rule: bool) {
+        let height = cells.iter().map(|(_, galley)| galley.size().y).fold(0.0, f32::max) + padding;
+        let cells = cells.into_iter().map(|(x, galley)| MarkdownCell::new(x, galley)).collect();
+        self.rows.push(MarkdownRow { top: self.height, height, cells, header, rule });
+        self.height += height;
+    }
+
+    fn prepare(&mut self, ui: &egui::Ui, text: &str) {
+        // Account for the solid vertical scrollbar before layout, so the
+        // cached wrapping width is the viewport width, not the parent width.
+        let width = (ui.available_width() - ui.spacing().scroll.bar_width - ui.spacing().scroll.bar_outer_margin).max(40.0);
+        let fonts = ui.fonts(Clone::clone);
+        let atlas = fonts.texture_atlas();
+        let key = (width.to_bits(), ui.ctx().pixels_per_point().to_bits(), std::sync::Arc::as_ptr(&atlas) as usize);
+        if self.key == Some(key) { return; }
+        self.key = Some(key);
+        self.fonts = Some(fonts);
+        self.rows.clear();
+        self.height = 0.0;
+        let mut lines = text.lines().peekable();
+        let mut fenced = false;
+        while let Some(line) = lines.next() {
+            let plain = line.trim();
+            if plain.starts_with("```") {
+                fenced = !fenced;
+                continue;
+            }
+            if fenced {
+                let galley = ui.painter().layout(line.to_owned(), theme::field_font(11.0), theme::DIM, width);
+                self.push(vec![(0.0, galley)], 2.0, false, false);
+            } else if plain.is_empty() {
+                self.push(Vec::new(), 6.0, false, false);
+            } else if plain.starts_with('#') {
+                let level = plain.chars().take_while(|c| *c == '#').count().min(6);
+                let title = plain[level..].trim().trim_end_matches('#').trim();
+                let size = match level { 1 => 15.0, 2 => 13.5, _ => 12.5 };
+                self.push(Vec::new(), 6.0, false, false);
+                let galley = ui.painter().layout(title.to_owned(), theme::title_font(size), theme::TEXT, width);
+                self.push(vec![(0.0, galley)], 2.0, false, false);
+            } else if matches!(plain, "---" | "***" | "___") {
+                self.push(Vec::new(), 6.0, false, true);
+            } else if is_table_row(plain) && lines.peek().is_some_and(|next| is_table_separator(next)) {
+                let mut rows = vec![table_cells(plain)];
+                lines.next();
+                while lines.peek().is_some_and(|next| is_table_row(next)) {
+                    rows.push(table_cells(lines.next().unwrap_or_default()));
                 }
-                code.push(next.to_owned());
-            }
-            for line in &code {
-                ui.label(RichText::new(line).color(theme::DIM).font(theme::field_font(11.0)));
-            }
-            continue;
-        }
-        if plain.starts_with('#') {
-            let level = plain.chars().take_while(|c| *c == '#').count().min(6);
-            let title = plain[level..].trim().trim_end_matches('#').trim();
-            let size = match level {
-                1 => 15.0,
-                2 => 13.5,
-                _ => 12.5,
-            };
-            ui.add_space(6.0);
-            ui.label(RichText::new(title).color(theme::TEXT).font(theme::title_font(size)));
-            ui.add_space(2.0);
-            continue;
-        }
-        if plain == "---" || plain == "***" || plain == "___" {
-            theme::hairline(ui);
-            ui.add_space(4.0);
-            continue;
-        }
-        if is_table_row(plain) && lines.peek().is_some_and(|next| is_table_separator(next)) {
-            let mut rows = vec![table_cells(plain)];
-            lines.next();
-            while let Some(next) = lines.peek() {
-                if !is_table_row(next) {
-                    break;
+                let columns = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
+                let gap = 10.0_f32.min(width / (columns * 2) as f32);
+                let column = ((width - gap * (columns - 1) as f32) / columns as f32).max(1.0);
+                for (index, row) in rows.into_iter().enumerate() {
+                    let colour = if index == 0 { theme::TEXT } else { theme::DIM };
+                    let cells = row.iter().enumerate().map(|(cell, text)| {
+                        (cell as f32 * (column + gap), ui.painter().layout_job(inline_job(text, 11.5, colour, column)))
+                    }).collect();
+                    self.push(cells, 3.0, index == 0, true);
                 }
-                let row = lines.next().unwrap_or_default();
-                rows.push(table_cells(row));
+                self.push(Vec::new(), 6.0, false, false);
+            } else {
+                let (text, colour) = if let Some(rest) = plain.strip_prefix("> ") {
+                    (format!("│ {rest}"), theme::FAINT)
+                } else if let Some(rest) = plain.strip_prefix("- ").or_else(|| plain.strip_prefix("* ")).or_else(|| plain.strip_prefix("+ ")) {
+                    (format!("• {rest}"), theme::DIM)
+                } else { (plain.to_owned(), theme::DIM) };
+                let galley = ui.painter().layout_job(inline_job(&text, 11.5, colour, width));
+                self.push(vec![(0.0, galley)], 2.0, false, false);
             }
-            table_view(ui, &rows);
-            ui.add_space(6.0);
-            continue;
         }
-        if let Some(rest) = plain.strip_prefix("> ") {
-            let width = ui.available_width();
-            ui.label(inline_job(&format!("│ {rest}"), 11.5, theme::FAINT, width));
-            continue;
-        }
-        let width = ui.available_width();
-        let bullet = plain.strip_prefix("- ").or_else(|| plain.strip_prefix("* ")).or_else(|| plain.strip_prefix("+ "));
-        match bullet {
-            Some(rest) => ui.label(inline_job(&format!("• {rest}"), 11.5, theme::DIM, width)),
-            None => ui.label(inline_job(plain, 11.5, theme::DIM, width)),
-        };
+    }
+
+    fn visible(&self, top: f32, bottom: f32) -> std::ops::Range<usize> {
+        let start = self.rows.partition_point(|row| row.top + row.height <= top);
+        let end = self.rows.partition_point(|row| row.top < bottom);
+        start..end.max(start)
+    }
+
+    fn show(&self, ui: &mut egui::Ui, height: f32, path: &str) {
+        ScrollArea::vertical().id_salt(("workspace-markdown-preview", path)).max_height(height).auto_shrink([false, false])
+            .show_viewport(ui, |ui, viewport| {
+                let origin = ui.cursor().min;
+                ui.set_min_height(self.height);
+                for index in self.visible(viewport.min.y, viewport.max.y) {
+                    let row = &self.rows[index];
+                    let rect = Rect::from_min_size(origin + Vec2::new(0.0, row.top), Vec2::new(ui.available_width(), row.height));
+                    if row.header { ui.painter().rect_filled(rect, 0.0, theme::TAB_ACTIVE_BG); }
+                    for cell in &row.cells {
+                        let visible = cell.visible(viewport.min.y - row.top, viewport.max.y - row.top);
+                        for index in visible {
+                            ui.painter().galley(rect.min + Vec2::new(cell.x, 0.0), cell.lines[index].clone(), theme::DIM);
+                        }
+                    }
+                    if row.rule { ui.painter().hline(rect.x_range(), rect.max.y - 1.0, Stroke::new(1.0, theme::LINE)); }
+                }
+            });
     }
 }
 
@@ -1599,68 +1869,40 @@ fn table_cells(line: &str) -> Vec<String> {
     line.trim().trim_matches('|').split('|').map(|cell| cell.trim().to_owned()).collect()
 }
 
-/// Table cells are painted by hand so every column wraps inside the panel; a
-/// grid of labels would run past its edge.
-fn table_view(ui: &mut egui::Ui, rows: &[Vec<String>]) {
-    let columns = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
-    let width = ui.available_width();
-    let gap = 10.0;
-    let column = ((width - gap * (columns - 1) as f32) / columns as f32).max(40.0);
-    for (index, row) in rows.iter().enumerate() {
-        let colour = if index == 0 { theme::TEXT } else { theme::DIM };
-        let galleys: Vec<_> = (0..columns)
-            .map(|cell| {
-                let text = row.get(cell).cloned().unwrap_or_default();
-                ui.painter().layout_job(inline_job(&text, 11.5, colour, column))
-            })
-            .collect();
-        let height = galleys.iter().map(|galley| galley.size().y).fold(0.0, f32::max).max(14.0);
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
-        if index == 0 {
-            ui.painter().rect_filled(rect, 0.0, theme::TAB_ACTIVE_BG);
-        }
-        for (cell, galley) in galleys.into_iter().enumerate() {
-            let x = rect.min.x + cell as f32 * (column + gap);
-            ui.painter().galley(egui::Pos2::new(x, rect.min.y), galley, colour);
-        }
-        theme::hairline(ui);
-    }
-}
 
 /// One patch line: a right-aligned file line number in the gutter, then the
 /// patch line itself, with the change band behind both — as in the reference
 /// diff view. Added and removed lines get a full-width tinted band with the
 /// line colour on top; colouring only the text is easy to miss.
-fn patch_line(ui: &mut egui::Ui, line: &str, number: Option<u64>) {
+fn patch_line(ui: &mut egui::Ui, line: &str, number: Option<u64>, kind: PatchKind) {
     // The bands must tile: any item spacing would show as a gap between lines.
     ui.spacing_mut().item_spacing.y = 0.0;
-    let (band, colour) = if line.starts_with('+') && !line.starts_with("+++") {
-        (Some(theme::DIFF_ADD_BG), theme::STATUS_GREEN)
-    } else if line.starts_with('-') && !line.starts_with("---") {
-        (Some(theme::DIFF_REMOVE_BG), theme::STATUS_RED)
-    } else if line.starts_with("@@") {
-        (None, theme::DIFF_HUNK)
-    } else {
-        (None, theme::DIM)
+    let (band, colour) = match kind {
+        PatchKind::Add => (Some(theme::DIFF_ADD_BG), theme::STATUS_GREEN),
+        PatchKind::Remove => (Some(theme::DIFF_REMOVE_BG), theme::STATUS_RED),
+        PatchKind::Hunk => (None, theme::DIFF_HUNK),
+        PatchKind::Context => (None, theme::DIM),
     };
     let width = ui.available_width();
-    let galley = ui.painter().layout(line.to_owned(), theme::field_font(11.0), colour, (width - GUTTER - 4.0).max(40.0));
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, galley.size().y), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, TEXT_ROW_HEIGHT), Sense::hover());
     if let Some(band) = band {
         // Half-pixel bleed: two bands sharing a fractional edge would blend
         // with the background where they meet and read as a torn line.
         ui.painter().rect_filled(rect.expand2(Vec2::new(0.0, 0.5)), 0.0, band);
     }
+    paint_text_row(ui, rect, line, number, colour);
+}
+
+fn paint_text_row(ui: &egui::Ui, rect: Rect, line: &str, number: Option<u64>, colour: egui::Color32) {
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
     if let Some(number) = number {
-        ui.painter().text(
+        painter.text(
             egui::Pos2::new(rect.min.x + GUTTER - 8.0, rect.min.y + 1.0),
-            Align2::RIGHT_TOP,
-            number.to_string(),
-            theme::field_font(10.5),
-            theme::FAINT,
+            Align2::RIGHT_TOP, number.to_string(), theme::field_font(10.5), theme::FAINT,
         );
     }
-    ui.painter().galley(egui::Pos2::new(rect.min.x + GUTTER, rect.min.y), galley, colour);
+    let galley = painter.layout_no_wrap(line.to_owned(), theme::field_font(11.0), colour);
+    painter.galley(egui::Pos2::new(rect.min.x + GUTTER, rect.min.y), galley, colour);
 }
 
 /// File line numbers of a patch: the old number for removals, the new one for
@@ -1835,36 +2077,53 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
-/// Opens a repository file with its associated application. Programs,
-/// scripts and shortcuts are shown in Explorer instead: the default verb of
-/// a `.js`, `.bat` or `.lnk` from a cloned repository runs it.
-fn open_external(root: &Option<PathBuf>, path: &str) {
-    if runs_when_opened(path) {
-        reveal_in_explorer(root, path);
-    } else if let Some(root) = root {
-        crate::settings_ui::open_path(&root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR)));
+/// Shell-open only a small set of viewer formats with matching content.
+/// Unknown extensions (including future script/installer types) reveal in
+/// Explorer. Resolve before either action, using the mutation/preview guard.
+fn external_open_target(root: &Path, path: &str) -> Result<(PathBuf, bool), String> {
+    use std::io::Read;
+    let full = git::resolve_path(root, path)?;
+    let extension = full.extension().and_then(|extension| extension.to_str()).unwrap_or("").to_ascii_lowercase();
+    let mut prefix = [0_u8; 512];
+    let safe = std::fs::File::open(&full).ok().and_then(|mut file| file.read(&mut prefix).ok())
+        .is_some_and(|size| viewable_content(&extension, &prefix[..size]));
+    Ok((full, safe))
+}
+
+fn viewable_content(extension: &str, prefix: &[u8]) -> bool {
+    match extension {
+        "png" => prefix.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "jpg" | "jpeg" => prefix.starts_with(b"\xff\xd8\xff"),
+        "gif" => prefix.starts_with(b"GIF87a") || prefix.starts_with(b"GIF89a"),
+        "bmp" => prefix.starts_with(b"BM"),
+        "webp" => prefix.starts_with(b"RIFF") && prefix.get(8..12) == Some(b"WEBP"),
+        "pdf" => prefix.starts_with(b"%PDF-"),
+        "txt" | "log" | "csv" | "md" | "markdown" => {
+            !prefix.starts_with(b"MZ") && !prefix.starts_with(b"\x7fELF") && !prefix.starts_with(b"#!")
+                && !prefix.contains(&0)
+                && std::str::from_utf8(prefix).map_or_else(|error| error.error_len().is_none(), |_| true)
+        }
+        _ => false,
     }
 }
 
-/// True when the shell's default action for `path` executes it.
-fn runs_when_opened(path: &str) -> bool {
-    const RUNNABLE: &[&str] = &[
-        "exe", "com", "bat", "cmd", "ps1", "psm1", "psd1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "ws", "hta", "msi",
-        "msp", "msc", "lnk", "url", "scr", "pif", "cpl", "reg", "jar", "py", "pyw", "appref-ms", "application", "gadget",
-        "inf", "scf", "chm", "settingcontent-ms", "library-ms", "search-ms",
-    ];
-    let Some((_, extension)) = path.rsplit_once('.') else { return false };
-    let extension = extension.to_ascii_lowercase();
-    if extension.contains(['/', '\\']) {
-        return false;
+fn open_external(root: &Option<PathBuf>, path: &str) {
+    let Some(root) = root else { return };
+    let Ok((full, safe)) = external_open_target(root, path) else { return };
+    if safe {
+        crate::settings_ui::open_path(&full);
+    } else {
+        reveal_resolved(&full);
     }
-    let pathext = std::env::var("PATHEXT").unwrap_or_default().to_ascii_lowercase();
-    RUNNABLE.contains(&extension.as_str()) || pathext.split(';').any(|known| known.trim_start_matches('.') == extension)
 }
 
 fn reveal_in_explorer(root: &Option<PathBuf>, path: &str) {
     let Some(root) = root else { return };
-    let full = root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR));
+    let Ok(full) = git::resolve_path(root, path) else { return };
+    reveal_resolved(&full);
+}
+
+fn reveal_resolved(full: &Path) {
     let mut command = std::process::Command::new("explorer.exe");
     command.arg(format!("/select,{}", full.display()));
     #[cfg(windows)]
@@ -1972,7 +2231,7 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                         };
                         let files = git::parse_diff(&bytes, from_index);
                         let text = String::from_utf8_lossy(&bytes).into_owned();
-                        send(Response::Diff { path, files, text, staged: from_index });
+                        send(Response::Diff { path, files, text, staged: from_index, side });
                     }
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
                 },
@@ -1997,7 +2256,7 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                     }
                     let result = root.as_ref().ok_or_else(|| strings::WORKSPACE_NO_REPO.to_owned()).and_then(|root| {
                         let prompt = staged_ai_prompt(root)?;
-                        git::ai_commit_message(&git::ai_workdir(), command.as_deref(), &prompt, git::AI_TIMEOUT)
+                        git::ai_commit_message(command.as_deref(), &prompt, git::AI_TIMEOUT)
                     });
                     // An AI subprocess can outlive a configuration change; never
                     // publish its result using approval for the old digest.
@@ -2071,7 +2330,7 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
                 },
                 Request::ReadFile { path } => match &root {
-                    Some(root) => match git::read_file(root, &path, 512 * 1024) {
+                    Some(root) => match git::read_file(root, &path, MAX_PREVIEW_BYTES) {
                         Ok((text, truncated)) => send(Response::FileText { path, text, truncated }),
                         Err(e) => send(Response::Error(e)),
                     },
@@ -2184,6 +2443,160 @@ pub fn clamp_width(width: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_ranges_preserve_unicode_crlf_numbers_and_last_line() {
+        let text = "diff --git a/f b/f\r\n@@ -10,2 +20,3 @@\r\n-old\r\n+новый\r\n context\r\n+last";
+        let rows = text_rows(text, true);
+        assert_eq!(rows.iter().map(|row| &text[row.bytes.clone()]).collect::<Vec<_>>(),
+            ["diff --git a/f b/f", "@@ -10,2 +20,3 @@", "-old", "+новый", " context", "+last"]);
+        assert_eq!(rows.iter().map(|row| row.number).collect::<Vec<_>>(), [None, None, Some(10), Some(20), Some(21), Some(22)]);
+        assert_eq!(rows[1].hunk, Some(0));
+        let plain = "first\n\nпоследний";
+        let rows = text_rows(plain, false);
+        assert_eq!(rows.last().unwrap().number, Some(3));
+        assert_eq!(&plain[rows.last().unwrap().bytes.clone()], "последний");
+    }
+
+    #[test]
+    fn file_cache_navigation_and_refresh_keep_original_paths() {
+        let (tx, rx) = mpsc::channel();
+        let mut workspace = Workspace { rx: Some(rx), ..Default::default() };
+        let files: Vec<_> = (0..50_001).map(|index| format!("src/file-{index:05}.txt")).collect();
+        tx.send(Response::Files(files.clone())).unwrap();
+        workspace.absorb();
+        workspace.update_file_rows();
+        assert_eq!(workspace.file_rows.len(), 1, "folded tree must not expose descendants");
+        workspace.toggle_file_folder("src");
+        workspace.update_file_rows();
+        assert_eq!(workspace.file_rows.len(), files.len() + 1);
+        assert_eq!(workspace.file_rows.last().unwrap().path, "src/file-50000.txt");
+        workspace.update_file_rows();
+        assert_eq!(workspace.file_rows.last().unwrap().path, "src/file-50000.txt", "idle cache preserves the last navigable row");
+        workspace.file_filter = "file-50000".to_owned();
+        workspace.update_file_rows();
+        assert_eq!(workspace.file_rows[0].path, "src/file-50000.txt", "search actions use the full original path");
+        tx.send(Response::Files(vec!["renamed.txt".to_owned()])).unwrap();
+        workspace.absorb();
+        workspace.update_file_rows();
+        assert!(workspace.file_rows.is_empty(), "removed search hits must not survive refresh");
+        workspace.file_filter.clear();
+        workspace.update_file_rows();
+        assert_eq!(workspace.file_rows[0].path, "renamed.txt");
+    }
+
+    #[test]
+    fn unchanged_poll_keeps_diff_and_changed_metadata_reloads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        if !git(dir.path(), &["init", "--quiet"]) { return; }
+        std::fs::write(dir.path().join("f.txt"), "old\n").unwrap();
+        let status = Status { branch: "main".to_owned(), changes: vec![changed_file("f.txt")], ..Default::default() };
+        let (request_tx, request_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+        let mut workspace = Workspace {
+            root: Some(dir.path().to_owned()), status: status.clone(), diff_path: Some("f.txt".to_owned()),
+            diff_stamp: Some(DiffStamp::read(Some(dir.path()), "f.txt", None, &status)),
+            log_status_seen: true, tx: Some(request_tx), rx: Some(response_rx), ..Default::default()
+        };
+        response_tx.send(Response::Status(status.clone(), workspace.root.clone())).unwrap();
+        workspace.absorb();
+        assert!(!request_rx.try_iter().any(|(_, request)| matches!(request, Request::Diff { .. })));
+        std::fs::write(dir.path().join("f.txt"), "new content, same status letters\n").unwrap();
+        response_tx.send(Response::Status(status.clone(), workspace.root.clone())).unwrap();
+        workspace.absorb();
+        assert!(request_rx.try_iter().any(|(_, request)| matches!(request, Request::Diff { .. })));
+        response_tx.send(Response::Diff { path: "f.txt".to_owned(), files: Vec::new(), text: "@@ -1 +1 @@\n-old\n+new".to_owned(), staged: false, side: None }).unwrap();
+        workspace.absorb();
+        assert_eq!(&workspace.diff_text[workspace.diff_rows.last().unwrap().bytes.clone()], "+new");
+        assert!(git(dir.path(), &["add", "--", "f.txt"]));
+        response_tx.send(Response::Status(status.clone(), workspace.root.clone())).unwrap();
+        workspace.absorb();
+        assert!(request_rx.try_iter().any(|(_, request)| matches!(request, Request::Diff { .. })), "an externally changed index invalidates the open diff");
+        response_tx.send(Response::Applied).unwrap();
+        response_tx.send(Response::Status(status, workspace.root.clone())).unwrap();
+        workspace.absorb();
+        assert!(request_rx.try_iter().any(|(_, request)| matches!(request, Request::Diff { .. })), "explicit staging invalidates even unchanged metadata");
+        workspace.diff_side = Some(true);
+        response_tx.send(Response::Diff { path: "f.txt".to_owned(), files: Vec::new(), text: "stale worktree".to_owned(), staged: false, side: Some(false) }).unwrap();
+        workspace.absorb();
+        assert!(workspace.diff_text.ends_with("+new"), "late worktree response cannot replace a selected index diff");
+    }
+
+    #[test]
+    fn multi_megabyte_preview_reads_and_maps_its_final_line() {
+        let repository = tempfile::tempdir().unwrap();
+        if !git(repository.path(), &["init", "--quiet"]) { return; }
+        let text = format!("{}tail marker\n", "preview row with sufficient width for realistic workload........\n".repeat(120_000));
+        assert!(text.len() > 7 * 1024 * 1024 && text.len() < MAX_PREVIEW_BYTES);
+        std::fs::write(repository.path().join("large.txt"), &text).unwrap();
+        let (tx, rx) = spawn_worker();
+        tx.send((None, Request::Refresh { cwd: repository.path().to_owned() })).unwrap();
+        let shown = approve_worker(&tx, &rx);
+        tx.send((shown.clone(), Request::ReadFile { path: "large.txt".to_owned() })).unwrap();
+        let response = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        let Response::FileText { text: loaded, truncated, .. } = &response else { panic!("real preview response expected") };
+        assert!(!truncated && loaded == &text, "supported multi-megabyte previews must not silently stop at 512 KiB");
+        let (response_tx, response_rx) = mpsc::channel();
+        let mut workspace = Workspace { rx: Some(response_rx), ..Default::default() };
+        response_tx.send(response).unwrap();
+        workspace.absorb();
+        let loaded = &workspace.file_preview.as_ref().unwrap().1;
+        let last = workspace.preview_rows.last().unwrap();
+        assert_eq!(&loaded[last.bytes.clone()], "tail marker");
+        assert_eq!(last.number, Some(120_001));
+        std::fs::write(repository.path().join("large.txt"), vec![b'x'; MAX_PREVIEW_BYTES + 1]).unwrap();
+        tx.send((shown, Request::ReadFile { path: "large.txt".to_owned() })).unwrap();
+        let Response::FileText { text, truncated, .. } = rx.recv_timeout(Duration::from_secs(20)).unwrap() else { panic!("real capped response expected") };
+        assert!(truncated && text.len() == MAX_PREVIEW_BYTES, "files beyond the cap still report truncation");
+    }
+
+    #[test]
+    fn wrapped_rows_preserve_text_and_hunk_identity_across_resizes() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        let text = "@@ -10,1 +10,1 @@ long header with context\n+длинная строка repeated repeated repeated repeated";
+        let source = text_rows(text, true);
+        let mut cache = WrappedRows::default();
+        for width in [180.0, 700.0] {
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_max_width(width);
+                    cache.prepare(ui, text, &source);
+                    assert_eq!(cache.rows.iter().map(|row| &text[row.bytes.clone()]).collect::<String>(), text.replace('\n', ""));
+                    assert_eq!(cache.rows.iter().filter(|row| row.hunk == Some(0)).count(), 1);
+                    assert_eq!(cache.rows.iter().filter(|row| row.number == Some(10)).count(), 1);
+                    assert!(cache.rows.last().unwrap().bytes.end == text.len());
+                    cache.prepare(ui, text, &source);
+                    assert_eq!(cache.rows.last().unwrap().kind, PatchKind::Add);
+                });
+            });
+        }
+    }
+
+    #[test]
+    fn rich_markdown_viewport_reaches_last_block_and_keeps_inline_formats() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        let text = format!("# Heading\n| Name | Value |\n| --- | --- |\n| **bold** | `code` |\n{}\nlast marker", "paragraph with wrapping and **bold** text\n".repeat(2_000));
+        let mut cache = MarkdownCache::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_max_width(300.0);
+                cache.prepare(ui, &text);
+                assert!(cache.rows.iter().any(|row| row.header && row.cells.len() == 2));
+                assert!(cache.rows.iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.lines)
+                    .flat_map(|line| &line.job.sections).any(|section| section.format.background == theme::TAB_ACTIVE_BG),
+                    "inline code retains its rich background");
+                let last = cache.rows.last().unwrap();
+                assert_eq!(last.cells[0].lines[0].rows[0].text(), "last marker");
+                let visible = cache.visible(last.top, cache.height);
+                assert!(visible.contains(&(cache.rows.len() - 1)));
+                assert!(visible.len() < 10, "scrolling to the end does not render the whole document");
+                cache.prepare(ui, &text);
+                assert_eq!(cache.rows.last().unwrap().cells[0].lines[0].rows[0].text(), "last marker");
+            });
+        });
+    }
 
     fn commit(hash: &str, section: git::Section) -> git::Commit {
         git::Commit {
@@ -2525,12 +2938,40 @@ mod tests {
     /// a shortcut from a cloned repository that is running it, not viewing it.
     #[test]
     fn programs_and_scripts_are_not_opened() {
-        for path in ["setup.exe", "run.BAT", "a/b/tool.cmd", "x.ps1", "x.js", "x.vbs", "x.wsf", "x.hta", "x.lnk", "x.url", "x.py", "x.reg", "x.msi"] {
-            assert!(runs_when_opened(path), "{path}");
+        let dir = tempfile::tempdir().unwrap();
+        for extension in ["exe", "BAT", "cmd", "ps1", "js", "vbs", "wsf", "hta", "lnk", "url", "py", "reg", "msi",
+            "sh", "pyz", "pyzw", "diagcab", "msix", "appx", "appinstaller", "xll", "rdp", "website", "unknown"] {
+            let path = format!("file.{extension}");
+            std::fs::write(dir.path().join(&path), b"ordinary text\n").unwrap();
+            assert!(!external_open_target(dir.path(), &path).unwrap().1, "{path} must reveal, never execute");
         }
-        for path in ["README.md", "src/main.rs", "image.png", "notes.txt", "Makefile", "data.json"] {
-            assert!(!runs_when_opened(path), "{path}");
+        for (path, content) in [("notes.txt", b"read me\n".as_slice()), ("README.md", b"# title\n"),
+            ("image.png", b"\x89PNG\r\n\x1a\n"), ("paper.pdf", b"%PDF-1.7\n")] {
+            std::fs::write(dir.path().join(path), content).unwrap();
+            assert!(external_open_target(dir.path(), path).unwrap().1, "{path} can use its viewer");
+            std::fs::write(dir.path().join(path), b"MZrenamed executable").unwrap();
+            assert!(!external_open_target(dir.path(), path).unwrap().1, "renaming a program to {path} must not approve it");
         }
+        assert!(external_open_target(dir.path(), "../outside.txt").is_err());
+        assert!(external_open_target(dir.path(), "notes.txt:stream").is_err());
+    }
+
+    #[test]
+    fn external_open_rejects_repository_reparse_escape() {
+        let repository = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("secret.txt");
+        std::fs::write(&target, "outside repository").unwrap();
+        let link = repository.path().join("link.txt");
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&target, &link);
+        #[cfg(not(windows))]
+        let linked = std::os::unix::fs::symlink(&target, &link);
+        if let Err(error) = linked {
+            eprintln!("symlink creation unavailable: {error}");
+            return;
+        }
+        assert!(external_open_target(repository.path(), "link.txt").is_err());
     }
 
     /// std::fs::rename replaces an existing target on Windows: renaming onto
@@ -2860,7 +3301,7 @@ mod tests {
         assert!(!workspace.busy && workspace.detail.is_none());
         workspace.busy = true;
         workspace.detail = Some(("new".to_owned(), git::CommitDetail { files: Vec::new(), header: String::new() }));
-        workspace.detail_file = Some(CommitFile { path: "new.txt".to_owned(), patch: None });
+        workspace.detail_file = Some(CommitFile { path: "new.txt".to_owned(), patch: None, rows: Vec::new(), wrapped: WrappedRows::default() });
         tx.send(Response::CommitDiff { hash: "new".to_owned(), path: "old.txt".to_owned(), patch: Ok("stale patch".to_owned()) }).unwrap();
         workspace.absorb();
         assert!(!workspace.busy);

@@ -97,12 +97,32 @@ pub fn run_git_timeout(root: &Path, args: &[&str], timeout: std::time::Duration)
     run_git_capped(root, args, timeout, GIT_MAX_OUTPUT)
 }
 
+/// The branch name `git rev-parse --abbrev-ref HEAD` reports in `dir`.
+///
+/// Used by the standalone Claude status helper, which runs next to ANVIL
+/// without a trust prompt: a guarded refusal (a network repository path) or
+/// any Git failure is simply reported as no branch, never as an error.
+pub fn branch_at(dir: &Path, timeout: std::time::Duration) -> Option<String> {
+    // No repository means no branch; not spawning Git also keeps the status
+    // line cheap in ordinary directories.
+    let checked = preflight(dir).ok()?;
+    checked.repository.as_ref()?;
+    let text = run_git_timeout(dir, &["rev-parse", "--abbrev-ref", "HEAD"], timeout).ok()?;
+    let branch = String::from_utf8_lossy(&text).trim().to_owned();
+    (!branch.is_empty()).then_some(branch)
+}
+
 /// `git` in `root`, configured the same way for every call the panel makes.
 /// The panel follows the shell into any folder, so the repository's own
 /// config must not be able to run code on a mere poll, and the user's config
 /// must not change the output the parsers read.
-fn git_command(root: &Path) -> Command {
-    let mut command = Command::new("git");
+fn git_command(root: &Path) -> Result<Command, String> {
+    let checked = preflight(root)?;
+    Ok(base_git_command(root, &checked.executable))
+}
+
+fn base_git_command(root: &Path, executable: &Path) -> Command {
+    let mut command = Command::new(executable);
     command
         // Command-line config wins over the repository's: a repo-local
         // fsmonitor hook or signature verifier must not run on a refresh,
@@ -118,6 +138,16 @@ fn git_command(root: &Path) -> Command {
         // The background poll must not take index.lock to refresh stat data:
         // a `git add` or commit in the shell next to it would then fail.
         .env("GIT_OPTIONAL_LOCKS", "0");
+    // Discovery belongs to the panel's cwd, not an inherited shell override.
+    // These variables can also redirect Git to an unchecked metadata path.
+    for key in [
+        "GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_INDEX_FILE", "GIT_SHALLOW_FILE",
+        "GIT_CONFIG", "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS", "GIT_CEILING_DIRECTORIES", "GIT_EXEC_PATH",
+    ] {
+        command.env_remove(key);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -128,7 +158,7 @@ fn git_command(root: &Path) -> Command {
 
 /// Spawns `git` with prompts disabled, literal pathspecs and a hard deadline.
 fn run_git_capped(root: &Path, args: &[&str], timeout: std::time::Duration, max_bytes: usize) -> Result<Vec<u8>, String> {
-    let mut command = git_command(root);
+    let mut command = git_command(root)?;
     command.args(args);
     let label = format!("git {}", args.first().copied().unwrap_or(""));
     let (success, stdout, stderr) = run_bounded(command, &label, timeout, max_bytes, None)?;
@@ -236,6 +266,7 @@ const NUL: char = '\0';
 /// catch symlinks and junctions pointing outside the repository.
 pub fn resolve_path(root: &Path, path: &str) -> Result<PathBuf, String> {
     let inside = crate::strings::WORKSPACE_PATH_INSIDE_REPO;
+    local_path(root)?;
     let clean = path.replace('\\', "/");
     if clean.is_empty() || clean.starts_with('/') || clean.contains(':') || clean.contains('~') {
         return Err(inside.to_owned());
@@ -261,6 +292,7 @@ pub fn resolve_path(root: &Path, path: &str) -> Result<PathBuf, String> {
     if full == root {
         return Err(inside.to_owned());
     }
+    local_path(&full)?;
     let canonical_root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
     let mut probe = full.clone();
     loop {
@@ -286,16 +318,16 @@ pub fn resolve_path(root: &Path, path: &str) -> Result<PathBuf, String> {
 
 /// The repository root containing `cwd`, if any.
 pub fn find_root(cwd: &Path) -> Option<PathBuf> {
-    if !cwd.is_dir() {
-        return None;
-    }
-    run_git(cwd, &["rev-parse", "--show-toplevel"]).ok().map(|text| PathBuf::from(text.trim()))
+    preflight(cwd).ok()?.repository.as_ref().map(|repository| repository.root.clone())
 }
 
 /// One configuration file whose stat decides whether a cached digest is stale.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ConfigSource {
     path: PathBuf,
+    /// All local aliases are checked: deduplicating a target must not hide a
+    /// junction/symlink replacement at a second include path.
+    aliases: Vec<PathBuf>,
     /// Length and mtime of the file when the digest was computed; `None` when
     /// it did not exist then.
     state: Option<(u64, Option<std::time::SystemTime>)>,
@@ -303,12 +335,34 @@ struct ConfigSource {
 
 impl ConfigSource {
     fn read(path: &Path) -> ConfigSource {
-        let state = std::fs::metadata(path).ok().map(|meta| (meta.len(), meta.modified().ok()));
-        ConfigSource { path: path.to_path_buf(), state }
+        let resolved = local_path(path);
+        let state = resolved.as_ref().ok().and_then(|path| {
+            std::fs::metadata(path).ok().map(|meta| (meta.len(), meta.modified().ok()))
+        });
+        let resolved = resolved.unwrap_or_else(|_| path.to_path_buf());
+        ConfigSource { path: resolved, aliases: vec![path.to_path_buf()], state }
     }
 
     fn is_current(&self) -> bool {
-        ConfigSource::read(&self.path).state == self.state
+        // Never follow a redirect installed since the previous snapshot, and
+        // never let a differently cased spelling of the same file look stale.
+        self.aliases.iter().all(|alias| local_path(alias).is_ok_and(|resolved| same_path(&resolved, &self.path)))
+            && std::fs::metadata(&self.path).ok().map(|meta| (meta.len(), meta.modified().ok())) == self.state
+    }
+}
+
+/// Windows paths compare case-insensitively, exactly as the filesystem does.
+fn same_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -318,7 +372,7 @@ impl ConfigSource {
 /// `checkout -b` write `branch.*` tracking keys, `remote add` writes
 /// `remote.*`, and the user's own editor or pager settings are not the
 /// repository's business.
-fn is_hazardous_key(key: &str) -> bool {
+fn is_hazardous_key(key: &str, value: &str) -> bool {
     let key = key.to_ascii_lowercase();
     let (section, rest) = key.split_once('.').unwrap_or((key.as_str(), ""));
     match section {
@@ -333,12 +387,19 @@ fn is_hazardous_key(key: &str) -> bool {
         // Signature programs run on commit, tag and `--show-signature`.
         "gpg" => true,
         // `submodule.<name>.update = !cmd` runs a command.
-        "submodule" => true,
+        "submodule" => rest.ends_with(".update") && value.trim_start().starts_with('!'),
         "core" => matches!(rest, "fsmonitor" | "hookspath" | "sshcommand" | "gitproxy" | "attributesfile"),
         "diff" => rest == "external" || rest.ends_with(".command") || rest.ends_with(".textconv"),
         "commit" | "tag" => matches!(rest, "gpgsign" | "gpgformat"),
         "log" => rest == "showsignature",
-        "remote" => rest.ends_with(".receivepack") || rest.ends_with(".uploadpack") || rest.ends_with(".proxy"),
+        "protocol" => (rest == "allow" || rest.ends_with(".allow")) && !value.eq_ignore_ascii_case("never"),
+        "url" => (rest.ends_with(".insteadof") || rest.ends_with(".pushinsteadof")) && !value.is_empty(),
+        "remote" => {
+            rest.ends_with(".receivepack") || rest.ends_with(".uploadpack") || rest.ends_with(".proxy")
+                || (rest.ends_with(".vcs") && !value.trim().is_empty())
+                || ((rest.ends_with(".url") || rest.ends_with(".pushurl"))
+                    && matches!(value.trim_start().split_once("::"), Some(("ext" | "fd", _))))
+        }
         _ => false,
     }
 }
@@ -391,11 +452,12 @@ pub struct RepositoryIdentity {
     pub stamp: RepositoryStamp,
 }
 
-/// Root/config discovery is read-only: unlike status/diff/log, these Git
-/// commands cannot invoke clean filters, hooks or signature programs.
+/// Discover metadata locally before Git may follow a gitfile, commondir or
+/// configuration include. Discovery itself never starts a Git process.
 pub fn repository_identity(cwd: &Path) -> Result<Option<RepositoryIdentity>, String> {
-    reject_network_repository(cwd)?;
-    let Some(root) = find_root(cwd) else { return Ok(None) };
+    let checked = preflight(cwd)?;
+    let Some(repository) = checked.repository.as_ref() else { return Ok(None) };
+    let root = repository.root.clone();
     let stamp = repository_stamp(&root)?;
     Ok(Some(RepositoryIdentity { root, stamp }))
 }
@@ -405,9 +467,9 @@ pub fn repository_identity(cwd: &Path) -> Result<Option<RepositoryIdentity>, Str
 /// Recomputed only when one of the configuration files behind the previous
 /// digest changed, so a poll cycle does not spawn a `git config` per request.
 pub fn repository_stamp(root: &Path) -> Result<RepositoryStamp, String> {
-    reject_network_repository(root)?;
+    let checked = preflight(root)?;
     if let Some(cached) = cached_stamp(root) {
-        if cached.is_current() {
+        if cached.sources == checked.sources {
             return Ok(cached);
         }
     }
@@ -418,16 +480,24 @@ pub fn repository_stamp(root: &Path) -> Result<RepositoryStamp, String> {
 
 fn read_stamp(root: &Path) -> Result<RepositoryStamp, String> {
     const CONFIG_MAX_OUTPUT: usize = 1024 * 1024;
-    let config = run_git_capped(
-        root,
-        &["config", "--includes", "--show-origin", "--show-scope", "--null", "--list"],
-        GIT_TIMEOUT,
-        CONFIG_MAX_OUTPUT,
-    )?;
-    if config.len() >= CONFIG_MAX_OUTPUT || config.last() != Some(&0) {
-        return Err("Не удалось полностью прочитать конфигурацию Git; доступ к репозиторию не разрешён.".to_owned());
+    // Capture ALL sources before Git reads any of them, including absent
+    // include targets. Never attach a post-read stat to earlier output.
+    for _ in 0..3 {
+        let checked = preflight(root)?;
+        let config = run_git_capped(
+            root,
+            &["config", "--includes", "--show-origin", "--show-scope", "--null", "--list"],
+            GIT_TIMEOUT,
+            CONFIG_MAX_OUTPUT,
+        )?;
+        if config.len() >= CONFIG_MAX_OUTPUT || config.last() != Some(&0) {
+            return Err(config_refusal());
+        }
+        if checked.sources.iter().all(ConfigSource::is_current) {
+            return Ok(digest_of(&config, root, checked.sources.clone()));
+        }
     }
-    Ok(digest_of(&config, root, &local_config_path(root)))
+    Err(config_refusal())
 }
 
 /// Local scope and files inside the repository only: the user's own global
@@ -435,10 +505,9 @@ fn read_stamp(root: &Path) -> Result<RepositoryStamp, String> {
 /// repository's, and changing them must not revoke approval. A global
 /// `includeIf` that points at a repository file still counts, because that
 /// file is repository-controlled.
-fn digest_of(config: &[u8], root: &Path, local_config: &Path) -> RepositoryStamp {
+fn digest_of(config: &[u8], root: &Path, sources: std::sync::Arc<Vec<ConfigSource>>) -> RepositoryStamp {
     let mut digest = Vec::new();
     let mut hazards = Vec::new();
-    let mut sources: Vec<ConfigSource> = Vec::new();
     // Each entry contributes three NUL-separated tokens: scope, origin, and
     // `key\nvalue`; the entries themselves are not separable by NUL alone.
     let mut tokens = config.split(|byte| *byte == 0).filter(|token| !token.is_empty());
@@ -455,12 +524,7 @@ fn digest_of(config: &[u8], root: &Path, local_config: &Path) -> RepositoryStamp
         if !local && !inside {
             continue;
         }
-        if let Some(path) = path {
-            if local || inside {
-                sources.push(ConfigSource::read(&path));
-            }
-        }
-        if is_hazardous_key(&String::from_utf8_lossy(key)) {
+        if is_hazardous_key(&String::from_utf8_lossy(key), &String::from_utf8_lossy(value)) {
             digest.extend_from_slice(key);
             digest.push(b'\n');
             digest.extend_from_slice(value);
@@ -468,37 +532,48 @@ fn digest_of(config: &[u8], root: &Path, local_config: &Path) -> RepositoryStamp
             hazards.push(String::from_utf8_lossy(key).into_owned());
         }
     }
-    // A configuration file with no hazardous entries still decides whether new
-    // ones appear, so its own stat belongs to the freshness check.
-    sources.push(ConfigSource::read(local_config));
     hazards.sort();
     hazards.dedup();
     RepositoryStamp {
         digest: std::sync::Arc::new(digest),
         hazards: std::sync::Arc::new(hazards),
-        sources: std::sync::Arc::new(sources),
+        sources,
     }
 }
 
 /// `<origin>` is `file:<path>`, C-quoted when the path has special bytes.
 fn origin_path(origin: &[u8]) -> Option<PathBuf> {
-    let text = String::from_utf8_lossy(origin);
-    let path = text.strip_prefix("file:")?;
-    let path = match path.strip_prefix('"') {
-        Some(quoted) => {
-            let mut unquoted = String::with_capacity(quoted.len());
-            let mut characters = quoted.chars();
-            while let Some(character) = characters.next() {
-                match character {
-                    '\\' => unquoted.push(characters.next()?),
-                    '"' => break,
-                    _ => unquoted.push(character),
+    let path = origin.strip_prefix(b"file:")?;
+    let bytes = if let Some(quoted) = path.strip_prefix(b"\"") {
+        let quoted = quoted.strip_suffix(b"\"")?;
+        let mut decoded = Vec::with_capacity(quoted.len());
+        let mut index = 0;
+        while index < quoted.len() {
+            let byte = quoted[index];
+            index += 1;
+            if byte != b'\\' { decoded.push(byte); continue; }
+            let escaped = *quoted.get(index)?;
+            index += 1;
+            decoded.push(match escaped {
+                b'n' => b'\n', b't' => b'\t', b'r' => b'\r', b'b' => 8,
+                b'f' => 12, b'v' => 11, b'\\' => b'\\', b'"' => b'"',
+                b'0'..=b'7' => {
+                    let mut value = u16::from(escaped - b'0');
+                    for _ in 0..2 {
+                        let Some(digit @ b'0'..=b'7') = quoted.get(index).copied() else { break };
+                        value = value * 8 + u16::from(digit - b'0');
+                        index += 1;
+                    }
+                    u8::try_from(value).ok()?
                 }
-            }
-            unquoted
+                _ => return None,
+            });
         }
-        None => path.to_owned(),
+        decoded
+    } else {
+        path.to_vec()
     };
+    let path = String::from_utf8(bytes).ok()?;
     (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
@@ -512,20 +587,698 @@ fn path_is_inside(path: &Path, root: &Path) -> bool {
     !root.is_empty() && (path == root || path.starts_with(&format!("{root}/")))
 }
 
-/// The repository's own config file, without asking Git for it: a `.git` file
-/// points at the real directory for worktrees and submodules.
-fn local_config_path(root: &Path) -> PathBuf {
-    let dot_git = root.join(".git");
-    if dot_git.is_dir() {
-        return dot_git.join("config");
+fn config_refusal() -> String {
+    "Не удалось безопасно прочитать конфигурацию Git; доступ к репозиторию не разрешён.".to_owned()
+}
+
+fn network_refusal() -> String {
+    "Git-панель не открывает сетевые репозитории и сетевые пути конфигурации.".to_owned()
+}
+
+/// Lexical rejection happens before any filesystem call. In particular, do
+/// not canonicalize a UNC path to find out whether it is a network path.
+fn reject_remote_path(path: &Path) -> Result<(), String> {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let lower = text.to_ascii_lowercase();
+    let ordinary_verbatim = lower.starts_with("//?/") && lower.as_bytes().get(5) == Some(&b':');
+    let text = if ordinary_verbatim { &text[4..] } else { &text };
+    if text.len() > 32767 { return Err(config_refusal()); }
+    if text.starts_with("//") || lower.starts_with("/??/") || lower.starts_with("/device/")
+        || text.chars().any(char::is_control) || text.contains("://")
+        || text.char_indices().any(|(index, character)| character == ':' && index != 1)
+    {
+        return Err(network_refusal());
     }
-    if let Ok(text) = std::fs::read_to_string(&dot_git) {
-        if let Some(target) = text.strip_prefix("gitdir:") {
-            return root.join(target.trim()).join("config");
+    #[cfg(windows)]
+    for part in text.split('/') {
+        let stem = part.trim_end_matches(['.', ' ']).split('.').next().unwrap_or("");
+        let numbered = stem.len() == 4
+            && stem.get(..3).is_some_and(|head| head.eq_ignore_ascii_case("COM") || head.eq_ignore_ascii_case("LPT"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9');
+        if numbered || ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].iter().any(|name| stem.eq_ignore_ascii_case(name)) {
+            return Err(network_refusal());
         }
     }
-    root.join(".git").join("config")
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+        // Win32 DRIVE_REMOTE; the windows-sys 0.59 binding lives behind an
+        // unrelated feature gate, and the value is part of the stable API.
+        const DRIVE_REMOTE: u32 = 4;
+        if text.as_bytes().get(1) == Some(&b':') {
+            if text.as_bytes().get(2) != Some(&b'/') {
+                return Err(network_refusal()); // drive-relative paths depend on hidden cwd state
+            }
+            let mut drive: Vec<u16> = std::ffi::OsStr::new(&text[..3]).encode_wide().collect();
+            drive.push(0);
+            if unsafe { GetDriveTypeW(drive.as_ptr()) } == DRIVE_REMOTE {
+                return Err(network_refusal());
+            }
+        }
+    }
+    Ok(())
 }
+
+/// Resolve one component at a time. read_link reads the LOCAL reparse entry,
+/// not its target; reject that target before inspecting the next component.
+fn local_path(path: &Path) -> Result<PathBuf, String> {
+    reject_remote_path(path)?;
+    let mut path = path.to_path_buf();
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy().replace('\\', "/");
+        if let Some(plain) = text.strip_prefix("//?/") {
+            path = PathBuf::from(plain);
+        }
+    }
+    if !path.is_absolute() {
+        path = std::env::current_dir().map_err(|e| e.to_string())?.join(path);
+    }
+    for _ in 0..32 {
+        reject_remote_path(&path)?;
+        let mut components = path.components();
+        let mut probe = PathBuf::new();
+        let mut redirected = None;
+        while let Some(component) = components.next() {
+            match component {
+                std::path::Component::CurDir => continue,
+                std::path::Component::Prefix(_) => { probe.push(component.as_os_str()); continue; }
+                std::path::Component::ParentDir => { probe.pop(); continue; }
+                _ => probe.push(component.as_os_str()),
+            }
+            match std::fs::symlink_metadata(&probe) {
+                Ok(meta) => {
+                    #[cfg(windows)]
+                    let reparse = {
+                        use std::os::windows::fs::MetadataExt;
+                        meta.file_attributes() & 0x400 != 0
+                    };
+                    #[cfg(not(windows))]
+                    let reparse = meta.file_type().is_symlink();
+                    if reparse {
+                        // Junctions and symlinks are inspectable, and their
+                        // targets are rejected before anything follows them.
+                        // A vendor filter (OneDrive, WCI, app aliases) cannot be
+                        // given an attacker-chosen target by unprivileged code,
+                        // so an unreadable link keeps resolving lexically
+                        // instead of refusing the whole folder.
+                        if let Ok(target) = std::fs::read_link(&probe) {
+                            reject_remote_path(&target)?;
+                            let mut target = if target.is_absolute() {
+                                target
+                            } else {
+                                probe.parent().ok_or_else(network_refusal)?.join(target)
+                            };
+                            for rest in components {
+                                target.push(rest.as_os_str());
+                            }
+                            redirected = Some(target);
+                            break;
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        match redirected {
+            Some(target) => {
+                #[cfg(windows)]
+                let target = {
+                    let text = target.to_string_lossy().replace('\\', "/");
+                    PathBuf::from(text.strip_prefix("//?/").unwrap_or(&text))
+                };
+                path = target;
+            }
+            None => return Ok(probe),
+        }
+    }
+    Err(config_refusal())
+}
+
+#[derive(Clone)]
+struct RepositoryPaths {
+    root: PathBuf,
+    git_dir: PathBuf,
+    common_dir: PathBuf,
+}
+
+#[derive(Clone)]
+struct Preflight {
+    repository: Option<RepositoryPaths>,
+    sources: std::sync::Arc<Vec<ConfigSource>>,
+    executable: PathBuf,
+}
+
+struct ConfigScan {
+    sources: Vec<ConfigSource>,
+    visited: std::collections::HashSet<PathBuf>,
+    bytes: usize,
+    cwd: PathBuf,
+    active: std::collections::HashSet<PathBuf>,
+    worktree_override: bool,
+    git_dir: PathBuf,
+}
+
+impl ConfigScan {
+    fn new(cwd: &Path) -> Self {
+        Self {
+            sources: Vec::new(), visited: Default::default(), bytes: 0,
+            cwd: cwd.to_path_buf(), active: Default::default(), worktree_override: false,
+            git_dir: cwd.to_path_buf(),
+        }
+    }
+
+    fn source(&mut self, path: &Path) -> Result<PathBuf, String> {
+        let resolved = local_path(path)?;
+        // Exact spelling: a case variant is a second alias to check, never a
+        // reason to drop a file from the watch list.
+        if let Some(source) = self.sources.iter_mut().find(|source| source.path == resolved) {
+            if !source.aliases.iter().any(|alias| alias == path) {
+                source.aliases.push(path.to_path_buf());
+            }
+        } else {
+            // Record the stat BEFORE read_to_string, also for absent files.
+            self.sources.push(ConfigSource::read(path));
+        }
+        Ok(resolved)
+    }
+
+    fn read(&mut self, path: &Path) -> Result<Option<String>, String> {
+        let resolved = self.source(path)?;
+        let meta = match std::fs::metadata(&resolved) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        if !meta.is_file() || meta.len() > 1024 * 1024 {
+            return Err(config_refusal());
+        }
+        self.bytes += meta.len() as usize;
+        if self.bytes > 4 * 1024 * 1024 {
+            return Err(config_refusal());
+        }
+        // A growing file is bounded too, not just its initial metadata.
+        use std::io::Read;
+        let mut text = String::new();
+        std::fs::File::open(resolved).map_err(|e| e.to_string())?
+            .take(1024 * 1024 + 1).read_to_string(&mut text).map_err(|_| config_refusal())?;
+        if text.len() > 1024 * 1024 {
+            return Err(config_refusal());
+        }
+        Ok(Some(text))
+    }
+
+    fn config(&mut self, path: &Path, depth: usize) -> Result<(), String> {
+        let resolved = self.source(path)?;
+        if depth > 10 || self.visited.len() >= 256 {
+            return Err(config_refusal());
+        }
+        if self.active.contains(&resolved) { return Err(config_refusal()); }
+        if !self.visited.insert(resolved.clone()) { return Ok(()); }
+        self.active.insert(resolved.clone());
+        let Some(text) = self.read(path)? else {
+            self.active.remove(&resolved);
+            return Ok(());
+        };
+        for (key, value) in config_paths(&text)? {
+            if key == "submodule.path" { continue; }
+            if key == "core.worktree" { self.worktree_override = true; }
+            let parent = if key.starts_with("include") {
+                path.parent().ok_or_else(config_refusal)?
+            } else if key == "core.worktree" {
+                &self.git_dir
+            } else {
+                &self.cwd
+            };
+            let target = config_path(&value, parent, &self.cwd)?;
+            if !key.starts_with("include") {
+                self.source(&target)?;
+            } else {
+                // Inspect conditional includes conservatively too: an absent
+                // target must be watched before Git ever prints its origin.
+                self.config(&target, depth + 1)?;
+            }
+        }
+        self.active.remove(&resolved);
+        Ok(())
+    }
+}
+
+/// Decode the path-bearing subset with Git's quoting/escape rules, but parse
+/// every line so an ambiguous/malformed config fails closed before Git runs.
+fn config_paths(text: &str) -> Result<Vec<(String, String)>, String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text).replace("\r\n", "\n");
+    // Split Git's physical lines into logical ones: a backslash that is not
+    // itself escaped continues the value on the next line; comments run to the
+    // end of the line and may contain either kind of quote.
+    let mut logical: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut characters = text.chars();
+    let mut comment = false;
+    let mut quoted = false;
+    while let Some(character) = characters.next() {
+        if comment {
+            if character == '\n' { comment = false; logical.push(std::mem::take(&mut current)); }
+            continue;
+        }
+        match character {
+            '\n' => {
+                if quoted { return Err(config_refusal()); }
+                logical.push(std::mem::take(&mut current));
+            }
+            '\\' => {
+                let next = characters.next().ok_or_else(config_refusal)?;
+                if next != '\n' {
+                    current.push('\\');
+                    current.push(next);
+                }
+            }
+            // Git ends an unquoted value at `#`/`;`; inside quotes they are
+            // literal characters (that is why Git itself quotes such values).
+            '#' | ';' if !quoted => comment = true,
+            '"' => {
+                quoted = !quoted;
+                current.push(character);
+            }
+            _ => current.push(character),
+        }
+    }
+    if quoted { return Err(config_refusal()); }
+    if !current.is_empty() { logical.push(current); }
+    let mut section = String::new();
+    let mut paths = Vec::new();
+    for line in logical {
+        let mut line = line.trim();
+        if line.is_empty() || line.starts_with(['#', ';']) { continue; }
+        if let Some(header) = line.strip_prefix('[') {
+            // A ] within a quoted subsection is not the section terminator.
+            let mut quoted = false;
+            let mut escaped = false;
+            let end = header.char_indices().find_map(|(index, character)| {
+                if escaped { escaped = false; return None; }
+                if character == '\\' { escaped = true; return None; }
+                if character == '"' { quoted = !quoted; }
+                (character == ']' && !quoted).then_some(index)
+            }).ok_or_else(config_refusal)?;
+            let rest = header[end + 1..].trim();
+            section = header[..end].split([' ', '\t', '.']).next().unwrap_or("").to_ascii_lowercase();
+            if section.is_empty() { return Err(config_refusal()); }
+            line = rest;
+            if line.is_empty() { continue; }
+        }
+        let key_end = line.find(|c: char| c == '=' || c.is_whitespace()).unwrap_or(line.len());
+        let name = &line[..key_end];
+        if section.is_empty() || name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(config_refusal());
+        }
+        let rest = line[key_end..].trim_start();
+        let value = if let Some(value) = rest.strip_prefix('=') {
+            config_value(value)?
+        } else if rest.is_empty() {
+            String::new()
+        } else {
+            return Err(config_refusal());
+        };
+        let key = format!("{section}.{}", name.to_ascii_lowercase());
+        if matches!(key.as_str(), "include.path" | "includeif.path" | "core.attributesfile" | "core.excludesfile" | "core.worktree" | "submodule.path") {
+            if value.is_empty() {
+                // An empty include target is nonsense; an empty `core.*`
+                // path or submodule path means the key is unset.
+                if key.starts_with("include") { return Err(config_refusal()); }
+                continue;
+            }
+            paths.push((key, value));
+        }
+    }
+    Ok(paths)
+}
+
+/// Git unquotes an alternates entry only when it starts with a quote; an
+/// unquoted entry is a literal path, backslashes included.
+fn alternates_path(line: &str) -> Result<std::ffi::OsString, String> {
+    let line = line.trim_end();
+    if line.is_empty() { return Err(config_refusal()); }
+    let Some(quoted) = line.strip_prefix('"') else { return Ok(line.into()) };
+    let mut decoded = String::new();
+    let mut characters = quoted.chars();
+    let mut closed = false;
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' => decoded.push(characters.next().ok_or_else(config_refusal)?),
+            '"' => { closed = true; break; }
+            _ => decoded.push(character),
+        }
+    }
+    if !closed || !characters.as_str().trim().is_empty() { return Err(config_refusal()); }
+    Ok(decoded.into())
+}
+
+fn config_value(value: &str) -> Result<String, String> {
+    let mut result = String::new();
+    let mut quoted = false;
+    let mut characters = value.trim_start().chars();
+    let mut kept = 0;
+    while let Some(character) = characters.next() {
+        match character {
+            '"' => quoted = !quoted,
+            '#' | ';' if !quoted => break,
+            '\\' => {
+                result.push(match characters.next().ok_or_else(config_refusal)? {
+                    'n' => '\n', 't' => '\t', 'b' => '\u{8}', '"' => '"', '\\' => '\\',
+                    _ => return Err(config_refusal()),
+                });
+                kept = result.len();
+            }
+            _ => {
+                result.push(character);
+                if quoted || !character.is_whitespace() { kept = result.len(); }
+            }
+        }
+    }
+    if quoted { return Err(config_refusal()); }
+    result.truncate(kept);
+    Ok(result)
+}
+
+fn home_path() -> Result<PathBuf, String> {
+    // Git reads `$HOME` first, then falls back to `%HOMEDRIVE%%HOMEPATH%`
+    // (and only then to USERPROFILE) on Windows.
+    let home = match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => home,
+        _ => match (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH")) {
+            (Some(drive), Some(path)) if !path.is_empty() => {
+                let mut home = PathBuf::from(drive);
+                home.push(path);
+                home.into_os_string()
+            }
+            _ => std::env::var_os("USERPROFILE").ok_or_else(config_refusal)?,
+        },
+    };
+    local_path(Path::new(&home))
+}
+
+/// Installation root: `git` under `cmd`, `bin` or `mingw64/bin` all belong to
+/// the same root that holds `etc/gitconfig`.
+#[cfg(windows)]
+fn git_install_root(executable: &Path) -> Result<PathBuf, String> {
+    let mut root = executable.parent().ok_or_else(config_refusal)?.to_path_buf();
+    for _ in 0..2 {
+        let name = root.file_name().and_then(|name| name.to_str()).map(str::to_ascii_lowercase);
+        match name.as_deref() {
+            Some("cmd" | "bin") => root = root.parent().ok_or_else(config_refusal)?.to_path_buf(),
+            Some("mingw64" | "mingw32") => root = root.parent().ok_or_else(config_refusal)?.to_path_buf(),
+            _ => break,
+        }
+    }
+    Ok(root)
+}
+
+/// The prefix `%(prefix)` expands to: the `mingw64`/`mingw32` subtree that
+/// contains the running `git.exe`, else the installation root itself.
+fn git_prefix(executable: &Path) -> Result<PathBuf, String> {
+    let parent = executable.parent().ok_or_else(config_refusal)?;
+    let base = match parent.file_name().and_then(|name| name.to_str()).map(str::to_ascii_lowercase).as_deref() {
+        Some("cmd" | "bin" | "mingw64" | "mingw32") => parent.parent().ok_or_else(config_refusal)?,
+        _ => parent,
+    };
+    for architecture in ["mingw64", "mingw32"] {
+        let candidate = base.join(architecture);
+        #[cfg(windows)]
+        let binary = candidate.join("bin/git.exe");
+        #[cfg(not(windows))]
+        let binary = candidate.join("bin/git");
+        if local_path(&binary).is_ok_and(|binary| binary.is_file()) { return Ok(candidate); }
+    }
+    Ok(base.to_path_buf())
+}
+
+/// Resolve a config path value against its anchor. On Windows a leading
+/// separator means the current drive's root, exactly as Git for Windows
+/// resolves it, not the process working directory.
+fn anchored_path(anchor: &Path, value: &Path) -> Result<PathBuf, String> {
+    if value.is_absolute() { return Ok(value.to_path_buf()); }
+    let text = value.as_os_str().to_string_lossy();
+    if text.starts_with(['/', '\\']) {
+        let mut base = PathBuf::new();
+        match anchor.components().next() {
+            Some(prefix @ std::path::Component::Prefix(_)) => base.push(prefix.as_os_str()),
+            _ => return Err(config_refusal()),
+        }
+        base.push(text.trim_start_matches(['/', '\\']));
+        return Ok(base);
+    }
+    Ok(anchor.join(value))
+}
+
+fn config_path(value: &str, parent: &Path, anchor: &Path) -> Result<PathBuf, String> {
+    reject_remote_path(Path::new(value))?;
+    let path = if let Some(relative) = value.strip_prefix("~/").or_else(|| value.strip_prefix("~\\")) {
+        home_path()?.join(relative)
+    } else if let Some(relative) = value.strip_prefix("%(prefix)/") {
+        git_prefix(&git_executable()?)?.join(relative)
+    } else if value.starts_with('~') {
+        return Err(config_refusal()); // ~user cannot be resolved safely by the panel
+    } else if value.contains("%(") {
+        return Err(config_refusal());
+    } else {
+        let path = PathBuf::from(value);
+        if path.is_absolute() || value.starts_with(['/', '\\']) {
+            anchored_path(anchor, &path)?
+        } else {
+            parent.join(path)
+        }
+    };
+    local_path(&path)?;
+    Ok(path)
+}
+
+fn git_executable() -> Result<PathBuf, String> {
+    let path = std::env::var_os("PATH").ok_or_else(config_refusal)?;
+    for directory in std::env::split_paths(&path) {
+        #[cfg(windows)]
+        let candidate = directory.join("git.exe");
+        #[cfg(not(windows))]
+        let candidate = directory.join("git");
+        // A PATH entry that is not a plain local path (a UNC share, a
+        // device path) is never a source of executables for the panel.
+        let Ok(candidate) = local_path(&candidate) else { continue };
+        if candidate.is_file() { return Ok(candidate); }
+    }
+    Err("Не найден Git.".to_owned())
+}
+
+fn global_configs(executable: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    let no_system = std::env::var("GIT_CONFIG_NOSYSTEM").unwrap_or_default().to_ascii_lowercase();
+    if !matches!(no_system.as_str(), "1" | "true" | "yes" | "on") {
+        if let Some(system) = std::env::var_os("GIT_CONFIG_SYSTEM") {
+            if !system.is_empty() { paths.push(PathBuf::from(system)); }
+        } else {
+            #[cfg(not(windows))]
+            {
+                paths.push(PathBuf::from("/etc/gitconfig"));
+                paths.push(git_prefix(executable)?.join("etc/gitconfig"));
+            }
+            #[cfg(windows)]
+            {
+                if let Some(program_data) = std::env::var_os("PROGRAMDATA") {
+                    paths.push(PathBuf::from(program_data).join("Git/config"));
+                }
+                // Git reads `<install root>/etc/gitconfig`; the root holds
+                // `cmd`, `bin` or `mingw64/bin`, and MSYS layouts use the
+                // prefix's own `etc` instead.
+                let root = git_install_root(executable)?;
+                paths.push(root.join("etc/gitconfig"));
+                for architecture in ["mingw64", "mingw32"] {
+                    paths.push(root.join(architecture).join("etc/gitconfig"));
+                }
+            }
+        }
+    }
+    if let Some(global) = std::env::var_os("GIT_CONFIG_GLOBAL") {
+        if !global.is_empty() { paths.push(PathBuf::from(global)); }
+    } else {
+        let home = home_path()?;
+        paths.push(home.join(".gitconfig"));
+        let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".config"));
+        paths.push(xdg.join("git/config"));
+    }
+    Ok(paths)
+}
+
+fn discover_repository(cwd: &Path, scan: &mut ConfigScan) -> Result<Option<RepositoryPaths>, String> {
+    let cwd = local_path(cwd)?;
+    if !cwd.is_dir() { return Ok(None); }
+    for root in cwd.ancestors() {
+        let dot_git = root.join(".git");
+        let marker = scan.source(&dot_git)?;
+        let git_dir = if marker.is_dir() {
+            marker
+        } else if let Some(text) = scan.read(&dot_git)? {
+            let target = text.strip_prefix("gitdir:").ok_or_else(config_refusal)?.trim();
+            config_path(target, root, root)?
+        } else {
+            // Bare repositories have metadata directly in the directory.
+            let head = scan.source(&root.join("HEAD"))?;
+            if head.is_file() && local_path(&root.join("objects"))?.is_dir() && local_path(&root.join("refs"))?.is_dir() {
+                root.to_path_buf()
+            } else {
+                continue;
+            }
+        };
+        let common_dir = match scan.read(&git_dir.join("commondir"))? {
+            Some(text) => config_path(text.trim(), &git_dir, &git_dir)?,
+            None => git_dir.clone(),
+        };
+        return Ok(Some(RepositoryPaths { root: root.to_path_buf(), git_dir, common_dir }));
+    }
+    Ok(None)
+}
+
+fn inspect_objects(directory: &Path, scan: &mut ConfigScan, depth: usize, visited: &mut std::collections::HashSet<PathBuf>) -> Result<(), String> {
+    let directory = scan.source(directory)?;
+    if depth > 10 { return Err(config_refusal()); }
+    if !visited.insert(directory.clone()) { return Ok(()); }
+    if let Some(alternates) = scan.read(&directory.join("info/alternates"))? {
+        for line in alternates.lines().filter(|line| !line.trim().is_empty()) {
+            let target = alternates_path(line)?;
+            let target = anchored_path(&directory, Path::new(&target))?;
+            inspect_objects(&target, scan, depth + 1, visited)?;
+        }
+    }
+    Ok(())
+}
+
+fn inspect_metadata(repository: &RepositoryPaths, scan: &mut ConfigScan, depth: usize) -> Result<(), String> {
+    if depth > 10 { return Err(config_refusal()); }
+    let previous_git_dir = std::mem::replace(&mut scan.git_dir, repository.git_dir.clone());
+    let previous_cwd = std::mem::replace(&mut scan.cwd, repository.root.clone());
+    scan.config(&repository.common_dir.join("config"), 0)?;
+    scan.config(&repository.git_dir.join("config.worktree"), 0)?;
+    // Watch HEAD as well: includeIf.onbranch can change its selected source
+    // without changing a config file.
+    scan.source(&repository.git_dir.join("HEAD"))?;
+    inspect_objects(&repository.common_dir.join("objects"), scan, 0, &mut Default::default())?;
+    for path in [
+        repository.git_dir.join("index"),
+        repository.common_dir.join("refs"),
+        repository.common_dir.join("packed-refs"),
+        repository.common_dir.join("info/attributes"),
+    ] {
+        scan.source(&path)?;
+    }
+    // Status/fetch can descend into initialized submodules without an
+    // explicit request for their identity. Inspect their gitfiles FIRST too.
+    if let Some(modules) = scan.read(&repository.root.join(".gitmodules"))? {
+        for (key, value) in config_paths(&modules)? {
+            if key != "submodule.path" { continue; }
+            let module = config_path(&value, &repository.root, &repository.root)?;
+            if !path_is_inside(&module, &repository.root) { return Err(config_refusal()); }
+            let marker = scan.source(&module.join(".git"))?;
+            if marker.exists() {
+                if let Some(child) = discover_repository(&module, scan)? {
+                    inspect_metadata(&child, scan, depth + 1)?;
+                }
+            }
+        }
+    }
+    scan.git_dir = previous_git_dir;
+    scan.cwd = previous_cwd;
+    Ok(())
+}
+
+fn head_is_unborn(root: &Path) -> Result<bool, String> {
+    let checked = preflight(root)?;
+    let repository = checked.repository.as_ref().ok_or_else(config_refusal)?;
+    let mut scan = ConfigScan::new(root);
+    let Some(head) = scan.read(&repository.git_dir.join("HEAD"))? else { return Ok(false) };
+    let Some(reference) = head.trim().strip_prefix("ref: ") else { return Ok(false) };
+    if !reference.starts_with("refs/heads/") || reference.contains('\\')
+        || reference.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(config_refusal());
+    }
+    let reference_path = scan.source(&repository.common_dir.join(reference))?;
+    if reference_path.exists() { return Ok(false); }
+    // Reftable repositories store refs differently; leave their resolution
+    // to Git, rather than treating them as empty.
+    if scan.source(&repository.common_dir.join("reftable"))?.exists() { return Ok(false); }
+    let packed = scan.read(&repository.common_dir.join("packed-refs"))?.unwrap_or_default();
+    let packed_has_head = packed.lines().any(|line| line.split_once(' ').is_some_and(|(_, name)| name == reference));
+    if !scan.sources.iter().all(ConfigSource::is_current) { return Err(config_refusal()); }
+    Ok(!packed_has_head)
+}
+
+type PreflightEnvironment = [Option<std::ffi::OsString>; 10];
+type PreflightCache = HashMap<PathBuf, (PreflightEnvironment, std::sync::Arc<Preflight>)>;
+static PREFLIGHT_CACHE: std::sync::Mutex<Option<PreflightCache>> = std::sync::Mutex::new(None);
+
+fn preflight(cwd: &Path) -> Result<std::sync::Arc<Preflight>, String> {
+    // Env redirects are part of freshness, not just the files already found.
+    let environment: PreflightEnvironment = [
+        "PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "XDG_CONFIG_HOME", "PROGRAMDATA",
+        "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM",
+    ].map(std::env::var_os);
+    let cwd = local_path(cwd)?;
+    if let Ok(cache) = PREFLIGHT_CACHE.lock() {
+        if let Some((previous, checked)) = cache.as_ref().and_then(|cache| cache.get(&cwd)) {
+            if previous == &environment && checked.sources.iter().all(ConfigSource::is_current) {
+                return Ok(checked.clone());
+            }
+        }
+    }
+    for _ in 0..3 {
+        let mut scan = ConfigScan::new(&cwd);
+        let mut repository = discover_repository(&cwd, &mut scan)?;
+        let executable = git_executable()?;
+        if let Some(repository) = &repository { scan.git_dir = repository.git_dir.clone(); }
+        if let Some(repository) = &repository { scan.cwd = repository.root.clone(); }
+        for path in global_configs(&executable)? {
+            scan.config(&path, 0)?;
+        }
+        // Git's default external attribute/exclude files are path-bearing
+        // configuration too, even with an explicit GIT_CONFIG_GLOBAL.
+        let home = home_path()?;
+        let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".config"));
+        scan.source(&xdg.join("git/attributes"))?;
+        scan.source(&xdg.join("git/ignore"))?;
+        if let Some(repository) = &repository {
+            inspect_metadata(repository, &mut scan, 0)?;
+        }
+        if !scan.sources.iter().all(ConfigSource::is_current) { continue; }
+        if scan.worktree_override {
+            let mut command = base_git_command(&cwd, &executable);
+            command.args(["rev-parse", "--show-toplevel"]);
+            let (success, stdout, stderr) = run_bounded(command, "git rev-parse", GIT_TIMEOUT, GIT_MAX_OUTPUT, None)?;
+            if !success { return Err(String::from_utf8_lossy(&stderr).trim().to_owned()); }
+            let actual = PathBuf::from(String::from_utf8(stdout).map_err(|_| config_refusal())?.trim());
+            if let Some(repository) = &mut repository { repository.root = local_path(&actual)?; }
+        }
+        if scan.sources.iter().all(ConfigSource::is_current) {
+            let checked = std::sync::Arc::new(Preflight { repository, sources: std::sync::Arc::new(scan.sources), executable });
+            if let Ok(mut cache) = PREFLIGHT_CACHE.lock() {
+                cache.get_or_insert_with(HashMap::new).insert(cwd.clone(), (environment, checked.clone()));
+            }
+            return Ok(checked);
+        }
+    }
+    Err(config_refusal())
+}
+
+/// A guarded worktree-specific metadata file (not the common worktree index).
+pub fn metadata_path(root: &Path, name: &str) -> Result<PathBuf, String> {
+    if name.is_empty() || name.contains(['/', '\\', ':']) || name == "." || name == ".." {
+        return Err(config_refusal());
+    }
+    let checked = preflight(root)?;
+    let repository = checked.repository.as_ref().ok_or_else(config_refusal)?;
+    let path = repository.git_dir.join(name);
+    local_path(&path)?;
+    Ok(path)
+}
+
 
 static STAMP_CACHE: std::sync::Mutex<Option<HashMap<PathBuf, RepositoryStamp>>> = std::sync::Mutex::new(None);
 
@@ -544,8 +1297,11 @@ fn store_stamp(root: &Path, stamp: &RepositoryStamp) {
 /// split or a restored panel does not ask again for the same repository.
 static TRUSTED: std::sync::Mutex<Option<HashMap<PathBuf, RepositoryStamp>>> = std::sync::Mutex::new(None);
 
-/// A hazard-free repository is always allowed; approval lives in memory only.
+/// A hazard-free repository always runs; a hazardous one needs a remembered
+/// approval for exactly this digest, and a stale stamp never authorizes
+/// commands even when the digest still matches what was remembered.
 pub fn trust_approved(root: &Path, stamp: &RepositoryStamp) -> bool {
+    if !stamp.is_current() { return false; }
     if stamp.is_hazard_free() {
         return true;
     }
@@ -561,21 +1317,6 @@ pub fn remember_trust(root: &Path, stamp: RepositoryStamp) {
     }
 }
 
-fn reject_network_repository(path: &Path) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        use std::path::{Component, Prefix};
-        if matches!(
-            path.components().next(),
-            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
-        ) {
-            return Err("Git-панель не открывает сетевые репозитории.".to_owned());
-        }
-    }
-    #[cfg(not(windows))]
-    let _ = path;
-    Ok(())
-}
 
 /// Reads branch, ahead/behind and every change (staged, unstaged, untracked).
 pub fn status(root: &Path) -> Result<Status, String> {
@@ -594,11 +1335,15 @@ pub fn status(root: &Path) -> Result<Status, String> {
             .map(|oid| oid.trim().to_owned())
             .filter(|oid| is_object_hash(oid));
     }
-    if let Ok(numstat) = run_git(root, &["diff", "--no-ext-diff", "--no-textconv", "--numstat", "-z", "--no-renames"]) {
-        apply_numstat(&mut status.changes, &parse_numstat(numstat.as_bytes()), false);
+    if status.changes.iter().any(|change| change.unstaged() && !change.untracked) {
+        if let Ok(numstat) = run_git(root, &["diff", "--no-ext-diff", "--no-textconv", "--numstat", "-z", "--no-renames"]) {
+            apply_numstat(&mut status.changes, &parse_numstat(numstat.as_bytes()), false);
+        }
     }
-    if let Ok(numstat) = run_git(root, &["diff", "--no-ext-diff", "--no-textconv", "--cached", "--numstat", "-z", "--no-renames"]) {
-        apply_numstat(&mut status.changes, &parse_numstat(numstat.as_bytes()), true);
+    if status.changes.iter().any(Change::staged) {
+        if let Ok(numstat) = run_git(root, &["diff", "--no-ext-diff", "--no-textconv", "--cached", "--numstat", "-z", "--no-renames"]) {
+            apply_numstat(&mut status.changes, &parse_numstat(numstat.as_bytes()), true);
+        }
     }
     status.additions = status.changes.iter().map(|c| c.additions).sum();
     status.deletions = status.changes.iter().map(|c| c.deletions).sum();
@@ -799,6 +1544,7 @@ fn rev_list_set(root: &Path, args: &[&str]) -> std::collections::HashSet<String>
 /// Recent commits of HEAD (and the upstream), marked with their section.
 pub fn log(root: &Path) -> Result<CommitLog, String> {
     const MAX_COMMITS: usize = 80;
+    if head_is_unborn(root)? { return Ok(CommitLog::default()); }
     let upstream = upstream(root);
     let (outgoing, incoming) = match &upstream {
         Some(upstream) => (
@@ -957,7 +1703,7 @@ pub fn stage(root: &Path, paths: &[String], staged: bool) -> Result<(), String> 
         input.extend_from_slice(path.as_bytes());
         input.push(0);
     }
-    let mut git = git_command(root);
+    let mut git = git_command(root)?;
     git.args(command).args(from_stdin);
     let (success, _, stderr) = run_bounded(git, &format!("git {}", command[0]), GIT_TIMEOUT, GIT_MAX_OUTPUT, Some(input))?;
     if success {
@@ -973,7 +1719,7 @@ pub fn commit(root: &Path, message: String) -> Result<String, String> {
     // Commit hooks (husky, lint-staged, a first pre-commit run) easily take
     // longer than the polling timeout, and killing git mid-commit leaves
     // index.lock behind. Stdin also avoids Windows' command-line size limit.
-    let mut command = git_command(root);
+    let mut command = git_command(root)?;
     command.args(["commit", "-F", "-"]);
     let (success, _, stderr) = run_bounded(command, "git commit", GIT_TIMEOUT_COMMIT, GIT_MAX_OUTPUT, Some(message.into_bytes()))?;
     if !success {
@@ -989,31 +1735,8 @@ pub fn recent_subjects(root: &Path, count: usize) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Command + argv for the AI commit message, per CLI.
-pub fn ai_command(spec: &str, prompt: &str) -> Option<(String, Vec<String>)> {
-    let trimmed = spec.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let formatted: Option<Vec<&str>> = match trimmed {
-        "claude" => Some(vec!["-p", prompt]),
-        "opencode" => Some(vec!["run", prompt]),
-        "codex" => Some(vec!["exec", prompt]),
-        "gemini" => Some(vec!["-p", prompt]),
-        // No --yes-always: it approves whatever the model proposes. --no-git:
-        // the CLI runs outside the repository (see ai_commit_message).
-        "aider" => Some(vec!["--message", prompt, "--no-auto-commits", "--no-git"]),
-        _ => None,
-    };
-    if let Some(args) = formatted {
-        return Some((trimmed.to_owned(), args.into_iter().map(str::to_owned).collect()));
-    }
-    let mut parts = trimmed.split_whitespace();
-    let command = parts.next()?.to_owned();
-    let mut args: Vec<String> = parts.map(str::to_owned).collect();
-    args.push(prompt.to_owned());
-    Some((command, args))
-}
+#[path = "ai_commit.rs"]
+mod ai_commit;
 
 /// Windows does not resolve an npm `.cmd` shim like an executable. OpenCode's
 /// npm package ships a native binary, so use it directly: a shell would
@@ -1026,6 +1749,17 @@ fn ai_cli_command(program: &str) -> Command {
         let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
         if let Some(executable) = opencode_executable(path.as_deref(), home.as_deref(), appdata.as_deref()) {
             return Command::new(executable);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let explicit = Path::new(program);
+        if explicit.file_stem().is_some_and(|name| name.eq_ignore_ascii_case("opencode")) {
+            if let Some(parent) = explicit.parent().filter(|p| !p.as_os_str().is_empty()) {
+                for native in [parent.join("opencode.exe"), parent.join("node_modules/opencode-ai/bin/opencode.exe")] {
+                    if native.is_file() { return Command::new(native); }
+                }
+            }
         }
     }
     #[cfg(windows)]
@@ -1047,7 +1781,11 @@ fn ai_cli_command(program: &str) -> Command {
 fn npm_script_command(program: &str, path: Option<&std::ffi::OsStr>) -> Option<Command> {
     let explicit = Path::new(program);
     let shim = if explicit.parent().is_some_and(|parent| !parent.as_os_str().is_empty()) {
-        explicit.to_path_buf()
+        if explicit.extension().is_some_and(|e| e.eq_ignore_ascii_case("ps1")) {
+            explicit.with_extension("cmd")
+        } else {
+            explicit.to_path_buf()
+        }
     } else {
         find_shim(program, path?)?
     };
@@ -1257,8 +1995,8 @@ pub const AI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The model IDs offered by the installed OpenCode and its configured providers.
 pub fn opencode_models() -> Result<Vec<String>, String> {
-    let mut command = ai_cli_command("opencode");
-    command.args(["models", "--pure"]).current_dir(ai_workdir());
+    let ai_commit::Invocation { program, directory: _directory, .. } = ai_commit::prepare_models()?;
+    let Some(command) = program else { return Err("OpenCode: нет команды".to_owned()); };
     let (success, stdout, stderr) = run_bounded(command, "opencode models", std::time::Duration::from_secs(30), 512 * 1024, None)?;
     if !success {
         return Err(String::from_utf8_lossy(&stderr).trim().to_owned());
@@ -1285,15 +2023,25 @@ fn parse_opencode_models(text: &str) -> Vec<String> {
     models
 }
 
-/// Add only our no-tools agent; retain any caller-supplied provider settings.
+/// Close the no-tools agent and remove every executable surface a caller config
+/// could add (MCP servers, plugins, commands, instruction files), while keeping
+/// inert provider settings so authentication and model choice still work.
 fn opencode_commit_config(existing: Option<&str>) -> Result<String, String> {
     let mut config: serde_json::Value = match existing {
         Some(text) => serde_json::from_str(text).map_err(|error| format!("OPENCODE_CONFIG_CONTENT: {error}"))?,
         None => serde_json::json!({}),
     };
     let object = config.as_object_mut().ok_or_else(|| "OPENCODE_CONFIG_CONTENT: нужен JSON-объект".to_owned())?;
-    let agents = object.entry("agent").or_insert_with(|| serde_json::json!({}));
-    let agents = agents.as_object_mut().ok_or_else(|| "OPENCODE_CONFIG_CONTENT.agent: нужен JSON-объект".to_owned())?;
+    object.insert("mcp".to_owned(), serde_json::json!({}));
+    object.insert("plugin".to_owned(), serde_json::json!([]));
+    object.insert("command".to_owned(), serde_json::json!({}));
+    object.insert("instructions".to_owned(), serde_json::json!([]));
+    object.insert("share".to_owned(), serde_json::json!("disabled"));
+    object.insert("autoupdate".to_owned(), serde_json::json!(false));
+    object.insert("tools".to_owned(), serde_json::json!({ "*": false }));
+    object.insert("permission".to_owned(), serde_json::json!({ "*": "deny" }));
+    object.insert("agent".to_owned(), serde_json::json!({}));
+    let agents = object.get_mut("agent").unwrap().as_object_mut().unwrap();
     agents.insert(
         "anvil-commit".to_owned(),
         serde_json::json!({
@@ -1340,57 +2088,39 @@ fn opencode_message(text: &str) -> Result<String, String> {
     Ok(message)
 }
 
-/// An empty folder the AI CLI runs in. Inside the repository the CLI would
-/// load the repository's own agent config (`.claude/settings.json` hooks and
-/// env, `opencode.json` MCP servers, `.aider.conf.yml`), so pressing the
-/// button in a cloned repository could run that repository's code. The diff
-/// is in the prompt; the CLI needs nothing from the folder.
-pub fn ai_workdir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join("anvil-ai");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
-
-/// Asks the given CLI (or the auto-detected one) for a full commit message,
-/// running it in `workdir` (see `ai_workdir`) for at most `timeout`.
+/// Generates a full commit message with an inference-only built-in profile.
+/// Every invocation owns a fresh private directory, removed on success/error.
+/// Explicit unknown custom executables remain user code, not safe profiles.
 pub fn ai_commit_message(
-    workdir: &Path,
     command: Option<&str>,
     prompt: &str,
     timeout: std::time::Duration,
 ) -> Result<String, String> {
-    let spec = command.unwrap_or("");
-    let (program, args) = ai_command(spec, "").ok_or_else(|| crate::strings::WORKSPACE_NO_AI_COMMAND.to_owned())?;
-    let prompt_index = if spec.trim() == "aider" { 1 } else { args.len() - 1 };
-    let mut invocation = ai_cli_command(&program);
-    let opencode = program == "opencode";
-    invocation.args(&args[..prompt_index]);
-    if opencode {
-        let config = opencode_commit_config(std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref())?;
-        invocation
-            .args(["--pure", "--agent", "anvil-commit", "--format", "json", "--title", "ANVIL commit message"])
-            .env("OPENCODE_CONFIG_CONTENT", config);
-    }
-    // Count suffix flags too: aider places them after the prompt.
-    let prompt = fit_ai_prompt(&invocation, prompt, &args[prompt_index + 1..])?;
-    invocation.arg(prompt.as_ref()).args(&args[prompt_index + 1..]);
-    invocation.current_dir(workdir).env("GIT_TERMINAL_PROMPT", "0");
-    let (success, stdout, stderr) = run_bounded(invocation, &program, timeout, 64 * 1024, None)?;
-    if opencode && !success {
-        let stderr = String::from_utf8_lossy(&stderr);
-        return Err(if stderr.trim().is_empty() {
-            opencode_message(&String::from_utf8_lossy(&stdout)).err().unwrap_or_else(|| "OpenCode завершился с ошибкой".to_owned())
-        } else {
-            stderr.trim().to_owned()
-        });
-    }
-    let text = String::from_utf8_lossy(&stdout);
-    let text = if opencode { opencode_message(&text)?.into() } else { text };
+    use ai_commit::Backend;
+    let ai_commit::Invocation { program, directory: _directory, backend, model } = ai_commit::prepare(command.unwrap_or(""))?;
+    let text = if let Some(mut process) = program {
+        if backend == Backend::Gemini { process.arg("--prompt"); }
+        if backend == Backend::Aider { process.arg("--message"); }
+        let prompt = fit_ai_prompt(&process, prompt, &[])?;
+        process.arg(prompt.as_ref());
+        let label = format!("{backend:?}");
+        let (success, stdout, stderr) = run_bounded(process, &label, timeout, 64 * 1024, None)?;
+        let output = String::from_utf8_lossy(&stdout);
+        if !success {
+            let stderr = String::from_utf8_lossy(&stderr);
+            return Err(if !stderr.trim().is_empty() {
+                stderr.trim().to_owned()
+            } else {
+                ai_commit::response(backend, &output).err().unwrap_or_else(|| format!("{label}: {}", output.trim()))
+            });
+        }
+        ai_commit::response(backend, &output)?
+    } else {
+        ai_commit::codex_generate(model.as_deref(), prompt, timeout)?
+    };
     let message = clean_ai_message(&text);
     if message.is_empty() {
-        let stderr = String::from_utf8_lossy(&stderr);
-        let fallback = crate::strings::WORKSPACE_AI_EMPTY.to_owned();
-        return Err(if stderr.trim().is_empty() { fallback } else { stderr.trim().to_owned() });
+        return Err(crate::strings::WORKSPACE_AI_EMPTY.to_owned());
     }
     Ok(message.to_owned())
 }
@@ -1565,7 +2295,7 @@ pub fn apply_hunks(root: &Path, file: &FileDiff, selection: &[usize], from_index
     if patch.trim_ascii().is_empty() {
         return Ok(());
     }
-    let mut command = git_command(root);
+    let mut command = git_command(root)?;
     command.args(["apply", "--cached", "--whitespace=nowarn"]);
     if from_index {
         command.arg("--reverse");
@@ -1734,20 +2464,6 @@ mod tests {
         assert_eq!((both[0].additions, both[0].deletions), (24, 6));
     }
 
-    #[test]
-    fn ai_command_formats() {
-        assert_eq!(
-            ai_command("claude", "prompt"),
-            Some(("claude".to_owned(), vec!["-p".to_owned(), "prompt".to_owned()]))
-        );
-        assert_eq!(
-            ai_command("opencode", "p"),
-            Some(("opencode".to_owned(), vec!["run".to_owned(), "p".to_owned()]))
-        );
-        let (program, args) = ai_command("my-cli --fast", "p").unwrap();
-        assert_eq!((program.as_str(), args), ("my-cli", vec!["--fast".to_owned(), "p".to_owned()]));
-        assert_eq!(ai_command("   ", "p"), None);
-    }
 
     const SAMPLE_DIFF: &str = "diff --git a/src/main.rs b/src/main.rs\n\
 index 111..222 100644\n\
@@ -1966,12 +2682,6 @@ index 111..222 100644\n\
         }
     }
 
-    #[test]
-    fn aider_does_not_confirm_everything() {
-        let (program, args) = ai_command("aider", "p").unwrap();
-        assert_eq!(program, "aider");
-        assert!(!args.iter().any(|arg| arg == "--yes-always"), "{args:?}");
-    }
 
     #[cfg(windows)]
     #[test]
@@ -2033,14 +2743,6 @@ index 111..222 100644\n\
     }
 
     #[test]
-    fn commit_agent_overlay_preserves_existing_provider_configuration() {
-        let source = r#"{"provider":{"custom":{"options":{"baseURL":"https://example.com"}}},"agent":{"review":{"mode":"subagent"}}}"#;
-        let config: serde_json::Value = serde_json::from_str(&opencode_commit_config(Some(source)).unwrap()).unwrap();
-        assert_eq!(config.pointer("/provider/custom/options/baseURL").unwrap(), "https://example.com");
-        assert_eq!(config.pointer("/agent/review/mode").unwrap(), "subagent");
-    }
-
-    #[test]
     fn hazard_keys_cover_program_runners_only() {
         for key in [
             "filter.lfs.clean",
@@ -2065,13 +2767,15 @@ index 111..222 100644\n\
             "submodule.lib.update",
             "remote.origin.uploadpack",
         ] {
-            assert!(is_hazardous_key(key), "{key} can start a program or pull in settings");
+            assert!(is_hazardous_key(key, "!run"), "{key} can start a program or pull in settings");
         }
         for key in [
             "branch.main.remote",
             "branch.main.merge",
             "remote.origin.url",
             "remote.origin.fetch",
+            "submodule.lib.url",
+            "submodule.lib.active",
             "user.name",
             "user.email",
             "core.editor",
@@ -2086,8 +2790,57 @@ index 111..222 100644\n\
             "push.default",
             "merge.conflictStyle",
         ] {
-            assert!(!is_hazardous_key(key), "{key} is routine and must not ask for trust");
+            assert!(!is_hazardous_key(key, "ordinary"), "{key} is routine and must not ask for trust");
         }
+    }
+
+    #[test]
+    fn transport_hazards_depend_on_the_configured_value() {
+        for (key, value) in [
+            ("protocol.ext.allow", "always"),
+            ("protocol.origin.allow", "always"),
+            ("protocol.ext.allow", ""),
+            ("protocol.ext.allow", "user"),
+            ("url.ext::command.insteadOf", "https://example.com/"),
+            ("url.fd::0.pushInsteadOf", "https://example.com/"),
+            ("remote.origin.vcs", "helper"),
+            ("remote.origin.url", "ext::command"),
+            ("remote.origin.pushurl", "fd::0"),
+            ("submodule.lib.update", "!command"),
+        ] {
+            assert!(is_hazardous_key(key, value), "{key} = {value} can leave the machine");
+        }
+        for (key, value) in [
+            ("protocol.ext.allow", "never"),
+            ("protocol.allow", "NEVER"),
+            ("url.ext::command.insteadOf", ""),
+            ("url.fd::0.pushInsteadOf", ""),
+            ("remote.origin.url", "https://example.com/repo"),
+            ("remote.origin.pushurl", "git@example.com:repo"),
+            ("remote.origin.vcs", ""),
+            ("submodule.lib.update", "checkout"),
+            ("submodule.lib.update", " merge"),
+            ("submodule.lib.update", "none"),
+        ] {
+            assert!(!is_hazardous_key(key, value), "{key} = {value} is routine metadata");
+        }
+    }
+
+    #[test]
+    fn config_parser_matches_git_values_and_fails_closed() {
+        let parsed = config_paths("[include]\n path = \"sec\"\\\r\nond.cfg # comment \"\n[includeIf \"gitdir:C:/repo\"]\n path = ~/x.cfg\n").unwrap();
+        assert_eq!(parsed, [
+            ("include.path".to_owned(), "second.cfg".to_owned()),
+            ("includeif.path".to_owned(), "~/x.cfg".to_owned()),
+        ]);
+        // Unquoted Windows paths keep backslashes only when Git escapes them;
+        // an unknown escape is a configuration Git itself rejects.
+        assert!(config_paths("[include]\n path = C:\\x\n").is_err());
+        assert_eq!(config_paths("[include]\n path = C:\\\\x\n").unwrap()[0].1, "C:\\x");
+        // An unterminated value quote is malformed; a nested include cycle is
+        // not (Git reads the file once).
+        assert!(config_paths("[user]\n name = \"unterminated\n").is_err());
+        assert!(config_paths("[include]\n path = a.cfg\n").is_ok());
     }
 
     fn config_records(entries: &[(&str, &str, &str, &str)]) -> Vec<u8> {
@@ -2108,31 +2861,30 @@ index 111..222 100644\n\
     #[test]
     fn digest_covers_repository_hazards_and_ignores_the_user_scope() {
         let root = Path::new("C:/repo");
-        let local_config = Path::new("C:/repo/.git/config");
         // The user's own global settings are not the repository's business.
         let global = config_records(&[("global", "file:C:/Users/u/.gitconfig", "filter.evil.clean", "rm -rf")]);
-        assert!(digest_of(&global, root, local_config).is_hazard_free());
+        assert!(digest_of(&global, root, Default::default()).is_hazard_free());
         // Routine repository keys never ask for trust either.
         let routine = config_records(&[
             ("local", "file:.git/config", "branch.main.remote", "origin"),
             ("local", "file:.git/config", "remote.origin.url", "https://example.com"),
             ("worktree", "file:.git/config", "core.editor", "notepad"),
         ]);
-        assert!(digest_of(&routine, root, local_config).is_hazard_free());
+        assert!(digest_of(&routine, root, Default::default()).is_hazard_free());
         // A global includeIf that points inside the repository is repository-controlled.
         let injected = config_records(&[("global", "file:C:/repo/injected.cfg", "filter.evil.clean", "run")]);
-        assert!(!digest_of(&injected, root, local_config).is_hazard_free());
+        assert!(!digest_of(&injected, root, Default::default()).is_hazard_free());
         let hazard = config_records(&[("local", "file:.git/config", "filter.hostile.clean", "cat")]);
-        let stamp = digest_of(&hazard, root, local_config);
+        let stamp = digest_of(&hazard, root, Default::default());
         assert!(!stamp.is_hazard_free());
         assert_eq!(stamp.hazards(), ["filter.hostile.clean"]);
-        let other = digest_of(&config_records(&[("local", "file:.git/config", "filter.hostile.clean", "cat -A")]), root, local_config);
+        let other = digest_of(&config_records(&[("local", "file:.git/config", "filter.hostile.clean", "cat -A")]), root, Default::default());
         assert_ne!(stamp, other, "a changed command is a changed digest");
         // The cached digest is dropped when the file behind it moves on.
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config");
         std::fs::write(&config, b"[branch]\n").unwrap();
-        let before = digest_of(&config_records(&[("local", "file:config", "filter.x.clean", "one")]), root, &config);
+        let before = digest_of(&config_records(&[("local", "file:config", "filter.x.clean", "one")]), root, std::sync::Arc::new(vec![ConfigSource::read(&config)]));
         assert!(before.is_current());
         std::fs::write(&config, b"[branch]\nextra = 1\n").unwrap();
         assert!(!before.is_current(), "a written config file invalidates the digest");
@@ -2141,14 +2893,14 @@ index 111..222 100644\n\
     #[test]
     fn approvals_are_shared_in_memory_and_never_cover_the_stripe_of_a_digest() {
         let root = PathBuf::from("C:/repo");
-        let stamp = |value: &str| digest_of(&config_records(&[("local", "file:.git/config", "filter.x.clean", value)]), &root, Path::new("C:/repo/.git/config"));
+        let stamp = |value: &str| digest_of(&config_records(&[("local", "file:.git/config", "filter.x.clean", value)]), &root, Default::default());
         let first = stamp("one");
         let second = stamp("two");
         assert!(!trust_approved(&root, &first));
         remember_trust(&root, first.clone());
         assert!(trust_approved(&root, &first), "every pane of the process sees the approval");
         assert!(!trust_approved(&root, &second), "a different digest is not covered");
-        let clean = digest_of(&[], &root, Path::new("C:/repo/.git/config"));
+        let clean = digest_of(&[], &root, Default::default());
         assert!(trust_approved(&root, &clean), "nothing to run, nothing to approve");
     }
 
@@ -2170,42 +2922,84 @@ index 111..222 100644\n\
         let (resolved_node, resolved_script) = npm_shim_targets(&shim).expect("npm template");
         assert_eq!(resolved_node, node);
         assert_eq!(resolved_script, script);
-        // The prompt a `.cmd` shim would reject reaches the script unchanged.
-        let output = Command::new(&resolved_node).arg(&resolved_script).arg("line one\nline two").output().unwrap();
-        assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
-        assert!(String::from_utf8_lossy(&output.stdout).contains("line one\\nline two"));
         // A shim without a real script, and any other file, stay untouched.
         assert!(npm_shim_targets(&dir.path().join("missing.cmd")).is_none());
         std::fs::write(dir.path().join("empty.cmd"), "@echo off\r\n").unwrap();
         assert!(npm_shim_targets(&dir.path().join("empty.cmd")).is_none());
     }
 
-    #[cfg(windows)]
     #[test]
-    fn ai_prompt_reaches_the_script_behind_an_npm_shim() {
-        let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("node_modules").join("faketool").join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(
-            bin.join("faketool.js"),
-            "console.log(process.argv[2].length + ':' + process.argv[2].includes('\\n') + ':' + (process.argv[2].match(/%/g) || []).length)\n",
-        )
-        .unwrap();
-        let shim = dir.path().join("faketool.cmd");
-        std::fs::write(
-            &shim,
-            "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\nendLocal & \"node\" \"%dp0%\\node_modules\\faketool\\bin\\faketool.js\" %*\r\n",
-        )
-        .unwrap();
-        if find_on_path("node.exe").is_none() {
-            return;
+    fn commit_agent_overlay_preserves_existing_provider_configuration() {
+        let source = r#"{"provider":{"custom":{"options":{"baseURL":"https://example.com"}}},"agent":{"review":{"mode":"subagent"}}}"#;
+        let config: serde_json::Value = serde_json::from_str(&opencode_commit_config(Some(source)).unwrap()).unwrap();
+        assert_eq!(config.pointer("/provider/custom/options/baseURL").unwrap(), "https://example.com");
+        assert!(config.pointer("/agent/review").is_none(), "a caller agent with tools must not replace anvil-commit");
+        assert_eq!(config.pointer("/tools/*").unwrap(), false);
+        assert_eq!(config.pointer("/permission/*").unwrap(), "deny");
+        assert_eq!(config.pointer("/mcp").unwrap(), &serde_json::json!({}));
+        assert_eq!(config.pointer("/plugin").unwrap(), &serde_json::json!([]));
+        assert_eq!(config.pointer("/command").unwrap(), &serde_json::json!({}));
+    }
+
+    #[test]
+    fn built_in_specs_reject_unsafe_options() {
+        for spec in ["gemini --yolo", "claude --dangerously-skip-permissions", "aider --yes-always",
+            "opencode run --auto", "codex exec --dangerously-bypass-approvals-and-sandbox"] {
+            let error = ai_commit::prepare(spec).err().unwrap_or_else(|| panic!("{spec} must be refused"));
+            assert!(error.contains("AI:"), "{spec}: {error}");
         }
-        // Multi-line and percent signs: `cmd.exe` would reject this argument
-        // (`batch file arguments are invalid`) and expand `%`; the script gets
-        // it verbatim on the full command-line budget.
-        let prompt = format!("subject\n\n{}", "- diff line with \"quotes\" and %PATH% signs\n".repeat(400));
-        let message = ai_commit_message(dir.path(), Some(shim.to_str().unwrap()), &prompt, std::time::Duration::from_secs(60))
-            .expect("the shim must run through node");
-        assert_eq!(message.trim(), format!("{}:true:{}", prompt.len(), prompt.matches('%').count()));
+        assert!(ai_commit::prepare("").is_err());
+    }
+
+    #[test]
+    fn wrapper_commands_cannot_downgrade_a_built_in_to_custom() {
+        for spec in [
+            "node C:\\npm\\node_modules\\@openai\\codex\\bin\\codex.js",
+            "cmd /c \"claude -p hi\"",
+        ] {
+            let error = ai_commit::prepare(spec).err().unwrap_or_else(|| panic!("{spec} must be refused"));
+            assert!(error.contains("AI:"), "{spec}: {error}");
+        }
+    }
+
+    #[test]
+    fn quoted_command_paths_are_not_split() {
+        let words = ai_commit::words("\"C:\\Program Files\\Claude\\claude.exe\" --model opus").unwrap();
+        assert_eq!(words, ["C:\\Program Files\\Claude\\claude.exe", "--model", "opus"]);
+        assert!(ai_commit::words("\"unclosed").is_err());
+    }
+
+    #[test]
+    fn codex_requests_never_advertise_or_accept_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.json"), r#"{"auth_mode":"chatgpt","tokens":{"access_token":"token","account_id":"account"}}"#).unwrap();
+        std::fs::write(dir.path().join("config.toml"), "model = \"gpt-6-astra\"\n").unwrap();
+        let (url, headers, body) = ai_commit::codex_request_for_tests(dir.path(), None, "diff").unwrap();
+        assert_eq!(url, "https://chatgpt.com/backend-api/codex/responses");
+        assert!(headers.iter().any(|(name, value)| name.eq_ignore_ascii_case("ChatGPT-Account-ID") && value == "account"));
+        assert!(body.get("tools").is_none(), "no tool is advertised, so none can be called");
+        assert_eq!(body.get("tool_choice").unwrap(), "none");
+        assert_eq!(body.get("model").unwrap(), "gpt-6-astra");
+
+        // An executable auth helper is not part of the request path: only the stored token is used.
+        std::fs::write(dir.path().join("auth.json"), r#"{"auth_mode":"apikey","OPENAI_API_KEY":"key"}"#).unwrap();
+        let (url, headers, _) = ai_commit::codex_request_for_tests(dir.path(), Some("gpt-5.2-codex"), "diff").unwrap();
+        assert_eq!(url, "https://api.openai.com/v1/responses");
+        assert!(!headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("ChatGPT-Account-ID")));
+
+        // A non-openai provider would need user-defined executable options: refuse.
+        std::fs::write(dir.path().join("config.toml"), "model_provider = \"custom\"\n").unwrap();
+        assert!(ai_commit::codex_request_for_tests(dir.path(), None, "diff").is_err());
+    }
+
+    #[test]
+    fn claude_managed_policy_gate_flags_executable_settings() {
+        let hooks = serde_json::json!({"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "evil.exe"}]}]}});
+        assert!(ai_commit::policy_is_executable(&hooks, true));
+        assert!(!ai_commit::policy_is_executable(&hooks, false), "bare mode runs no hooks module");
+        assert!(ai_commit::policy_is_executable(&serde_json::json!({"apiKeyHelper": "evil.exe"}), false));
+        assert!(ai_commit::policy_is_executable(&serde_json::json!({"managedMcpServers": {"x": {}}}), false));
+        assert!(ai_commit::policy_is_executable(&serde_json::json!({"env": {"NODE_OPTIONS": "--require evil"}}), false));
+        assert!(!ai_commit::policy_is_executable(&serde_json::json!({"permissions": {"deny": ["Read(./x)"]}}), true));
     }
 }

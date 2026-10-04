@@ -24,6 +24,7 @@ fn spawn(program: &str, args: &[&str]) -> Pane {
         cell_height: 16,
         scrollback: 1000,
         word_separators: " ".into(),
+        allow_osc52: false,
         palette: Palette::hardcore(),
         cursor_style: alacritty_terminal::vte::ansi::CursorStyle::default(),
     };
@@ -153,7 +154,7 @@ fn tracks_reported_working_directory() {
 #[test]
 fn scrollback_setting_reaches_a_running_pane() {
     let pane = spawn("cmd.exe", &["/c", "ping -n 2 127.0.0.1 >nul & for /L %i in (1,1,200) do @echo %i"]);
-    pane.set_options(alacritty_terminal::vte::ansi::CursorStyle::default(), 20, " ");
+    pane.set_options(alacritty_terminal::vte::ansi::CursorStyle::default(), 20, " ", false);
     wait_exit(&pane);
     let history = pane.term.lock().grid().history_size();
     assert!(history <= 20, "history of {history} lines kept with a 20-line scrollback");

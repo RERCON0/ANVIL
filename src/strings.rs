@@ -57,6 +57,7 @@ pub const SETTINGS_PROFILES: &str = "Профили";
 pub const SETTINGS_HOTKEYS: &str = "Горячие клавиши";
 pub const SETTINGS_FONT: &str = "Шрифт";
 pub const SETTINGS_FONT_SIZE: &str = "Размер";
+pub const SETTINGS_FONT_REFRESH: &str = "Обновить список шрифтов";
 pub const SETTINGS_SCHEME: &str = "Цветовая схема";
 pub const SETTINGS_SCROLLBACK: &str = "История (строк)";
 pub const SETTINGS_CURSOR: &str = "Курсор";
@@ -70,6 +71,7 @@ pub const RIGHT_CLICK_PASTE: &str = "Вставка";
 pub const RIGHT_CLICK_MENU: &str = "Меню";
 pub const SETTINGS_MIDDLE_CLICK: &str = "Вставка средней кнопкой";
 pub const SETTINGS_COPY_ON_SELECT: &str = "Копировать при выделении";
+pub const SETTINGS_ALLOW_OSC52: &str = "Разрешить приложениям менять буфер обмена (OSC 52)";
 pub const SETTINGS_WORD_SEPARATORS: &str = "Разделители слов";
 pub const SETTINGS_DEFAULT_PROFILE: &str = "Профиль по умолчанию";
 pub const SETTINGS_ADD: &str = "Добавить";
@@ -97,17 +99,27 @@ pub const SETTINGS_CLAUDE_ENABLED: &str = "Статус Claude Code";
 pub const SETTINGS_CLAUDE_CONNECTED: &str = "Подключён";
 pub const SETTINGS_CLAUDE_NOT_CONNECTED: &str = "Не подключён";
 pub const SETTINGS_CLAUDE_DECLINED: &str = "Строка статуса не подключена: вы выбрали оставить свою команду";
+pub const SETTINGS_CLAUDE_PENDING: &str = "Интеграция включена; установка требует подтверждения";
+pub const SETTINGS_CLAUDE_GLOBAL_HINT: &str = "Установка меняет глобальную строку статуса Claude Code. Отключите интеграцию перед удалением ANVIL; после перемещения подтвердите новый путь.";
+pub const SETTINGS_CLAUDE_INSTALL: &str = "Установить / обновить интеграцию…";
+pub const SETTINGS_CLAUDE_RESTORE: &str = "Повторить восстановление строки статуса";
 pub const SETTINGS_CUSTOM_PROFILE: &str = "Пользовательский профиль";
 pub const SETTINGS_NO_PROFILES: &str = "Пользовательских профилей нет";
 pub const SETTINGS_APPLY_HINT: &str = "Изменения применяются сразу и сохраняются в config.json";
 pub const SETTINGS_HOTKEYS_HINT: &str = "Редактирование клавиш — только в config.json";
 
-// Claude Code status line setup dialog.
-pub fn claude_replace_question(command: &str) -> String {
-    format!("Строка статуса Claude Code сейчас: `{command}`. Заменить на встроенную в ANVIL? Вывод тот же, Node не нужен.")
-}
-pub const CLAUDE_REPLACE: &str = "Заменить";
-pub const CLAUDE_KEEP: &str = "Оставить";
+// Explicit consent for global Claude settings and executable paste.
+pub const CLAUDE_INSTALL_QUESTION: &str = "Установить или обновить строку статуса Claude Code?";
+pub const CLAUDE_INSTALL_GLOBAL: &str = "Это меняет глобальные настройки Claude Code для всех терминалов:";
+pub const CLAUDE_CURRENT_COMMAND: &str = "Текущая команда:";
+pub const CLAUDE_NEW_COMMAND: &str = "Новая команда:";
+pub const CLAUDE_INSTALL_WARNING: &str = "При отключении ANVIL восстановит предыдущую строку, если её не изменили. После перемещения или удаления ANVIL команда перестанет работать: отключите интеграцию до удаления или подтвердите обновление пути.";
+pub const CLAUDE_INSTALL_ACCEPT: &str = "Установить / обновить";
+pub const CLAUDE_HELPER_MISSING: &str = "Не найден anvil-claude-status.exe; интеграция не установлена.";
+pub const CLAUDE_DIRECTORY_CHANGED: &str = "Сначала отключите интеграцию и восстановите прежние настройки Claude Code, затем установите её в новом каталоге.";
+pub const PASTE_WARNING: &str = "Многострочная вставка может выполнить команды в оболочке.";
+pub const PASTE_PREVIEW_HINT: &str = "Bracketed paste отключён. Ничего не отправлено. Проверьте текст перед вставкой:";
+pub const PASTE_ACCEPT: &str = "Вставить и разрешить выполнение";
 
 // Workspace panel (git).
 pub const WORKSPACE_NO_REPO: &str = "не репозиторий";
