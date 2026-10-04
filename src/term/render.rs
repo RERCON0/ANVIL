@@ -23,6 +23,12 @@ pub const MATCH_CURRENT: Color32 = Color32::from_rgba_premultiplied(177, 106, 22
 pub struct CellMetrics {
     pub width: f32,
     pub height: f32,
+    /// Downward shift applied to a row's text so the font's own line box — the
+    /// box its block and box-drawing glyphs fill, which is what a cell means to
+    /// a terminal — lands on the cell. epaint places the baseline at the font's
+    /// typographic ascent, which for faces whose line box is taller (Consolas)
+    /// leaves every row of text hanging under the top edge of its background.
+    pub offset_y: f32,
 }
 
 pub fn snap_to_pixels(points: f32, pixels_per_point: f32) -> f32 {
@@ -31,8 +37,23 @@ pub fn snap_to_pixels(points: f32, pixels_per_point: f32) -> f32 {
 
 pub fn cell_metrics(ctx: &egui::Context, fonts: &TermFonts) -> CellMetrics {
     let ppp = ctx.pixels_per_point();
-    let (advance, row) = ctx.fonts(|f| (f.glyph_width(&fonts.regular, 'M'), f.row_height(&fonts.regular)));
-    CellMetrics { width: snap_to_pixels(advance, ppp), height: snap_to_pixels(row, ppp) }
+    let (advance, row, line) = ctx.fonts(|f| {
+        // The full block is what a terminal cell means: programs tile regions
+        // with it, so the face draws it exactly as tall as its line box. The
+        // heavy vertical is no reference — Cascadia draws it a third taller on
+        // purpose, so borders overlap — and epaint exposes no font table.
+        let line = f.layout_no_wrap("\u{2588}".to_owned(), fonts.primary.clone(), Color32::WHITE);
+        (f.glyph_width(&fonts.regular, 'M'), f.row_height(&fonts.regular), line.mesh_bounds)
+    });
+    // epaint pads every glyph in its atlas by one physical pixel per side.
+    let ink_top = line.min.y + 1.0 / ppp;
+    // Only a face whose line box agrees with the row height is a terminal face;
+    // a substitute box for a missing glyph (or a decorative block) keeps the
+    // plain metrics rather than shifting text on a guess.
+    let aligned = line.is_finite() && (line.height() - row).abs() <= row * 0.15;
+    let round = |points: f32| (points * ppp).round() / ppp;
+    let offset_y = if aligned { round(-ink_top) } else { 0.0 };
+    CellMetrics { width: snap_to_pixels(advance, ppp), height: snap_to_pixels(row, ppp), offset_y }
 }
 
 /// Longest OSC 8 target treated as a link. Real URLs are far shorter; a
@@ -291,6 +312,9 @@ pub struct PaintOptions<'a> {
 
 pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions) {
     let (cw, ch) = (opt.metrics.width, opt.metrics.height);
+    // The font's line box sits this far below epaint's ascent: shift every
+    // glyph down so text lines up with the cell its background fills.
+    let dy = opt.metrics.offset_y;
     let ppp = painter.ctx().pixels_per_point();
     // Cells come from grid lines snapped to physical pixels: the edge two
     // neighbours share is computed once, so their fills meet exactly.
@@ -340,7 +364,7 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
                     let ink = galley.mesh_bounds;
                     let mut pos = Pos2::new(
                         span.min.x + ((span.width() - galley.size().x) / 2.0).max(0.0),
-                        span.min.y + (ch - galley.size().y) / 2.0,
+                        span.min.y + dy + (ch - galley.size().y) / 2.0,
                     );
                     if ink.is_positive() && ink.is_finite() {
                         pos.x = span.center().x - ink.center().x;
@@ -349,7 +373,7 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
                             let center = *primary_ink_center.get_or_insert_with(|| {
                                 painter.layout_no_wrap("M".to_owned(), opt.fonts.primary.clone(), s.fg).mesh_bounds.center().y
                             });
-                            pos.y = span.min.y + center - ink.center().y;
+                            pos.y = span.min.y + dy + center - ink.center().y;
                         }
                         if pos.y + ink.min.y < span.min.y || pos.y + ink.max.y > span.max.y {
                             pos.y = span.center().y - ink.center().y;
@@ -366,7 +390,7 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
                     ..Default::default()
                 };
                 let galley = painter.layout_job(LayoutJob::single_section(run.text.clone(), format));
-                painter.galley(span.min, galley, s.fg);
+                painter.galley(span.min + Vec2::new(0.0, dy), galley, s.fg);
             }
             paint_underline(painter, span, s.underline, s.fg);
         }
@@ -377,21 +401,9 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
         let cell = cell_rect(c.row, c.col, if c.wide { 2 } else { 1 });
         let color = opt.palette.cursor;
         let shape = if opt.focused { c.shape } else { CursorShape::HollowBlock };
-        let rect = if matches!(shape, CursorShape::Block | CursorShape::HollowBlock) && (opt.cursor_on || !opt.focused) {
-            // Font rows include descender space below the visible capitals.
-            // Keep the cursor's size, but centre it on the text rather than
-            // that taller row; character redraws retain their original baseline.
-            let center = *primary_ink_center.get_or_insert_with(|| {
-                painter.layout_no_wrap("M".to_owned(), opt.fonts.primary.clone(), color).mesh_bounds.center().y
-            });
-            let offset = center - ch / 2.0;
-            Rect::from_min_max(
-                Pos2::new(cell.min.x, snap(cell.min.y + offset, ppp)),
-                Pos2::new(cell.max.x, snap(cell.max.y + offset, ppp)),
-            )
-        } else {
-            cell
-        };
+        // The cell is the font's line box now, so the block covers exactly what
+        // the text occupies.
+        let rect = cell;
         match shape {
             _ if !opt.cursor_on && opt.focused => {}
             CursorShape::Block => {
@@ -399,7 +411,7 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
                 if c.ch != ' ' {
                     let font = opt.fonts.regular.clone();
                     let galley = painter.layout_no_wrap(c.ch.to_string(), font, frame.default_bg);
-                    painter.galley(cell.min, galley, frame.default_bg);
+                    painter.galley(cell.min + Vec2::new(0.0, dy), galley, frame.default_bg);
                 }
             }
             CursorShape::Beam => {
@@ -461,6 +473,65 @@ mod tests {
         assert_eq!(snap_to_pixels(8.79, 1.0), 9.0);
         assert!((snap_to_pixels(8.79, 1.25) - 8.8).abs() < 1e-4, "10.99 px rounds to 11 px = 8.8 pt");
         assert_eq!(snap_to_pixels(0.1, 1.0), 1.0, "never zero");
+    }
+
+    /// The cell is the font's line box, so the capitals have to sit centred in
+    /// it. Otherwise every backgrounded row is off — the text of a chip or a
+    /// menu row hangs under the top edge of its highlight, which is how the
+    /// Consolas look went wrong: epaint places the baseline at the font's
+    /// typographic ascent, below the line box the face actually draws.
+    #[test]
+    fn capitals_sit_centred_in_their_cells() {
+        let ppp = 1.25;
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(ppp);
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        let _ = ctx.run(Default::default(), |_| {});
+        let fonts = TermFonts::new(14.0);
+        let metrics = cell_metrics(&ctx, &fonts);
+        let style = crate::term::style::CellStyle {
+            fg: Color32::WHITE,
+            bg: Color32::BLACK,
+            bold: false,
+            italic: false,
+            underline: Underline::None,
+            strike: false,
+        };
+        let cell = |ch: char| RenderCell { ch, combining: None, style, wide: false, spacer: false, in_primary_font: true, hyperlink: None };
+        let rows = vec![
+            "MM".chars().map(cell).collect::<Vec<_>>(),
+            "  ".chars().map(cell).collect(),
+        ];
+        let frame = Frame { rows, columns: 2, lines: 2, cursor: None, selection: Vec::new(), display_offset: 0, history_size: 0, default_bg: Color32::BLACK };
+        let origin = Pos2::new(4.0, 4.0);
+        let output = ctx.run(Default::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            let palette = Palette::hardcore();
+            let opt = PaintOptions { metrics, fonts: &fonts, palette: &palette, focused: true, cursor_on: true, highlights: &[] };
+            paint(&painter, origin, &frame, &opt);
+        });
+        let mut inks = Vec::new();
+        for primitive in ctx.tessellate(output.shapes, ppp) {
+            let egui::epaint::Primitive::Mesh(mesh) = &primitive.primitive else { continue };
+            let mut i = 0;
+            while i + 5 < mesh.indices.len() {
+                let verts: Vec<&egui::epaint::Vertex> = (0..6).map(|k| &mesh.vertices[mesh.indices[i + k] as usize]).collect();
+                let uv = verts[0].uv;
+                let glyph = (uv.x - egui::epaint::WHITE_UV.x).abs() > 1e-6 || (uv.y - egui::epaint::WHITE_UV.y).abs() > 1e-6;
+                if glyph {
+                    let y0 = verts.iter().map(|v| v.pos.y).fold(f32::INFINITY, f32::min);
+                    let y1 = verts.iter().map(|v| v.pos.y).fold(f32::NEG_INFINITY, f32::max);
+                    inks.push((y0, y1));
+                }
+                i += 6;
+            }
+        }
+        assert_eq!(inks.len(), 2, "both capitals were drawn");
+        let centre = snap_to_pixels(origin.y, ppp) + metrics.height / 2.0;
+        for (y0, y1) in inks {
+            let offset = ((y0 + y1) / 2.0 - centre) * ppp;
+            assert!(offset.abs() <= 1.5, "the capital's centre is {offset:.2} px off the cell's centre");
+        }
     }
 
     /// Bars and block art (the Claude Code mascot, the context meter) showed a
