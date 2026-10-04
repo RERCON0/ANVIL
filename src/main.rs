@@ -22,6 +22,11 @@ fn main() {
             }
         }
     }));
+    // Credential copies from a crashed AI run are removed in the background:
+    // startup never scans %TEMP% on the main thread.
+    if let Err(error) = std::thread::Builder::new().name("ai-state-sweep".to_owned()).spawn(anvil::git::sweep_stale_ai_state) {
+        log::info!("cannot start the AI state sweep: {error}");
+    }
     anvil::host::run(anvil::app::AnvilApp::new());
 }
 

@@ -113,7 +113,7 @@ pub(super) fn prepare(spec: &str) -> Result<Invocation, String> {
         return Err("AI: укажите исполняемый файл AI напрямую, без shell/node-обёртки".to_owned());
     }
     let directory = {
-        sweep_stale_directories(std::time::Duration::from_secs(3600));
+        sweep_stale_ai_state();
         tempfile::Builder::new().prefix("anvil-ai-").tempdir().map_err(|e| format!("AI: {e}"))?
     };
     let mut command = super::ai_cli_command(&program);
@@ -235,8 +235,17 @@ fn claude_settings(source: &serde_json::Value, with_user_settings: bool) -> (ser
 /// Credential copies (Gemini OAuth files, aider API keys) live inside
 /// `anvil-ai-*` directories. Normal completion removes them, but a crash, a
 /// kill or a child still holding a file leaves one behind, so directories older
-/// than `max_age` are swept before the next generation starts. A generation
-/// that is running now is younger than the threshold and stays.
+/// than this are swept before the next generation starts — and once at startup,
+/// since nothing else would ever clean them. A generation that is running now is
+/// younger than the threshold and stays.
+const STALE_AI_STATE_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Sweeps what a dead generation left behind: its credential copies must not
+/// survive it, whether the run crashed or the machine went down.
+pub(super) fn sweep_stale_ai_state() {
+    sweep_stale_directories(STALE_AI_STATE_AGE);
+}
+
 fn sweep_stale_directories(max_age: std::time::Duration) {
     sweep_stale_directories_in(&std::env::temp_dir(), max_age);
 }
@@ -286,9 +295,6 @@ fn claude(command: &mut Command) -> Result<(), String> {
     let (settings, environment) = claude_settings(&source, root.is_some());
     let static_auth = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"]
         .iter().any(|key| std::env::var_os(key).is_some() || environment.iter().any(|(name, _)| name == key));
-    for (key, value) in &environment {
-        command.env(key, value);
-    }
     if static_auth {
         if let Some(root) = root.as_deref() { check_claude_managed_policy(root, false)?; }
         command.arg("--bare");

@@ -606,6 +606,29 @@ fn invalid_nested_git_markers_follow_real_git() {
     assert_eq!(root.canonicalize().unwrap(), outer.canonicalize().unwrap());
     assert!(!git::status(&root).unwrap().branch.is_empty());
 
+    // A `.git` directory that carries HEAD, objects and refs but whose HEAD
+    // names no ref and is no object name: git skips it, so ANVIL must too.
+    let junk = outer.join("sub-junk-head");
+    std::fs::create_dir_all(junk.join(".git/objects")).unwrap();
+    std::fs::create_dir_all(junk.join(".git/refs")).unwrap();
+    std::fs::write(junk.join(".git/HEAD"), "garbage\n").unwrap();
+    assert_eq!(
+        PathBuf::from(git_toplevel(&junk)).canonicalize().unwrap(),
+        outer.canonicalize().unwrap(),
+        "git ignores a nested .git whose HEAD is neither a refs/… name nor an object name"
+    );
+    assert_eq!(git::find_root(&junk).unwrap().canonicalize().unwrap(), outer.canonicalize().unwrap());
+
+    // The same directory with a detached object name is a repository for git
+    // and therefore for ANVIL.
+    std::fs::write(junk.join(".git/HEAD"), format!("{}\n", "a".repeat(40))).unwrap();
+    assert_eq!(
+        PathBuf::from(git_toplevel(&junk)).canonicalize().unwrap(),
+        junk.canonicalize().unwrap(),
+        "a detached HEAD is a repository"
+    );
+    assert_eq!(git::find_root(&junk).unwrap().canonicalize().unwrap(), junk.canonicalize().unwrap());
+
     // A `.git` file whose target is not a git directory: git refuses the
     // repository instead of walking up, so ANVIL must not promote it either.
     let bogus = outer.join("sub-bogus");

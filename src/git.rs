@@ -1156,7 +1156,14 @@ fn global_configs(executable: &Path) -> Result<Vec<PathBuf>, String> {
 /// directory when the candidate is a real git directory, `None` otherwise.
 fn valid_git_dir(git_dir: &Path, scan: &mut ConfigScan) -> Result<Option<PathBuf>, String> {
     let git_dir = scan.source(git_dir)?;
-    if !scan.source(&git_dir.join("HEAD"))?.is_file() {
+    let head = scan.source(&git_dir.join("HEAD"))?;
+    if !head.is_file() {
+        return Ok(None);
+    }
+    // Git reads HEAD as well and refuses the directory when it names neither a
+    // ref under `refs/` nor an object: such a `.git` is skipped and the walk
+    // continues, so a stray directory cannot become ANVIL's repository.
+    if !head_reference(&scan.read(&head)?.unwrap_or_default()) {
         return Ok(None);
     }
     let common_dir = match scan.read(&git_dir.join("commondir"))? {
@@ -1178,6 +1185,19 @@ fn valid_git_dir(git_dir: &Path, scan: &mut ConfigScan) -> Result<Option<PathBuf
     } else {
         Ok(None)
     }
+}
+
+/// `HEAD` content git accepts, probed against git 2.54: either `ref:` followed
+/// by spaces and a name under `refs/`, or an object name — the first forty bytes
+/// must be hex digits, and git ignores whatever follows them. A leading space,
+/// `ref: HEAD`, a short hash and an empty file are all rejected by git, and a
+/// rejected marker means "not a repository here, keep walking up".
+fn head_reference(text: &str) -> bool {
+    if let Some(name) = text.strip_prefix("ref:") {
+        return name.trim_start_matches([' ', '\t']).starts_with("refs/");
+    }
+    let bytes = text.as_bytes();
+    bytes.len() >= 40 && bytes[..40].iter().all(u8::is_ascii_hexdigit)
 }
 
 fn discover_repository(cwd: &Path, scan: &mut ConfigScan) -> Result<Option<RepositoryPaths>, String> {
@@ -1649,6 +1669,16 @@ pub fn log(root: &Path) -> Result<CommitLog, String> {
     args.extend(revs.iter().map(|rev| (*rev).to_owned()));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let text = run_git(root, &arg_refs)?;
+    let commits = parse_log(&text, &outgoing, &incoming);
+    let truncated = commits.len() >= MAX_COMMITS;
+    Ok(CommitLog { commits, upstream, truncated })
+}
+
+/// Parses `git log` records into commits. A commit subject may itself contain
+/// the record/field separators; only records whose hash is a real object id are
+/// trusted, so a crafted subject cannot inject a "hash" that later reaches git
+/// as an option.
+fn parse_log(text: &str, outgoing: &std::collections::HashSet<String>, incoming: &std::collections::HashSet<String>) -> Vec<Commit> {
     let mut commits = Vec::new();
     for record in text.split('\u{1e}') {
         let record = record.trim_start_matches(['\n', '\r']);
@@ -1656,9 +1686,6 @@ pub fn log(root: &Path) -> Result<CommitLog, String> {
             continue;
         }
         let fields: Vec<&str> = record.split('\u{1f}').collect();
-        // A commit subject may itself contain the record/field separators; only
-        // records whose hash is a real object id are trusted, so a crafted
-        // subject cannot inject a "hash" that later reaches git as an option.
         if fields.len() < 7 || !is_object_hash(fields[0]) || fields.iter().any(|field| field.contains(NUL)) {
             continue;
         }
@@ -1680,8 +1707,7 @@ pub fn log(root: &Path) -> Result<CommitLog, String> {
             },
         });
     }
-    let truncated = commits.len() >= MAX_COMMITS;
-    Ok(CommitLog { commits, upstream, truncated })
+    commits
 }
 
 /// Files and message of one commit, relative to its first parent.
@@ -2170,6 +2196,13 @@ fn opencode_message(text: &str) -> Result<String, String> {
     Ok(message)
 }
 
+/// Credential copies left behind by a crashed or killed generation. The AI
+/// worker sweeps before every run; startup sweeps too, because otherwise the
+/// files would sit in `%TEMP%` until the next generation happens to run.
+pub fn sweep_stale_ai_state() {
+    ai_commit::sweep_stale_ai_state();
+}
+
 /// Generates a full commit message with an inference-only built-in profile.
 /// Every invocation owns a fresh private directory, removed on success/error.
 /// Explicit unknown custom executables remain user code, not safe profiles.
@@ -2617,19 +2650,8 @@ index 111..222 100644\n\
             raw.push(0x1e);
         }
         let text = String::from_utf8(raw).unwrap();
-        let mut commits = Vec::new();
-        for record in text.split('\u{1e}') {
-            let record = record.trim_start_matches(['\n', '\r']);
-            if record.is_empty() {
-                continue;
-            }
-            let fields: Vec<&str> = record.split('\u{1f}').collect();
-            if fields.len() < 7 || !is_object_hash(fields[0]) {
-                continue;
-            }
-            commits.push(fields[0].to_owned());
-        }
-        assert_eq!(commits, vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()]);
+        let commits = parse_log(&text, &std::collections::HashSet::new(), &std::collections::HashSet::new());
+        assert_eq!(commits.iter().map(|commit| commit.hash.as_str()).collect::<Vec<_>>(), vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]);
     }
 
     #[test]
