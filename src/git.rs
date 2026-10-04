@@ -66,6 +66,8 @@ impl Change {
 pub struct Status {
     pub branch: String,
     pub upstream: Option<String>,
+    pub head_oid: Option<String>,
+    pub upstream_oid: Option<String>,
     pub ahead: u32,
     pub behind: u32,
     pub changes: Vec<Change>,
@@ -103,9 +105,9 @@ fn git_command(root: &Path) -> Command {
     let mut command = Command::new("git");
     command
         // Command-line config wins over the repository's: a repo-local
-        // fsmonitor hook would otherwise run on every status refresh, and
-        // quotePath would C-quote non-ASCII names in diff headers.
-        .args(["-c", "core.fsmonitor=false", "-c", "core.quotePath=false"])
+        // fsmonitor hook or signature verifier must not run on a refresh,
+        // and quotePath must not C-quote non-ASCII names in diff headers.
+        .args(["-c", "core.fsmonitor=false", "-c", "core.quotePath=false", "-c", "log.showSignature=false"])
         .current_dir(root)
         // Never let git ask a human: no terminal prompts, no GUI helpers, and
         // treat every path we pass as a literal, not a pathspec pattern.
@@ -290,10 +292,82 @@ pub fn find_root(cwd: &Path) -> Option<PathBuf> {
     run_git(cwd, &["rev-parse", "--show-toplevel"]).ok().map(|text| PathBuf::from(text.trim()))
 }
 
+/// Exact effective configuration approved for one repository/session.
+/// Keep values opaque: Git configuration may contain credentials.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RepositoryStamp(std::sync::Arc<Vec<u8>>);
+
+impl std::fmt::Debug for RepositoryStamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RepositoryStamp")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepositoryIdentity {
+    pub root: PathBuf,
+    pub stamp: RepositoryStamp,
+}
+
+/// Root/config discovery is read-only: unlike status/diff/log, these Git
+/// commands cannot invoke clean filters, hooks or signature programs.
+pub fn repository_identity(cwd: &Path) -> Result<Option<RepositoryIdentity>, String> {
+    reject_network_repository(cwd)?;
+    let Some(root) = find_root(cwd) else { return Ok(None) };
+    let stamp = repository_stamp(&root)?;
+    Ok(Some(RepositoryIdentity { root, stamp }))
+}
+
+/// Includes all effective scopes and included files, not just .git/config.
+/// Compare before accepting approval and before running repository commands.
+pub fn repository_stamp(root: &Path) -> Result<RepositoryStamp, String> {
+    reject_network_repository(root)?;
+    const CONFIG_MAX_OUTPUT: usize = 1024 * 1024;
+    let config = run_git_capped(
+        root,
+        &["config", "--includes", "--show-origin", "--show-scope", "--null", "--list"],
+        GIT_TIMEOUT,
+        CONFIG_MAX_OUTPUT,
+    )?;
+    if config.len() >= CONFIG_MAX_OUTPUT || config.last() != Some(&0) {
+        return Err("Не удалось полностью прочитать конфигурацию Git; доступ к репозиторию не разрешён.".to_owned());
+    }
+    Ok(RepositoryStamp(std::sync::Arc::new(config)))
+}
+
+fn reject_network_repository(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        if matches!(
+            path.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
+        ) {
+            return Err("Git-панель не открывает сетевые репозитории.".to_owned());
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+    Ok(())
+}
+
 /// Reads branch, ahead/behind and every change (staged, unstaged, untracked).
 pub fn status(root: &Path) -> Result<Status, String> {
     let raw = run_git_bytes(root, &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"])?;
     let mut status = parse_status(&raw);
+    if status.head_oid.is_some() || status.upstream.is_some() {
+        // Match log's origin/<branch> fallback without making a branch name
+        // an option or interpreting it as a revision expression.
+        let reference: std::borrow::Cow<'_, str> = if status.upstream.is_some() {
+            "@{upstream}^{commit}".into()
+        } else {
+            format!("refs/remotes/origin/{}^{{commit}}", status.branch).into()
+        };
+        status.upstream_oid = run_git(root, &["rev-parse", "--verify", "--quiet", "--end-of-options", &reference])
+            .ok()
+            .map(|oid| oid.trim().to_owned())
+            .filter(|oid| is_object_hash(oid));
+    }
     if let Ok(numstat) = run_git(root, &["diff", "--no-ext-diff", "--no-textconv", "--numstat", "-z", "--no-renames"]) {
         apply_numstat(&mut status.changes, &parse_numstat(numstat.as_bytes()), false);
     }
@@ -320,7 +394,9 @@ pub fn parse_status(bytes: &[u8]) -> Status {
         let text = String::from_utf8_lossy(record);
         match record[0] {
             b'#' => {
-                if let Some(rest) = text.strip_prefix("# branch.head ") {
+                if let Some(rest) = text.strip_prefix("# branch.oid ") {
+                    status.head_oid = is_object_hash(rest).then(|| rest.to_owned());
+                } else if let Some(rest) = text.strip_prefix("# branch.head ") {
                     status.branch = rest.to_owned();
                 } else if let Some(rest) = text.strip_prefix("# branch.upstream ") {
                     status.upstream = Some(rest.to_owned());
@@ -665,12 +741,18 @@ pub fn stage(root: &Path, paths: &[String], staged: bool) -> Result<(), String> 
     }
 }
 
-/// Commits staged changes; returns the short hash.
-pub fn commit(root: &Path, message: &str) -> Result<String, String> {
+/// Commits staged changes; consumes the UTF-8 message without copying it.
+/// Returns the short hash.
+pub fn commit(root: &Path, message: String) -> Result<String, String> {
     // Commit hooks (husky, lint-staged, a first pre-commit run) easily take
     // longer than the polling timeout, and killing git mid-commit leaves
-    // index.lock behind.
-    run_git_timeout(root, &["commit", "-m", message], GIT_TIMEOUT_COMMIT)?;
+    // index.lock behind. Stdin also avoids Windows' command-line size limit.
+    let mut command = git_command(root);
+    command.args(["commit", "-F", "-"]);
+    let (success, _, stderr) = run_bounded(command, "git commit", GIT_TIMEOUT_COMMIT, GIT_MAX_OUTPUT, Some(message.into_bytes()))?;
+    if !success {
+        return Err(String::from_utf8_lossy(&stderr).trim().to_owned());
+    }
     run_git(root, &["rev-parse", "--short", "HEAD"]).map(|hash| hash.trim().to_owned())
 }
 
@@ -721,6 +803,115 @@ fn ai_cli_command(program: &str) -> Command {
         }
     }
     Command::new(program)
+}
+
+const WINDOWS_COMMAND_LIMIT: usize = 32_767; // Includes the terminating NUL.
+const WINDOWS_BATCH_LIMIT: usize = 8_191; // Conservative, also including NUL.
+
+fn utf16_len(text: &std::ffi::OsStr) -> usize {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        text.encode_wide().count()
+    }
+    #[cfg(not(windows))]
+    text.to_string_lossy().encode_utf16().count()
+}
+
+/// Rust's regular Windows argv escaping, measured without building a second
+/// command line. Batch arguments use a conservative always-quoted budget and
+/// include Rust's expansion of percent signs.
+fn windows_argument_units(text: &std::ffi::OsStr, batch: bool) -> usize {
+    let quoted = batch || text.is_empty() || text.as_encoded_bytes().iter().any(|byte| *byte == b' ' || *byte == b'\t');
+    let count = |units: &mut dyn Iterator<Item = u16>| {
+        let mut size = if quoted { 2 } else { 0 };
+        let mut backslashes = 0;
+        for unit in units {
+            size += 1;
+            if unit == b'\\' as u16 {
+                backslashes += 1;
+            } else {
+                if unit == b'"' as u16 {
+                    size += backslashes + 1;
+                } else if batch && matches!(unit, 37 | 13) {
+                    size += 7;
+                }
+                backslashes = 0;
+            }
+        }
+        size + if quoted { backslashes } else { 0 }
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        count(&mut text.encode_wide())
+    }
+    #[cfg(not(windows))]
+    count(&mut text.to_string_lossy().encode_utf16())
+}
+
+fn windows_batch_shell_units() -> usize {
+    // Rust currently spells argv[0] as "cmd.exe" in its batch wrapper.
+    // Budget a fully qualified/quoted shell too, for Windows installations
+    // and custom COMSPEC settings with longer or supplementary-character paths.
+    let shell = std::env::var_os("COMSPEC").or_else(|| {
+        std::env::var_os("SystemRoot").map(|root| PathBuf::from(root).join("System32").join("cmd.exe").into_os_string())
+    });
+    shell.as_deref().map(utf16_len).unwrap_or("cmd.exe".len()).max("cmd.exe".len()) + 2
+}
+
+fn windows_command_units(command: &Command, batch: bool) -> usize {
+    let program_units = if batch {
+        // Rust resolves a batch script to an absolute path before wrapping it
+        // with cmd.exe. The verbatim prefix allowance is deliberately retained.
+        let path = Path::new(command.get_program());
+        let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| {
+            std::env::current_dir().unwrap_or_default().join(path)
+        });
+        utf16_len(absolute.as_os_str()) + 8 + windows_batch_shell_units() + " /e:ON /v:OFF /d /c \"".len() + 1
+    } else {
+        utf16_len(command.get_program())
+    };
+    // Quoted argv[0], one separating space per argument, and terminating NUL.
+    program_units + 3 + command.get_args().map(|arg| 1 + windows_argument_units(arg, batch)).sum::<usize>()
+}
+
+/// Budget the prompt against the fully resolved executable and every fixed
+/// flag. Prefixes are cut at UTF-8 boundaries; a cut is always visible.
+fn fit_ai_prompt<'a>(command: &Command, prompt: &'a str, suffix: &[String]) -> Result<std::borrow::Cow<'a, str>, String> {
+    let batch = Path::new(command.get_program()).extension().and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat"));
+    let suffix_units = suffix.iter().map(|arg| 1 + windows_argument_units(arg.as_ref(), batch)).sum::<usize>();
+    let limit = if batch { WINDOWS_BATCH_LIMIT } else { WINDOWS_COMMAND_LIMIT };
+    let available = limit.checked_sub(windows_command_units(command, batch) + suffix_units + 1)
+        .ok_or_else(|| "Команда AI превышает лимит командной строки Windows".to_owned())?;
+    if windows_argument_units(prompt.as_ref(), batch) <= available {
+        return Ok(prompt.into());
+    }
+    // Do not introduce a newline into a single-line batch argument: Rust
+    // safely rejects multiline batch arguments rather than shell-escaping them.
+    let separator = if batch { ' ' } else { '\n' };
+    let marker_units = windows_argument_units(AI_TRUNCATED.as_ref(), batch) + 1;
+    let room = available.checked_sub(marker_units)
+        .ok_or_else(|| "Команда AI не оставляет места для запроса".to_owned())?;
+    let mut used = 0;
+    let mut backslashes = 0;
+    let mut end = 0;
+    for (offset, character) in prompt.char_indices() {
+        let extra = if character == '"' { backslashes + 1 } else if batch && matches!(character, '%' | '\r') { 7 } else { 0 };
+        let size = character.len_utf16() + extra;
+        if used + size > room {
+            break;
+        }
+        used += size;
+        backslashes = if character == '\\' { backslashes + 1 } else { 0 };
+        end = offset + character.len_utf8();
+    }
+    let mut shortened = String::with_capacity(end + 1 + AI_TRUNCATED.len());
+    shortened.push_str(&prompt[..end]);
+    shortened.push(separator);
+    shortened.push_str(AI_TRUNCATED);
+    Ok(shortened.into())
 }
 
 #[cfg(windows)]
@@ -861,20 +1052,20 @@ pub fn ai_commit_message(
     timeout: std::time::Duration,
 ) -> Result<String, String> {
     let spec = command.unwrap_or("");
-    let (program, args) = ai_command(spec, prompt).ok_or_else(|| crate::strings::WORKSPACE_NO_AI_COMMAND.to_owned())?;
+    let (program, args) = ai_command(spec, "").ok_or_else(|| crate::strings::WORKSPACE_NO_AI_COMMAND.to_owned())?;
+    let prompt_index = if spec.trim() == "aider" { 1 } else { args.len() - 1 };
     let mut invocation = ai_cli_command(&program);
     let opencode = program == "opencode";
+    invocation.args(&args[..prompt_index]);
     if opencode {
-        let (prompt, options) = args.split_last().expect("ai_command always appends the prompt");
         let config = opencode_commit_config(std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref())?;
         invocation
-            .args(options)
             .args(["--pure", "--agent", "anvil-commit", "--format", "json", "--title", "ANVIL commit message"])
-            .arg(prompt)
             .env("OPENCODE_CONFIG_CONTENT", config);
-    } else {
-        invocation.args(&args);
     }
+    // Count suffix flags too: aider places them after the prompt.
+    let prompt = fit_ai_prompt(&invocation, prompt, &args[prompt_index + 1..])?;
+    invocation.arg(prompt.as_ref()).args(&args[prompt_index + 1..]);
     invocation.current_dir(workdir).env("GIT_TERMINAL_PROMPT", "0");
     let (success, stdout, stderr) = run_bounded(invocation, &program, timeout, 64 * 1024, None)?;
     if opencode && !success {
@@ -1062,31 +1253,21 @@ pub fn hunk_patch(file: &FileDiff, selection: &[usize]) -> Vec<u8> {
 /// Applies selected hunks to the index (`staged = false`) or takes them back
 /// out of it (`staged = true`), by piping the rebuilt patch to `git apply`.
 pub fn apply_hunks(root: &Path, file: &FileDiff, selection: &[usize], from_index: bool) -> Result<(), String> {
-    use std::io::Write;
     let patch = hunk_patch(file, selection);
     if patch.trim_ascii().is_empty() {
         return Ok(());
     }
     let mut command = git_command(root);
-    command
-        .args(["apply", "--cached", "--whitespace=nowarn"])
-        .args(if from_index { vec!["--reverse"] } else { vec![] })
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|e| format!("git apply: {e}"))?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| "git apply: no stdin".to_owned())?
-        .write_all(&patch)
-        .map_err(|e| e.to_string())?;
-    let output = child.wait_with_output().map_err(|e| e.to_string())?;
-    if output.status.success() {
+    command.args(["apply", "--cached", "--whitespace=nowarn"]);
+    if from_index {
+        command.arg("--reverse");
+    }
+    command.arg("-");
+    let (success, _, stderr) = run_bounded(command, "git apply", GIT_TIMEOUT, GIT_MAX_OUTPUT, Some(patch))?;
+    if success {
         Ok(())
     } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        Err(String::from_utf8_lossy(&stderr).trim().to_owned())
     }
 }
 
@@ -1142,8 +1323,8 @@ fn clip(text: &str, limit: usize) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// The prompt goes to the CLI on its command line, which Windows caps at
-/// 32767 characters, so the status and the diff are cut well below that.
+/// Bound the context sections independently. The final executable, flags and
+/// Windows argument escaping are budgeted again immediately before invocation.
 pub fn ai_prompt(status_text: &str, diff_text: &str, recent: &[String]) -> String {
     const STATUS_LIMIT: usize = 3_000;
     const DIFF_LIMIT: usize = 20_000;
@@ -1180,11 +1361,14 @@ mod tests {
 
     #[test]
     fn parses_branch_and_ahead_behind() {
-        let raw = status_bytes(&["# branch.oid abc", "# branch.head main", "# branch.upstream origin/main", "# branch.ab +2 -1"]);
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        let raw = status_bytes(&[&format!("# branch.oid {oid}"), "# branch.head main", "# branch.upstream origin/main", "# branch.ab +2 -1"]);
         let status = parse_status(&raw);
         assert_eq!(status.branch, "main");
         assert_eq!(status.upstream.as_deref(), Some("origin/main"));
         assert_eq!((status.ahead, status.behind), (2, 1));
+        assert_eq!(status.head_oid.as_deref(), Some(oid));
+        assert_eq!(parse_status(&status_bytes(&["# branch.oid (initial)", "# branch.head main"])).head_oid, None);
     }
 
     #[test]
@@ -1398,16 +1582,80 @@ index 111..222 100644\n\
         assert_eq!(clean_ai_message("```\n\n```"), "");
     }
 
-    /// The prompt travels on the command line, which Windows caps at 32767
-    /// characters: a real diff (up to 16 MB) failed with os error 206.
     #[test]
-    fn ai_prompt_fits_a_command_line() {
-        let diff = "+ строка изменений\n".repeat(200_000);
-        let status = " M file.rs\n".repeat(10_000);
-        let prompt = ai_prompt(&status, &diff, &["feat: past".to_owned()]);
-        assert!(prompt.chars().count() < 30_000, "prompt of {} chars", prompt.chars().count());
-        assert!(prompt.contains(AI_TRUNCATED), "the model is told the diff was cut");
-        assert!(prompt.contains("Diff:\n+ строка изменений"));
+    fn windows_argument_budget_counts_utf16_and_rust_escaping() {
+        for (argument, expected) in [
+            ("", 2),
+            ("plain", 5),
+            ("two words", 11),
+            ("😀", 2),
+            ("a\"b", 4),
+            ("\\\"", 4),
+            ("two words\\", 13),
+            ("two words\\\\", 15),
+        ] {
+            assert_eq!(windows_argument_units(argument.as_ref(), false), expected, "{argument:?}");
+        }
+        let mut command = Command::new("C:\\Program Files\\AI😀\\cli.exe");
+        command.args(["--model", "provider/model with spaces", "\\\""]);
+        let expected = utf16_len(command.get_program()) + 3 + 1 + 7 + 1 + 28 + 1 + 4;
+        assert_eq!(windows_command_units(&command, false), expected);
+        assert_eq!(windows_argument_units("%😀".as_ref(), true), 12);
+    }
+
+    #[test]
+    fn final_ai_budget_handles_exact_boundary_and_multibyte_truncation() {
+        let mut command = Command::new("C:\\Program Files\\AI😀\\cli.exe");
+        command.args(["run", "--model", "provider/model with spaces"]);
+        let suffix = vec!["--no-auto-commits".to_owned(), "--no-git".to_owned()];
+        let fixed = windows_command_units(&command, false)
+            + suffix.iter().map(|arg| 1 + windows_argument_units(arg.as_ref(), false)).sum::<usize>() + 1;
+        let capacity = WINDOWS_COMMAND_LIMIT - fixed;
+        let exact = "x".repeat(capacity);
+        assert_eq!(fit_ai_prompt(&command, &exact, &suffix).unwrap(), exact);
+        let over = format!("{exact}x");
+        let cut = fit_ai_prompt(&command, &over, &suffix).unwrap();
+        assert!(cut.ends_with(AI_TRUNCATED));
+        assert!(fixed + windows_argument_units(cut.as_ref().as_ref(), false) <= WINDOWS_COMMAND_LIMIT);
+        let difficult = "😀 \\\\\\\"quoted\\\\\\\" ".repeat(20_000);
+        let cut = fit_ai_prompt(&command, &difficult, &suffix).unwrap();
+        assert!(cut.ends_with(AI_TRUNCATED));
+        assert!(fixed + windows_argument_units(cut.as_ref().as_ref(), false) <= WINDOWS_COMMAND_LIMIT);
+        assert!(difficult.starts_with(cut.strip_suffix(&format!("\n{AI_TRUNCATED}")).unwrap()));
+    }
+
+    #[test]
+    fn ai_budget_rejects_fixed_flags_that_leave_no_room() {
+        let mut command = Command::new("cli.exe");
+        command.arg("😀".repeat(WINDOWS_COMMAND_LIMIT));
+        assert!(fit_ai_prompt(&command, "prompt", &[]).is_err());
+        let mut command = Command::new("cli.cmd");
+        command.arg("--model");
+        let prompt = "%😀\\\" ".repeat(20_000);
+        let cut = fit_ai_prompt(&command, &prompt, &[]).unwrap();
+        command.arg(cut.as_ref());
+        assert!(windows_command_units(&command, true) <= WINDOWS_BATCH_LIMIT);
+    }
+
+    #[test]
+    fn batch_ai_budget_obeys_the_shell_boundary_and_preserves_single_line_input() {
+        for program in ["cli.cmd", "cli.bat"] {
+            let mut command = Command::new(program);
+            command.args(["--model", "provider/model with spaces"]);
+            let suffix = vec!["--custom-flag".to_owned()];
+            let fixed = windows_command_units(&command, true)
+                + suffix.iter().map(|arg| 1 + windows_argument_units(arg.as_ref(), true)).sum::<usize>() + 1;
+            let exact = "x".repeat(WINDOWS_BATCH_LIMIT - fixed - 2);
+            assert_eq!(fit_ai_prompt(&command, &exact, &suffix).unwrap(), exact);
+            assert_eq!(fixed + windows_argument_units(exact.as_ref(), true), WINDOWS_BATCH_LIMIT);
+            let over = format!("{exact}x");
+            let cut = fit_ai_prompt(&command, &over, &suffix).unwrap();
+            assert!(cut.ends_with(AI_TRUNCATED));
+            assert!(!cut.contains(['\r', '\n']));
+            assert!(fixed + windows_argument_units(cut.as_ref().as_ref(), true) <= WINDOWS_BATCH_LIMIT);
+            command.arg("x".repeat(WINDOWS_BATCH_LIMIT));
+            assert!(fit_ai_prompt(&command, "prompt", &suffix).is_err());
+        }
     }
 
     #[test]

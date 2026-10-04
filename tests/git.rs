@@ -75,11 +75,69 @@ fn detects_reads_stages_and_commits() {
     assert!(tracked.staged(), "tracked.txt must be staged");
     assert!(!git::diff(&root, "tracked.txt", true).is_empty(), "staged diff");
 
-    let hash = git::commit(&root, "test: stage tracked").expect("commit");
+    let hash = git::commit(&root, "test: stage tracked".to_owned()).expect("commit");
     assert!(!hash.is_empty());
     let after = git::status(&root).expect("status");
     assert!(!after.changes.iter().any(|c| c.path == "tracked.txt" && c.staged()));
     assert_eq!(git::recent_subjects(&root, 5).first().map(String::as_str), Some("test: stage tracked"));
+}
+
+#[test]
+fn oversized_multiline_commit_message_is_stored_intact() {
+    let Some(dir) = repo() else { return };
+    let root = dir.path();
+    std::fs::write(root.join("tracked.txt"), "one\nlarge message\n").unwrap();
+    git::stage(root, &["tracked.txt".to_owned()], true).expect("stage");
+    let message = format!(
+        "feat: retain the entire detailed commit message\n\n{}\nCompatibility: preserve every bullet and UTF-8 character.\n",
+        "- Explain a meaningful change with quotes \"detail\", backslashes C:\\source\\file, and supplementary characters 😀.\n".repeat(700)
+    );
+    assert!(message.encode_utf16().count() > 32_767);
+    let short = git::commit(root, message.clone()).expect("commit over Windows command-line limit");
+    assert_eq!(short, String::from_utf8(output(root, &["rev-parse", "--short", "HEAD"])).unwrap().trim());
+    let commit = String::from_utf8(output(root, &["cat-file", "commit", "HEAD"])).unwrap();
+    assert_eq!(commit.split_once("\n\n").expect("commit headers").1, message);
+}
+
+#[test]
+fn status_snapshots_track_head_and_upstream_even_when_counts_match() {
+    let Some(dir) = repo() else { return };
+    let root = dir.path();
+    run(root, &["branch", "-M", "main"]);
+    let first = String::from_utf8(output(root, &["rev-parse", "HEAD"])).unwrap().trim().to_owned();
+    run(root, &["checkout", "--quiet", "-b", "remote-one"]);
+    run(root, &["commit", "--quiet", "--allow-empty", "-m", "remote one"]);
+    let remote_one = String::from_utf8(output(root, &["rev-parse", "HEAD"])).unwrap().trim().to_owned();
+    run(root, &["checkout", "--quiet", "-b", "remote-two", &first]);
+    run(root, &["commit", "--quiet", "--allow-empty", "-m", "remote two"]);
+    let remote_two = String::from_utf8(output(root, &["rev-parse", "HEAD"])).unwrap().trim().to_owned();
+    run(root, &["checkout", "--quiet", "main"]);
+    run(root, &["commit", "--quiet", "--allow-empty", "-m", "local"]);
+    run(root, &["remote", "add", "origin", "."]);
+    run(root, &["update-ref", "refs/remotes/origin/main", &remote_one]);
+    let fallback = git::status(root).expect("status without configured upstream");
+    assert_eq!(fallback.upstream, None);
+    assert_eq!(fallback.upstream_oid.as_deref(), Some(remote_one.as_str()));
+    run(root, &["branch", "--set-upstream-to=origin/main", "main"]);
+    let before = git::status(root).expect("status");
+    let head = String::from_utf8(output(root, &["rev-parse", "HEAD"])).unwrap().trim().to_owned();
+    assert_eq!(before.head_oid.as_deref(), Some(head.as_str()));
+    assert_eq!(before.upstream_oid.as_deref(), Some(remote_one.as_str()));
+    assert_eq!((before.ahead, before.behind), (1, 1));
+
+    run(root, &["update-ref", "refs/remotes/origin/main", &remote_two]);
+    let remote_changed = git::status(root).expect("status after remote ref rewrite");
+    assert_eq!((remote_changed.ahead, remote_changed.behind), (before.ahead, before.behind));
+    assert_eq!(remote_changed.head_oid, before.head_oid);
+    assert_eq!(remote_changed.upstream_oid.as_deref(), Some(remote_two.as_str()));
+
+    run(root, &["commit", "--quiet", "--allow-empty", "--amend", "-m", "local rewritten"]);
+    let head_changed = git::status(root).expect("status after external amend");
+    let head = String::from_utf8(output(root, &["rev-parse", "HEAD"])).unwrap().trim().to_owned();
+    assert_eq!((head_changed.ahead, head_changed.behind), (before.ahead, before.behind));
+    assert_eq!(head_changed.head_oid.as_deref(), Some(head.as_str()));
+    assert_ne!(head_changed.head_oid, before.head_oid);
+    assert_eq!(head_changed.upstream_oid, remote_changed.upstream_oid);
 }
 
 #[test]
@@ -212,6 +270,10 @@ fn staging_many_paths_and_unstaging_before_the_first_commit() {
     let dir = tempfile::tempdir().unwrap();
     run(dir.path(), &["init", "--quiet"]);
     let root = git::find_root(dir.path()).expect("root");
+    let unborn = git::status(&root).expect("unborn status");
+    assert_eq!(unborn.head_oid, None);
+    assert_eq!(unborn.upstream_oid, None);
+    assert!(unborn.is_repo());
     let folder = "a-rather-long-folder-name-to-make-the-command-line-long";
     std::fs::create_dir_all(dir.path().join(folder)).unwrap();
     let paths: Vec<String> = (0..600)

@@ -49,6 +49,17 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(windows)'.dependencies]
+# Generated COM interfaces and progress-sink implementation for fail-closed recycling.
+windows = { version = "0.58", features = [
+    "implement",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
+# The implement macro emits references to windows_core.
+windows-core = "0.58"
+
 [dev-dependencies]
 tempfile = "3"
 # Examples only: the icon generator writes PNG and ICO files.

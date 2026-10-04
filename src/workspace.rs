@@ -35,6 +35,8 @@ const FOLDER_ICON: (char, egui::Color32) = ('\u{e032}', egui::Color32::from_rgb(
 
 pub enum Request {
     Refresh { cwd: PathBuf },
+    /// Approval is for precisely the repository/configuration shown by the UI.
+    Approve { identity: git::RepositoryIdentity },
     /// `side`: Some(true) the index, Some(false) the worktree, None the
     /// index when it has changes for the file, else the worktree.
     Diff { path: String, side: Option<bool> },
@@ -59,21 +61,8 @@ pub enum Request {
 }
 
 impl Request {
-    /// Acts on the repository: refused when the worker has moved on to
-    /// another repository since the panel showed the one the user meant.
-    fn acts_on_repository(&self) -> bool {
-        matches!(
-            self,
-            Request::Stage { .. }
-                | Request::Commit { .. }
-                | Request::AiMessage { .. }
-                | Request::ApplyHunks { .. }
-                | Request::Fetch
-                | Request::Push
-                | Request::WritePath { .. }
-                | Request::RenamePath { .. }
-                | Request::DeletePath { .. }
-        )
+    fn requires_current_repository(&self) -> bool {
+        !matches!(self, Request::Refresh { .. } | Request::Approve { .. })
     }
 }
 
@@ -83,6 +72,8 @@ type Envelope = (Option<PathBuf>, Request);
 pub enum Response {
     /// Status plus the resolved repository root (None: not a repository).
     Status(Status, Option<PathBuf>),
+    TrustRequired { identity: Option<git::RepositoryIdentity>, error: Option<String> },
+    Trusted(git::RepositoryIdentity),
     Diff { path: String, files: Vec<FileDiff>, text: String, staged: bool },
     Refreshed,
     Committed(String),
@@ -173,6 +164,11 @@ pub struct Workspace {
     pub prompt: Option<Prompt>,
     ai_command: Option<String>,
     ai_generating: bool,
+    trust_required: bool,
+    trust_approval_pending: bool,
+    pending_identity: Option<git::RepositoryIdentity>,
+    last_cwd: Option<PathBuf>,
+    log_status_seen: bool,
     tx: Option<Sender<Envelope>>,
     rx: Option<Receiver<Response>>,
 }
@@ -208,6 +204,11 @@ impl Default for Workspace {
             prompt: None,
             ai_command: None,
             ai_generating: false,
+            trust_required: false,
+            trust_approval_pending: false,
+            pending_identity: None,
+            last_cwd: None,
+            log_status_seen: false,
             tx: None,
             rx: None,
         }
@@ -222,10 +223,12 @@ impl Workspace {
             self.tx = Some(tx);
             self.rx = Some(rx);
         }
-        if self.busy || self.ai_generating || self.last_poll.elapsed() < POLL_INTERVAL {
+        let cwd_changed = self.last_cwd.as_ref() != Some(&cwd);
+        if !cwd_changed && (self.busy || self.ai_generating || self.last_poll.elapsed() < POLL_INTERVAL) {
             return;
         }
         self.last_poll = Instant::now();
+        self.last_cwd = Some(cwd.clone());
         self.busy = true;
         self.send(Request::Refresh { cwd });
     }
@@ -240,6 +243,48 @@ impl Workspace {
             let _ = tx.send((self.root.clone(), request));
         }
     }
+    fn clear_repository_view(&mut self) {
+        self.busy = false;
+        self.trust_approval_pending = false;
+        self.ai_generating = false;
+        self.status = Status::default();
+        self.selected.clear();
+        self.collapsed.clear();
+        self.diff_path = None;
+        self.diff_text.clear();
+        self.diff_files.clear();
+        self.diff_side = None;
+        self.detail = None;
+        self.detail_file = None;
+        self.files.clear();
+        self.file_expanded.clear();
+        self.line_count = None;
+        self.file_preview = None;
+        self.log = CommitLog::default();
+        self.graph.clear();
+        self.prompt = None;
+        self.commit_message.clear();
+        self.log_status_seen = false;
+    }
+
+    fn trust_view(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new(strings::WORKSPACE_TRUST_TITLE).color(theme::STATUS_YELLOW).font(theme::font(13.0)));
+        if let Some(identity) = &self.pending_identity {
+            ui.label(RichText::new(display(&identity.root.to_string_lossy(), 240)).color(theme::TEXT).font(theme::field_font(11.5)));
+        }
+        ui.label(RichText::new(strings::WORKSPACE_TRUST_HINT).color(theme::DIM).font(theme::font(12.0)));
+        if let Some((notice, _)) = &self.notice {
+            ui.label(RichText::new(notice).color(theme::STATUS_RED).font(theme::font(11.5)));
+        }
+        if ui.add_enabled(self.pending_identity.is_some() && !self.trust_approval_pending, theme::accent_button(strings::WORKSPACE_TRUST_APPROVE)).clicked() {
+            if let Some(identity) = self.pending_identity.clone() {
+                self.busy = true;
+                self.trust_approval_pending = true;
+                self.send(Request::Approve { identity });
+            }
+        }
+    }
+
 
     /// Applies worker responses; returns true when the UI should repaint.
     pub fn absorb(&mut self) -> bool {
@@ -253,29 +298,39 @@ impl Workspace {
         for response in responses {
             repaint = true;
             match response {
+                Response::TrustRequired { identity, error } => {
+                    self.clear_repository_view();
+                    self.root = identity.as_ref().map(|identity| identity.root.clone());
+                    self.pending_identity = identity;
+                    self.trust_required = true;
+                    self.busy = false;
+                    self.ai_generating = false;
+                    self.notice = error.map(|message| (message, true));
+                }
+                Response::Trusted(identity) => {
+                    self.root = Some(identity.root);
+                    self.pending_identity = None;
+                    self.trust_required = false;
+                    self.trust_approval_pending = false;
+                    self.notice = None;
+                }
                 Response::Status(status, root) => {
                     self.busy = false;
-                    // Another repository invalidates everything read from the
-                    // previous one: its commits, file browser and open commit
-                    // must never be shown under the new header.
                     let root_changed = self.root != root;
+                    let commit_state_changed = root_changed || !self.log_status_seen
+                        || self.status.head_oid != status.head_oid
+                        || self.status.upstream_oid != status.upstream_oid
+                        || self.status.branch != status.branch
+                        || self.status.upstream != status.upstream
+                        || self.status.ahead != status.ahead
+                        || self.status.behind != status.behind;
                     if root_changed {
-                        self.selected.clear();
-                        self.diff_path = None;
-                        self.diff_text.clear();
-                        self.diff_files.clear();
-                        self.detail = None;
-                        self.detail_file = None;
-                        self.files.clear();
-                        self.line_count = None;
-                        self.file_preview = None;
-                        self.log = CommitLog::default();
-                        self.graph.clear();
-                        // A delete/rename prompt names a path of the old one.
-                        self.prompt = None;
-                        self.diff_side = None;
+                        self.clear_repository_view();
                     }
+                    self.log_status_seen = true;
                     self.root = root;
+                    self.trust_required = false;
+                    self.pending_identity = None;
                     self.status = status;
                     self.selected.retain(|path| self.status.changes.iter().any(|change| &change.path == path));
                     if let Some(path) = self.diff_path.clone() {
@@ -287,7 +342,7 @@ impl Workspace {
                             self.send(Request::Diff { path, side: self.diff_side });
                         }
                     }
-                    if root_changed || self.log.commits.is_empty() {
+                    if commit_state_changed && self.root.is_some() {
                         self.send(Request::Log);
                     }
                     if root_changed || (self.tab == PanelTab::Files && self.files.is_empty()) {
@@ -336,10 +391,10 @@ impl Workspace {
                     self.detail_file = None;
                 }
                 Response::CommitDiff { hash, path, patch } => {
+                    self.busy = false;
                     if self.detail.as_ref().is_some_and(|(current, _)| current == &hash) {
                         if let Some(file) = self.detail_file.as_mut().filter(|file| file.path == path) {
                             file.patch = Some(patch);
-                            self.busy = false;
                         }
                     }
                 }
@@ -359,11 +414,13 @@ impl Workspace {
                     self.busy = false;
                     self.notice = Some((strings::workspace_fetch_done(&what), false));
                     self.last_poll = Instant::now() - POLL_INTERVAL;
+                    self.send(Request::Log);
                 }
                 Response::Pushed(branch) => {
                     self.busy = false;
                     self.notice = Some((strings::workspace_pushed(&branch), false));
                     self.last_poll = Instant::now() - POLL_INTERVAL;
+                    self.send(Request::Log);
                 }
                 Response::Error(message) => {
                     self.busy = false;
@@ -425,12 +482,16 @@ impl Workspace {
                 });
             });
             theme::hairline(ui);
-            if self.prompt.is_some() {
-                self.prompt_row(ui);
-            }
-            match self.tab {
-                PanelTab::Changes => self.changes_mode(ui),
-                PanelTab::Files => self.files_tab(ui),
+            if self.trust_required {
+                self.trust_view(ui);
+            } else {
+                if self.prompt.is_some() {
+                    self.prompt_row(ui);
+                }
+                match self.tab {
+                    PanelTab::Changes => self.changes_mode(ui),
+                    PanelTab::Files => self.files_tab(ui),
+                }
             }
         });
         actions
@@ -531,7 +592,8 @@ impl Workspace {
         ui.painter().rect_stroke(editor.response.rect, visuals.rounding, stroke);
         let ctrl_enter = commit.has_focus() && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter));
         ui.horizontal_wrapped(|ui| {
-            let can_commit = !self.ai_generating && !self.commit_message.trim().is_empty() && self.status.changes.iter().any(Change::staged);
+            let has_staged = self.status.changes.iter().any(Change::staged);
+            let can_commit = !self.ai_generating && !self.commit_message.trim().is_empty() && has_staged;
             if ui.add_enabled(can_commit, theme::accent_button(strings::WORKSPACE_COMMIT)).clicked() || (can_commit && ctrl_enter) {
                 self.busy = true;
                 self.notice = None;
@@ -542,8 +604,8 @@ impl Workspace {
                 None => strings::WORKSPACE_AI.to_owned(),
             };
             let ai = ui
-                .add_enabled(!self.ai_generating, theme::ghost_button(ai_label))
-                .on_hover_text(self.ai_command.as_deref().unwrap_or(strings::WORKSPACE_NO_AI_COMMAND));
+                .add_enabled(!self.ai_generating && has_staged, theme::ghost_button(ai_label))
+                .on_hover_text(if has_staged { self.ai_command.as_deref().unwrap_or(strings::WORKSPACE_NO_AI_COMMAND) } else { strings::WORKSPACE_AI_NO_STAGE });
             if ai.clicked() {
                 self.ai_generating = true;
                 self.busy = true;
@@ -733,20 +795,27 @@ impl Workspace {
             PromptKind::Delete(path) => format!("{}: {path}", strings::WORKSPACE_DELETE),
         };
         ui.label(RichText::new(label).color(theme::DIM).font(theme::font(11.5)));
+        if matches!(prompt.kind, PromptKind::Delete(_)) {
+            ui.label(RichText::new(strings::WORKSPACE_DELETE_HINT).color(theme::FAINT).font(theme::font(11.5)));
+        }
         let mut commit = false;
         let mut cancel = false;
         ui.horizontal(|ui| {
-            let field = ui.add(
-                egui::TextEdit::singleline(&mut prompt.text)
-                    .font(theme::field_font(12.0))
-                    .desired_width(180.0),
-            );
-            if prompt.focus {
-                field.request_focus();
-                prompt.focus = false;
+            let deleting = matches!(prompt.kind, PromptKind::Delete(_));
+            if !deleting {
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut prompt.text)
+                        .font(theme::field_font(12.0))
+                        .desired_width(180.0),
+                );
+                if prompt.focus {
+                    field.request_focus();
+                    prompt.focus = false;
+                }
+                commit = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             }
-            commit = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui.add(theme::ghost_button(strings::SETTINGS_SAVE)).clicked() {
+            let action = if deleting { strings::WORKSPACE_DELETE } else { strings::SETTINGS_SAVE };
+            if ui.add(theme::ghost_button(action)).clicked() {
                 commit = true;
             }
             if ui.add(theme::ghost_button(strings::SETTINGS_CANCEL)).clicked() {
@@ -956,27 +1025,31 @@ impl Workspace {
             });
         });
         let mut hunks_to_apply: Option<(usize, String, bool)> = None;
-        {
-            let ui = &mut *ui;
-            let mut hunk_index = 0;
-            let mut numbers = PatchNumbers::default();
-            for line in self.diff_text.lines() {
-                let number = numbers.line(line);
-                if line.starts_with("@@") {
-                    let label = if self.diff_from_index { "◂" } else { "▸" };
-                    let header = line.to_owned();
-                    ui.horizontal(|ui| {
-                        if ui.add(theme::ghost_button(label)).clicked() {
-                            hunks_to_apply = Some((hunk_index, header.clone(), self.diff_from_index));
-                        }
-                        ui.label(RichText::new(line).color(theme::DIFF_HUNK).font(theme::field_font(11.0)));
-                    });
-                    hunk_index += 1;
-                    continue;
+        let height = (ui.available_height() * 0.55).clamp(24.0, 300.0);
+        ScrollArea::vertical()
+            .id_salt(("workspace-diff", &path, self.diff_from_index))
+            .max_height(height)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                let mut hunk_index = 0;
+                let mut numbers = PatchNumbers::default();
+                for line in self.diff_text.lines() {
+                    let number = numbers.line(line);
+                    if line.starts_with("@@") {
+                        let label = if self.diff_from_index { "◂" } else { "▸" };
+                        let header = line.to_owned();
+                        ui.horizontal(|ui| {
+                            if ui.add(theme::ghost_button(label)).clicked() {
+                                hunks_to_apply = Some((hunk_index, header.clone(), self.diff_from_index));
+                            }
+                            ui.label(RichText::new(line).color(theme::DIFF_HUNK).font(theme::field_font(11.0)));
+                        });
+                        hunk_index += 1;
+                        continue;
+                    }
+                    patch_line(ui, line, number);
                 }
-                patch_line(ui, line, number);
-            }
-        }
+            });
         if let Some((index, header, from_index)) = hunks_to_apply {
             self.busy = true;
             self.send(Request::ApplyHunks { path, index, header, from_index });
@@ -1791,29 +1864,82 @@ fn reveal_in_explorer(root: &Option<PathBuf>, path: &str) {
     let _ = command.spawn();
 }
 
+/// The actual AI path reads only index content and index file/status context.
+/// Errors and an empty index never start a CLI or silently stage anything.
+fn staged_ai_prompt(root: &Path) -> Result<String, String> {
+    let status = git::run_git(root, &["diff", "--cached", "--name-status", "--no-ext-diff", "--no-textconv", "--no-color"])?;
+    if status.trim().is_empty() {
+        return Err(strings::WORKSPACE_AI_NO_STAGE.to_owned());
+    }
+    let staged = git::run_git(root, &["diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color", "--unified=1"])?;
+    let recent = git::recent_subjects(root, 8);
+    Ok(git::ai_prompt(&status, staged.trim(), &recent))
+}
+
 fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
     let (request_tx, request_rx) = mpsc::channel::<Envelope>();
     let (response_tx, response_rx) = mpsc::channel::<Response>();
     std::thread::spawn(move || {
         let mut root: Option<PathBuf> = None;
         let mut cwd: Option<PathBuf> = None;
+        let mut approved: Option<git::RepositoryIdentity> = None;
         while let Ok((expected_root, request)) = request_rx.recv() {
             let send = |response: Response| {
                 let _ = response_tx.send(response);
             };
-            // Paths are resolved against the repository refreshed last: an
-            // action the user meant for another one must not run here.
-            if request.acts_on_repository() && expected_root != root {
+            if request.requires_current_repository() && expected_root != root {
                 let error = strings::WORKSPACE_REPO_CHANGED.to_owned();
                 send(if matches!(request, Request::AiMessage { .. }) { Response::AiMessage(Err(error)) } else { Response::Error(error) });
                 continue;
             }
+            if let Request::Refresh { cwd: new_cwd } = &request {
+                cwd = Some(new_cwd.clone());
+            }
+            // Only root/config inspection is permitted before explicit trust.
+            // Re-resolve on refresh/approval, including a shell changing repos.
+            let identity = if matches!(request, Request::Refresh { .. } | Request::Approve { .. }) {
+                cwd.as_ref().map_or(Ok(None), |cwd| git::repository_identity(cwd))
+            } else {
+                root.as_ref().map_or(Ok(None), |root| {
+                    git::repository_stamp(root).map(|stamp| Some(git::RepositoryIdentity { root: root.clone(), stamp }))
+                })
+            };
+            let identity = match identity {
+                Ok(identity) => identity,
+                Err(error) => {
+                    approved = None;
+                    send(Response::TrustRequired { identity: None, error: Some(error) });
+                    continue;
+                }
+            };
+            if matches!(request, Request::Refresh { .. }) {
+                root = identity.as_ref().map(|identity| identity.root.clone());
+            }
+            if let Request::Approve { identity: shown } = &request {
+                let current_matches = identity.as_ref().is_some_and(|current| {
+                    current.root == shown.root && current.stamp == shown.stamp
+                        && root.as_ref() == Some(&shown.root) && expected_root.as_ref() == Some(&shown.root)
+                });
+                if !current_matches {
+                    approved = None;
+                    root = identity.as_ref().map(|identity| identity.root.clone());
+                    send(Response::TrustRequired { identity, error: Some(strings::WORKSPACE_TRUST_STALE.to_owned()) });
+                    continue;
+                }
+                approved = identity.clone();
+                send(Response::Trusted(identity.as_ref().unwrap().clone()));
+            }
+            if let Some(current) = &identity {
+                if !approved.as_ref().is_some_and(|approved| approved.root == current.root && approved.stamp == current.stamp) {
+                    approved = None;
+                    send(Response::TrustRequired { identity, error: None });
+                    continue;
+                }
+            } else {
+                approved = None;
+            }
             match request {
-                Request::Refresh { cwd: new_cwd } => {
-                    if cwd.as_ref() != Some(&new_cwd) || root.is_none() {
-                        root = git::find_root(&new_cwd);
-                        cwd = Some(new_cwd);
-                    }
+                Request::Refresh { .. } | Request::Approve { .. } => {
                     match &root {
                         Some(root) => match git::status(root) {
                             Ok(status) => send(Response::Status(status, Some(root.clone()))),
@@ -1849,24 +1975,39 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
                 },
                 Request::Commit { message } => match &root {
-                    Some(root) => match git::commit(root, &message) {
+                    Some(root) => match git::commit(root, message) {
                         Ok(hash) => send(Response::Committed(hash)),
                         Err(e) => send(Response::Error(e)),
                     },
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
                 },
                 Request::AiMessage { command } => {
-                    let result = root.as_ref().map(|root| {
-                        let diff_args = ["--no-ext-diff", "--no-textconv", "--no-color", "--unified=1"];
-                        let staged = git::run_git(root, &[&["diff", "--cached"][..], &diff_args].concat()).unwrap_or_default();
-                        let unstaged = git::run_git(root, &[&["diff"][..], &diff_args].concat()).unwrap_or_default();
-                        let status = git::run_git(root, &["status", "--porcelain"]).unwrap_or_default();
-                        let recent = git::recent_subjects(root, 8);
-                        let diff = format!("{staged}\n{unstaged}");
-                        let prompt = git::ai_prompt(&status, diff.trim(), &recent);
+                    if root.is_none() {
+                        send(Response::AiMessage(Err(strings::WORKSPACE_NO_REPO.to_owned())));
+                        continue;
+                    }
+                    let result = root.as_ref().ok_or_else(|| strings::WORKSPACE_NO_REPO.to_owned()).and_then(|root| {
+                        let prompt = staged_ai_prompt(root)?;
                         git::ai_commit_message(&git::ai_workdir(), command.as_deref(), &prompt, git::AI_TIMEOUT)
                     });
-                    send(Response::AiMessage(result.unwrap_or_else(|| Err(strings::WORKSPACE_NO_REPO.to_owned()))));
+                    // An AI subprocess can outlive a configuration change; never
+                    // publish its result using approval for the old stamp.
+                    let current = root.as_ref().map_or(Ok(None), |root| {
+                        git::repository_stamp(root).map(|stamp| Some(git::RepositoryIdentity { root: root.clone(), stamp }))
+                    });
+                    match current {
+                        Ok(identity) if identity.as_ref().zip(approved.as_ref()).is_some_and(|(current, approved)| current.root == approved.root && current.stamp == approved.stamp) => {
+                            send(Response::AiMessage(result));
+                        }
+                        Ok(identity) => {
+                            approved = None;
+                            send(Response::TrustRequired { identity, error: Some(strings::WORKSPACE_TRUST_STALE.to_owned()) });
+                        }
+                        Err(error) => {
+                            approved = None;
+                            send(Response::TrustRequired { identity: None, error: Some(error) });
+                        }
+                    }
                 }
                 Request::Log => match &root {
                     Some(root) => match git::log(root) {
@@ -2026,11 +2167,7 @@ fn rename_path(root: &Path, from: &str, to: &str) -> Result<(), String> {
 
 fn delete_path(root: &Path, path: &str) -> Result<(), String> {
     let full = git::resolve_path(root, path)?;
-    if full.is_dir() {
-        std::fs::remove_dir_all(&full).map_err(|e| e.to_string())
-    } else {
-        std::fs::remove_file(&full).map_err(|e| e.to_string())
-    }
+    crate::fsutil::recycle_path(&full)
 }
 
 /// Width clamped to the panel bounds.
@@ -2097,6 +2234,98 @@ mod tests {
         command.output().is_ok_and(|out| out.status.success())
     }
 
+    fn approve_worker(tx: &Sender<Envelope>, rx: &Receiver<Response>) -> Option<PathBuf> {
+        let Response::TrustRequired { identity: Some(identity), error: None } =
+            rx.recv_timeout(Duration::from_secs(20)).expect("trust prompt")
+        else { panic!("repository must require explicit trust first") };
+        let shown = Some(identity.root.clone());
+        tx.send((shown.clone(), Request::Approve { identity })).unwrap();
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(20)).unwrap(), Response::Trusted(_)));
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(20)).unwrap(), Response::Status(_, _)));
+        shown
+    }
+
+    #[test]
+    fn push_and_fetch_refresh_commit_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        let remote = dir.path().join("remote.git");
+        let peer = dir.path().join("peer");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&remote).unwrap();
+        if !git(&root, &["init", "--quiet", "--initial-branch=main"]) {
+            eprintln!("git is not installed; skipping");
+            return;
+        }
+        assert!(git(&remote, &["init", "--quiet", "--bare", "--initial-branch=main"]));
+        assert!(git(&root, &["config", "user.email", "anvil@test"]) && git(&root, &["config", "user.name", "ANVIL test"]));
+        assert!(git(&root, &["remote", "add", "origin", remote.to_str().unwrap()]));
+        std::fs::write(root.join("file.txt"), "base\n").unwrap();
+        assert!(git(&root, &["add", "file.txt"]) && git(&root, &["commit", "--quiet", "-m", "base"]));
+        assert!(git(&root, &["push", "--quiet", "--set-upstream", "origin", "main"]));
+        std::fs::write(root.join("file.txt"), "base\nlocal\n").unwrap();
+        assert!(git(&root, &["add", "file.txt"]) && git(&root, &["commit", "--quiet", "-m", "local change"]));
+
+        // Apply real worker responses one at a time to exercise the same
+        // response/poll lifecycle as the UI without sleeps or remote services.
+        let (worker_tx, worker_rx) = spawn_worker();
+        let (response_tx, response_rx) = mpsc::channel();
+        let mut workspace = Workspace { tx: Some(worker_tx), rx: Some(response_rx), ..Default::default() };
+        let apply_response = |workspace: &mut Workspace| {
+            response_tx.send(worker_rx.recv_timeout(Duration::from_secs(20)).expect("git worker response")).unwrap();
+            workspace.absorb();
+        };
+        workspace.poll(root.clone());
+        apply_response(&mut workspace);
+        let identity = workspace.pending_identity.clone().expect("explicit trust before status");
+        workspace.send(Request::Approve { identity });
+        while workspace.log.commits.is_empty() {
+            apply_response(&mut workspace);
+        }
+        let local_hash = workspace.log.commits[0].hash.clone();
+        assert_eq!(workspace.status.ahead, 1);
+        assert_eq!(workspace.log.commits[0].section, git::Section::Outgoing);
+        assert!(!workspace.log.commits[0].refs.iter().any(|reference| reference == "origin/main"));
+
+        workspace.busy = true;
+        workspace.send(Request::Push);
+        while workspace.notice.is_none() {
+            apply_response(&mut workspace);
+        }
+        assert!(!workspace.notice.as_ref().unwrap().1, "{:?}", workspace.notice);
+        workspace.poll(root.clone());
+        while workspace.status.ahead != 0 {
+            apply_response(&mut workspace);
+        }
+        let pushed = workspace.log.commits.iter().find(|commit| commit.hash == local_hash).unwrap();
+        assert_eq!(pushed.section, git::Section::History, "pushed commits must leave the outgoing section");
+        assert!(pushed.refs.iter().any(|reference| reference == "origin/main"), "the remote label must move to the pushed tip");
+
+        assert!(git(dir.path(), &["clone", "--quiet", remote.to_str().unwrap(), peer.to_str().unwrap()]));
+        assert!(git(&peer, &["config", "user.email", "anvil@test"]) && git(&peer, &["config", "user.name", "ANVIL test"]));
+        std::fs::write(peer.join("file.txt"), "base\nlocal\nremote\n").unwrap();
+        assert!(git(&peer, &["add", "file.txt"]) && git(&peer, &["commit", "--quiet", "-m", "remote change"]));
+        assert!(git(&peer, &["push", "--quiet"]));
+        workspace.notice = None;
+        workspace.busy = true;
+        workspace.send(Request::Fetch);
+        while workspace.notice.is_none() {
+            apply_response(&mut workspace);
+        }
+        assert!(!workspace.notice.as_ref().unwrap().1, "{:?}", workspace.notice);
+        workspace.poll(root.clone());
+        while workspace.status.behind != 1 {
+            apply_response(&mut workspace);
+        }
+        let incoming = &workspace.log.commits[0];
+        assert_eq!(incoming.subject, "remote change");
+        assert_eq!(incoming.section, git::Section::Incoming);
+        assert!(incoming.refs.iter().any(|reference| reference == "origin/main"));
+        let local = workspace.log.commits.iter().find(|commit| commit.hash == local_hash).unwrap();
+        assert_eq!(local.section, git::Section::History);
+        assert!(!local.refs.iter().any(|reference| reference == "origin/main"), "fetch must move the remote label to the incoming tip");
+    }
+
     /// The "index / worktree" button asked for the same automatic side again,
     /// so the worktree hunks of a partly staged file could never be shown.
     #[test]
@@ -2117,7 +2346,7 @@ mod tests {
         let (tx, rx) = spawn_worker();
         let wait = || rx.recv_timeout(std::time::Duration::from_secs(20)).expect("a worker response");
         tx.send((None, Request::Refresh { cwd: root.to_path_buf() })).unwrap();
-        let Response::Status(_, shown) = wait() else { panic!("status first") };
+        let shown = approve_worker(&tx, &rx);
         let diff = |side: Option<bool>| {
             tx.send((shown.clone(), Request::Diff { path: "f.txt".to_owned(), side })).unwrap();
             match wait() {
@@ -2152,7 +2381,7 @@ mod tests {
         let (tx, rx) = spawn_worker();
         let wait = || rx.recv_timeout(std::time::Duration::from_secs(20)).expect("a worker response");
         tx.send((None, Request::Refresh { cwd: dir.path().to_path_buf() })).unwrap();
-        let Response::Status(_, Some(_)) = wait() else { panic!("the folder is a repository") };
+        assert!(approve_worker(&tx, &rx).is_some(), "the folder is a repository");
 
         let elsewhere = Some(PathBuf::from("C:/some/other/repo"));
         tx.send((elsewhere, Request::DeletePath { path: "keep.txt".to_owned() })).unwrap();
@@ -2263,6 +2492,8 @@ mod tests {
                 changes: vec![changed_file("src/lib.rs"), changed_file("README.md")],
                 additions: 6,
                 deletions: 2,
+                head_oid: None,
+                upstream_oid: None,
             },
             graph: graph::compute(&commits),
             log: CommitLog { commits, upstream: Some("origin/main".to_owned()), truncated: false },
@@ -2481,5 +2712,172 @@ mod tests {
         assert!(!workspace.busy);
         assert_eq!(workspace.commit_message, "Existing draft");
         assert_eq!(workspace.notice, Some(("CLI timed out".to_owned(), true)));
+    }
+
+    #[test]
+    fn hostile_clean_filter_requires_current_explicit_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        if !git(root, &["init", "--quiet"]) { return; }
+        assert!(git(root, &["config", "user.email", "anvil@test"]));
+        assert!(git(root, &["config", "user.name", "ANVIL test"]));
+        std::fs::write(root.join("victim.txt"), "original\n").unwrap();
+        std::fs::write(root.join(".gitattributes"), "victim.txt filter=hostile\n").unwrap();
+        assert!(git(root, &["add", "."]));
+        assert!(git(root, &["commit", "--quiet", "-m", "initial"]));
+        let marker = root.join("filter-ran");
+        let command = format!("printf executed > '{}'; cat", marker.to_string_lossy().replace('\\', "/").replace('\'', "'\\''"));
+        assert!(git(root, &["config", "filter.hostile.clean", &command]));
+        std::fs::write(root.join("victim.txt"), "modified with different size\n").unwrap();
+        let (tx, rx) = spawn_worker();
+        let wait = || rx.recv_timeout(Duration::from_secs(20)).expect("worker response");
+        let required = || match wait() {
+            Response::TrustRequired { identity: Some(identity), .. } => identity,
+            _ => panic!("trust must be required"),
+        };
+        tx.send((None, Request::Refresh { cwd: root.to_owned() })).unwrap();
+        let first = required();
+        assert!(!marker.exists(), "opening must not execute a clean filter");
+        let shown = Some(first.root.clone());
+        tx.send((shown.clone(), Request::Diff { path: "victim.txt".to_owned(), side: Some(false) })).unwrap();
+        required();
+        tx.send((shown.clone(), Request::Refresh { cwd: root.to_owned() })).unwrap();
+        required();
+        assert!(!marker.exists(), "automatic polls and diff requests must stay gated");
+
+        assert!(git(root, &["config", "audit.changed", "one"]));
+        tx.send((shown.clone(), Request::Approve { identity: first })).unwrap();
+        let current = required();
+        assert!(!marker.exists(), "stale configuration approval must not execute Git");
+        let other = git::RepositoryIdentity { root: root.join("wrong-root"), stamp: current.stamp.clone() };
+        tx.send((shown.clone(), Request::Approve { identity: other })).unwrap();
+        let current = required();
+        assert!(!marker.exists(), "approval for another root must not bypass the gate");
+
+        tx.send((shown.clone(), Request::Approve { identity: current.clone() })).unwrap();
+        assert!(matches!(wait(), Response::Trusted(_)));
+        assert!(matches!(wait(), Response::Status(_, _)));
+        assert!(marker.exists(), "the real clean filter must run only after valid approval");
+        std::fs::remove_file(&marker).unwrap();
+        assert!(git(root, &["config", "audit.changed", "two"]));
+        tx.send((shown.clone(), Request::Stage { paths: vec!["victim.txt".to_owned()], staged: true })).unwrap();
+        required();
+        tx.send((shown, Request::Approve { identity: current })).unwrap();
+        required();
+        assert!(!marker.exists(), "config changes revoke approval before staging or stale reapproval");
+    }
+
+    #[test]
+    fn ai_prompt_uses_real_index_without_unstaged_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        if !git(root, &["init", "--quiet"]) { return; }
+        assert!(git(root, &["config", "user.email", "anvil@test"]));
+        assert!(git(root, &["config", "user.name", "ANVIL test"]));
+        std::fs::write(root.join("mixed.txt"), "base\n").unwrap();
+        std::fs::write(root.join("unstaged-only.txt"), "base\n").unwrap();
+        assert!(git(root, &["add", "."]));
+        assert!(git(root, &["commit", "--quiet", "-m", "initial"]));
+        std::fs::write(root.join("mixed.txt"), "base\nSTAGED_SENTINEL\n").unwrap();
+        assert!(git(root, &["add", "mixed.txt"]));
+        std::fs::write(root.join("mixed.txt"), "base\nSTAGED_SENTINEL\nUNSTAGED_SENTINEL\n").unwrap();
+        std::fs::write(root.join("unstaged-only.txt"), "UNSTAGED_ONLY_SENTINEL\n").unwrap();
+        std::fs::write(root.join("untracked.txt"), "UNTRACKED_SENTINEL\n").unwrap();
+        let prompt = staged_ai_prompt(root).unwrap();
+        assert!(prompt.contains("STAGED_SENTINEL") && prompt.contains("mixed.txt"));
+        for excluded in ["UNSTAGED_SENTINEL", "UNSTAGED_ONLY_SENTINEL", "UNTRACKED_SENTINEL", "unstaged-only.txt", "untracked.txt"] {
+            assert!(!prompt.contains(excluded), "unstaged data leaked: {excluded}");
+        }
+        assert!(git(root, &["reset", "--quiet", "HEAD"]));
+        assert_eq!(staged_ai_prompt(root), Err(strings::WORKSPACE_AI_NO_STAGE.to_owned()));
+        let (tx, rx) = spawn_worker();
+        tx.send((None, Request::Refresh { cwd: root.to_owned() })).unwrap();
+        let shown = approve_worker(&tx, &rx);
+        tx.send((shown, Request::AiMessage { command: Some("nonexistent-ai-command".to_owned()) })).unwrap();
+        let Response::AiMessage(Err(message)) = rx.recv_timeout(Duration::from_secs(20)).unwrap() else { panic!("empty index must reject generation") };
+        assert_eq!(message, strings::WORKSPACE_AI_NO_STAGE, "the CLI must not start for an empty index");
+        let missing = root.join("missing");
+        assert!(staged_ai_prompt(&missing).is_err(), "index read errors cannot start generation");
+    }
+
+    #[test]
+    fn late_commit_diff_releases_busy_without_replacing_current_file() {
+        let (tx, rx) = mpsc::channel();
+        let mut workspace = Workspace { busy: true, rx: Some(rx), ..Default::default() };
+        tx.send(Response::CommitDiff { hash: "old".to_owned(), path: "old.txt".to_owned(), patch: Ok("old patch".to_owned()) }).unwrap();
+        workspace.absorb();
+        assert!(!workspace.busy && workspace.detail.is_none());
+        workspace.busy = true;
+        workspace.detail = Some(("new".to_owned(), git::CommitDetail { files: Vec::new(), header: String::new() }));
+        workspace.detail_file = Some(CommitFile { path: "new.txt".to_owned(), patch: None });
+        tx.send(Response::CommitDiff { hash: "new".to_owned(), path: "old.txt".to_owned(), patch: Ok("stale patch".to_owned()) }).unwrap();
+        workspace.absorb();
+        assert!(!workspace.busy);
+        assert!(workspace.detail_file.as_ref().unwrap().patch.is_none());
+    }
+
+    #[test]
+    fn revoked_trust_clears_views_and_releases_ai_busy() {
+        let (tx, rx) = mpsc::channel();
+        let mut workspace = Workspace {
+            busy: true, ai_generating: true, rx: Some(rx),
+            log: CommitLog { commits: vec![commit("0123456789", git::Section::History)], ..Default::default() },
+            commit_message: "old draft".to_owned(),
+            diff_text: "old diff".to_owned(),
+            ..Default::default()
+        };
+        tx.send(Response::TrustRequired { identity: None, error: Some("configuration unavailable".to_owned()) }).unwrap();
+        workspace.absorb();
+        assert!(!workspace.busy && !workspace.ai_generating && workspace.trust_required);
+        assert!(workspace.log.commits.is_empty() && workspace.commit_message.is_empty() && workspace.diff_text.is_empty());
+    }
+
+    #[test]
+    fn external_commit_state_refreshes_log_but_unchanged_unborn_status_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        if !git(root, &["init", "--quiet", "--initial-branch=main"]) { return; }
+        assert!(git(root, &["config", "user.email", "anvil@test"]));
+        assert!(git(root, &["config", "user.name", "ANVIL test"]));
+        let (worker_tx, worker_rx) = spawn_worker();
+        worker_tx.send((None, Request::Refresh { cwd: root.to_owned() })).unwrap();
+        let shown = approve_worker(&worker_tx, &worker_rx);
+        let (response_tx, response_rx) = mpsc::channel();
+        let (request_tx, request_rx) = mpsc::channel();
+        let mut workspace = Workspace { tx: Some(request_tx), rx: Some(response_rx), ..Default::default() };
+        let apply_status = |workspace: &mut Workspace| {
+            worker_tx.send((shown.clone(), Request::Refresh { cwd: root.to_owned() })).unwrap();
+            let response = worker_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+            assert!(matches!(&response, Response::Status(_, _)));
+            response_tx.send(response).unwrap();
+            workspace.absorb();
+            request_rx.try_iter().filter(|(_, request)| matches!(request, Request::Log)).count()
+        };
+        assert_eq!(apply_status(&mut workspace), 1);
+        assert_eq!(apply_status(&mut workspace), 0, "unborn status is not an excuse to repeatedly load empty history");
+        std::fs::write(root.join("file.txt"), "first\n").unwrap();
+        assert!(git(root, &["add", "."]));
+        assert!(git(root, &["commit", "--quiet", "-m", "first external commit"]));
+        assert_eq!(apply_status(&mut workspace), 1);
+        assert_eq!(apply_status(&mut workspace), 0);
+        let first = workspace.status.head_oid.clone();
+        std::fs::write(root.join("file.txt"), "second\n").unwrap();
+        assert!(git(root, &["add", "."]));
+        assert!(git(root, &["commit", "--quiet", "-m", "second external commit"]));
+        assert_eq!(apply_status(&mut workspace), 1, "same branch/counts but new HEAD invalidates history");
+        assert_ne!(workspace.status.head_oid, first);
+        assert_eq!(apply_status(&mut workspace), 0);
+        let remote = "refs/remotes/origin/main";
+        assert!(git(root, &["update-ref", remote, "HEAD"]));
+        assert!(git(root, &["config", "branch.main.remote", "origin"]));
+        assert!(git(root, &["config", "branch.main.merge", "refs/heads/main"]));
+        assert!(git(root, &["config", "remote.origin.url", "."]));
+        assert!(git(root, &["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]));
+        worker_tx.send((shown.clone(), Request::Refresh { cwd: root.to_owned() })).unwrap();
+        assert_eq!(approve_worker(&worker_tx, &worker_rx), shown);
+        assert_eq!(apply_status(&mut workspace), 1);
+        assert!(git(root, &["update-ref", remote, "HEAD~1"]));
+        assert_eq!(apply_status(&mut workspace), 1, "external upstream changes invalidate history");
+        assert_eq!(apply_status(&mut workspace), 0);
     }
 }

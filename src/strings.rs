@@ -162,7 +162,8 @@ pub const WORKSPACE_COPY_PATCH: &str = "Копировать патч";
 pub const WORKSPACE_NEW_FILE: &str = "Новый файл";
 pub const WORKSPACE_NEW_FOLDER: &str = "Новая папка";
 pub const WORKSPACE_RENAME: &str = "Переименовать";
-pub const WORKSPACE_DELETE: &str = "Удалить";
+pub const WORKSPACE_DELETE: &str = "Удалить в корзину";
+pub const WORKSPACE_DELETE_HINT: &str = "Папка целиком, включая скрытые и игнорируемые файлы, будет перемещена в корзину. Отмена или ошибка оставит её на месте.";
 pub const WORKSPACE_OPEN_EXTERNAL: &str = "Открыть в системе";
 pub const WORKSPACE_REVEAL: &str = "Показать в проводнике";
 pub const WORKSPACE_FILE_FILTER: &str = "Фильтр файлов";
@@ -179,6 +180,11 @@ pub const WORKSPACE_FILE_EXISTS: &str = "файл уже существует";
 pub const WORKSPACE_NO_SUCH_FILE: &str = "нет такого файла";
 pub const WORKSPACE_DIFF_STALE: &str = "файл изменился — обновите панель";
 pub const WORKSPACE_REPO_CHANGED: &str = "репозиторий сменился — действие отменено";
+pub const WORKSPACE_TRUST_TITLE: &str = "Требуется доверие к репозиторию";
+pub const WORKSPACE_TRUST_HINT: &str = "Git может запускать команды из конфигурации репозитория, включённых файлов и пользовательских настроек (например, фильтры). До вашего разрешения ANVIL не читает статус, diff и историю и не выполняет Git-действия. Доверие действует только в этой сессии для этой папки и текущей конфигурации; её изменение требует нового разрешения.";
+pub const WORKSPACE_TRUST_APPROVE: &str = "Доверять этой конфигурации";
+pub const WORKSPACE_TRUST_STALE: &str = "Репозиторий или конфигурация изменились — разрешение отменено. Проверьте папку и подтвердите заново.";
+pub const WORKSPACE_AI_NO_STAGE: &str = "Сначала добавьте изменения в индекс: AI составляет сообщение только по staged-изменениям.";
 
 /// Russian relative time of a unix timestamp, as the commit list shows it.
 pub fn relative_time(now_secs: i64, then_secs: i64) -> String {
