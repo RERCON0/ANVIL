@@ -3,7 +3,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+use crate::process::run_bounded;
 
 /// One changed file, as `git status --porcelain=v2` reports it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -169,86 +170,6 @@ fn run_git_capped(root: &Path, args: &[&str], timeout: std::time::Duration, max_
     }
 }
 
-/// Runs `command` without a console, feeding it `input` (or no stdin),
-/// keeping at most `max_bytes` of each output stream and killing it at
-/// `timeout`: a hung fetch, a credential prompt or a CLI that never answers
-/// must not pin the panel's worker thread. `(success, stdout, stderr)`.
-fn run_bounded(
-    mut command: Command,
-    label: &str,
-    timeout: std::time::Duration,
-    max_bytes: usize,
-    input: Option<Vec<u8>>,
-) -> Result<(bool, Vec<u8>, Vec<u8>), String> {
-    command
-        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    let mut child = command.spawn().map_err(|e| format!("{label}: {e}"))?;
-    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
-        // Written on its own thread: a child that answers before reading all
-        // of its input would otherwise deadlock against the full output pipe.
-        std::thread::spawn(move || {
-            use std::io::Write;
-            let _ = stdin.write_all(&input);
-        });
-    }
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    // Each stream is drained on its own thread and handed over through a
-    // channel, never joined: a grandchild (a hook, ssh) that inherited the
-    // pipe can keep it open long after the process itself is gone.
-    let reader = |mut stream: Box<dyn std::io::Read + Send>| {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut buffer = Vec::new();
-            let mut chunk = [0u8; 64 * 1024];
-            loop {
-                match stream.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if buffer.len() < max_bytes {
-                            let room = max_bytes - buffer.len();
-                            buffer.extend_from_slice(&chunk[..n.min(room)]);
-                        }
-                    }
-                }
-            }
-            let _ = tx.send(buffer);
-        });
-        rx
-    };
-    let stdout_rx = reader(Box::new(stdout));
-    let stderr_rx = reader(Box::new(stderr));
-
-    let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("{label} не ответил за {} с", timeout.as_secs()));
-            }
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
-            Err(e) => return Err(format!("{label}: {e}")),
-        }
-    };
-    // The process has exited; its own output is complete. Wait a little for
-    // the pipes to close, but never longer than the deadline allows.
-    let collect = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        rx.recv_timeout(left.max(std::time::Duration::from_millis(500))).unwrap_or_default()
-    };
-    let stdout = collect(stdout_rx);
-    let stderr = collect(stderr_rx);
-    Ok((status.success(), stdout, stderr))
-}
 
 /// True for a full object id (sha-1 or sha-256) — the only hashes ever passed
 /// back to `git`, so a crafted log record cannot smuggle an option.
@@ -321,13 +242,22 @@ pub fn find_root(cwd: &Path) -> Option<PathBuf> {
     preflight(cwd).ok()?.repository.as_ref().map(|repository| repository.root.clone())
 }
 
+// Budgets apply to metadata, not the number of ordinary loose object files.
+const MAX_WATCHED_SOURCES: usize = 8192;
+const MAX_SOURCE_ALIASES: usize = 16384;
+const MAX_ALTERNATE_STORES: usize = 128;
+const MAX_REPOSITORIES: usize = 256;
+const MAX_METADATA_ENTRIES: usize = 4 * 1024 * 1024;
+const MAX_METADATA_DEPTH: usize = 64;
+const MAX_CACHED_ROOTS: usize = 128;
+
 /// One configuration file whose stat decides whether a cached digest is stale.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ConfigSource {
     path: PathBuf,
     /// All local aliases are checked: deduplicating a target must not hide a
     /// junction/symlink replacement at a second include path.
-    aliases: Vec<PathBuf>,
+    aliases: std::collections::HashSet<PathBuf>,
     /// Length and mtime of the file when the digest was computed; `None` when
     /// it did not exist then.
     state: Option<(u64, Option<std::time::SystemTime>)>,
@@ -340,7 +270,7 @@ impl ConfigSource {
             std::fs::metadata(path).ok().map(|meta| (meta.len(), meta.modified().ok()))
         });
         let resolved = resolved.unwrap_or_else(|_| path.to_path_buf());
-        ConfigSource { path: resolved, aliases: vec![path.to_path_buf()], state }
+        ConfigSource { path: resolved, aliases: std::collections::HashSet::from([path.to_path_buf()]), state }
     }
 
     fn is_current(&self) -> bool {
@@ -414,6 +344,7 @@ pub struct RepositoryStamp {
     hazards: std::sync::Arc<Vec<String>>,
     /// Files whose stat invalidates a cached digest.
     sources: std::sync::Arc<Vec<ConfigSource>>,
+    source_index: std::sync::Arc<HashMap<PathBuf, usize>>,
 }
 
 impl PartialEq for RepositoryStamp {
@@ -472,8 +403,9 @@ pub fn repository_stamp(root: &Path) -> Result<RepositoryStamp, String> {
         // The cached digest may watch more than preflight alone discovers (it
         // also carries the origins Git reported). It stays valid while every
         // file behind it is untouched and no new source has appeared.
-        if cached.sources.iter().all(ConfigSource::is_current)
-            && checked.sources.iter().all(|source| cached.sources.contains(source))
+        if cached.is_current()
+            && checked.sources.iter().all(|source| cached.source_index.get(&source.path)
+                .is_some_and(|index| cached.sources[*index] == *source))
         {
             return Ok(cached);
         }
@@ -486,59 +418,100 @@ pub fn repository_stamp(root: &Path) -> Result<RepositoryStamp, String> {
 fn read_stamp(root: &Path) -> Result<RepositoryStamp, String> {
     const CONFIG_MAX_OUTPUT: usize = 1024 * 1024;
     const CONFIG_ARGS: [&str; 6] = ["config", "--includes", "--show-origin", "--show-scope", "--null", "--list"];
-    // Capture ALL sources before Git reads any of them, including absent
-    // include targets. Never attach a post-read stat to earlier output.
+    // All initialized children participate in the root approval. Capture their
+    // includes and identities before reading any effective configuration.
+    let deadline = std::time::Instant::now() + GIT_TIMEOUT;
     for _ in 0..3 {
         let checked = preflight(root)?;
-        let config = run_git_capped(root, &CONFIG_ARGS, GIT_TIMEOUT, CONFIG_MAX_OUTPUT)?;
-        if config.len() >= CONFIG_MAX_OUTPUT || config.last() != Some(&0) {
-            return Err(config_refusal());
-        }
-        if !checked.sources.iter().all(ConfigSource::is_current) {
-            continue;
-        }
-        // Union the preflight discovery with every repository-scoped origin
-        // Git itself reports, so a file that contributed configuration is
-        // watched even when the conservative scan did not predict it.
         let mut sources = (*checked.sources).clone();
-        let extras: Vec<PathBuf> = config_origins(&config, root)?
-            .into_iter()
-            .filter(|origin| !sources.iter().any(|source| source.path == *origin))
-            .collect();
-        if extras.is_empty() {
-            return Ok(digest_of(&config, root, std::sync::Arc::new(sources)));
+        let mut source_index: HashMap<PathBuf, usize> = sources.iter().enumerate()
+            .map(|(index, source)| (source.path.clone(), index)).collect();
+        let mut snapshots = Vec::new();
+        let mut output_bytes = 0;
+        let mut alias_count: usize = sources.iter().map(|source| source.aliases.len()).sum();
+        for repository in &checked.repositories {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() { return Err(config_refusal()); }
+            let mut command = base_git_command(&repository.root, &checked.executable);
+            command.args(CONFIG_ARGS);
+            let (success, config, _) = run_bounded(command, "git config", remaining, CONFIG_MAX_OUTPUT, None)?;
+            output_bytes += config.len();
+            if !success || config.len() >= CONFIG_MAX_OUTPUT || config.last() != Some(&0)
+                || output_bytes > 4 * CONFIG_MAX_OUTPUT
+            {
+                return Err(config_refusal());
+            }
+            for origin in config_origins(&config, &repository.root)? {
+                if source_index.contains_key(&origin) { continue; }
+                if sources.len() >= MAX_WATCHED_SOURCES || alias_count >= MAX_SOURCE_ALIASES {
+                    return Err(config_refusal());
+                }
+                alias_count += 1;
+                source_index.insert(origin.clone(), sources.len());
+                sources.push(ConfigSource::read(&origin));
+            }
+            snapshots.push((repository, config));
         }
-        // The extras come from Git's own read, so their stat cannot precede it.
-        // Take it now and confirm Git's output did not change under it before
-        // trusting the snapshot; a change makes the next attempt start over.
-        for origin in &extras {
-            sources.push(ConfigSource::read(origin));
+        if !sources.iter().all(ConfigSource::is_current) { continue; }
+        // An origin discovered only from Git needs a second read under its
+        // already captured stat; never bless output with a post-read snapshot.
+        if sources.len() != checked.sources.len() {
+            let mut changed = false;
+            for (repository, config) in &snapshots {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() { return Err(config_refusal()); }
+                let mut command = base_git_command(&repository.root, &checked.executable);
+                command.args(CONFIG_ARGS);
+                let (success, confirm, _) = run_bounded(command, "git config", remaining, CONFIG_MAX_OUTPUT, None)?;
+                if !success || &confirm != config { changed = true; break; }
+            }
+            if changed || !sources.iter().all(ConfigSource::is_current) { continue; }
         }
-        let confirm = run_git_capped(root, &CONFIG_ARGS, GIT_TIMEOUT, CONFIG_MAX_OUTPUT)?;
-        if confirm != config || !sources.iter().all(ConfigSource::is_current) {
-            continue;
+        let mut combined = digest_of(&[], root, std::sync::Arc::new(sources));
+        for (repository, config) in snapshots {
+            let child = digest_of(&config, &repository.root, Default::default());
+            merge_repository_digest(&mut combined, repository, &child);
         }
-        return Ok(digest_of(&config, root, std::sync::Arc::new(sources)));
+        return Ok(combined);
     }
     Err(config_refusal())
+}
+
+fn merge_repository_digest(combined: &mut RepositoryStamp, repository: &RepositoryPaths, stamp: &RepositoryStamp) {
+    if stamp.is_hazard_free() { return; }
+    let digest = std::sync::Arc::make_mut(&mut combined.digest);
+    // Length-prefix identity and content: moving the same dangerous config to
+    // another initialized child must not inherit the previous child's trust.
+    for part in [
+        repository.root.as_os_str().as_encoded_bytes(), repository.git_dir.as_os_str().as_encoded_bytes(),
+        repository.common_dir.as_os_str().as_encoded_bytes(), stamp.digest.as_slice(),
+    ] {
+        digest.extend_from_slice(&(part.len() as u64).to_le_bytes());
+        digest.extend_from_slice(part);
+    }
+    let hazards = std::sync::Arc::make_mut(&mut combined.hazards);
+    hazards.extend(stamp.hazards.iter().cloned());
+    hazards.sort();
+    hazards.dedup();
 }
 
 /// The repository-scoped configuration files Git names with `--show-origin`
 /// (local/worktree scope, or any origin inside the repository), resolved for
 /// the watch list. The guarded resolver also fails closed on a network path.
 fn config_origins(config: &[u8], root: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut origins = Vec::new();
+    let mut origins = std::collections::HashSet::new();
     let mut tokens = config.split(|byte| *byte == 0).filter(|token| !token.is_empty());
     while let (Some(scope), Some(origin), Some(_)) = (tokens.next(), tokens.next(), tokens.next()) {
         let local = matches!(scope, b"local" | b"worktree");
-        let Some(path) = origin_path(origin) else { continue };
+        let Some(path) = origin_path(origin)? else { continue };
         let path = if path.is_absolute() { path } else { root.join(path) };
         if !local && !path_is_inside(&path, root) {
             continue;
         }
-        origins.push(local_path(&path)?);
+        if origins.len() >= MAX_WATCHED_SOURCES { return Err(config_refusal()); }
+        origins.insert(local_path(&path)?);
     }
-    Ok(origins)
+    Ok(origins.into_iter().collect())
 }
 
 /// Local scope and files inside the repository only: the user's own global
@@ -559,7 +532,7 @@ fn digest_of(config: &[u8], root: &Path, sources: std::sync::Arc<Vec<ConfigSourc
         };
         // Git prints `.git/config` relative to the work tree; resolve it
         // against the repository, never against the process working directory.
-        let path = origin_path(origin).map(|path| if path.is_absolute() { path } else { root.join(path) });
+        let path = origin_path(origin).ok().flatten().map(|path| if path.is_absolute() { path } else { root.join(path) });
         let local = matches!(scope, b"local" | b"worktree");
         let inside = path.as_deref().is_some_and(|path| path_is_inside(path, root));
         if !local && !inside {
@@ -578,44 +551,65 @@ fn digest_of(config: &[u8], root: &Path, sources: std::sync::Arc<Vec<ConfigSourc
     RepositoryStamp {
         digest: std::sync::Arc::new(digest),
         hazards: std::sync::Arc::new(hazards),
+        source_index: std::sync::Arc::new(sources.iter().enumerate().map(|(index, source)| (source.path.clone(), index)).collect()),
         sources,
     }
 }
 
-/// `<origin>` is `file:<path>`, C-quoted when the path has special bytes.
-fn origin_path(origin: &[u8]) -> Option<PathBuf> {
-    let path = origin.strip_prefix(b"file:")?;
-    let bytes = if let Some(quoted) = path.strip_prefix(b"\"") {
-        let quoted = quoted.strip_suffix(b"\"")?;
-        let mut decoded = Vec::with_capacity(quoted.len());
-        let mut index = 0;
-        while index < quoted.len() {
-            let byte = quoted[index];
-            index += 1;
-            if byte != b'\\' { decoded.push(byte); continue; }
-            let escaped = *quoted.get(index)?;
-            index += 1;
-            decoded.push(match escaped {
-                b'n' => b'\n', b't' => b'\t', b'r' => b'\r', b'b' => 8,
-                b'f' => 12, b'v' => 11, b'\\' => b'\\', b'"' => b'"',
-                b'0'..=b'7' => {
-                    let mut value = u16::from(escaped - b'0');
-                    for _ in 0..2 {
-                        let Some(digit @ b'0'..=b'7') = quoted.get(index).copied() else { break };
-                        value = value * 8 + u16::from(digit - b'0');
-                        index += 1;
+/// Git C-style quoting is byte-oriented (including three-digit octal bytes).
+/// A path without an opening quote is literal, backslashes included.
+fn git_unquote(path: &[u8]) -> Result<Vec<u8>, String> {
+    if !path.starts_with(b"\"") { return Ok(path.to_vec()); }
+    let mut decoded = Vec::with_capacity(path.len());
+    let mut index = 1;
+    while let Some(&byte) = path.get(index) {
+        index += 1;
+        match byte {
+            b'"' if index == path.len() => return Ok(decoded),
+            b'"' => return Err(config_refusal()),
+            b'\\' => {
+                let escaped = *path.get(index).ok_or_else(config_refusal)?;
+                index += 1;
+                decoded.push(match escaped {
+                    b'a' => 7, b'b' => 8, b't' => b'\t', b'n' => b'\n',
+                    b'v' => 11, b'f' => 12, b'r' => b'\r', b'\\' => b'\\', b'"' => b'"',
+                    b'0'..=b'3' => {
+                        let second = *path.get(index).ok_or_else(config_refusal)?;
+                        let third = *path.get(index + 1).ok_or_else(config_refusal)?;
+                        if !(b'0'..=b'7').contains(&second) || !(b'0'..=b'7').contains(&third) {
+                            return Err(config_refusal());
+                        }
+                        index += 2;
+                        (escaped - b'0') * 64 + (second - b'0') * 8 + (third - b'0')
                     }
-                    u8::try_from(value).ok()?
-                }
-                _ => return None,
-            });
+                    _ => return Err(config_refusal()),
+                });
+            }
+            _ => decoded.push(byte),
         }
-        decoded
-    } else {
-        path.to_vec()
-    };
-    let path = String::from_utf8(bytes).ok()?;
-    (!path.is_empty()).then(|| PathBuf::from(path))
+    }
+    Err(config_refusal())
+}
+
+fn bytes_path(bytes: Vec<u8>) -> Result<PathBuf, String> {
+    if bytes.is_empty() || bytes.contains(&0) { return Err(config_refusal()); }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(PathBuf::from(String::from_utf8(bytes).map_err(|_| config_refusal())?))
+    }
+}
+
+/// A malformed file origin is not an ignorable, non-file origin.
+fn origin_path(origin: &[u8]) -> Result<Option<PathBuf>, String> {
+    let Some(path) = origin.strip_prefix(b"file:") else { return Ok(None) };
+    let path = bytes_path(git_unquote(path)?)?;
+    reject_remote_path(&path)?;
+    Ok(Some(path))
 }
 
 /// Case-insensitive prefix test on the platform's own separators.
@@ -768,13 +762,22 @@ struct RepositoryPaths {
 #[derive(Clone)]
 struct Preflight {
     repository: Option<RepositoryPaths>,
+    repositories: Vec<RepositoryPaths>,
     sources: std::sync::Arc<Vec<ConfigSource>>,
     executable: PathBuf,
 }
 
 struct ConfigScan {
     sources: Vec<ConfigSource>,
-    visited: std::collections::HashSet<PathBuf>,
+    source_index: HashMap<PathBuf, usize>,
+    alias_index: HashMap<PathBuf, usize>,
+    repositories: Vec<RepositoryPaths>,
+    repository_keys: std::collections::HashSet<(PathBuf, PathBuf)>,
+    metadata_dirs: std::collections::HashSet<PathBuf>,
+    alternate_stores: std::collections::HashSet<PathBuf>,
+    metadata_entries: usize,
+    visited: std::collections::HashSet<(PathBuf, PathBuf, PathBuf)>,
+    global_paths: std::sync::Arc<Vec<PathBuf>>,
     bytes: usize,
     cwd: PathBuf,
     active: std::collections::HashSet<PathBuf>,
@@ -788,21 +791,32 @@ impl ConfigScan {
             sources: Vec::new(), visited: Default::default(), bytes: 0,
             cwd: cwd.to_path_buf(), active: Default::default(), worktree_override: false,
             git_dir: cwd.to_path_buf(),
+            source_index: Default::default(), alias_index: Default::default(),
+            repositories: Vec::new(), repository_keys: Default::default(),
+            metadata_dirs: Default::default(), alternate_stores: Default::default(), metadata_entries: 0,
+            global_paths: Default::default(),
         }
     }
 
     fn source(&mut self, path: &Path) -> Result<PathBuf, String> {
+        if let Some(&index) = self.alias_index.get(path) { return Ok(self.sources[index].path.clone()); }
+        if self.alias_index.len() >= MAX_SOURCE_ALIASES { return Err(config_refusal()); }
         let resolved = local_path(path)?;
-        // Exact spelling: a case variant is a second alias to check, never a
-        // reason to drop a file from the watch list.
-        if let Some(source) = self.sources.iter_mut().find(|source| source.path == resolved) {
-            if !source.aliases.iter().any(|alias| alias == path) {
-                source.aliases.push(path.to_path_buf());
-            }
+        let index = if let Some(&index) = self.source_index.get(&resolved) {
+            self.sources[index].aliases.insert(path.to_path_buf());
+            index
         } else {
-            // Record the stat BEFORE read_to_string, also for absent files.
-            self.sources.push(ConfigSource::read(path));
-        }
+            if self.sources.len() >= MAX_WATCHED_SOURCES { return Err(config_refusal()); }
+            let index = self.sources.len();
+            // Record the stat BEFORE reading, including absent metadata.
+            let state = std::fs::metadata(&resolved).ok().map(|meta| (meta.len(), meta.modified().ok()));
+            self.sources.push(ConfigSource {
+                path: resolved.clone(), aliases: std::collections::HashSet::from([path.to_path_buf()]), state,
+            });
+            self.source_index.insert(resolved.clone(), index);
+            index
+        };
+        self.alias_index.insert(path.to_path_buf(), index);
         Ok(resolved)
     }
 
@@ -833,11 +847,12 @@ impl ConfigScan {
 
     fn config(&mut self, path: &Path, depth: usize) -> Result<(), String> {
         let resolved = self.source(path)?;
-        if depth > 10 || self.visited.len() >= 256 {
-            return Err(config_refusal());
-        }
+        if depth > 10 { return Err(config_refusal()); }
         if self.active.contains(&resolved) { return Err(config_refusal()); }
-        if !self.visited.insert(resolved.clone()) { return Ok(()); }
+        let context = (resolved.clone(), self.cwd.clone(), self.git_dir.clone());
+        if self.visited.contains(&context) { return Ok(()); }
+        if self.visited.len() >= 1024 { return Err(config_refusal()); }
+        self.visited.insert(context);
         self.active.insert(resolved.clone());
         let Some(text) = self.read(path)? else {
             self.active.remove(&resolved);
@@ -959,21 +974,9 @@ fn config_paths(text: &str) -> Result<Vec<(String, String)>, String> {
 /// Git unquotes an alternates entry only when it starts with a quote; an
 /// unquoted entry is a literal path, backslashes included.
 fn alternates_path(line: &str) -> Result<std::ffi::OsString, String> {
-    let line = line.trim_end();
-    if line.is_empty() { return Err(config_refusal()); }
-    let Some(quoted) = line.strip_prefix('"') else { return Ok(line.into()) };
-    let mut decoded = String::new();
-    let mut characters = quoted.chars();
-    let mut closed = false;
-    while let Some(character) = characters.next() {
-        match character {
-            '\\' => decoded.push(characters.next().ok_or_else(config_refusal)?),
-            '"' => { closed = true; break; }
-            _ => decoded.push(character),
-        }
-    }
-    if !closed || !characters.as_str().trim().is_empty() { return Err(config_refusal()); }
-    Ok(decoded.into())
+    let path = bytes_path(git_unquote(line.as_bytes())?)?;
+    reject_remote_path(&path)?;
+    Ok(path.into_os_string())
 }
 
 fn config_value(value: &str) -> Result<String, String> {
@@ -1244,15 +1247,82 @@ fn discover_repository(cwd: &Path, scan: &mut ConfigScan) -> Result<Option<Repos
     Ok(None)
 }
 
-fn inspect_objects(directory: &Path, scan: &mut ConfigScan, depth: usize, visited: &mut std::collections::HashSet<PathBuf>) -> Result<(), String> {
+/// Enumerate local entries without resolving ordinary files one by one.
+/// Directory snapshots catch newly inserted/replaced reparse entries, while
+/// only actual redirects need a guarded target lookup and an alias watch.
+fn inspect_metadata_tree(directory: &Path, scan: &mut ConfigScan, depth: usize) -> Result<(), String> {
+    if depth > MAX_METADATA_DEPTH { return Err(config_refusal()); }
     let directory = scan.source(directory)?;
+    if !scan.metadata_dirs.insert(directory.clone()) { return Ok(()); }
+    let entries = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    for entry in entries {
+        if scan.metadata_entries >= MAX_METADATA_ENTRIES { return Err(config_refusal()); }
+        scan.metadata_entries += 1;
+        let entry = entry.map_err(|error| error.to_string())?;
+        let kind = entry.file_type().map_err(|error| error.to_string())?;
+        #[cfg(windows)]
+        let reparse = {
+            use std::os::windows::fs::MetadataExt;
+            // DirEntry::metadata does not follow Windows reparse points.
+            entry.metadata().map_err(|error| error.to_string())?.file_attributes() & 0x400 != 0
+        };
+        #[cfg(not(windows))]
+        let reparse = kind.is_symlink();
+        if reparse {
+            // Never ask is_dir/metadata about a target before local_path.
+            let target = scan.source(&entry.path())?;
+            if target.is_dir() { inspect_metadata_tree(&entry.path(), scan, depth + 1)?; }
+        } else if kind.is_dir() {
+            inspect_metadata_tree(&entry.path(), scan, depth + 1)?;
+        }
+    }
+    Ok(())
+}
+
+fn inspect_symbolic_head(repository: &RepositoryPaths, scan: &mut ConfigScan) -> Result<(), String> {
+    let mut path = repository.git_dir.join("HEAD");
+    let mut visited = std::collections::HashSet::new();
+    for _ in 0..32 {
+        let resolved = scan.source(&path)?;
+        if !visited.insert(resolved) { return Err(config_refusal()); }
+        let Some(text) = scan.read(&path)? else { return Ok(()) };
+        let Some(reference) = text.strip_prefix("ref:") else { return Ok(()) };
+        let reference = reference.trim_matches(is_ref_space);
+        if !reference.starts_with("refs/") || reference.contains('\\') || reference.contains(':')
+            || reference.chars().any(char::is_control)
+            || reference.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return Err(config_refusal());
+        }
+        // Git's three per-worktree namespaces bypass commondir.
+        let per_worktree = ["refs/bisect/", "refs/worktree/", "refs/rewritten/"]
+            .iter().any(|prefix| reference.starts_with(prefix));
+        path = (if per_worktree { &repository.git_dir } else { &repository.common_dir }).join(reference);
+    }
+    Err(config_refusal())
+}
+
+fn inspect_objects(directory: &Path, scan: &mut ConfigScan, depth: usize) -> Result<(), String> {
     if depth > 10 { return Err(config_refusal()); }
-    if !visited.insert(directory.clone()) { return Ok(()); }
+    if scan.alternate_stores.len() >= MAX_ALTERNATE_STORES
+        && !scan.alias_index.get(directory).is_some_and(|&index| scan.alternate_stores.contains(&scan.sources[index].path))
+    {
+        return Err(config_refusal());
+    }
+    let directory = scan.source(directory)?;
+    if scan.alternate_stores.contains(&directory) { return Ok(()); }
+    if scan.alternate_stores.len() >= MAX_ALTERNATE_STORES { return Err(config_refusal()); }
+    scan.alternate_stores.insert(directory.clone());
+    inspect_metadata_tree(&directory, scan, 0)?;
     if let Some(alternates) = scan.read(&directory.join("info/alternates"))? {
-        for line in alternates.lines().filter(|line| !line.trim().is_empty()) {
+        for line in alternates.lines().filter(|line| !line.is_empty()) {
             let target = alternates_path(line)?;
             let target = anchored_path(&directory, Path::new(&target))?;
-            inspect_objects(&target, scan, depth + 1, visited)?;
+            inspect_objects(&target, scan, depth + 1)?;
         }
     }
     Ok(())
@@ -1260,19 +1330,34 @@ fn inspect_objects(directory: &Path, scan: &mut ConfigScan, depth: usize, visite
 
 fn inspect_metadata(repository: &RepositoryPaths, scan: &mut ConfigScan, depth: usize) -> Result<(), String> {
     if depth > 10 { return Err(config_refusal()); }
+    if !scan.repository_keys.insert((repository.root.clone(), repository.git_dir.clone())) { return Ok(()); }
+    if scan.repositories.len() >= MAX_REPOSITORIES { return Err(config_refusal()); }
+    scan.repositories.push(repository.clone());
     let previous_git_dir = std::mem::replace(&mut scan.git_dir, repository.git_dir.clone());
     let previous_cwd = std::mem::replace(&mut scan.cwd, repository.root.clone());
+    // Relative global attribute/include settings apply in each child's cwd,
+    // not just the superproject's. Context-keyed visited entries preserve this.
+    let globals = scan.global_paths.clone();
+    for path in globals.iter() { scan.config(path, 0)?; }
     scan.config(&repository.common_dir.join("config"), 0)?;
     scan.config(&repository.git_dir.join("config.worktree"), 0)?;
     // Watch HEAD as well: includeIf.onbranch can change its selected source
     // without changing a config file.
-    scan.source(&repository.git_dir.join("HEAD"))?;
-    inspect_objects(&repository.common_dir.join("objects"), scan, 0, &mut Default::default())?;
+    inspect_symbolic_head(repository, scan)?;
+    inspect_objects(&repository.common_dir.join("objects"), scan, 0)?;
+    for directory in [
+        repository.common_dir.join("refs"), repository.git_dir.join("refs"),
+        repository.common_dir.join("reftable"), repository.git_dir.join("reftable"),
+    ] {
+        inspect_metadata_tree(&directory, scan, 0)?;
+    }
     for path in [
         repository.git_dir.join("index"),
         repository.common_dir.join("refs"),
         repository.common_dir.join("packed-refs"),
         repository.common_dir.join("info/attributes"),
+        repository.common_dir.join("shallow"),
+        repository.git_dir.join("shallow"),
     ] {
         scan.source(&path)?;
     }
@@ -1286,6 +1371,7 @@ fn inspect_metadata(repository: &RepositoryPaths, scan: &mut ConfigScan, depth: 
             let marker = scan.source(&module.join(".git"))?;
             if marker.exists() {
                 if let Some(child) = discover_repository(&module, scan)? {
+                    if !same_path(&child.root, &local_path(&module)?) { return Err(config_refusal()); }
                     inspect_metadata(&child, scan, depth + 1)?;
                 }
             }
@@ -1329,11 +1415,11 @@ fn preflight(cwd: &Path) -> Result<std::sync::Arc<Preflight>, String> {
         "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM",
     ].map(std::env::var_os);
     let cwd = local_path(cwd)?;
-    if let Ok(cache) = PREFLIGHT_CACHE.lock() {
-        if let Some((previous, checked)) = cache.as_ref().and_then(|cache| cache.get(&cwd)) {
-            if previous == &environment && checked.sources.iter().all(ConfigSource::is_current) {
-                return Ok(checked.clone());
-            }
+    let cached = PREFLIGHT_CACHE.lock().ok().and_then(|cache| cache.as_ref()
+        .and_then(|cache| cache.get(&cwd)).cloned());
+    if let Some((previous, checked)) = cached {
+        if previous == environment && checked.sources.iter().all(ConfigSource::is_current) {
+            return Ok(checked);
         }
     }
     for _ in 0..3 {
@@ -1342,9 +1428,9 @@ fn preflight(cwd: &Path) -> Result<std::sync::Arc<Preflight>, String> {
         let executable = git_executable()?;
         if let Some(repository) = &repository { scan.git_dir = repository.git_dir.clone(); }
         if let Some(repository) = &repository { scan.cwd = repository.root.clone(); }
-        for path in global_configs(&executable)? {
-            scan.config(&path, 0)?;
-        }
+        scan.global_paths = std::sync::Arc::new(global_configs(&executable)?);
+        let globals = scan.global_paths.clone();
+        for path in globals.iter() { scan.config(path, 0)?; }
         // Git's default external attribute/exclude files are path-bearing
         // configuration too, even with an explicit GIT_CONFIG_GLOBAL.
         let home = home_path()?;
@@ -1361,12 +1447,19 @@ fn preflight(cwd: &Path) -> Result<std::sync::Arc<Preflight>, String> {
             let (success, stdout, stderr) = run_bounded(command, "git rev-parse", GIT_TIMEOUT, GIT_MAX_OUTPUT, None)?;
             if !success { return Err(String::from_utf8_lossy(&stderr).trim().to_owned()); }
             let actual = PathBuf::from(String::from_utf8(stdout).map_err(|_| config_refusal())?.trim());
-            if let Some(repository) = &mut repository { repository.root = local_path(&actual)?; }
+            if let Some(repository) = &mut repository {
+                repository.root = local_path(&actual)?;
+                if let Some(first) = scan.repositories.first_mut() { first.root = repository.root.clone(); }
+            }
         }
         if scan.sources.iter().all(ConfigSource::is_current) {
-            let checked = std::sync::Arc::new(Preflight { repository, sources: std::sync::Arc::new(scan.sources), executable });
+            let checked = std::sync::Arc::new(Preflight {
+                repository, repositories: scan.repositories, sources: std::sync::Arc::new(scan.sources), executable,
+            });
             if let Ok(mut cache) = PREFLIGHT_CACHE.lock() {
-                cache.get_or_insert_with(HashMap::new).insert(cwd.clone(), (environment, checked.clone()));
+                let cache = cache.get_or_insert_with(HashMap::new);
+                if cache.len() >= MAX_CACHED_ROOTS && !cache.contains_key(&cwd) { cache.clear(); }
+                cache.insert(cwd.clone(), (environment, checked.clone()));
             }
             return Ok(checked);
         }
@@ -1395,7 +1488,9 @@ fn cached_stamp(root: &Path) -> Option<RepositoryStamp> {
 
 fn store_stamp(root: &Path, stamp: &RepositoryStamp) {
     if let Ok(mut cache) = STAMP_CACHE.lock() {
-        cache.get_or_insert_with(HashMap::new).insert(root.to_path_buf(), stamp.clone());
+        let cache = cache.get_or_insert_with(HashMap::new);
+        if cache.len() >= MAX_CACHED_ROOTS && !cache.contains_key(root) { cache.clear(); }
+        cache.insert(root.to_path_buf(), stamp.clone());
     }
 }
 
@@ -2990,6 +3085,159 @@ index 111..222 100644\n\
         // not (Git reads the file once).
         assert!(config_paths("[user]\n name = \"unterminated\n").is_err());
         assert!(config_paths("[include]\n path = a.cfg\n").is_ok());
+    }
+
+    #[test]
+    fn git_path_consumers_decode_octal_bytes_and_fail_closed() {
+        assert_eq!(alternates_path(r#""..\\store\040space""#).unwrap(), std::ffi::OsString::from(r"..\store space"));
+        assert_eq!(alternates_path(r"..\store literal ").unwrap(), std::ffi::OsString::from(r"..\store literal "));
+        assert_eq!(origin_path(br#"file:"store\040space""#).unwrap(), Some(PathBuf::from("store space")));
+        assert_eq!(git_unquote(br#""\303\251""#).unwrap(), "é".as_bytes());
+        assert_eq!(git_unquote(br#""\377""#).unwrap(), [255]);
+        for malformed in [r#""unterminated"#, r#""\4""#, r#""\400""#, r#""\12""#, r#""\q""#, r#""ok"suffix"#, r#""\000""#] {
+            assert!(alternates_path(malformed).is_err(), "{malformed}");
+            assert!(origin_path(format!("file:{malformed}").as_bytes()).is_err(), "{malformed}");
+        }
+        for remote in [r#""\134\134127.0.0.1\134ANVIL-denied""#, r#""\057\057127.0.0.1/ANVIL-denied""#] {
+            assert!(alternates_path(remote).unwrap_err().contains("сетевые"));
+            assert!(origin_path(format!("file:{remote}").as_bytes()).unwrap_err().contains("сетевые"));
+        }
+    }
+
+    #[test]
+    fn missing_alternate_fanout_stops_at_the_store_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = dir.path().join("objects");
+        std::fs::create_dir_all(objects.join("info")).unwrap();
+        let list = (0..MAX_ALTERNATE_STORES).map(|index| format!("../missing-{index}\n")).collect::<String>();
+        std::fs::write(objects.join("info/alternates"), list).unwrap();
+        let mut scan = ConfigScan::new(dir.path());
+        assert!(inspect_objects(&objects, &mut scan, 0).is_err());
+        assert_eq!(scan.alternate_stores.len(), MAX_ALTERNATE_STORES);
+        assert!(scan.sources.len() <= 2 * MAX_ALTERNATE_STORES + 2);
+        // Exactly root +127 missing stores is permitted, including a repeat.
+        let list = (0..MAX_ALTERNATE_STORES - 1).map(|index| format!("../missing-{index}\n")).collect::<String>();
+        std::fs::write(objects.join("info/alternates"), format!("{list}../missing-0\n")).unwrap();
+        let mut scan = ConfigScan::new(dir.path());
+        inspect_objects(&objects, &mut scan, 0).unwrap();
+        assert_eq!(scan.alternate_stores.len(), MAX_ALTERNATE_STORES);
+    }
+
+    #[test]
+    fn source_and_alias_budgets_cover_missing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut scan = ConfigScan::new(dir.path());
+        for index in 0..MAX_WATCHED_SOURCES {
+            scan.source(&dir.path().join(format!("missing-{index}"))).unwrap();
+        }
+        assert!(scan.source(&dir.path().join("one-too-many")).is_err());
+        assert_eq!(scan.source_index.len(), MAX_WATCHED_SOURCES);
+        let mut aliases = ConfigScan::new(dir.path());
+        for index in 0..MAX_SOURCE_ALIASES {
+            aliases.source(&dir.path().join(format!("alias-{index}/../config"))).unwrap();
+        }
+        assert_eq!(aliases.sources.len(), 1);
+        assert_eq!(aliases.sources[0].aliases.len(), MAX_SOURCE_ALIASES);
+        assert!(aliases.source(&dir.path().join("alias-extra/../config")).is_err());
+    }
+
+    #[test]
+    fn ordinary_loose_objects_do_not_consume_source_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = dir.path().join("objects");
+        let fanout = objects.join("ab");
+        std::fs::create_dir_all(&fanout).unwrap();
+        for index in 0..MAX_WATCHED_SOURCES + 1 {
+            std::fs::write(fanout.join(format!("{index:038x}")), b"local object").unwrap();
+        }
+        let mut scan = ConfigScan::new(dir.path());
+        inspect_objects(&objects, &mut scan, 0).unwrap();
+        assert!(scan.sources.len() < 10, "only directories and path-bearing metadata are watched");
+        assert_eq!(scan.metadata_entries, MAX_WATCHED_SOURCES + 2);
+        let mut bounded = ConfigScan::new(dir.path());
+        bounded.metadata_entries = MAX_METADATA_ENTRIES - 1;
+        assert!(inspect_objects(&objects, &mut bounded, 0).is_err());
+        assert_eq!(bounded.metadata_entries, MAX_METADATA_ENTRIES);
+    }
+
+    #[cfg(any(unix, windows))]
+    fn metadata_link(target: &Path, path: &Path, directory: bool) -> bool {
+        #[cfg(unix)]
+        let result = {
+            let _ = directory;
+            std::os::unix::fs::symlink(target, path)
+        };
+        #[cfg(windows)]
+        let result = if directory {
+            std::os::windows::fs::symlink_dir(target, path)
+        } else {
+            std::os::windows::fs::symlink_file(target, path)
+        };
+        match result {
+            Ok(()) => true,
+            #[cfg(windows)]
+            Err(error) if error.raw_os_error() == Some(1314) => {
+                eprintln!("symlink privilege is unavailable; skipping reparse fixture");
+                false
+            }
+            Err(error) => panic!("create metadata link: {error}"),
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn nested_metadata_reparse_targets_are_guarded_before_following() {
+        for (entry, directory) in [
+            ("refs/heads", true), ("objects/pack", true),
+            ("objects/ab", true), ("reftable/tables.list", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(entry);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            if !metadata_link(Path::new("//127.0.0.1/ANVIL-denied"), &path, directory) { return; }
+            let mut scan = ConfigScan::new(dir.path());
+            assert!(inspect_metadata_tree(path.parent().unwrap(), &mut scan, 0).unwrap_err().contains("сетевые"), "{entry}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(git_dir.join("refs")).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        if !metadata_link(Path::new("//127.0.0.1/ANVIL-denied"), &git_dir.join("refs/heads"), true) { return; }
+        let repository = RepositoryPaths { root: dir.path().to_path_buf(), git_dir: git_dir.clone(), common_dir: git_dir };
+        assert!(inspect_symbolic_head(&repository, &mut ConfigScan::new(dir.path())).unwrap_err().contains("сетевые"));
+    }
+
+    #[test]
+    fn symbolic_head_chains_watch_targets_and_reject_escaping_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("refs/heads")).unwrap();
+        std::fs::write(dir.path().join("HEAD"), "ref:\trefs/heads/main\n").unwrap();
+        std::fs::write(dir.path().join("refs/heads/main"), "ref: refs/heads/next\n").unwrap();
+        let repository = RepositoryPaths { root: dir.path().to_path_buf(), git_dir: dir.path().to_path_buf(), common_dir: dir.path().to_path_buf() };
+        let mut scan = ConfigScan::new(dir.path());
+        inspect_symbolic_head(&repository, &mut scan).unwrap();
+        assert!(scan.source_index.contains_key(&dir.path().join("refs/heads/next")));
+        std::fs::write(dir.path().join("refs/heads/next"), "ref: refs/../outside\n").unwrap();
+        assert!(!scan.sources.iter().all(ConfigSource::is_current));
+        assert!(inspect_symbolic_head(&repository, &mut ConfigScan::new(dir.path())).is_err());
+    }
+
+    #[test]
+    fn symbolic_head_resolves_per_worktree_namespaces_in_the_gitdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join("linked");
+        let common_dir = dir.path().join("common");
+        std::fs::create_dir_all(&common_dir).unwrap();
+        for namespace in ["bisect", "worktree", "rewritten"] {
+            std::fs::create_dir_all(git_dir.join(format!("refs/{namespace}"))).unwrap();
+            std::fs::write(git_dir.join("HEAD"), format!("ref: refs/{namespace}/main\n")).unwrap();
+            std::fs::write(git_dir.join(format!("refs/{namespace}/main")), "ref: refs/heads/next\n").unwrap();
+            let repository = RepositoryPaths { root: dir.path().to_path_buf(), git_dir: git_dir.clone(), common_dir: common_dir.clone() };
+            let mut scan = ConfigScan::new(dir.path());
+            inspect_symbolic_head(&repository, &mut scan).unwrap();
+            assert!(scan.source_index.contains_key(&git_dir.join(format!("refs/{namespace}/main"))));
+            assert!(scan.source_index.contains_key(&common_dir.join("refs/heads/next")));
+        }
     }
 
     fn config_records(entries: &[(&str, &str, &str, &str)]) -> Vec<u8> {

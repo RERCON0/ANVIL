@@ -169,6 +169,59 @@ fn network_includes_and_external_attributes_are_rejected_before_git_reads_them()
 }
 
 #[test]
+fn initialized_submodule_hazards_and_identity_belong_to_parent_approval() {
+    let Some(parent) = repo() else { return };
+    let Some(source) = repo() else { return };
+    let root = parent.path();
+    run(root, &["-c", "protocol.file.allow=always", "submodule", "add", "--quiet", source.path().to_str().unwrap(), "module"]);
+    let child = root.join("module");
+    let clean = git::repository_stamp(root).unwrap();
+    assert!(clean.is_hazard_free());
+    std::fs::write(child.join("tracked.txt"), "dirty child\n").unwrap();
+    assert!(git::status(root).unwrap().changes.iter().any(|change| change.path == "module" && change.unstaged()),
+        "ordinary submodule dirty checking remains enabled");
+    let included = child.join("child-include.cfg");
+    std::fs::write(&included, "[filter \"child\"]\n clean = first-command\n").unwrap();
+    run(&child, &["config", "include.path", included.to_str().unwrap()]);
+    let first = git::repository_stamp(root).unwrap();
+    assert!(first.hazards().iter().any(|key| key == "filter.child.clean"));
+    assert!(!git::trust_approved(root, &first), "clean parent cannot authorize dangerous child configuration");
+    git::remember_trust(root, first.clone());
+    assert!(git::trust_approved(root, &first));
+    assert_eq!(first, git::repository_stamp(root).unwrap(), "unchanged cached source membership preserves the digest");
+    std::fs::write(&included, "[filter \"child\"]\n clean = second-longer-command\n").unwrap();
+    assert!(!git::trust_approved(root, &first), "child include freshness revokes the old snapshot");
+    let changed = git::repository_stamp(root).unwrap();
+    assert_ne!(first, changed);
+    assert!(!git::trust_approved(root, &changed), "child command changes require a new root approval");
+    git::remember_trust(root, changed.clone());
+    let original_git_dir = git::metadata_path(&child, "config").unwrap().parent().unwrap().to_path_buf();
+    let relocated = original_git_dir.with_file_name("reidentified");
+    std::fs::rename(&original_git_dir, &relocated).unwrap();
+    std::fs::write(child.join(".git"), format!("gitdir: {}\n", relocated.to_str().unwrap())).unwrap();
+    let reidentified = git::repository_stamp(root).unwrap();
+    assert_ne!(changed, reidentified, "identical commands under a different child gitdir do not inherit trust");
+    assert!(!git::trust_approved(root, &reidentified));
+}
+
+#[test]
+fn quoted_local_alternates_work_and_octal_unc_is_rejected_by_command_consumers() {
+    let Some(dir) = repo() else { return };
+    let objects = dir.path().join(".git/objects");
+    let alternate = dir.path().join("alternate store");
+    std::fs::create_dir_all(alternate.join("pack")).unwrap();
+    std::fs::create_dir_all(alternate.join("info")).unwrap();
+    std::fs::create_dir_all(objects.join("info")).unwrap();
+    std::fs::write(objects.join("info/alternates"), "\"../../alternate\\040store\"\n").unwrap();
+    assert!(git::repository_stamp(dir.path()).unwrap().is_hazard_free());
+    assert!(!git::status(dir.path()).unwrap().branch.is_empty());
+    std::fs::write(objects.join("info/alternates"), "\"\\134\\134127.0.0.1\\134ANVIL-denied\"\n").unwrap();
+    assert!(git::repository_stamp(dir.path()).unwrap_err().contains("сетевые"));
+    assert!(git::status(dir.path()).unwrap_err().contains("сетевые"));
+    assert!(git::run_git(dir.path(), &["rev-parse", "HEAD"]).unwrap_err().contains("сетевые"));
+}
+
+#[test]
 fn worktree_submodule_and_empty_repositories_have_routine_metadata() {
     let Some(dir) = repo() else { return };
     let worktree = tempfile::tempdir().unwrap();

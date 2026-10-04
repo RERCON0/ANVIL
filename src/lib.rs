@@ -13,6 +13,7 @@ pub mod hotkeys;
 pub mod layout;
 pub mod logging;
 pub mod procs;
+pub(crate) mod process;
 pub mod profiles;
 pub mod session;
 pub mod settings_ui;
