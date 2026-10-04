@@ -469,7 +469,12 @@ pub fn repository_identity(cwd: &Path) -> Result<Option<RepositoryIdentity>, Str
 pub fn repository_stamp(root: &Path) -> Result<RepositoryStamp, String> {
     let checked = preflight(root)?;
     if let Some(cached) = cached_stamp(root) {
-        if cached.sources == checked.sources {
+        // The cached digest may watch more than preflight alone discovers (it
+        // also carries the origins Git reported). It stays valid while every
+        // file behind it is untouched and no new source has appeared.
+        if cached.sources.iter().all(ConfigSource::is_current)
+            && checked.sources.iter().all(|source| cached.sources.contains(source))
+        {
             return Ok(cached);
         }
     }
@@ -480,24 +485,60 @@ pub fn repository_stamp(root: &Path) -> Result<RepositoryStamp, String> {
 
 fn read_stamp(root: &Path) -> Result<RepositoryStamp, String> {
     const CONFIG_MAX_OUTPUT: usize = 1024 * 1024;
+    const CONFIG_ARGS: [&str; 6] = ["config", "--includes", "--show-origin", "--show-scope", "--null", "--list"];
     // Capture ALL sources before Git reads any of them, including absent
     // include targets. Never attach a post-read stat to earlier output.
     for _ in 0..3 {
         let checked = preflight(root)?;
-        let config = run_git_capped(
-            root,
-            &["config", "--includes", "--show-origin", "--show-scope", "--null", "--list"],
-            GIT_TIMEOUT,
-            CONFIG_MAX_OUTPUT,
-        )?;
+        let config = run_git_capped(root, &CONFIG_ARGS, GIT_TIMEOUT, CONFIG_MAX_OUTPUT)?;
         if config.len() >= CONFIG_MAX_OUTPUT || config.last() != Some(&0) {
             return Err(config_refusal());
         }
-        if checked.sources.iter().all(ConfigSource::is_current) {
-            return Ok(digest_of(&config, root, checked.sources.clone()));
+        if !checked.sources.iter().all(ConfigSource::is_current) {
+            continue;
         }
+        // Union the preflight discovery with every repository-scoped origin
+        // Git itself reports, so a file that contributed configuration is
+        // watched even when the conservative scan did not predict it.
+        let mut sources = (*checked.sources).clone();
+        let extras: Vec<PathBuf> = config_origins(&config, root)?
+            .into_iter()
+            .filter(|origin| !sources.iter().any(|source| source.path == *origin))
+            .collect();
+        if extras.is_empty() {
+            return Ok(digest_of(&config, root, std::sync::Arc::new(sources)));
+        }
+        // The extras come from Git's own read, so their stat cannot precede it.
+        // Take it now and confirm Git's output did not change under it before
+        // trusting the snapshot; a change makes the next attempt start over.
+        for origin in &extras {
+            sources.push(ConfigSource::read(origin));
+        }
+        let confirm = run_git_capped(root, &CONFIG_ARGS, GIT_TIMEOUT, CONFIG_MAX_OUTPUT)?;
+        if confirm != config || !sources.iter().all(ConfigSource::is_current) {
+            continue;
+        }
+        return Ok(digest_of(&config, root, std::sync::Arc::new(sources)));
     }
     Err(config_refusal())
+}
+
+/// The repository-scoped configuration files Git names with `--show-origin`
+/// (local/worktree scope, or any origin inside the repository), resolved for
+/// the watch list. The guarded resolver also fails closed on a network path.
+fn config_origins(config: &[u8], root: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut origins = Vec::new();
+    let mut tokens = config.split(|byte| *byte == 0).filter(|token| !token.is_empty());
+    while let (Some(scope), Some(origin), Some(_)) = (tokens.next(), tokens.next(), tokens.next()) {
+        let local = matches!(scope, b"local" | b"worktree");
+        let Some(path) = origin_path(origin) else { continue };
+        let path = if path.is_absolute() { path } else { root.join(path) };
+        if !local && !path_is_inside(&path, root) {
+            continue;
+        }
+        origins.push(local_path(&path)?);
+    }
+    Ok(origins)
 }
 
 /// Local scope and files inside the repository only: the user's own global
@@ -1108,31 +1149,71 @@ fn global_configs(executable: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
+/// Resolve a candidate git directory exactly as Git's `is_git_directory()`
+/// does: `HEAD` lives in the directory itself, while `objects/` and `refs/`
+/// live in the common directory — a `commondir` file (relative to the git
+/// directory) redirects there for a linked worktree. Returns the common
+/// directory when the candidate is a real git directory, `None` otherwise.
+fn valid_git_dir(git_dir: &Path, scan: &mut ConfigScan) -> Result<Option<PathBuf>, String> {
+    let git_dir = scan.source(git_dir)?;
+    if !scan.source(&git_dir.join("HEAD"))?.is_file() {
+        return Ok(None);
+    }
+    let common_dir = match scan.read(&git_dir.join("commondir"))? {
+        Some(text) => {
+            let target = text.trim();
+            if target.is_empty() {
+                return Ok(None);
+            }
+            config_path(target, &git_dir, &git_dir)?
+        }
+        None => git_dir.clone(),
+    };
+    // The guarded resolver refuses a network or device object store before it
+    // is ever touched.
+    let objects = local_path(&common_dir.join("objects"))?;
+    let refs = local_path(&common_dir.join("refs"))?;
+    if objects.is_dir() && refs.is_dir() {
+        Ok(Some(common_dir))
+    } else {
+        Ok(None)
+    }
+}
+
 fn discover_repository(cwd: &Path, scan: &mut ConfigScan) -> Result<Option<RepositoryPaths>, String> {
     let cwd = local_path(cwd)?;
     if !cwd.is_dir() { return Ok(None); }
     for root in cwd.ancestors() {
         let dot_git = root.join(".git");
         let marker = scan.source(&dot_git)?;
-        let git_dir = if marker.is_dir() {
-            marker
-        } else if let Some(text) = scan.read(&dot_git)? {
-            let target = text.strip_prefix("gitdir:").ok_or_else(config_refusal)?.trim();
-            config_path(target, root, root)?
-        } else {
-            // Bare repositories have metadata directly in the directory.
-            let head = scan.source(&root.join("HEAD"))?;
-            if head.is_file() && local_path(&root.join("objects"))?.is_dir() && local_path(&root.join("refs"))?.is_dir() {
-                root.to_path_buf()
-            } else {
-                continue;
+        if marker.is_dir() {
+            if let Some(common_dir) = valid_git_dir(&marker, scan)? {
+                return Ok(Some(RepositoryPaths { root: root.to_path_buf(), git_dir: marker, common_dir }));
             }
-        };
-        let common_dir = match scan.read(&git_dir.join("commondir"))? {
-            Some(text) => config_path(text.trim(), &git_dir, &git_dir)?,
-            None => git_dir.clone(),
-        };
-        return Ok(Some(RepositoryPaths { root: root.to_path_buf(), git_dir, common_dir }));
+            // An ordinary directory that merely contains a `.git` folder is
+            // not a repository here: Git keeps walking up (and may still find
+            // a bare repository at this level, checked below).
+        } else if marker.is_file() {
+            // A gitfile is authoritative. Git refuses the repository outright
+            // when the file is malformed or its target is not a valid git
+            // directory, rather than continuing to the parent, so fail closed
+            // the same way instead of hijacking the walk.
+            let text = scan.read(&dot_git)?.ok_or_else(config_refusal)?;
+            let target = text.strip_prefix("gitdir:").ok_or_else(config_refusal)?.trim();
+            if target.is_empty() {
+                return Err(config_refusal());
+            }
+            let target = config_path(target, root, root)?;
+            let Some(common_dir) = valid_git_dir(&target, scan)? else {
+                return Err(config_refusal());
+            };
+            return Ok(Some(RepositoryPaths { root: root.to_path_buf(), git_dir: target, common_dir }));
+        }
+        // No `.git` marker (or only an invalid directory): a bare repository
+        // keeps HEAD, objects and refs directly in the directory.
+        if let Some(common_dir) = valid_git_dir(root, scan)? {
+            return Ok(Some(RepositoryPaths { root: root.to_path_buf(), git_dir: root.to_path_buf(), common_dir }));
+        }
     }
     Ok(None)
 }
@@ -1292,9 +1373,10 @@ fn store_stamp(root: &Path, stamp: &RepositoryStamp) {
     }
 }
 
-/// Repositories trusted in this session (process lifetime), keyed by root and
-/// digest: every pane, tab and extra window of the process shares them, so a
-/// split or a restored panel does not ask again for the same repository.
+/// Repositories trusted in this process, keyed by root and digest: every pane
+/// and tab shares them, so a split or a restored panel does not ask again for
+/// the same repository. Approvals live in memory only, so a window opened with
+/// Ctrl+Shift+N — a separate process — starts with none and asks again.
 static TRUSTED: std::sync::Mutex<Option<HashMap<PathBuf, RepositoryStamp>>> = std::sync::Mutex::new(None);
 
 /// A hazard-free repository always runs; a hazardous one needs a remembered
@@ -2974,8 +3056,9 @@ index 111..222 100644\n\
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("auth.json"), r#"{"auth_mode":"chatgpt","tokens":{"access_token":"token","account_id":"account"}}"#).unwrap();
         std::fs::write(dir.path().join("config.toml"), "model = \"gpt-6-astra\"\n").unwrap();
-        let (url, headers, body) = ai_commit::codex_request_for_tests(dir.path(), None, "diff").unwrap();
+        let (url, headers, body, token) = ai_commit::codex_request_for_tests(dir.path(), None, "diff").unwrap();
         assert_eq!(url, "https://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(token, "token", "the stored access token is used as-is");
         assert!(headers.iter().any(|(name, value)| name.eq_ignore_ascii_case("ChatGPT-Account-ID") && value == "account"));
         assert!(body.get("tools").is_none(), "no tool is advertised, so none can be called");
         assert_eq!(body.get("tool_choice").unwrap(), "none");
@@ -2983,8 +3066,9 @@ index 111..222 100644\n\
 
         // An executable auth helper is not part of the request path: only the stored token is used.
         std::fs::write(dir.path().join("auth.json"), r#"{"auth_mode":"apikey","OPENAI_API_KEY":"key"}"#).unwrap();
-        let (url, headers, _) = ai_commit::codex_request_for_tests(dir.path(), Some("gpt-5.2-codex"), "diff").unwrap();
+        let (url, headers, _, token) = ai_commit::codex_request_for_tests(dir.path(), Some("gpt-5.2-codex"), "diff").unwrap();
         assert_eq!(url, "https://api.openai.com/v1/responses");
+        assert_eq!(token, "key");
         assert!(!headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("ChatGPT-Account-ID")));
 
         // A non-openai provider would need user-defined executable options: refuse.

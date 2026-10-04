@@ -2,6 +2,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// The request-shape regression test (src/git.rs) exercises this module even
+// when the optional HTTP client is not part of the build.
+#[cfg(any(feature = "codex", test))]
 #[path = "ai_codex.rs"]
 mod ai_codex;
 
@@ -109,7 +112,10 @@ pub(super) fn prepare(spec: &str) -> Result<Invocation, String> {
     if backend == Backend::Custom && args.iter().any(|arg| wrapper_hides_agent(arg)) {
         return Err("AI: укажите исполняемый файл AI напрямую, без shell/node-обёртки".to_owned());
     }
-    let directory = tempfile::Builder::new().prefix("anvil-ai-").tempdir().map_err(|e| format!("AI: {e}"))?;
+    let directory = {
+        sweep_stale_directories(std::time::Duration::from_secs(3600));
+        tempfile::Builder::new().prefix("anvil-ai-").tempdir().map_err(|e| format!("AI: {e}"))?
+    };
     let mut command = super::ai_cli_command(&program);
     strip_runtime_injection(&mut command);
     if backend == Backend::Custom {
@@ -146,22 +152,44 @@ pub(super) fn prepare(spec: &str) -> Result<Invocation, String> {
     Ok(Invocation { program: Some(command), directory, backend, model: None })
 }
 
-/// Native Codex inference: the official Responses request, never its agent.
-pub(super) fn codex_generate(model: Option<&str>, prompt: &str, timeout: std::time::Duration) -> Result<String, String> {
+#[cfg(feature = "codex")]
+fn codex_generate_impl(model: Option<&str>, prompt: &str, timeout: std::time::Duration) -> Result<String, String> {
     let home = config_home().ok_or_else(|| "Codex: не найден каталог ~/.codex".to_owned())?;
     ai_codex::generate(&home, model, prompt, timeout)
 }
 
-/// The shape a Codex request has: URL, headers, and body.
+/// Native Codex inference: the official Responses request, never its agent.
+/// Without the `codex` feature the HTTP client is not linked, so the backend
+/// reports how to get it instead of silently degrading to the CLI's agent.
+pub(super) fn codex_generate(model: Option<&str>, prompt: &str, timeout: std::time::Duration) -> Result<String, String> {
+    #[cfg(feature = "codex")]
+    {
+        codex_generate_impl(model, prompt, timeout)
+    }
+    #[cfg(not(feature = "codex"))]
+    {
+        let _ = (model, prompt, timeout);
+        Err("Codex: эта сборка ANVIL без бэкенда Codex (меньше размер и зависимости). Соберите с `--features codex` или выберите другой AI-бэкенд".to_owned())
+    }
+}
+
+/// The shape a Codex request has: URL, headers, body, and the token carried in
+/// the `Authorization` header.
 #[cfg(test)]
-pub(super) type CodexRequest = (String, Vec<(String, String)>, serde_json::Value);
+pub(super) type CodexRequest = (String, Vec<(String, String)>, serde_json::Value, String);
 
 #[cfg(test)]
 pub(super) fn codex_request_for_tests(home: &Path, model: Option<&str>, prompt: &str) -> Result<CodexRequest, String> {
     let request = ai_codex::request(home, model, prompt)?;
-    Ok((request.url, request.headers.into_iter().map(|(name, value)| (name.to_owned(), value)).collect(), request.body))
+    Ok((
+        request.url,
+        request.headers.into_iter().map(|(name, value)| (name.to_owned(), value)).collect(),
+        request.body,
+        request.token,
+    ))
 }
 
+#[cfg(feature = "codex")]
 fn config_home() -> Option<PathBuf> {
     std::env::var_os("CODEX_HOME").map(PathBuf::from).or_else(|| home().map(|home| home.join(".codex")))
 }
@@ -175,28 +203,91 @@ fn wrapper_hides_agent(arg: &str) -> bool {
     path.split_whitespace().next().is_some_and(|first| classify_backend(first) != Backend::Custom)
 }
 
+/// Environment values Claude Code reads: credentials and provider routing.
+/// They reach the child through its environment, never through `--settings` —
+/// a command line is visible to every process of the same user and lands in
+/// audit/EDR logs (Sysmon 4688).
+const CLAUDE_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+    "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_PROJECT_ID", "CLOUD_ML_REGION", "AWS_REGION",
+];
+
+/// The `--settings` document and the environment it must not carry: inert model
+/// preferences plus `disableAllHooks`, and the projected env pairs separately.
+fn claude_settings(source: &serde_json::Value, with_user_settings: bool) -> (serde_json::Value, Vec<(String, String)>) {
+    let mut settings = serde_json::json!({ "disableAllHooks": true });
+    if with_user_settings {
+        merge(&mut settings, project(source, &["model", "effortLevel", "modelSettings"]));
+    }
+    let mut environment = Vec::new();
+    if let Some(values) = source.get("env").and_then(serde_json::Value::as_object) {
+        for key in CLAUDE_ENV_KEYS {
+            if let Some(text) = values.get(*key).and_then(serde_json::Value::as_str) {
+                environment.push(((*key).to_owned(), text.to_owned()));
+            }
+        }
+    }
+    (settings, environment)
+}
+
+/// Credential copies (Gemini OAuth files, aider API keys) live inside
+/// `anvil-ai-*` directories. Normal completion removes them, but a crash, a
+/// kill or a child still holding a file leaves one behind, so directories older
+/// than `max_age` are swept before the next generation starts. A generation
+/// that is running now is younger than the threshold and stays.
+fn sweep_stale_directories(max_age: std::time::Duration) {
+    sweep_stale_directories_in(&std::env::temp_dir(), max_age);
+}
+
+fn sweep_stale_directories_in(root: &Path, max_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("anvil-ai-") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        let stale = meta.modified().ok().and_then(|modified| modified.elapsed().ok()).is_some_and(|age| age >= max_age);
+        if stale {
+            if let Err(error) = std::fs::remove_dir_all(entry.path()) {
+                log::info!("cannot remove stale AI directory {}: {error}", entry.path().display());
+            }
+        }
+    }
+}
+
+/// Applies the fixed Claude flags, the credential-free `--settings` document and
+/// the projected environment. The split exists so a test can hold the invariant
+/// that secrets travel in the environment and never on the command line.
+fn apply_claude_session(command: &mut Command, settings: &serde_json::Value, environment: &[(String, String)]) {
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+    command.args(["--print", "--restricted", "--setting-sources", "", "--tools", "", "--disallowedTools", "*",
+        "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--disable-slash-commands", "--no-chrome",
+        "--no-session-persistence", "--output-format", "json", "--settings"]).arg(settings.to_string());
+    command.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+}
+
 fn claude(command: &mut Command) -> Result<(), String> {
     // OAuth remains in the original auth directory, but executable helpers and
     // env injection from settings are not inherited. Only inert model/auth data.
     let root = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from)
         .or_else(|| home().map(|h| h.join(".claude")));
-    let mut settings = serde_json::json!({"disableAllHooks": true});
-    if let Some(root) = root.as_ref() {
-        let source = json_config(&root.join("settings.json"))?;
-        merge(&mut settings, project(&source, &["model", "effortLevel", "modelSettings"]));
-        if let Some(env) = source.get("env") {
-            settings["env"] = project(env, &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
-                "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
-                "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
-                "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_PROJECT_ID", "CLOUD_ML_REGION", "AWS_REGION"]);
-        }
-    }
+    let source = match root.as_ref() {
+        Some(root) => json_config(&root.join("settings.json"))?,
+        None => serde_json::json!({}),
+    };
+    let (settings, environment) = claude_settings(&source, root.is_some());
     let static_auth = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"]
-        .iter().any(|key| std::env::var_os(key).is_some() || settings.pointer(&format!("/env/{key}")).is_some());
-    if let Some(env) = settings.get("env").and_then(serde_json::Value::as_object) {
-        for (key, value) in env {
-            if let Some(text) = value.as_str() { command.env(key, text); }
-        }
+        .iter().any(|key| std::env::var_os(key).is_some() || environment.iter().any(|(name, _)| name == key));
+    for (key, value) in &environment {
+        command.env(key, value);
     }
     if static_auth {
         if let Some(root) = root.as_deref() { check_claude_managed_policy(root, false)?; }
@@ -213,10 +304,7 @@ fn claude(command: &mut Command) -> Result<(), String> {
         }
         command.arg("--safe-mode");
     }
-    command.args(["--print", "--restricted", "--setting-sources", "", "--tools", "", "--disallowedTools", "*",
-        "--strict-mcp-config", "--mcp-config", "{\"mcpServers\":{}}", "--disable-slash-commands", "--no-chrome",
-        "--no-session-persistence", "--output-format", "json", "--settings"]).arg(settings.to_string());
-    command.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+    apply_claude_session(command, &settings, &environment);
     Ok(())
 }
 
@@ -550,6 +638,67 @@ fn claude_registry_policies() -> Result<Vec<serde_json::Value>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A provider token must never reach the command line: `--settings` is
+    /// visible to every process of the user and to audit/EDR logs, while the
+    /// environment is not. The JSON the CLI receives carries no credentials.
+    #[test]
+    fn claude_settings_carry_no_credentials() {
+        let source = serde_json::json!({
+            "model": "opus",
+            "env": {
+                "ANTHROPIC_AUTH_TOKEN": "secret-token",
+                "ANTHROPIC_BASE_URL": "https://proxy.example",
+                "EVIL_TYPO": "not-projected"
+            }
+        });
+        let (settings, environment) = claude_settings(&source, true);
+        let serialized = settings.to_string();
+        assert!(!serialized.contains("secret-token"), "the token must not be serialized: {serialized}");
+        assert_eq!(settings.get("disableAllHooks"), Some(&serde_json::json!(true)));
+        assert_eq!(settings.get("model").and_then(serde_json::Value::as_str), Some("opus"));
+        assert!(settings.get("env").is_none(), "settings must never carry an env object");
+        assert!(environment.iter().any(|(key, value)| key == "ANTHROPIC_AUTH_TOKEN" && value == "secret-token"));
+        assert!(environment.iter().any(|(key, _)| key == "ANTHROPIC_BASE_URL"));
+        assert!(!environment.iter().any(|(key, _)| key == "EVIL_TYPO"));
+    }
+
+    /// The invariant end to end: what `claude()` hands to the process.
+    #[test]
+    fn claude_command_keeps_credentials_out_of_argv() {
+        let source = serde_json::json!({
+            "model": "sonnet",
+            "env": { "ANTHROPIC_AUTH_TOKEN": "sk-ant-secret", "ANTHROPIC_BASE_URL": "https://proxy.example" }
+        });
+        let (settings, environment) = claude_settings(&source, true);
+        let mut command = Command::new("claude.exe");
+        apply_claude_session(&mut command, &settings, &environment);
+        let args: Vec<String> = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert!(!args.iter().any(|arg| arg.contains("sk-ant-secret")), "a credential reached the command line: {args:?}");
+        let document = args.iter().position(|arg| arg == "--settings").and_then(|index| args.get(index + 1))
+            .expect("--settings carries a document");
+        let document: serde_json::Value = serde_json::from_str(document).unwrap();
+        assert!(document.get("env").is_none(), "--settings must not carry env: {document}");
+        let environment: Vec<String> = command
+            .get_envs()
+            .filter_map(|(key, value)| Some(format!("{}={}", key.to_string_lossy(), value?.to_string_lossy())))
+            .collect();
+        assert!(environment.iter().any(|pair| pair == "ANTHROPIC_AUTH_TOKEN=sk-ant-secret"), "the token must travel in the environment: {environment:?}");
+    }
+
+    /// Credential copies must not survive a crash: only our own prefix is swept.
+    #[test]
+    fn stale_generation_directories_are_swept_by_prefix_only() {
+        let root = tempfile::tempdir().unwrap();
+        let stale = root.path().join("anvil-ai-dead1234");
+        std::fs::create_dir_all(stale.join("home/.gemini")).unwrap();
+        std::fs::write(stale.join("home/.gemini/oauth_creds.json"), "secret").unwrap();
+        let foreign = root.path().join("anvil-other-work");
+        std::fs::create_dir_all(&foreign).unwrap();
+        sweep_stale_directories_in(root.path(), std::time::Duration::ZERO);
+        assert!(!stale.exists(), "an abandoned generation directory keeps credentials");
+        assert!(foreign.exists(), "directories that are not ours are untouched");
+    }
 
     /// A provider entry can pull executable code in through `npm`; only the
     /// inert SDK names are projected, and no field that becomes a process.

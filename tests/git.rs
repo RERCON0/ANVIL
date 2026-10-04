@@ -1,7 +1,7 @@
 //! Real `git` integration for the workspace panel: detect the repository,
 //! read the status, stage, diff and commit.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::process::Command;
 
@@ -411,6 +411,31 @@ fn stages_and_unstages_a_single_hunk() {
     assert!(unstaged.contains("+FIRST change") && unstaged.contains("+SECOND change"));
 }
 
+/// Runs git without asserting success: `(succeeded, stdout-or-stderr)`.
+fn attempt(dir: &Path, args: &[&str]) -> (bool, String) {
+    let mut command = Command::new("git");
+    command.args(args).current_dir(dir);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let out = command.output().expect("git");
+    let text = if out.status.success() {
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    } else {
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    (out.status.success(), text.trim().to_owned())
+}
+
+/// The root real git reports for `dir`; panics if git refuses the directory.
+fn git_toplevel(dir: &Path) -> String {
+    let (ok, text) = attempt(dir, &["rev-parse", "--show-toplevel"]);
+    assert!(ok, "git rev-parse --show-toplevel failed in {}: {text}", dir.display());
+    text
+}
+
 fn output(dir: &Path, args: &[&str]) -> Vec<u8> {
     let mut command = Command::new("git");
     command.args(args).current_dir(dir);
@@ -558,6 +583,101 @@ fn non_repository_is_reported_as_such() {
     std::fs::create_dir_all(&nested).unwrap();
     assert!(git::find_root(&nested).is_none());
     assert!(git::status(&nested).is_err() || git::status(&nested).unwrap().changes.is_empty());
+}
+
+/// Regression: a nested `.git` that real git rejects used to become ANVIL's
+/// root. An empty `.git` directory must be skipped exactly as git skips it,
+/// and a dangling gitfile must fail closed exactly as git refuses.
+#[test]
+fn invalid_nested_git_markers_follow_real_git() {
+    let Some(dir) = repo() else { return };
+    let outer = dir.path();
+
+    // An empty `.git` directory under `sub`: git walks up to the outer
+    // repository, and so must ANVIL.
+    let sub = outer.join("sub-empty");
+    std::fs::create_dir_all(sub.join(".git")).unwrap();
+    assert_eq!(
+        PathBuf::from(git_toplevel(&sub)).canonicalize().unwrap(),
+        outer.canonicalize().unwrap(),
+        "git ignores a nested .git directory without HEAD/objects/refs"
+    );
+    let root = git::find_root(&sub).expect("the outer repository is still found");
+    assert_eq!(root.canonicalize().unwrap(), outer.canonicalize().unwrap());
+    assert!(!git::status(&root).unwrap().branch.is_empty());
+
+    // A `.git` file whose target is not a git directory: git refuses the
+    // repository instead of walking up, so ANVIL must not promote it either.
+    let bogus = outer.join("sub-bogus");
+    std::fs::create_dir_all(&bogus).unwrap();
+    std::fs::write(bogus.join(".git"), format!("gitdir: {}\n", outer.join("not-a-git-dir").display())).unwrap();
+    let (ok, error) = attempt(&bogus, &["rev-parse", "--show-toplevel"]);
+    assert!(!ok, "git refuses a dangling gitfile: {error}");
+    assert!(git::find_root(&bogus).is_none(), "ANVIL must refuse it too");
+    assert!(git::repository_identity(&bogus).is_err());
+}
+
+/// A real nested repository and a valid gitfile worktree are discovered at
+/// their own root, matching `git rev-parse --show-toplevel`.
+#[test]
+fn valid_nested_repositories_match_git() {
+    let Some(dir) = repo() else { return };
+    let outer = dir.path();
+
+    // A real nested repository keeps its own root.
+    let nested = outer.join("nested-repo");
+    std::fs::create_dir_all(&nested).unwrap();
+    run(&nested, &["init", "--quiet"]);
+    assert_eq!(
+        PathBuf::from(git_toplevel(&nested)).canonicalize().unwrap(),
+        nested.canonicalize().unwrap()
+    );
+    assert_eq!(git::find_root(&nested).unwrap().canonicalize().unwrap(), nested.canonicalize().unwrap());
+
+    // A valid gitfile points a nested directory at metadata elsewhere; git
+    // reports the gitfile's own directory as the work tree.
+    let worktree = tempfile::tempdir().unwrap();
+    let target = worktree.path().join("tree");
+    run(outer, &["worktree", "add", "--quiet", "--detach", target.to_str().unwrap()]);
+    let gitfile = std::fs::read_to_string(target.join(".git")).unwrap();
+    assert!(gitfile.starts_with("gitdir: "), "{gitfile}");
+    let linked = outer.join("linked-worktree");
+    std::fs::create_dir_all(&linked).unwrap();
+    std::fs::write(linked.join(".git"), gitfile).unwrap();
+    assert_eq!(
+        PathBuf::from(git_toplevel(&linked)).canonicalize().unwrap(),
+        linked.canonicalize().unwrap(),
+        "git resolves a valid gitfile to its own directory"
+    );
+    let root = git::find_root(&linked).expect("gitfile worktree root");
+    assert_eq!(root.canonicalize().unwrap(), linked.canonicalize().unwrap());
+    assert!(!git::status(&root).unwrap().branch.is_empty());
+}
+
+/// Opening the outer repository from a directory whose own `.git` is invalid
+/// must address paths relative to git's real root, not the nested directory.
+#[test]
+fn staging_from_an_outer_repository_uses_gits_own_root() {
+    let Some(dir) = repo() else { return };
+    let outer = dir.path();
+    let sub = outer.join("sub");
+    std::fs::create_dir_all(sub.join(".git")).unwrap();
+    std::fs::write(sub.join("inner.txt"), "inner\n").unwrap();
+
+    let git_root = PathBuf::from(git_toplevel(&sub)).canonicalize().unwrap();
+    let root = git::find_root(&sub).expect("root");
+    assert_eq!(root.canonicalize().unwrap(), outer.canonicalize().unwrap());
+    assert_eq!(root.canonicalize().unwrap(), git_root);
+
+    git::stage(&root, &["sub/inner.txt".to_owned()], true).expect("stage relative to git's root");
+    let (ok, staged) = attempt(outer, &["diff", "--cached", "--name-only"]);
+    assert!(ok, "{staged}");
+    assert_eq!(staged.lines().collect::<Vec<_>>(), ["sub/inner.txt"]);
+    // Real git, run from the nested directory, sees the same staged path.
+    let (ok, from_sub) = attempt(&sub, &["diff", "--cached", "--name-only"]);
+    assert!(ok, "{from_sub}");
+    assert_eq!(from_sub.lines().collect::<Vec<_>>(), ["sub/inner.txt"]);
+    assert!(git::diff(&root, "sub/inner.txt", true).contains("+inner"));
 }
 
 #[test]
