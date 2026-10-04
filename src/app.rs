@@ -286,15 +286,20 @@ impl AnvilApp {
                 let area = Rect::from_min_max(Pos2::new(body.min.x + theme::TABBAR_WIDTH, body.min.y), body.max);
                 ui.painter().vline(tabbar_rect.max.x - 0.5, tabbar_rect.y_range(), egui::Stroke::new(1.0, theme::colors().border));
 
+                let badge = &self.config.claude_status;
+                let show_badge = badge.badge && badge.badge_fields.any();
                 let infos: Vec<TabInfo> = (0..self.tabs.len())
                     .map(|i| TabInfo {
                         title: self.tabs[i].title(),
                         active: i == self.active && !self.settings_open,
                         activity: self.tabs[i].has_activity && i != self.active,
-                        claude: self.tabs[i].claude_status().cloned(),
+                        // Hidden badge: no extra row height either.
+                        claude: show_badge.then(|| self.tabs[i].claude_status().cloned()).flatten(),
                     })
                     .collect();
-                let tabbar_actions = tabbar::show(ui, tabbar_rect, &mut self.tabbar, &infos, self.settings_open);
+                let badge_fields = self.config.claude_status.badge_fields;
+                let tabbar_actions =
+                    tabbar::show(ui, tabbar_rect, &mut self.tabbar, &infos, self.settings_open, &badge_fields);
                 for action in tabbar_actions {
                     self.apply_tabbar_action(action, &ctx);
                 }

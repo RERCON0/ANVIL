@@ -181,6 +181,18 @@ pub fn colors() -> Colors {
     *COLORS.read().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Colour of a used share, by the Claude status thresholds: green, yellow
+/// from 60 %, red from 85 %.
+pub fn threshold_color(pct: f64) -> Color32 {
+    if pct >= 85.0 {
+        colors().status_red
+    } else if pct >= 60.0 {
+        colors().status_yellow
+    } else {
+        colors().status_green
+    }
+}
+
 /// Recolours the chrome for `scheme`; `apply` then rebuilds egui's visuals.
 pub fn set_scheme(scheme: &Palette) {
     *COLORS.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Colors::for_scheme(scheme);

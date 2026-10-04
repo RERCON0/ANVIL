@@ -73,6 +73,7 @@ pub fn show(
     state: &mut TabbarState,
     tabs: &[TabInfo],
     settings_open: bool,
+    badge_fields: &ClaudeBadgeFields,
 ) -> Vec<TabbarAction> {
     let mut actions = Vec::new();
     let painter = ui.painter_at(rect);
@@ -143,7 +144,7 @@ pub fn show(
             text_color,
         );
         if let Some(record) = &tab.claude {
-            paint_claude_line(&painter, row, record);
+            paint_claude_line(&painter, row, record, badge_fields);
         }
 
         // Close button: the row's own response owns the click (a nested widget
@@ -275,57 +276,74 @@ fn elide(painter: &egui::Painter, text: &str, font: FontId, max_width: f32) -> S
     out
 }
 
-/// The Claude badge line: `Opus 5 · ▓▓▓▓░░░░░░ 37% · 5h 17% · 7d 64%` with the
-/// percentage colours of the Hardcore scheme.
-fn paint_claude_line(painter: &egui::Painter, row: Rect, record: &StatusRecord) {
+use crate::config::ClaudeBadgeFields;
+
+/// Text pieces of the Claude line under a tab, each with the share that
+/// colours it (None: plain tab text).
+fn badge_parts(record: &StatusRecord, fields: &ClaudeBadgeFields) -> Vec<(String, Option<f64>)> {
+    let mut parts = Vec::new();
+    if let Some(model) = record.model.as_ref().filter(|_| fields.model) {
+        parts.push((model.clone(), None));
+    }
+    if let Some(pct) = record.context_pct.filter(|_| fields.context) {
+        let filled = js_round(pct / 10.0).clamp(0, 10) as usize;
+        let bar = format!("{}{} {}%", "▓".repeat(filled), "░".repeat(10 - filled), js_round(pct));
+        parts.push((bar, Some(pct)));
+    }
+    if let Some(pct) = record.five_hour_pct.filter(|_| fields.five_hour) {
+        parts.push((format!("5h {}", js_round(pct)), Some(pct)));
+    }
+    if let Some(pct) = record.seven_day_pct.filter(|_| fields.seven_day) {
+        parts.push((format!("7d {}", js_round(pct)), Some(pct)));
+    }
+    if let Some(agent) = record.agent.as_ref().filter(|_| fields.agent) {
+        parts.push((agent.clone(), None));
+    }
+    parts
+}
+
+/// The Claude badge line: `Opus 5 · ▓▓▓▓░░░░░░ 37% · 5h 17 · 7d 64` with the
+/// percentage colours of the Hardcore scheme, limited to the chosen pieces.
+fn paint_claude_line(painter: &egui::Painter, row: Rect, record: &StatusRecord, fields: &ClaudeBadgeFields) {
     let mut x = row.min.x + 36.0;
     let y = row.min.y + theme::TAB_ROW_HEIGHT + theme::CLAUDE_ROW_HEIGHT / 2.0;
     let font = FontId::proportional(11.0);
-    let mut parts: Vec<(String, Color32)> = Vec::new();
-    if let Some(model) = &record.model {
-        parts.push((model.clone(), theme::colors().tab_text));
-    }
-    if let Some(pct) = record.context_pct {
-        let filled = js_round(pct / 10.0).clamp(0, 10) as usize;
-        let bar = format!("{}{} {}%", "▓".repeat(filled), "░".repeat(10 - filled), js_round(pct));
-        parts.push((bar, threshold_color(pct)));
-    }
-    if let Some(pct) = record.five_hour_pct {
-        parts.push((format!("5h {}", js_round(pct)), threshold_color(pct)));
-    }
-    if let Some(pct) = record.seven_day_pct {
-        parts.push((format!("7d {}", js_round(pct)), threshold_color(pct)));
-    }
-    if let Some(agent) = &record.agent {
-        parts.push((agent.clone(), theme::colors().tab_text));
-    }
     let limit = row.max.x - 10.0;
-    for (index, (text, color)) in parts.iter().enumerate() {
+    for (index, (text, pct)) in badge_parts(record, fields).into_iter().enumerate() {
+        let color = pct.map(theme::threshold_color).unwrap_or(theme::colors().tab_text);
         let prefix = if index == 0 { "" } else { " · " };
-        let chunk = format!("{prefix}{text}");
-        let galley = painter.layout_no_wrap(chunk, font.clone(), *color);
+        let galley = painter.layout_no_wrap(format!("{prefix}{text}"), font.clone(), color);
         let width = galley.size().x;
         if x + width > limit {
             break;
         }
-        painter.galley(Pos2::new(x, y - galley.size().y / 2.0), galley, *color);
+        painter.galley(Pos2::new(x, y - galley.size().y / 2.0), galley, color);
         x += width;
-    }
-}
-
-fn threshold_color(pct: f64) -> Color32 {
-    if pct >= 85.0 {
-        theme::colors().status_red
-    } else if pct >= 60.0 {
-        theme::colors().status_yellow
-    } else {
-        theme::colors().status_green
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn badge_parts_follow_the_fields() {
+        use crate::config::ClaudeBadgeFields;
+        let record = StatusRecord {
+            model: Some("Opus 5".into()),
+            context_pct: Some(37.4),
+            five_hour_pct: Some(17.0),
+            seven_day_pct: Some(64.0),
+            agent: Some("reviewer".into()),
+            ..StatusRecord::default()
+        };
+        let texts =
+            |fields: &ClaudeBadgeFields| badge_parts(&record, fields).into_iter().map(|(t, _)| t).collect::<Vec<_>>();
+        assert_eq!(texts(&ClaudeBadgeFields::default()), vec!["Opus 5", "▓▓▓▓░░░░░░ 37%", "5h 17", "7d 64", "reviewer"]);
+        let fields = ClaudeBadgeFields { model: false, five_hour: false, ..ClaudeBadgeFields::default() };
+        assert_eq!(texts(&fields), vec!["▓▓▓▓░░░░░░ 37%", "7d 64", "reviewer"]);
+        assert_eq!(badge_parts(&record, &fields)[0].1, Some(37.4), "percent parts carry their value for the colour");
+    }
 
     /// A rename or drag in progress names a tab by index: when an earlier tab
     /// closes (a pane exiting in the background), it must follow its tab, not
