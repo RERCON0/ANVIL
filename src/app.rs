@@ -72,6 +72,16 @@ pub struct ClosedTab {
     pub state: TabState,
 }
 
+/// The quota block's rows with the inputs they were built from, so an unchanged
+/// minute reuses them instead of relaying out the same text.
+#[derive(Default)]
+struct QuotaRows {
+    version: u64,
+    minute: i64,
+    config: crate::config::QuotaConfig,
+    rows: Vec<crate::quota::view::Row>,
+}
+
 /// Command-line flag of a window opened with Ctrl+Shift+N.
 pub const NEW_WINDOW_ARG: &str = "--new-window";
 
@@ -107,6 +117,11 @@ pub struct AnvilApp {
     /// Claude Code's statusLine as the settings page shows it, with the
     /// settings.json mtime it was read at.
     claude_line: (Option<SystemTime>, crate::claude_setup::LineState),
+    /// This window's quota worker; None while quotas are switched off.
+    quota: Option<crate::quota::QuotaHandle>,
+    /// Block rows, rebuilt when the snapshot, the quota settings or the minute
+    /// changes (relative times are printed to the minute).
+    quota_rows: QuotaRows,
     run_dir: Option<PathBuf>,
     repaint: Option<Arc<dyn Fn() + Send + Sync>>,
     inherited_prompt_command: Option<String>,
@@ -173,6 +188,8 @@ impl AnvilApp {
             window_maximized: session_window.map(|w| w.maximized).unwrap_or(false),
             status_dir,
             claude_line: (None, crate::claude_setup::LineState::Missing),
+            quota: None,
+            quota_rows: QuotaRows::default(),
             run_dir: None,
             repaint: None,
             inherited_prompt_command: std::env::var("PROMPT_COMMAND").ok(),
@@ -241,6 +258,7 @@ impl AnvilApp {
         self.status_dir = dir;
         self.run_dir = run_dir;
         self.setup_claude();
+        self.sync_quota();
 
         let mut tabs = Vec::new();
         if self.config.restore_session {
@@ -302,8 +320,14 @@ impl AnvilApp {
                     })
                     .collect();
                 let badge_fields = self.config.claude_status.badge_fields;
-                let tabbar_actions =
-                    tabbar::show(ui, tabbar_rect, &mut self.tabbar, &infos, self.settings_open, &badge_fields);
+                let quota_rows = self.current_quota_rows();
+                let quota_block = (!quota_rows.is_empty()).then(|| crate::chrome::quota_block::QuotaBlock {
+                    rows: &quota_rows,
+                    collapsed: self.config.quota.collapsed,
+                });
+                let tabbar_actions = tabbar::show(
+                    ui, tabbar_rect, &mut self.tabbar, &infos, self.settings_open, &badge_fields, quota_block.as_ref(),
+                );
                 for action in tabbar_actions {
                     self.apply_tabbar_action(action, &ctx);
                 }
@@ -456,6 +480,50 @@ impl AnvilApp {
         }
     }
 
+    /// Starts or stops this window's quota worker to match the settings.
+    fn sync_quota(&mut self) {
+        if !self.config.quota.enabled {
+            self.quota = None;
+            self.quota_rows = QuotaRows::default();
+            return;
+        }
+        if self.quota.is_some() {
+            return;
+        }
+        let repaint = self.repaint.clone();
+        let config_path = Config::path();
+        self.quota = Some(crate::quota::QuotaHandle::start(
+            crate::quota::Paths::in_dir(&crate::quota::Paths::default_dir()),
+            // Read per cycle from the file every window saves to, so a provider
+            // switched off anywhere gets no further request.
+            move || match Config::load_for_reload(&config_path) {
+                Ok(config) => Some(crate::quota::prefs_from(&config.quota)),
+                Err(_) if !config_path.exists() => Some(crate::quota::Prefs::new()),
+                Err(_) => None,
+            },
+            move || {
+                if let Some(repaint) = &repaint {
+                    repaint();
+                }
+            },
+        ));
+    }
+
+    fn current_quota_rows(&mut self) -> Vec<crate::quota::view::Row> {
+        let Some(handle) = &self.quota else { return Vec::new() };
+        let now = crate::quota::time::now_unix();
+        let version = handle.version();
+        let snapshot = handle.snapshot();
+        let cache = &mut self.quota_rows;
+        if cache.version != version || cache.minute != now / 60 || cache.config != self.config.quota {
+            cache.rows = crate::quota::view::rows(&snapshot, &self.config.quota, now);
+            cache.version = version;
+            cache.minute = now / 60;
+            cache.config = self.config.quota.clone();
+        }
+        cache.rows.clone()
+    }
+
     /// Re-reads Claude Code's user settings when they changed (one stat per
     /// frame, only while the settings page is open).
     fn refresh_claude_line(&mut self) {
@@ -544,6 +612,16 @@ impl AnvilApp {
             tabbar::TabbarAction::Settings => {
                 self.settings_open = true;
                 ctx.request_repaint();
+            }
+            tabbar::TabbarAction::QuotaToggle => {
+                let mut next = self.config.clone();
+                next.quota.collapsed = !next.quota.collapsed;
+                self.apply_config(ctx.clone(), next, true);
+            }
+            tabbar::TabbarAction::QuotaRefresh => {
+                if let Some(quota) = &self.quota {
+                    quota.refresh();
+                }
             }
         }
     }
@@ -1326,6 +1404,7 @@ impl AnvilApp {
         let claude_disabled = self.config.claude_status.enabled && !config.claude_status.enabled;
         let claude_enabled = !self.config.claude_status.enabled && config.claude_status.enabled;
         let previous_integration = claude_disabled.then(|| self.config.claude_status.clone());
+        let quota_switches_changed = config.quota.providers != self.config.quota.providers;
         self.config = config;
         if profiles_changed {
             self.profiles = self.build_profiles();
@@ -1385,6 +1464,12 @@ impl AnvilApp {
                     }
                     pane.set_options(style, scrollback, &word_separators, self.config.terminal.allow_osc52);
                 }
+            }
+        }
+        self.sync_quota();
+        if quota_switches_changed {
+            if let Some(quota) = &self.quota {
+                quota.refresh();
             }
         }
         ctx.request_repaint();

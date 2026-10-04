@@ -65,6 +65,8 @@ pub enum TabbarAction {
     NewTab,
     Profiles,
     Settings,
+    QuotaToggle,
+    QuotaRefresh,
 }
 
 pub fn show(
@@ -74,6 +76,7 @@ pub fn show(
     tabs: &[TabInfo],
     settings_open: bool,
     badge_fields: &ClaudeBadgeFields,
+    quota: Option<&crate::chrome::quota_block::QuotaBlock>,
 ) -> Vec<TabbarAction> {
     let mut actions = Vec::new();
     let painter = ui.painter_at(rect);
@@ -234,7 +237,21 @@ pub fn show(
         actions.push(TabbarAction::Profiles);
     }
 
-    let settings_rect = Rect::from_min_size(Pos2::new(rect.min.x + 8.0, rect.max.y - 30.0), Vec2::new(rect.width() - 16.0, 24.0));
+    let settings_rect =
+        Rect::from_min_size(Pos2::new(rect.min.x + 8.0, rect.max.y - 30.0), Vec2::new(rect.width() - 16.0, 24.0));
+
+    // Tabs and their buttons get the space first; the quota block takes what is
+    // left above Settings and collapses or hides itself when that is too little.
+    if let Some(block) = quota {
+        let area = Rect::from_min_max(Pos2::new(rect.min.x, y + 40.0), Pos2::new(rect.max.x, settings_rect.min.y - 4.0));
+        if area.height() > 0.0 {
+            match crate::chrome::quota_block::show(ui, area, block) {
+                Some(crate::chrome::quota_block::QuotaAction::ToggleCollapsed) => actions.push(TabbarAction::QuotaToggle),
+                Some(crate::chrome::quota_block::QuotaAction::Refresh) => actions.push(TabbarAction::QuotaRefresh),
+                None => {}
+            }
+        }
+    }
     let settings = ui.interact(settings_rect, ui.id().with("tab-settings"), Sense::click());
     if settings_open {
         painter.rect_filled(settings_rect, 0.0, theme::colors().tab_active_bg);
@@ -257,7 +274,7 @@ fn row_height(tab: &TabInfo) -> f32 {
     theme::TAB_ROW_HEIGHT + if tab.claude.is_some() { theme::CLAUDE_ROW_HEIGHT } else { 0.0 }
 }
 
-fn elide(painter: &egui::Painter, text: &str, font: FontId, max_width: f32) -> String {
+pub(crate) fn elide(painter: &egui::Painter, text: &str, font: FontId, max_width: f32) -> String {
     let measure = |s: &str| painter.layout_no_wrap(s.to_owned(), font.clone(), Color32::WHITE).size().x;
     if measure(text) <= max_width {
         return text.to_owned();
