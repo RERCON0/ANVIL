@@ -125,6 +125,41 @@ pub const SETTINGS_NO_PROFILES: &str = "Пользовательских про�
 pub const SETTINGS_APPLY_HINT: &str = "Изменения применяются сразу и сохраняются в config.json";
 pub const SETTINGS_HOTKEYS_HINT: &str = "Редактирование клавиш — только в config.json";
 
+// Quotas.
+pub const SETTINGS_QUOTA: &str = "Квоты";
+pub const SETTINGS_QUOTA_ENABLED: &str = "Показывать квоты";
+pub const SETTINGS_QUOTA_INTERVAL: &str = "Обновление раз в 5 минут";
+pub const SETTINGS_QUOTA_REFRESH: &str = "Обновить сейчас";
+pub const SETTINGS_QUOTA_NO_LOGIN: &str = "вход не найден";
+pub const SETTINGS_QUOTA_SET_KEY: &str = "Задать ключ…";
+pub const SETTINGS_QUOTA_CHANGE_KEY: &str = "Ключ…";
+pub const SETTINGS_QUOTA_DELETE_KEY: &str = "Удалить ключ";
+pub const SETTINGS_QUOTA_KEY_FAILED: &str = "Не удалось сохранить ключ в Диспетчере учётных данных Windows";
+pub const SETTINGS_QUOTA_KEY_INVALID: &str = "Ключ пуст, слишком длинный или содержит переводы строк";
+pub const SETTINGS_QUOTA_WINDOWS_LATER: &str = "окна появятся после первого ответа";
+pub const QUOTA_TITLE: &str = "КВОТЫ";
+pub const QUOTA_REFRESH_HINT: &str = "Обновить квоты";
+pub const QUOTA_LOGIN: &str = "вход:";
+pub const QUOTA_SOURCE_CLAUDE_CODE: &str = "Claude Code";
+pub const QUOTA_SOURCE_CODEX: &str = "Codex CLI";
+pub const QUOTA_SOURCE_OMP: &str = "OMP";
+pub const QUOTA_SOURCE_OPENCODE: &str = "OpenCode";
+pub const QUOTA_SOURCE_ANVIL_KEY: &str = "ключ ANVIL";
+pub const QUOTA_SOURCE_ENV: &str = "переменная";
+pub const QUOTA_SOURCE_CLAUDE_SETTINGS: &str = "настройки Claude Code";
+pub const QUOTA_UNIT_DAY: &str = "д";
+pub const QUOTA_UNIT_HOUR: &str = "ч";
+pub const QUOTA_UNIT_MINUTE: &str = "мин";
+pub const QUOTA_MONTH: &str = "мес";
+pub const QUOTA_MCP: &str = "MCP";
+pub const QUOTA_REVIEW: &str = "ревью";
+pub const QUOTA_AUTH_EXPIRED: &str = "вход устарел";
+pub const QUOTA_FORMAT_ERROR: &str = "ошибка формата";
+pub const QUOTA_RESET_IN: &str = "сброс через";
+pub const QUOTA_DATA_AT: &str = "данные от";
+pub const QUOTA_UPDATE_FAILED: &str = "не удалось обновить:";
+pub const QUOTA_RETRY_AT: &str = "повтор в";
+
 // Explicit consent for global Claude settings and executable paste.
 pub const CLAUDE_INSTALL_QUESTION: &str = "Установить или обновить строку статуса Claude Code?";
 pub const CLAUDE_INSTALL_GLOBAL: &str = "Это меняет глобальные настройки Claude Code для всех терминалов:";
