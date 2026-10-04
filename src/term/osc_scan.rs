@@ -1,10 +1,120 @@
 //! Watches the raw PTY output for working-directory reports. alacritty_terminal
 //! ignores these OSCs, so scanning a copy of the bytes is the only way to see
-//! them. The scanner never changes the stream.
+//! them. The scanner never changes the stream; the separate guard prevents
+//! oversized OSC strings from reaching VTE's unbounded std buffer.
 
 use std::path::PathBuf;
 
 const MAX_PAYLOAD: usize = 4096;
+
+/// VTE's std OSC buffer is an unbounded Vec. Hold an OSC until it terminates
+/// so an oversized one can be discarded entirely, not applied as a truncated
+/// title/link/clipboard request. This leaves ordinary screen output untouched.
+pub const MAX_OSC_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum GuardState {
+    #[default]
+    Ground,
+    Escape,
+    EscapeIntermediate,
+    Osc,
+    Discard,
+}
+
+#[derive(Default)]
+pub struct OscGuard {
+    state: GuardState,
+    osc: Vec<u8>,
+    ready: Vec<u8>,
+    offset: usize,
+}
+
+impl OscGuard {
+    /// Copies pending filtered bytes without reading more PTY output.
+    pub fn drain(&mut self, buf: &mut [u8]) -> usize {
+        let n = buf.len().min(self.ready.len() - self.offset);
+        buf[..n].copy_from_slice(&self.ready[self.offset..self.offset + n]);
+        self.offset += n;
+        if self.offset == self.ready.len() {
+            self.ready.clear();
+            self.offset = 0;
+        }
+        n
+    }
+
+    /// False when the original bytes can be returned directly. The common
+    /// CSI-only TUI redraw never allocates or copies through `ready`.
+    pub fn filter(&mut self, bytes: &[u8]) -> bool {
+        if !matches!(self.state, GuardState::Osc | GuardState::Discard) {
+            let mut state = self.state;
+            let starts_osc = bytes.iter().any(|&b| {
+                let starts = state == GuardState::Escape && b == b']';
+                state = escape_state(state, b);
+                starts
+            });
+            if !starts_osc {
+                self.state = state;
+                return false;
+            }
+        }
+
+        for &b in bytes {
+            match self.state {
+                GuardState::Osc => {
+                    if matches!(b, 0x07 | 0x18 | 0x1a | 0x1b) {
+                        self.ready.extend_from_slice(&self.osc);
+                        self.ready.push(b);
+                        self.osc.clear();
+                        self.state = if b == 0x1b { GuardState::Escape } else { GuardState::Ground };
+                    } else if self.osc.len() < MAX_OSC_BYTES {
+                        self.osc.push(b);
+                    } else {
+                        self.osc.clear();
+                        // Only the initial ESC was forwarded. CAN resets that
+                        // escape without dispatching any partial OSC to VTE.
+                        self.ready.push(0x18);
+                        self.state = GuardState::Discard;
+                    }
+                }
+                GuardState::Discard => match b {
+                    0x07 | 0x18 | 0x1a => self.state = GuardState::Ground,
+                    0x1b => {
+                        self.ready.push(b);
+                        self.state = GuardState::Escape;
+                    }
+                    _ => {}
+                },
+                GuardState::Escape if b == b']' => {
+                    self.osc.push(b);
+                    self.state = GuardState::Osc;
+                }
+                state => {
+                    self.ready.push(b);
+                    self.state = escape_state(state, b);
+                }
+            }
+        }
+        true
+    }
+}
+
+// Mirror VTE's escape entry, including ignored controls and intermediates.
+// ESC anywhere ends OSC/DCS/APC/PM and begins an escape in VTE; a literal
+// ESC ] therefore starts an OSC even when it follows one of those strings.
+fn escape_state(state: GuardState, b: u8) -> GuardState {
+    if b == 0x1b {
+        return GuardState::Escape;
+    }
+    match state {
+        GuardState::Escape | GuardState::EscapeIntermediate => match b {
+            0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f => state,
+            0x20..=0x2f => GuardState::EscapeIntermediate,
+            _ => GuardState::Ground,
+        },
+        _ => GuardState::Ground,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -253,5 +363,77 @@ mod tests {
     fn escape_inside_osc_restarts() {
         let out = scan(&[b"\x1b]1337;CurrentDir=C:\\A\x1b]1337;CurrentDir=C:\\B\x07"]);
         assert_eq!(out, Some(PathBuf::from("C:\\B")));
+    }
+
+    fn guarded(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut guard = OscGuard::default();
+        let mut output = Vec::new();
+        let mut buf = [0u8; 17];
+        for chunk in chunks {
+            if guard.filter(chunk) {
+                loop {
+                    let n = guard.drain(&mut buf);
+                    if n == 0 {
+                        break;
+                    }
+                    output.extend_from_slice(&buf[..n]);
+                }
+            } else {
+                output.extend_from_slice(chunk);
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn osc_guard_preserves_split_sequences_and_string_transitions() {
+        for seq in [
+            &b"plain\x1b[31mred\x1b]0;title\x07done"[..],
+            b"\x1b]0;title\x1b\\done",
+            b"\x1b]0;title\x18done",
+            b"\x1b]0;title\x1adone",
+            b"\x1b]0;first\x1b]0;second\x07done",
+            b"\x1bPignored\x1b]0;title\x07\x1b\\",
+            b"\x1b_ignored\x1b\\\x1b^ignored\x1b\\",
+            b"\x1b\x00]0;title\x07",
+            b"\x1b ]not-an-osc",
+            // VTE 0.15 executes (and ansi ignores) C1 OSC; neither form
+            // enters OscString. Do not reinterpret either as ESC ].
+            b"\x9d0;not-an-osc\x07",
+            b"\xc2\x9d0;not-an-osc\x07",
+        ] {
+            for cut in 0..=seq.len() {
+                assert_eq!(guarded(&[&seq[..cut], &seq[cut..]]), seq, "cut at {cut}");
+            }
+        }
+    }
+
+    #[test]
+    fn osc_guard_discards_overflow_and_recovers_without_payload_leak() {
+        let mut exact = b"\x1b]0;".to_vec();
+        exact.resize(MAX_OSC_BYTES + 1, b'a'); // ESC plus the allowed OSC bytes.
+        for end in [&b"\x07"[..], b"\x1b\\", b"\x18", b"\x1a"] {
+            let mut valid = exact.clone();
+            valid.extend_from_slice(end);
+            assert_eq!(guarded(&[&valid]), valid);
+            let mut too_long = exact.clone();
+            too_long.push(b'b');
+            too_long.extend_from_slice(end);
+            let suffix = b"\x1b]0;ok\x07visible";
+            let expected = if end == b"\x1b\\" { &b"\x1b\x18\x1b\\"[..] } else { &b"\x1b\x18"[..] };
+            let mut output = expected.to_vec();
+            output.extend_from_slice(suffix);
+            assert_eq!(guarded(&[&too_long, suffix]), output);
+            assert_eq!(guarded(&[&too_long[..MAX_OSC_BYTES], &too_long[MAX_OSC_BYTES..], suffix]), output);
+        }
+        let mut guard = OscGuard::default();
+        assert!(guard.filter(&exact));
+        let mut buf = [0; 8];
+        assert_eq!(guard.drain(&mut buf), 1); // Only the initial ESC.
+        assert!(guard.filter(&[b'b'; 32]));
+        assert_eq!(guard.osc.len(), 0);
+        assert_eq!(guard.drain(&mut buf), 1); // CAN, not truncated payload.
+        assert!(guard.filter(&[b'a'; 32]));
+        assert_eq!(guard.drain(&mut buf), 0);
     }
 }

@@ -72,6 +72,7 @@ pub fn usable_link(link: alacritty_terminal::term::cell::Hyperlink) -> Option<al
     (link.uri().len() <= MAX_LINK_URI).then_some(link)
 }
 
+const MAX_KNOWN_GLYPHS: usize = 4096;
 /// Remembers which non-ASCII characters the primary font can draw.
 #[derive(Default)]
 pub struct GlyphCache {
@@ -82,6 +83,38 @@ pub struct GlyphCache {
 /// cell-sized geometry instead of a font glyph.
 pub fn is_block_element(ch: char) -> bool {
     ('\u{2580}'..='\u{259F}').contains(&ch)
+}
+
+pub fn is_braille(ch: char) -> bool {
+    ('\u{2800}'..='\u{28ff}').contains(&ch)
+}
+
+/// Dot positions depend on the cell, never on which subset is lit. Unicode
+/// numbers them 1,2,3 down the left, 4,5,6 down the right, then 7,8 below.
+fn braille_dots(ch: char, rect: Rect, ppp: f32) -> Option<impl Iterator<Item = (Pos2, f32)>> {
+    if !is_braille(ch) {
+        return None;
+    }
+    let mask = ch as u32 - 0x2800;
+    let radius = ((rect.width() / 2.0).min(rect.height() / 4.0) * 0.25 * ppp * 2.0).round().max(1.0) / (2.0 * ppp);
+    let positions = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (0, 3), (1, 3)];
+    Some(positions.into_iter().enumerate().filter_map(move |(bit, (col, row))| {
+        (mask & (1 << bit) != 0).then(|| {
+            let center = Pos2::new(
+                snap(rect.min.x + rect.width() * (col as f32 + 0.5) / 2.0, ppp),
+                snap(rect.min.y + rect.height() * (row as f32 + 0.5) / 4.0, ppp),
+            );
+            (center, radius)
+        })
+    }))
+}
+
+fn paint_braille(painter: &Painter, ch: char, rect: Rect, color: Color32) -> bool {
+    let Some(dots) = braille_dots(ch, rect, painter.ctx().pixels_per_point()) else { return false };
+    for (center, radius) in dots {
+        painter.circle_filled(center, radius, color);
+    }
+    true
 }
 
 /// `v` points moved onto the nearest physical pixel boundary.
@@ -194,7 +227,20 @@ pub fn fit_font(font: &FontId, ink: Vec2, room: Vec2) -> Option<FontId> {
 
 impl GlyphCache {
     pub fn in_primary(&mut self, c: char, has_glyph: &mut dyn FnMut(char) -> bool) -> bool {
-        c.is_ascii() || *self.known.entry(c).or_insert_with(|| has_glyph(c))
+        if c.is_ascii() || is_block_element(c) || is_braille(c) {
+            return true;
+        }
+        if let Some(known) = self.known.get(&c) {
+            return *known;
+        }
+        // This is a font lookup cache, not terminal history. A long Unicode
+        // session must not retain every character ever displayed in this pane.
+        if self.known.len() == MAX_KNOWN_GLYPHS {
+            self.known.clear();
+        }
+        let known = has_glyph(c);
+        self.known.insert(c, known);
+        known
     }
 }
 
@@ -252,7 +298,11 @@ pub fn snapshot<L: EventListener>(
             style: cell_style(cell.c, cell.fg, cell.bg, flags, colors, palette),
             wide: flags.contains(Flags::WIDE_CHAR),
             spacer: flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
-            in_primary_font: glyphs.in_primary(cell.c, has_glyph),
+            in_primary_font: if (is_block_element(cell.c) || is_braille(cell.c)) && cell.zerowidth().is_some_and(|marks| !marks.is_empty()) {
+                has_glyph(cell.c)
+            } else {
+                glyphs.in_primary(cell.c, has_glyph)
+            },
             hyperlink: cell.hyperlink().and_then(usable_link),
         });
     }
@@ -363,8 +413,13 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
             if run.standalone {
                 let mut chars = run.text.chars();
                 let single = chars.next().filter(|_| chars.next().is_none());
-                if single.is_some_and(|ch| block_fills(ch, span, s.fg, &mut blocks)) {
-                    // Painted with the other block fills after the text.
+                if single.is_some_and(|ch| block_fills(ch, span, s.fg, &mut blocks) || paint_braille(painter, ch, span, s.fg)) {
+                    // Block fills are batched; Braille dots keep a fixed 2x4
+                    // cell reference instead of fitting/recentering their ink.
+                    if s.strike {
+                        let y = span.min.y + dy + ch / 2.0;
+                        blocks.rect(Rect::from_x_y_ranges(span.x_range(), y - 0.5..=y + 0.5), s.fg);
+                    }
                 } else {
                     let mut galley = painter.layout_no_wrap(run.text.clone(), font.clone(), s.fg);
                     if let Some(smaller) = fit_font(&font, galley.mesh_bounds.size(), span.size()) {
@@ -445,7 +500,7 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
             _ if !opt.cursor_on && opt.focused => {}
             CursorShape::Block => {
                 painter.rect_filled(rect, 0.0, color);
-                if c.ch != ' ' {
+                if c.ch != ' ' && !paint_braille(painter, c.ch, cell, frame.default_bg) {
                     let font = opt.fonts.regular.clone();
                     let text = c.ch.to_string();
                     let cursor_glyphs = hinted.as_mut().and_then(|h| h.run(painter.ctx(), Face::Regular, font.size * ppp, &text));
@@ -524,6 +579,57 @@ mod tests {
         assert_eq!(snap_to_pixels(8.79, 1.0), 9.0);
         assert!((snap_to_pixels(8.79, 1.25) - 8.8).abs() < 1e-4, "10.99 px rounds to 11 px = 8.8 pt");
         assert_eq!(snap_to_pixels(0.1, 1.0), 1.0, "never zero");
+    }
+
+    #[test]
+    fn primary_glyph_cache_rechecks_evicted_characters() {
+        let mut glyphs = GlyphCache::default();
+        let mut calls = 0;
+        let mut has_glyph = |_| {
+            calls += 1;
+            true
+        };
+        for scalar in 0x1000..0x1000 + MAX_KNOWN_GLYPHS as u32 {
+            assert!(glyphs.in_primary(char::from_u32(scalar).unwrap(), &mut has_glyph));
+        }
+        assert_eq!(glyphs.known.len(), MAX_KNOWN_GLYPHS);
+        assert!(glyphs.in_primary('\u{1000}', &mut has_glyph));
+        assert!(glyphs.in_primary('\u{3000}', &mut has_glyph));
+        assert_eq!(glyphs.known.len(), 1);
+        assert!(glyphs.in_primary('\u{1000}', &mut has_glyph));
+        assert_eq!(calls, MAX_KNOWN_GLYPHS + 2);
+    }
+
+    #[test]
+    fn braille_dot_positions_are_invariant_for_all_patterns_and_dpi() {
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            for size in [Vec2::new(8.0, 16.0), Vec2::new(14.0, 28.0), Vec2::new(24.0, 48.0)] {
+                let rect = Rect::from_min_size(Pos2::new(3.2, 7.3), size);
+                let full: Vec<_> = braille_dots('\u{28ff}', rect, ppp).unwrap().collect();
+                assert_eq!(full.len(), 8);
+                assert!(full[0].0.x < full[3].0.x);
+                assert!(full[0].0.y < full[1].0.y && full[1].0.y < full[2].0.y && full[2].0.y < full[6].0.y);
+                assert_eq!(full[0].0.y, full[3].0.y);
+                assert_eq!(full[6].0.y, full[7].0.y);
+                for mask in 0..=255u32 {
+                    let ch = char::from_u32(0x2800 + mask).unwrap();
+                    let dots: Vec<_> = braille_dots(ch, rect, ppp).unwrap().collect();
+                    let expected: Vec<_> = full.iter().enumerate().filter_map(|(bit, &dot)| (mask & (1 << bit) != 0).then_some(dot)).collect();
+                    assert_eq!(dots, expected, "pattern {mask:#x} at DPI {ppp}");
+                    for (center, radius) in dots {
+                        assert!(rect.contains(center - Vec2::splat(radius)));
+                        assert!(rect.contains(center + Vec2::splat(radius)));
+                        assert!((center.x * ppp - (center.x * ppp).round()).abs() < 1e-4);
+                        assert!((center.y * ppp - (center.y * ppp).round()).abs() < 1e-4);
+                    }
+                }
+            }
+        }
+        assert!(braille_dots('x', Rect::EVERYTHING, 1.0).is_none());
+        let mut cache = GlyphCache::default();
+        for ch in ['\u{2800}', '\u{28ff}', '\u{2588}'] {
+            assert!(cache.in_primary(ch, &mut |_| panic!("geometry must not request a fallback font")));
+        }
     }
 
     /// The cell is the font's line box, so the capitals have to sit centred in

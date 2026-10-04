@@ -20,6 +20,10 @@ use crate::fonts::TermFaces;
 /// the atlas has to start over.
 pub const ATLAS: usize = 1024;
 
+// Missing/blank glyphs consume no atlas texels, so texture capacity alone does
+// not bound the map, especially across many physical font sizes.
+const MAX_CACHED_GLYPHS: usize = 16_384;
+
 /// One of the four faces of `TermFaces`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Face {
@@ -154,6 +158,9 @@ impl TermGlyphs {
         let key = Key { face, ch, em: em.to_bits() };
         if let Some(slot) = self.glyphs.get(&key) {
             return Some(*slot);
+        }
+        if self.glyphs.len() >= MAX_CACHED_GLYPHS {
+            self.full_since = Some(pass);
         }
         if self.full_since.is_some() {
             return None;

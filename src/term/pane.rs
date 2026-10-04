@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+#[cfg(test)]
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use alacritty_terminal::event::{Event, EventListener, Notify, OnResize, WindowSize};
@@ -57,6 +58,27 @@ struct Shared {
     palette: RwLock<Palette>,
     output: AtomicBool,
     exited: AtomicBool,
+    wake_pending: AtomicBool,
+}
+
+/// Only the last UI effect of each kind matters between frames. In particular,
+/// title and bell floods must not accumulate while the window cannot redraw.
+#[derive(Default)]
+struct PendingEvents {
+    events: Vec<PaneEvent>,
+}
+
+impl PendingEvents {
+    fn push(&mut self, event: PaneEvent) {
+        let same_kind = |pending: &PaneEvent| match (pending, &event) {
+            (PaneEvent::Title(_) | PaneEvent::ResetTitle, PaneEvent::Title(_) | PaneEvent::ResetTitle) => true,
+            _ => std::mem::discriminant(pending) == std::mem::discriminant(&event),
+        };
+        if let Some(index) = self.events.iter().position(same_kind) {
+            self.events.remove(index);
+        }
+        self.events.push(event);
+    }
 }
 
 impl Shared {
@@ -72,7 +94,7 @@ impl Shared {
 /// to the PTY; everything else is queued for the UI and wakes it up.
 #[derive(Clone)]
 pub struct Listener {
-    tx: Sender<PaneEvent>,
+    events: Arc<Mutex<PendingEvents>>,
     shared: Arc<Shared>,
     repaint: Arc<dyn Fn() + Send + Sync>,
 }
@@ -101,7 +123,7 @@ impl EventListener for Listener {
             }
             Event::Wakeup => {
                 self.shared.output.store(true, Ordering::Relaxed);
-                (self.repaint)();
+                self.wake();
             }
             Event::Title(title) => self.queue(PaneEvent::Title(clip_title(title))),
             Event::ResetTitle => self.queue(PaneEvent::ResetTitle),
@@ -125,8 +147,16 @@ impl EventListener for Listener {
 
 impl Listener {
     fn queue(&self, event: PaneEvent) {
-        let _ = self.tx.send(event);
-        (self.repaint)();
+        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        events.push(event);
+        drop(events);
+        self.wake();
+    }
+
+    fn wake(&self) {
+        if !self.shared.wake_pending.swap(true, Ordering::Relaxed) {
+            (self.repaint)();
+        }
     }
 }
 
@@ -155,7 +185,7 @@ pub struct Pane {
     pub cwd: Arc<Mutex<Option<PathBuf>>>,
     pub shell_pid: u32,
     notifier: Notifier,
-    events: Receiver<PaneEvent>,
+    events: Arc<Mutex<PendingEvents>>,
     shared: Arc<Shared>,
     size: WindowSize,
     /// The full `Term` config, kept so settings can update it at runtime.
@@ -184,15 +214,16 @@ impl Pane {
         let cwd = Arc::new(Mutex::new(None));
         let pty = ScanPty::new(pty, cwd.clone());
 
-        let (tx, events) = mpsc::channel();
+        let events = Arc::new(Mutex::new(PendingEvents::default()));
         let shared = Arc::new(Shared {
             sender: OnceLock::new(),
             size: Mutex::new(size),
             palette: RwLock::new(opts.palette),
             output: AtomicBool::new(false),
             exited: AtomicBool::new(false),
+            wake_pending: AtomicBool::new(false),
         });
-        let listener = Listener { tx, shared: shared.clone(), repaint };
+        let listener = Listener { events: events.clone(), shared: shared.clone(), repaint };
         let config = Config {
             scrolling_history: opts.scrollback,
             semantic_escape_chars: opts.word_separators,
@@ -267,7 +298,11 @@ impl Pane {
     }
 
     pub fn drain_events(&self) -> Vec<PaneEvent> {
-        self.events.try_iter().collect()
+        // Reset before draining: output arriving during this frame must be able
+        // to schedule the next one, including for panes not currently rendered.
+        self.shared.wake_pending.store(false, Ordering::Relaxed);
+        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        events.events.drain(..).collect()
     }
 
     /// True once since the last call if the process printed anything.
@@ -325,6 +360,26 @@ mod tests {
         let long = "заголовок ".repeat(10_000);
         assert_eq!(clip_title(long).chars().count(), MAX_TITLE_CHARS);
         assert_eq!(clip_title("short".to_owned()), "short");
+    }
+
+    #[test]
+    fn pending_events_coalesce_without_losing_exit_or_final_effects() {
+        let mut pending = PendingEvents::default();
+        pending.push(PaneEvent::Exited(Some(1)));
+        for i in 0..10_000 {
+            pending.push(PaneEvent::Title(i.to_string()));
+            pending.push(PaneEvent::Bell);
+            pending.push(PaneEvent::Clipboard(i.to_string()));
+            pending.push(PaneEvent::CursorBlinkingChange);
+        }
+        pending.push(PaneEvent::ResetTitle);
+        assert_eq!(pending.events.len(), 5);
+        assert_eq!(pending.events[0], PaneEvent::Exited(Some(1)));
+        assert_eq!(pending.events.last(), Some(&PaneEvent::ResetTitle));
+        assert!(pending.events.contains(&PaneEvent::Clipboard("9999".to_owned())));
+        pending.push(PaneEvent::Title("last".to_owned()));
+        assert_eq!(pending.events.len(), 5);
+        assert_eq!(pending.events.last(), Some(&PaneEvent::Title("last".to_owned())));
     }
 
     #[test]

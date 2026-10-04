@@ -571,6 +571,11 @@ impl AnvilApp {
                     pane.term.lock().selection = None;
                 }
             }
+            PaneCommand::CopySelection => {
+                if let Some(text) = self.selection_text(id) {
+                    ctx.copy_text(text);
+                }
+            }
             PaneCommand::Paste => self.paste_clipboard(id),
             PaneCommand::SelectAll => self.select_all(id),
             PaneCommand::Clear => self.clear_pane(id),

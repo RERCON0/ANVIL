@@ -165,7 +165,7 @@ impl Default for TerminalConfig {
             cursor: CursorConfig::default(),
             right_click: RightClick::Clipboard,
             paste_on_middle_click: true,
-            copy_on_select: false,
+            copy_on_select: true,
             allow_osc52: false,
             word_separators: " ()[]{}'\"".into(),
             bell: Bell::Off,

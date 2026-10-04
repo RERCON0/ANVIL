@@ -317,7 +317,11 @@ pub fn text_runs(row: &[RenderCell]) -> Vec<TextRun> {
         if cell.spacer {
             continue;
         }
-        let standalone = cell.wide || !cell.in_primary_font || cell.combining.is_some() || crate::term::render::is_block_element(cell.ch);
+        let standalone = cell.wide
+            || !cell.in_primary_font
+            || cell.combining.is_some()
+            || crate::term::render::is_block_element(cell.ch)
+            || crate::term::render::is_braille(cell.ch);
         if standalone {
             flush(&mut current, &mut runs);
             let mut text = cell.ch.to_string();

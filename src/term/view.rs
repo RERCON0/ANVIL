@@ -34,6 +34,8 @@ const RIGHT_CLICK_MENU_MS: u128 = 250;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaneCommand {
     Copy,
+    /// Automatic copy keeps the highlight and does not show a toast.
+    CopySelection,
     Paste,
     SelectAll,
     Clear,
@@ -212,6 +214,7 @@ impl TerminalView {
                     if let Some(bytes) = mouse::encode_report(MouseButton::Left, MouseAction::Press, col, row, mods, modes) {
                         pane.write(bytes);
                         self.press_reported = true;
+                        self.last_reported_cell = Some((col, row));
                     }
                     self.selecting = false;
                 } else {
@@ -252,21 +255,15 @@ impl TerminalView {
         }
 
         if primary_released {
-            if let Some(pos) = pointer {
-                let (col, row) = clamp_cell(pos);
-                if app_mouse {
-                    if self.press_reported {
-                        if let Some(bytes) = mouse::encode_report(MouseButton::Left, MouseAction::Release, col, row, mods, modes) {
-                            pane.write(bytes);
-                        }
-                        self.press_reported = false;
-                    }
-                } else if self.selecting {
-                    self.selecting = false;
-                    if input.copy_on_select && pane.term.lock().selection.is_some() {
-                        commands.push(PaneCommand::Copy);
+            if std::mem::take(&mut self.press_reported) && modes.any() {
+                if let Some((col, row)) = pointer.map(clamp_cell).or(self.last_reported_cell) {
+                    if let Some(bytes) = mouse::encode_report(MouseButton::Left, MouseAction::Release, col, row, mods, modes) {
+                        pane.write(bytes);
                     }
                 }
+            }
+            if std::mem::take(&mut self.selecting) && input.copy_on_select {
+                commands.push(PaneCommand::CopySelection);
             }
         }
 
@@ -305,13 +302,14 @@ impl TerminalView {
         if hovered && ui.input(|i| i.pointer.secondary_pressed()) {
             self.right_press_at = Some(Instant::now());
         }
-        if let Some(pressed_at) = self.right_press_at.take().filter(|_| ui.input(|i| i.pointer.secondary_released())) {
+        let secondary_released = ui.input(|i| i.pointer.secondary_released());
+        if let Some(pressed_at) = self.release_right_press(secondary_released) {
             let short = pressed_at.elapsed().as_millis() < RIGHT_CLICK_MENU_MS;
             if short {
                 match input.right_click {
                     RightClick::Paste => commands.push(PaneCommand::Paste),
                     RightClick::Clipboard => {
-                        if pane.term.lock().selection.is_some() {
+                        if pane.term.lock().selection.as_ref().is_some_and(|selection| !selection.is_empty()) {
                             commands.push(PaneCommand::Copy);
                         } else {
                             commands.push(PaneCommand::Paste);
@@ -389,28 +387,24 @@ impl TerminalView {
             let primary = fonts.primary.clone();
             ctx.fonts(|f| snapshot(&term, input.palette, &mut self.glyphs, &mut |c| f.has_glyph(&primary, c)))
         };
-        self.last_rows = frame
-            .rows
-            .iter()
-            .map(|row| {
-                let mut text = String::with_capacity(row.len());
-                let mut cols = Vec::with_capacity(row.len());
-                for (i, cell) in row.iter().enumerate() {
-                    if cell.spacer {
-                        continue;
-                    }
-                    if let Some(extra) = cell.combining.as_deref() {
-                        text.push_str(extra);
-                        for _ in 0..extra.chars().count() {
-                            cols.push(i);
-                        }
-                    }
-                    text.push(cell.ch);
-                    cols.push(i);
+        self.last_rows.resize_with(frame.rows.len(), || (String::new(), Vec::new()));
+        for (row, (text, cols)) in frame.rows.iter().zip(&mut self.last_rows) {
+            text.clear();
+            cols.clear();
+            for (i, cell) in row.iter().enumerate() {
+                if cell.spacer {
+                    continue;
                 }
-                (text, cols)
-            })
-            .collect();
+                if let Some(extra) = cell.combining.as_deref() {
+                    text.push_str(extra);
+                    for _ in 0..extra.chars().count() {
+                        cols.push(i);
+                    }
+                }
+                text.push(cell.ch);
+                cols.push(i);
+            }
+        }
         // OSC 8 targets per row, so Ctrl+click works on hyperlinked labels too.
         self.last_links = link_runs(&frame.rows);
 
@@ -549,6 +543,10 @@ impl TerminalView {
                 .iter()
                 .any(|row| row.iter().any(|cell| !cell.in_primary_font && !cell.spacer && cell.ch != ' '));
         ViewOutput { pressed: response.is_pointer_button_down_on(), cursor_rect, commands, needs_fallbacks }
+    }
+
+    fn release_right_press(&mut self, released: bool) -> Option<Instant> {
+        if released { self.right_press_at.take() } else { None }
     }
 
     /// Recomputes the current match and scrolls it into view.
@@ -784,6 +782,17 @@ mod tests {
         RenderCell { ch, combining: None, style, wide: false, spacer: false, in_primary_font: true, hyperlink }
     }
 
+
+    #[test]
+    fn right_press_survives_frames_until_release() {
+        let mut view = TerminalView::new(15.0);
+        let pressed_at = Instant::now();
+        view.right_press_at = Some(pressed_at);
+        assert_eq!(view.release_right_press(false), None);
+        assert_eq!(view.release_right_press(false), None);
+        assert_eq!(view.release_right_press(true), Some(pressed_at));
+        assert_eq!(view.release_right_press(true), None);
+    }
     #[test]
     fn hyperlinked_cells_form_one_target_per_link() {
         let a = Hyperlink::new(None::<String>, "https://a.example".to_owned());
