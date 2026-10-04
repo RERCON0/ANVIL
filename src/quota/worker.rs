@@ -1,0 +1,376 @@
+//! The quota cycle. `Engine` decides, provider by provider, whether to ask
+//! the network and what the snapshot says afterwards; it is pure apart from
+//! the closures it is given, so the scheduling rules are tested without
+//! threads, files or sockets. `run` is the thin thread loop around it.
+
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::Duration;
+
+use super::cache::{self, Paths};
+use super::creds::{self, CredEnv, Credential, Detection};
+use super::http::{Http, WinHttp};
+use super::model::{FetchError, Fetched, ProviderId, ProviderSnapshot, ProviderState, Snapshot};
+use super::sqlite::Sqlite;
+use super::time::now_unix;
+use super::{credman, providers, Shared};
+
+/// Seconds between cycles.
+pub const INTERVAL: i64 = 300;
+/// A manual refresh is honoured at most this often.
+pub const MANUAL_GAP: i64 = 30;
+/// An observing window retries the lock this often.
+const LEAD_RETRY: i64 = 30;
+/// After a network failure (often: just woke from sleep, network not up yet)
+/// the next cycle comes this soon instead of a full interval later.
+pub const QUICK_RETRY: i64 = 60;
+
+#[derive(Default)]
+struct Memory {
+    /// 429s in a row.
+    failures: u32,
+    paused_until: i64,
+    /// The login that was refused (401/403); not retried until it changes.
+    refused: Option<u64>,
+}
+
+/// `Some(true)`/`Some(false)`: switched on/off by the user; `None`: automatic.
+pub type Prefs = HashMap<ProviderId, Option<bool>>;
+
+#[derive(Default)]
+pub struct Engine {
+    memory: HashMap<ProviderId, Memory>,
+    last_cycle: Option<i64>,
+    last_manual: Option<i64>,
+    retry_at: Option<i64>,
+}
+
+impl Engine {
+    /// Whether a cycle should run now. `snapshot_age` is the age of the newest
+    /// data any window wrote (None: there is none), so a window that becomes
+    /// leader does not re-poll what another one fetched a minute ago.
+    pub fn due(&mut self, now: i64, snapshot_age: Option<i64>, manual: bool) -> bool {
+        if manual && self.last_manual.is_none_or(|at| now - at >= MANUAL_GAP) {
+            self.last_manual = Some(now);
+            return true;
+        }
+        if self.retry_at.is_some_and(|at| now >= at) {
+            return true;
+        }
+        match self.last_cycle {
+            Some(at) => now - at >= INTERVAL,
+            None => snapshot_age.is_none_or(|age| age >= INTERVAL),
+        }
+    }
+
+    pub fn cycle(
+        &mut self,
+        now: i64,
+        prefs: &Prefs,
+        previous: &Snapshot,
+        detect: impl Fn(ProviderId) -> Detection,
+        fetch: impl Fn(ProviderId, &Credential) -> Result<Fetched, FetchError>,
+    ) -> Snapshot {
+        self.last_cycle = Some(now);
+        self.retry_at = None;
+        let mut next = Snapshot::default();
+        for id in ProviderId::ALL {
+            let old = previous.get(id);
+            let keep = |state: ProviderState, source: String, plan: Option<String>| ProviderSnapshot {
+                id,
+                plan: plan.or_else(|| old.and_then(|o| o.plan.clone())),
+                source,
+                state,
+                windows: old.map(|o| o.windows.clone()).unwrap_or_default(),
+                fetched_at: old.and_then(|o| o.fetched_at),
+                checked_at: now,
+            };
+            let memory = self.memory.entry(id).or_default();
+            let entry = match detect(id) {
+                Detection::Missing => {
+                    *memory = Memory::default();
+                    continue;
+                }
+                Detection::Expired { source, .. } => keep(ProviderState::AuthExpired, source.label(), None),
+                Detection::Found(credential) => {
+                    let source = credential.source.label();
+                    let enabled = prefs.get(&id).copied().flatten().unwrap_or(true);
+                    let previous_state = old.map(|o| o.state.clone()).unwrap_or(ProviderState::Idle);
+                    if memory.refused.is_some_and(|m| m != credential.marker) {
+                        memory.refused = None;
+                    }
+                    if !enabled {
+                        keep(previous_state, source, credential.plan)
+                    } else if memory.refused.is_some() {
+                        keep(ProviderState::AuthExpired, source, credential.plan)
+                    } else if memory.paused_until > now {
+                        keep(previous_state, source, credential.plan)
+                    } else {
+                        match fetch(id, &credential) {
+                            Ok(fetched) => {
+                                memory.failures = 0;
+                                ProviderSnapshot {
+                                    id,
+                                    plan: fetched.plan.or(credential.plan),
+                                    source,
+                                    state: ProviderState::Ok,
+                                    windows: fetched.windows,
+                                    fetched_at: Some(now),
+                                    checked_at: now,
+                                }
+                            }
+                            Err(error) => {
+                                if matches!(error, FetchError::Network(_)) {
+                                    self.retry_at = Some(now + QUICK_RETRY);
+                                }
+                                let state = error.into_state(now, memory.failures);
+                                match &state {
+                                    ProviderState::AuthExpired => memory.refused = Some(credential.marker),
+                                    ProviderState::RateLimited { retry_at } => {
+                                        memory.failures += 1;
+                                        memory.paused_until = *retry_at;
+                                    }
+                                    _ => {}
+                                }
+                                keep(state, source, credential.plan)
+                            }
+                        }
+                    }
+                }
+            };
+            next.providers.push(entry);
+        }
+        next
+    }
+}
+
+/// Keys typed into ANVIL, read fresh every cycle (six local calls).
+fn own_keys() -> HashMap<ProviderId, String> {
+    ProviderId::ALL
+        .into_iter()
+        .filter(|id| !id.is_subscription())
+        .filter_map(|id| credman::read(&credman::target(id)).map(|key| (id, key)))
+        .collect()
+}
+
+/// The thread body: observe `quota.json`, lead when the lock is free, poll on
+/// schedule. Ends within a second of `Shared::stop` (plus any request in flight).
+pub(super) fn run(shared: Arc<Shared>, paths: Paths, user_agent: String) {
+    let sqlite = Sqlite::load().map(Arc::new);
+    if sqlite.is_none() {
+        log::info!("quota: winsqlite3.dll unavailable; OMP and OpenCode 2 logins are skipped");
+    }
+    let mut engine = Engine::default();
+    let mut leader = None;
+    let mut http: Option<WinHttp> = None;
+    let mut last_lead_try: Option<i64> = None;
+    let mut seen_snapshot = None;
+    let mut seen_refresh = cache::mtime(&paths.refresh);
+    while !shared.stop.load(Ordering::Relaxed) {
+        let now = now_unix();
+        let snapshot_mtime = cache::mtime(&paths.snapshot);
+        if snapshot_mtime != seen_snapshot {
+            seen_snapshot = snapshot_mtime;
+            if let Some(snapshot) = cache::read(&paths.snapshot) {
+                shared.publish(snapshot);
+            }
+        }
+        if leader.is_none() && last_lead_try.is_none_or(|at| now - at >= LEAD_RETRY) {
+            last_lead_try = Some(now);
+            leader = cache::try_lead(&paths.lock);
+        }
+        let refresh_mtime = cache::mtime(&paths.refresh);
+        let manual = refresh_mtime != seen_refresh;
+        seen_refresh = refresh_mtime;
+        if leader.is_some() {
+            let age = shared.snapshot().checked_at().map(|at| now - at);
+            if engine.due(now, age, manual) {
+                if http.is_none() {
+                    http = WinHttp::new(&user_agent).map_err(|e| log::warn!("quota: WinHTTP: {e}")).ok();
+                }
+                if let (Some(http), Some(prefs)) = (&http, shared.prefs()) {
+                    let previous = shared.snapshot();
+                    let env = CredEnv::from_process(now, sqlite.clone(), own_keys());
+                    let cycle = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        engine.cycle(
+                            now,
+                            &prefs,
+                            &previous,
+                            |id| creds::detect(id, &env),
+                            |id, credential| providers::fetch(id, http as &dyn Http, credential, now),
+                        )
+                    }));
+                    match cycle {
+                        Ok(next) => {
+                            if let Err(e) = cache::write(&paths.snapshot, &next) {
+                                log::warn!("quota: cannot write {}: {e}", paths.snapshot.display());
+                            }
+                            seen_snapshot = cache::mtime(&paths.snapshot);
+                            shared.publish(next);
+                        }
+                        Err(_) => log::error!("quota: a cycle panicked; the worker continues"),
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+    use crate::quota::creds::{Secret, Source};
+    use crate::quota::model::Window;
+
+    fn login(marker: u64) -> Detection {
+        Detection::Found(Credential {
+            secret: Secret::new("k"),
+            source: Source::AnvilKey,
+            plan: None,
+            account: None,
+            expires_at: None,
+            marker,
+        })
+    }
+
+    fn only(id: ProviderId, detection: impl Fn() -> Detection) -> impl Fn(ProviderId) -> Detection {
+        move |asked| if asked == id { detection() } else { Detection::Missing }
+    }
+
+    fn ok() -> Result<Fetched, FetchError> {
+        Ok(Fetched { plan: Some("Pro".into()), windows: vec![Window::new("5h", "5ч", 10.0, None)] })
+    }
+
+    #[test]
+    fn first_cycle_waits_for_stale_data_then_follows_the_interval() {
+        let mut engine = Engine::default();
+        assert!(engine.due(1_000, None, false), "no data at all");
+        let mut engine = Engine::default();
+        assert!(!engine.due(1_000, Some(60), false), "another window fetched a minute ago");
+        assert!(engine.due(1_000, Some(INTERVAL), false));
+        engine.cycle(1_000, &Prefs::new(), &Snapshot::default(), |_| Detection::Missing, |_, _| ok());
+        assert!(!engine.due(1_000 + INTERVAL - 1, None, false));
+        assert!(engine.due(1_000 + INTERVAL, None, false));
+    }
+
+    #[test]
+    fn a_network_failure_brings_the_next_cycle_closer() {
+        let mut engine = Engine::default();
+        let down = |_: ProviderId, _: &Credential| Err(FetchError::Network("no route".into()));
+        engine.cycle(1_000, &Prefs::new(), &Snapshot::default(), only(ProviderId::Zai, || login(1)), down);
+        assert!(!engine.due(1_000 + QUICK_RETRY - 1, None, false));
+        assert!(engine.due(1_000 + QUICK_RETRY, None, false));
+        engine.cycle(
+            1_000 + QUICK_RETRY,
+            &Prefs::new(),
+            &Snapshot::default(),
+            only(ProviderId::Zai, || login(1)),
+            |_, _| ok(),
+        );
+        assert!(!engine.due(1_000 + 2 * QUICK_RETRY, None, false), "back to the normal interval");
+    }
+
+    #[test]
+    fn manual_refreshes_are_rate_limited() {
+        let mut engine = Engine::default();
+        engine.cycle(1_000, &Prefs::new(), &Snapshot::default(), |_| Detection::Missing, |_, _| ok());
+        assert!(engine.due(1_010, None, true));
+        assert!(!engine.due(1_020, None, true), "within the manual gap");
+        assert!(engine.due(1_010 + MANUAL_GAP, None, true));
+    }
+
+    #[test]
+    fn missing_logins_disappear_and_disabled_providers_are_never_fetched() {
+        let mut engine = Engine::default();
+        let calls = Cell::new(0);
+        let fetch = |_: ProviderId, _: &Credential| {
+            calls.set(calls.get() + 1);
+            ok()
+        };
+        let prefs = Prefs::from([(ProviderId::Zai, Some(false))]);
+        let snapshot = engine.cycle(1, &prefs, &Snapshot::default(), only(ProviderId::Zai, || login(1)), fetch);
+        assert_eq!(calls.get(), 0);
+        assert_eq!(snapshot.get(ProviderId::Zai).map(|p| &p.state), Some(&ProviderState::Idle));
+        assert!(snapshot.get(ProviderId::Claude).is_none());
+        let snapshot = engine.cycle(2, &Prefs::new(), &snapshot, only(ProviderId::Zai, || login(1)), fetch);
+        assert_eq!(calls.get(), 1);
+        let zai = snapshot.get(ProviderId::Zai).unwrap();
+        assert_eq!(
+            (&zai.state, zai.plan.as_deref(), zai.fetched_at, zai.windows.len()),
+            (&ProviderState::Ok, Some("Pro"), Some(2), 1)
+        );
+    }
+
+    #[test]
+    fn rate_limits_pause_and_failures_keep_old_windows() {
+        let mut engine = Engine::default();
+        let first =
+            engine.cycle(10, &Prefs::new(), &Snapshot::default(), only(ProviderId::Kimi, || login(1)), |_, _| ok());
+        let calls = Cell::new(0);
+        let limited = |_: ProviderId, _: &Credential| {
+            calls.set(calls.get() + 1);
+            Err(FetchError::Status { code: 429, retry_after: Some(120) })
+        };
+        let second = engine.cycle(20, &Prefs::new(), &first, only(ProviderId::Kimi, || login(1)), limited);
+        let kimi = second.get(ProviderId::Kimi).unwrap();
+        assert_eq!(
+            (&kimi.state, kimi.windows.len(), kimi.fetched_at),
+            (&ProviderState::RateLimited { retry_at: 140 }, 1, Some(10))
+        );
+        let third = engine.cycle(100, &Prefs::new(), &second, only(ProviderId::Kimi, || login(1)), limited);
+        assert_eq!(calls.get(), 1, "paused until retry_at");
+        assert_eq!(third.get(ProviderId::Kimi).unwrap().state, ProviderState::RateLimited { retry_at: 140 });
+        let failed = engine.cycle(200, &Prefs::new(), &third, only(ProviderId::Kimi, || login(1)), |_, _| {
+            Err(FetchError::Network("timeout".into()))
+        });
+        let kimi = failed.get(ProviderId::Kimi).unwrap();
+        assert_eq!((&kimi.state, kimi.windows.len()), (&ProviderState::UpdateFailed { reason: "timeout".into() }, 1));
+    }
+
+    #[test]
+    fn a_refused_login_is_not_retried_until_it_changes() {
+        let mut engine = Engine::default();
+        let calls = Cell::new(0);
+        let refuse = |_: ProviderId, _: &Credential| {
+            calls.set(calls.get() + 1);
+            Err(FetchError::Status { code: 401, retry_after: None })
+        };
+        let s = engine.cycle(1, &Prefs::new(), &Snapshot::default(), only(ProviderId::Claude, || login(7)), refuse);
+        let s = engine.cycle(400, &Prefs::new(), &s, only(ProviderId::Claude, || login(7)), refuse);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(s.get(ProviderId::Claude).unwrap().state, ProviderState::AuthExpired);
+        engine.cycle(800, &Prefs::new(), &s, only(ProviderId::Claude, || login(8)), refuse);
+        assert_eq!(calls.get(), 2, "a new login is tried again");
+    }
+
+    #[test]
+    fn expired_logins_are_shown_without_a_request() {
+        let mut engine = Engine::default();
+        let detection = || Detection::Expired { source: Source::ClaudeCode, marker: 1 };
+        let s = engine.cycle(1, &Prefs::new(), &Snapshot::default(), only(ProviderId::Claude, detection), |_, _| {
+            panic!("no request")
+        });
+        let claude = s.get(ProviderId::Claude).unwrap();
+        assert_eq!((&claude.state, claude.source.as_str()), (&ProviderState::AuthExpired, "Claude Code"));
+    }
+
+    #[test]
+    fn one_failing_provider_does_not_stop_the_others() {
+        let mut engine = Engine::default();
+        let fetch = |id: ProviderId, _: &Credential| {
+            if id == ProviderId::Zai {
+                Err(FetchError::Format("bad".into()))
+            } else {
+                ok()
+            }
+        };
+        let s = engine.cycle(1, &Prefs::new(), &Snapshot::default(), |_| login(1), fetch);
+        assert_eq!(s.providers.len(), ProviderId::ALL.len());
+        assert_eq!(s.get(ProviderId::Zai).unwrap().state, ProviderState::FormatError { reason: "bad".into() });
+        assert!(s.providers.iter().filter(|p| p.id != ProviderId::Zai).all(|p| p.state == ProviderState::Ok));
+    }
+}
