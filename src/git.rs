@@ -292,14 +292,96 @@ pub fn find_root(cwd: &Path) -> Option<PathBuf> {
     run_git(cwd, &["rev-parse", "--show-toplevel"]).ok().map(|text| PathBuf::from(text.trim()))
 }
 
-/// Exact effective configuration approved for one repository/session.
-/// Keep values opaque: Git configuration may contain credentials.
-#[derive(Clone, PartialEq, Eq)]
-pub struct RepositoryStamp(std::sync::Arc<Vec<u8>>);
+/// One configuration file whose stat decides whether a cached digest is stale.
+#[derive(Clone, Debug)]
+struct ConfigSource {
+    path: PathBuf,
+    /// Length and mtime of the file when the digest was computed; `None` when
+    /// it did not exist then.
+    state: Option<(u64, Option<std::time::SystemTime>)>,
+}
+
+impl ConfigSource {
+    fn read(path: &Path) -> ConfigSource {
+        let state = std::fs::metadata(path).ok().map(|meta| (meta.len(), meta.modified().ok()));
+        ConfigSource { path: path.to_path_buf(), state }
+    }
+
+    fn is_current(&self) -> bool {
+        ConfigSource::read(&self.path).state == self.state
+    }
+}
+
+/// Configuration keys that let a repository start a program or pull in more
+/// settings while the panel reads status, diff or log, stages, commits or
+/// applies a patch. Everything else is routine: `push --set-upstream` and
+/// `checkout -b` write `branch.*` tracking keys, `remote add` writes
+/// `remote.*`, and the user's own editor or pager settings are not the
+/// repository's business.
+fn is_hazardous_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    let (section, rest) = key.split_once('.').unwrap_or((key.as_str(), ""));
+    match section {
+        // Filter commands run on status, diff and add for every selected file.
+        "filter" => true,
+        // Includes decide which files the configuration is read from.
+        "include" | "includeif" => true,
+        // Credential and SSH helpers.
+        "credential" => true,
+        // External diff and merge tools.
+        "difftool" => true,
+        // Signature programs run on commit, tag and `--show-signature`.
+        "gpg" => true,
+        // `submodule.<name>.update = !cmd` runs a command.
+        "submodule" => true,
+        "core" => matches!(rest, "fsmonitor" | "hookspath" | "sshcommand" | "gitproxy" | "attributesfile"),
+        "diff" => rest == "external" || rest.ends_with(".command") || rest.ends_with(".textconv"),
+        "commit" | "tag" => matches!(rest, "gpgsign" | "gpgformat"),
+        "log" => rest == "showsignature",
+        "remote" => rest.ends_with(".receivepack") || rest.ends_with(".uploadpack") || rest.ends_with(".proxy"),
+        _ => false,
+    }
+}
+
+/// The configuration the user approves: only the repository's own hazardous
+/// keys, plus any file a global `includeIf` points at inside the repository.
+/// Values stay opaque (they may hold credentials) and never reach the UI.
+#[derive(Clone)]
+pub struct RepositoryStamp {
+    digest: std::sync::Arc<Vec<u8>>,
+    /// Hazardous key names, for the trust prompt. No values.
+    hazards: std::sync::Arc<Vec<String>>,
+    /// Files whose stat invalidates a cached digest.
+    sources: std::sync::Arc<Vec<ConfigSource>>,
+}
+
+impl PartialEq for RepositoryStamp {
+    fn eq(&self, other: &Self) -> bool {
+        self.digest == other.digest
+    }
+}
+
+impl Eq for RepositoryStamp {}
 
 impl std::fmt::Debug for RepositoryStamp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("RepositoryStamp")
+    }
+}
+
+impl RepositoryStamp {
+    /// A repository with nothing that can run a program needs no approval.
+    pub fn is_hazard_free(&self) -> bool {
+        self.digest.is_empty()
+    }
+
+    pub fn hazards(&self) -> &[String] {
+        &self.hazards
+    }
+
+    /// Whether the files behind this digest still look untouched.
+    fn is_current(&self) -> bool {
+        self.sources.iter().all(ConfigSource::is_current)
     }
 }
 
@@ -318,10 +400,23 @@ pub fn repository_identity(cwd: &Path) -> Result<Option<RepositoryIdentity>, Str
     Ok(Some(RepositoryIdentity { root, stamp }))
 }
 
-/// Includes all effective scopes and included files, not just .git/config.
-/// Compare before accepting approval and before running repository commands.
+/// The digest the user has to approve before repository commands run.
+///
+/// Recomputed only when one of the configuration files behind the previous
+/// digest changed, so a poll cycle does not spawn a `git config` per request.
 pub fn repository_stamp(root: &Path) -> Result<RepositoryStamp, String> {
     reject_network_repository(root)?;
+    if let Some(cached) = cached_stamp(root) {
+        if cached.is_current() {
+            return Ok(cached);
+        }
+    }
+    let stamp = read_stamp(root)?;
+    store_stamp(root, &stamp);
+    Ok(stamp)
+}
+
+fn read_stamp(root: &Path) -> Result<RepositoryStamp, String> {
     const CONFIG_MAX_OUTPUT: usize = 1024 * 1024;
     let config = run_git_capped(
         root,
@@ -332,7 +427,138 @@ pub fn repository_stamp(root: &Path) -> Result<RepositoryStamp, String> {
     if config.len() >= CONFIG_MAX_OUTPUT || config.last() != Some(&0) {
         return Err("Не удалось полностью прочитать конфигурацию Git; доступ к репозиторию не разрешён.".to_owned());
     }
-    Ok(RepositoryStamp(std::sync::Arc::new(config)))
+    Ok(digest_of(&config, root, &local_config_path(root)))
+}
+
+/// Local scope and files inside the repository only: the user's own global
+/// settings (where Git for Windows even ships `filter.lfs.*`) are not the
+/// repository's, and changing them must not revoke approval. A global
+/// `includeIf` that points at a repository file still counts, because that
+/// file is repository-controlled.
+fn digest_of(config: &[u8], root: &Path, local_config: &Path) -> RepositoryStamp {
+    let mut digest = Vec::new();
+    let mut hazards = Vec::new();
+    let mut sources: Vec<ConfigSource> = Vec::new();
+    // Each entry contributes three NUL-separated tokens: scope, origin, and
+    // `key\nvalue`; the entries themselves are not separable by NUL alone.
+    let mut tokens = config.split(|byte| *byte == 0).filter(|token| !token.is_empty());
+    while let (Some(scope), Some(origin), Some(key_value)) = (tokens.next(), tokens.next(), tokens.next()) {
+        let (key, value) = match key_value.iter().position(|byte| *byte == b'\n') {
+            Some(index) => (&key_value[..index], &key_value[index + 1..]),
+            None => (key_value, &[][..]),
+        };
+        // Git prints `.git/config` relative to the work tree; resolve it
+        // against the repository, never against the process working directory.
+        let path = origin_path(origin).map(|path| if path.is_absolute() { path } else { root.join(path) });
+        let local = matches!(scope, b"local" | b"worktree");
+        let inside = path.as_deref().is_some_and(|path| path_is_inside(path, root));
+        if !local && !inside {
+            continue;
+        }
+        if let Some(path) = path {
+            if local || inside {
+                sources.push(ConfigSource::read(&path));
+            }
+        }
+        if is_hazardous_key(&String::from_utf8_lossy(key)) {
+            digest.extend_from_slice(key);
+            digest.push(b'\n');
+            digest.extend_from_slice(value);
+            digest.push(0);
+            hazards.push(String::from_utf8_lossy(key).into_owned());
+        }
+    }
+    // A configuration file with no hazardous entries still decides whether new
+    // ones appear, so its own stat belongs to the freshness check.
+    sources.push(ConfigSource::read(local_config));
+    hazards.sort();
+    hazards.dedup();
+    RepositoryStamp {
+        digest: std::sync::Arc::new(digest),
+        hazards: std::sync::Arc::new(hazards),
+        sources: std::sync::Arc::new(sources),
+    }
+}
+
+/// `<origin>` is `file:<path>`, C-quoted when the path has special bytes.
+fn origin_path(origin: &[u8]) -> Option<PathBuf> {
+    let text = String::from_utf8_lossy(origin);
+    let path = text.strip_prefix("file:")?;
+    let path = match path.strip_prefix('"') {
+        Some(quoted) => {
+            let mut unquoted = String::with_capacity(quoted.len());
+            let mut characters = quoted.chars();
+            while let Some(character) = characters.next() {
+                match character {
+                    '\\' => unquoted.push(characters.next()?),
+                    '"' => break,
+                    _ => unquoted.push(character),
+                }
+            }
+            unquoted
+        }
+        None => path.to_owned(),
+    };
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// Case-insensitive prefix test on the platform's own separators.
+fn path_is_inside(path: &Path, root: &Path) -> bool {
+    let path = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    let mut root = root.to_string_lossy().replace('\\', "/").to_lowercase();
+    while root.ends_with('/') {
+        root.pop();
+    }
+    !root.is_empty() && (path == root || path.starts_with(&format!("{root}/")))
+}
+
+/// The repository's own config file, without asking Git for it: a `.git` file
+/// points at the real directory for worktrees and submodules.
+fn local_config_path(root: &Path) -> PathBuf {
+    let dot_git = root.join(".git");
+    if dot_git.is_dir() {
+        return dot_git.join("config");
+    }
+    if let Ok(text) = std::fs::read_to_string(&dot_git) {
+        if let Some(target) = text.strip_prefix("gitdir:") {
+            return root.join(target.trim()).join("config");
+        }
+    }
+    root.join(".git").join("config")
+}
+
+static STAMP_CACHE: std::sync::Mutex<Option<HashMap<PathBuf, RepositoryStamp>>> = std::sync::Mutex::new(None);
+
+fn cached_stamp(root: &Path) -> Option<RepositoryStamp> {
+    STAMP_CACHE.lock().ok()?.as_ref()?.get(root).cloned()
+}
+
+fn store_stamp(root: &Path, stamp: &RepositoryStamp) {
+    if let Ok(mut cache) = STAMP_CACHE.lock() {
+        cache.get_or_insert_with(HashMap::new).insert(root.to_path_buf(), stamp.clone());
+    }
+}
+
+/// Repositories trusted in this session (process lifetime), keyed by root and
+/// digest: every pane, tab and extra window of the process shares them, so a
+/// split or a restored panel does not ask again for the same repository.
+static TRUSTED: std::sync::Mutex<Option<HashMap<PathBuf, RepositoryStamp>>> = std::sync::Mutex::new(None);
+
+/// A hazard-free repository is always allowed; approval lives in memory only.
+pub fn trust_approved(root: &Path, stamp: &RepositoryStamp) -> bool {
+    if stamp.is_hazard_free() {
+        return true;
+    }
+    TRUSTED
+        .lock()
+        .map(|trusted| trusted.as_ref().is_some_and(|trusted| trusted.get(root).is_some_and(|approved| approved == stamp)))
+        .unwrap_or(false)
+}
+
+pub fn remember_trust(root: &Path, stamp: RepositoryStamp) {
+    if let Ok(mut trusted) = TRUSTED.lock() {
+        trusted.get_or_insert_with(HashMap::new).insert(root.to_path_buf(), stamp);
+    }
 }
 
 fn reject_network_repository(path: &Path) -> Result<(), String> {
@@ -802,7 +1028,89 @@ fn ai_cli_command(program: &str) -> Command {
             return Command::new(executable);
         }
     }
+    #[cfg(windows)]
+    if let Some(command) = npm_script_command(program, std::env::var_os("PATH").as_deref()) {
+        return command;
+    }
     Command::new(program)
+}
+
+/// The command an npm shim stands for, or `None` when the name resolves to a
+/// real executable or to nothing.
+///
+/// A `.cmd` shim runs through `cmd.exe`, and Rust refuses to pass a multi-line
+/// argument to it (`batch file arguments are invalid`), which every commit
+/// prompt is. The shims npm writes are a fixed template around
+/// `"%dp0%\node_modules\...\*.js"`, so the script can be started directly:
+/// the prompt then travels as an ordinary argument on the full Windows budget.
+#[cfg(windows)]
+fn npm_script_command(program: &str, path: Option<&std::ffi::OsStr>) -> Option<Command> {
+    let explicit = Path::new(program);
+    let shim = if explicit.parent().is_some_and(|parent| !parent.as_os_str().is_empty()) {
+        explicit.to_path_buf()
+    } else {
+        find_shim(program, path?)?
+    };
+    let (node, script) = npm_shim_targets(&shim)?;
+    let mut command = Command::new(node);
+    command.arg(script);
+    Some(command)
+}
+
+/// `<dir>\<name>.cmd` (or `.bat`) for the first PATH entry that has one, unless
+/// that entry already holds a real `<name>.exe`, which Windows would prefer.
+#[cfg(windows)]
+fn find_shim(program: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    if Path::new(program).extension().is_some() {
+        return None;
+    }
+    for dir in std::env::split_paths(path).filter(|dir| dir.is_absolute()) {
+        if dir.join(format!("{program}.exe")).is_file() {
+            return None;
+        }
+        for extension in ["cmd", "bat"] {
+            let candidate = dir.join(format!("{program}.{extension}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Parses the npm shim template: `"%_prog%" "%dp0%\node_modules\...\cli.js"`.
+#[cfg(windows)]
+fn npm_shim_targets(shim: &Path) -> Option<(PathBuf, PathBuf)> {
+    const SHIM_MAX_BYTES: u64 = 64 * 1024;
+    if std::fs::metadata(shim).ok()?.len() > SHIM_MAX_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(shim).ok()?;
+    let directory = shim.parent()?;
+    let script = text
+        .match_indices("%dp0%")
+        .filter_map(|(index, marker)| {
+            let rest = &text[index + marker.len()..];
+            let rest = rest.strip_prefix('\\').unwrap_or(rest);
+            let end = rest.find('"')?;
+            let relative = &rest[..end];
+            let extension = Path::new(relative).extension()?.to_str()?.to_ascii_lowercase();
+            matches!(extension.as_str(), "js" | "mjs" | "cjs").then_some(relative)
+        })
+        .map(|relative| directory.join(relative))
+        .find(|script| script.is_file())?;
+    let node = directory.join("node.exe");
+    let node = if node.is_file() { node } else { find_on_path("node.exe")? };
+    Some((node, script))
+}
+
+#[cfg(windows)]
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
 const WINDOWS_COMMAND_LIMIT: usize = 32_767; // Includes the terminating NUL.
@@ -1730,5 +2038,174 @@ index 111..222 100644\n\
         let config: serde_json::Value = serde_json::from_str(&opencode_commit_config(Some(source)).unwrap()).unwrap();
         assert_eq!(config.pointer("/provider/custom/options/baseURL").unwrap(), "https://example.com");
         assert_eq!(config.pointer("/agent/review/mode").unwrap(), "subagent");
+    }
+
+    #[test]
+    fn hazard_keys_cover_program_runners_only() {
+        for key in [
+            "filter.lfs.clean",
+            "filter.hostile.process",
+            "core.fsmonitor",
+            "core.hooksPath",
+            "core.sshCommand",
+            "core.attributesFile",
+            "core.gitProxy",
+            "diff.external",
+            "diff.mydriver.command",
+            "diff.mydriver.textconv",
+            "difftool.meld.cmd",
+            "credential.helper",
+            "credential.https://host.helper",
+            "gpg.program",
+            "commit.gpgSign",
+            "tag.gpgSign",
+            "log.showSignature",
+            "include.path",
+            "includeIf.gitdir:C:/repo/.path",
+            "submodule.lib.update",
+            "remote.origin.uploadpack",
+        ] {
+            assert!(is_hazardous_key(key), "{key} can start a program or pull in settings");
+        }
+        for key in [
+            "branch.main.remote",
+            "branch.main.merge",
+            "remote.origin.url",
+            "remote.origin.fetch",
+            "user.name",
+            "user.email",
+            "core.editor",
+            "core.pager",
+            "core.autocrlf",
+            "diff.algorithm",
+            "diff.context",
+            "log.date",
+            "pull.rebase",
+            "init.defaultBranch",
+            "status.showUntrackedFiles",
+            "push.default",
+            "merge.conflictStyle",
+        ] {
+            assert!(!is_hazardous_key(key), "{key} is routine and must not ask for trust");
+        }
+    }
+
+    fn config_records(entries: &[(&str, &str, &str, &str)]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (scope, origin, key, value) in entries {
+            bytes.extend_from_slice(scope.as_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(origin.as_bytes());
+            bytes.push(0);
+            bytes.extend_from_slice(key.as_bytes());
+            bytes.push(b'\n');
+            bytes.extend_from_slice(value.as_bytes());
+            bytes.push(0);
+        }
+        bytes
+    }
+
+    #[test]
+    fn digest_covers_repository_hazards_and_ignores_the_user_scope() {
+        let root = Path::new("C:/repo");
+        let local_config = Path::new("C:/repo/.git/config");
+        // The user's own global settings are not the repository's business.
+        let global = config_records(&[("global", "file:C:/Users/u/.gitconfig", "filter.evil.clean", "rm -rf")]);
+        assert!(digest_of(&global, root, local_config).is_hazard_free());
+        // Routine repository keys never ask for trust either.
+        let routine = config_records(&[
+            ("local", "file:.git/config", "branch.main.remote", "origin"),
+            ("local", "file:.git/config", "remote.origin.url", "https://example.com"),
+            ("worktree", "file:.git/config", "core.editor", "notepad"),
+        ]);
+        assert!(digest_of(&routine, root, local_config).is_hazard_free());
+        // A global includeIf that points inside the repository is repository-controlled.
+        let injected = config_records(&[("global", "file:C:/repo/injected.cfg", "filter.evil.clean", "run")]);
+        assert!(!digest_of(&injected, root, local_config).is_hazard_free());
+        let hazard = config_records(&[("local", "file:.git/config", "filter.hostile.clean", "cat")]);
+        let stamp = digest_of(&hazard, root, local_config);
+        assert!(!stamp.is_hazard_free());
+        assert_eq!(stamp.hazards(), ["filter.hostile.clean"]);
+        let other = digest_of(&config_records(&[("local", "file:.git/config", "filter.hostile.clean", "cat -A")]), root, local_config);
+        assert_ne!(stamp, other, "a changed command is a changed digest");
+        // The cached digest is dropped when the file behind it moves on.
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        std::fs::write(&config, b"[branch]\n").unwrap();
+        let before = digest_of(&config_records(&[("local", "file:config", "filter.x.clean", "one")]), root, &config);
+        assert!(before.is_current());
+        std::fs::write(&config, b"[branch]\nextra = 1\n").unwrap();
+        assert!(!before.is_current(), "a written config file invalidates the digest");
+    }
+
+    #[test]
+    fn approvals_are_shared_in_memory_and_never_cover_the_stripe_of_a_digest() {
+        let root = PathBuf::from("C:/repo");
+        let stamp = |value: &str| digest_of(&config_records(&[("local", "file:.git/config", "filter.x.clean", value)]), &root, Path::new("C:/repo/.git/config"));
+        let first = stamp("one");
+        let second = stamp("two");
+        assert!(!trust_approved(&root, &first));
+        remember_trust(&root, first.clone());
+        assert!(trust_approved(&root, &first), "every pane of the process sees the approval");
+        assert!(!trust_approved(&root, &second), "a different digest is not covered");
+        let clean = digest_of(&[], &root, Path::new("C:/repo/.git/config"));
+        assert!(trust_approved(&root, &clean), "nothing to run, nothing to approve");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn npm_shims_resolve_to_the_script_they_wrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("node_modules").join("faketool").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = bin.join("faketool.js");
+        std::fs::write(&script, "console.log(JSON.stringify(process.argv.slice(2)))\n").unwrap();
+        let shim = dir.path().join("faketool.cmd");
+        std::fs::write(
+            &shim,
+            "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\nendLocal & \"node\" \"%dp0%\\node_modules\\faketool\\bin\\faketool.js\" %*\r\n",
+        )
+        .unwrap();
+        let Some(node) = find_on_path("node.exe") else { return };
+        let (resolved_node, resolved_script) = npm_shim_targets(&shim).expect("npm template");
+        assert_eq!(resolved_node, node);
+        assert_eq!(resolved_script, script);
+        // The prompt a `.cmd` shim would reject reaches the script unchanged.
+        let output = Command::new(&resolved_node).arg(&resolved_script).arg("line one\nline two").output().unwrap();
+        assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("line one\\nline two"));
+        // A shim without a real script, and any other file, stay untouched.
+        assert!(npm_shim_targets(&dir.path().join("missing.cmd")).is_none());
+        std::fs::write(dir.path().join("empty.cmd"), "@echo off\r\n").unwrap();
+        assert!(npm_shim_targets(&dir.path().join("empty.cmd")).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ai_prompt_reaches_the_script_behind_an_npm_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("node_modules").join("faketool").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            bin.join("faketool.js"),
+            "console.log(process.argv[2].length + ':' + process.argv[2].includes('\\n') + ':' + (process.argv[2].match(/%/g) || []).length)\n",
+        )
+        .unwrap();
+        let shim = dir.path().join("faketool.cmd");
+        std::fs::write(
+            &shim,
+            "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\nendLocal & \"node\" \"%dp0%\\node_modules\\faketool\\bin\\faketool.js\" %*\r\n",
+        )
+        .unwrap();
+        if find_on_path("node.exe").is_none() {
+            return;
+        }
+        // Multi-line and percent signs: `cmd.exe` would reject this argument
+        // (`batch file arguments are invalid`) and expand `%`; the script gets
+        // it verbatim on the full command-line budget.
+        let prompt = format!("subject\n\n{}", "- diff line with \"quotes\" and %PATH% signs\n".repeat(400));
+        let message = ai_commit_message(dir.path(), Some(shim.to_str().unwrap()), &prompt, std::time::Duration::from_secs(60))
+            .expect("the shim must run through node");
+        assert_eq!(message.trim(), format!("{}:true:{}", prompt.len(), prompt.matches('%').count()));
     }
 }

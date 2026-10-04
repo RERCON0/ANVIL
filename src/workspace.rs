@@ -118,7 +118,7 @@ pub enum PromptKind {
     NewFile,
     NewFolder,
     Rename(String),
-    Delete(String),
+    Delete { path: String, folder: bool },
 }
 
 pub struct Prompt {
@@ -263,7 +263,8 @@ impl Workspace {
         self.log = CommitLog::default();
         self.graph.clear();
         self.prompt = None;
-        self.commit_message.clear();
+        // The draft stays: a configuration change must not eat typed or
+        // AI-generated text the user has not committed yet.
         self.log_status_seen = false;
     }
 
@@ -273,6 +274,15 @@ impl Workspace {
             ui.label(RichText::new(display(&identity.root.to_string_lossy(), 240)).color(theme::TEXT).font(theme::field_font(11.5)));
         }
         ui.label(RichText::new(strings::WORKSPACE_TRUST_HINT).color(theme::DIM).font(theme::font(12.0)));
+        if let Some(identity) = &self.pending_identity {
+            let hazards = identity.stamp.hazards();
+            if !hazards.is_empty() {
+                ui.label(RichText::new(strings::WORKSPACE_TRUST_HAZARDS).color(theme::TEXT).font(theme::font(11.5)));
+                for hazard in hazards {
+                    ui.label(RichText::new(format!("· {hazard}")).color(theme::STATUS_YELLOW).font(theme::field_font(11.0)));
+                }
+            }
+        }
         if let Some((notice, _)) = &self.notice {
             ui.label(RichText::new(notice).color(theme::STATUS_RED).font(theme::font(11.5)));
         }
@@ -792,16 +802,17 @@ impl Workspace {
             PromptKind::NewFile => strings::WORKSPACE_NEW_FILE.to_owned(),
             PromptKind::NewFolder => strings::WORKSPACE_NEW_FOLDER.to_owned(),
             PromptKind::Rename(path) => format!("{}: {path}", strings::WORKSPACE_RENAME),
-            PromptKind::Delete(path) => format!("{}: {path}", strings::WORKSPACE_DELETE),
+            PromptKind::Delete { path, .. } => format!("{}: {path}", strings::WORKSPACE_DELETE),
         };
         ui.label(RichText::new(label).color(theme::DIM).font(theme::font(11.5)));
-        if matches!(prompt.kind, PromptKind::Delete(_)) {
-            ui.label(RichText::new(strings::WORKSPACE_DELETE_HINT).color(theme::FAINT).font(theme::font(11.5)));
+        if let PromptKind::Delete { folder, .. } = prompt.kind {
+            let hint = if folder { strings::WORKSPACE_DELETE_HINT } else { strings::WORKSPACE_DELETE_FILE_HINT };
+            ui.label(RichText::new(hint).color(theme::FAINT).font(theme::font(11.5)));
         }
         let mut commit = false;
         let mut cancel = false;
         ui.horizontal(|ui| {
-            let deleting = matches!(prompt.kind, PromptKind::Delete(_));
+            let deleting = matches!(prompt.kind, PromptKind::Delete { .. });
             if !deleting {
                 let field = ui.add(
                     egui::TextEdit::singleline(&mut prompt.text)
@@ -841,7 +852,7 @@ impl Workspace {
                     self.busy = true;
                     self.send(Request::RenamePath { from, to: text });
                 }
-                PromptKind::Delete(path) => {
+                PromptKind::Delete { path, .. } => {
                     self.busy = true;
                     self.send(Request::DeletePath { path });
                 }
@@ -1280,7 +1291,7 @@ impl Workspace {
                 ui.close_menu();
             }
             if ui.button(strings::WORKSPACE_DELETE).clicked() {
-                self.prompt = Some(Prompt { kind: PromptKind::Delete(path.clone()), text: String::new(), focus: false });
+                self.prompt = Some(Prompt { kind: PromptKind::Delete { path: path.clone(), folder: row.folder }, text: String::new(), focus: false });
                 ui.close_menu();
             }
         });
@@ -1882,7 +1893,6 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
     std::thread::spawn(move || {
         let mut root: Option<PathBuf> = None;
         let mut cwd: Option<PathBuf> = None;
-        let mut approved: Option<git::RepositoryIdentity> = None;
         while let Ok((expected_root, request)) = request_rx.recv() {
             let send = |response: Response| {
                 let _ = response_tx.send(response);
@@ -1907,7 +1917,6 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
             let identity = match identity {
                 Ok(identity) => identity,
                 Err(error) => {
-                    approved = None;
                     send(Response::TrustRequired { identity: None, error: Some(error) });
                     continue;
                 }
@@ -1921,22 +1930,22 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                         && root.as_ref() == Some(&shown.root) && expected_root.as_ref() == Some(&shown.root)
                 });
                 if !current_matches {
-                    approved = None;
                     root = identity.as_ref().map(|identity| identity.root.clone());
                     send(Response::TrustRequired { identity, error: Some(strings::WORKSPACE_TRUST_STALE.to_owned()) });
                     continue;
                 }
-                approved = identity.clone();
+                if let Some(current) = &identity {
+                    git::remember_trust(&current.root, current.stamp.clone());
+                }
                 send(Response::Trusted(identity.as_ref().unwrap().clone()));
             }
+            // Hazard-free repositories never ask; a hazardous digest needs an
+            // approval that every pane and window of this process shares.
             if let Some(current) = &identity {
-                if !approved.as_ref().is_some_and(|approved| approved.root == current.root && approved.stamp == current.stamp) {
-                    approved = None;
+                if !git::trust_approved(&current.root, &current.stamp) {
                     send(Response::TrustRequired { identity, error: None });
                     continue;
                 }
-            } else {
-                approved = None;
             }
             match request {
                 Request::Refresh { .. } | Request::Approve { .. } => {
@@ -1991,20 +2000,17 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                         git::ai_commit_message(&git::ai_workdir(), command.as_deref(), &prompt, git::AI_TIMEOUT)
                     });
                     // An AI subprocess can outlive a configuration change; never
-                    // publish its result using approval for the old stamp.
-                    let current = root.as_ref().map_or(Ok(None), |root| {
-                        git::repository_stamp(root).map(|stamp| Some(git::RepositoryIdentity { root: root.clone(), stamp }))
-                    });
+                    // publish its result using approval for the old digest.
+                    let current = root.as_ref().ok_or_else(|| strings::WORKSPACE_NO_REPO.to_owned())
+                        .and_then(|root| git::repository_stamp(root).map(|stamp| git::RepositoryIdentity { root: root.clone(), stamp }));
                     match current {
-                        Ok(identity) if identity.as_ref().zip(approved.as_ref()).is_some_and(|(current, approved)| current.root == approved.root && current.stamp == approved.stamp) => {
+                        Ok(identity) if git::trust_approved(&identity.root, &identity.stamp) => {
                             send(Response::AiMessage(result));
                         }
                         Ok(identity) => {
-                            approved = None;
-                            send(Response::TrustRequired { identity, error: Some(strings::WORKSPACE_TRUST_STALE.to_owned()) });
+                            send(Response::TrustRequired { identity: Some(identity), error: Some(strings::WORKSPACE_TRUST_STALE.to_owned()) });
                         }
                         Err(error) => {
-                            approved = None;
                             send(Response::TrustRequired { identity: None, error: Some(error) });
                         }
                     }
@@ -2205,7 +2211,7 @@ mod tests {
             ..Default::default()
         };
         workspace.selected.insert("old.txt".to_owned());
-        workspace.prompt = Some(Prompt { kind: PromptKind::Delete("src".to_owned()), text: String::new(), focus: false });
+        workspace.prompt = Some(Prompt { kind: PromptKind::Delete { path: "src".to_owned(), folder: true }, text: String::new(), focus: false });
 
         let (request_tx, request_rx) = mpsc::channel();
         let (response_tx, response_rx) = mpsc::channel();
@@ -2234,15 +2240,21 @@ mod tests {
         command.output().is_ok_and(|out| out.status.success())
     }
 
+    /// Approves the repository when its configuration is hazardous and returns
+    /// the root. Hazard-free fixtures reply with status immediately: nothing in
+    /// them can run a program, so the panel never asks.
     fn approve_worker(tx: &Sender<Envelope>, rx: &Receiver<Response>) -> Option<PathBuf> {
-        let Response::TrustRequired { identity: Some(identity), error: None } =
-            rx.recv_timeout(Duration::from_secs(20)).expect("trust prompt")
-        else { panic!("repository must require explicit trust first") };
-        let shown = Some(identity.root.clone());
-        tx.send((shown.clone(), Request::Approve { identity })).unwrap();
-        assert!(matches!(rx.recv_timeout(Duration::from_secs(20)).unwrap(), Response::Trusted(_)));
-        assert!(matches!(rx.recv_timeout(Duration::from_secs(20)).unwrap(), Response::Status(_, _)));
-        shown
+        match rx.recv_timeout(Duration::from_secs(20)).expect("worker response") {
+            Response::TrustRequired { identity: Some(identity), error: None } => {
+                let shown = Some(identity.root.clone());
+                tx.send((shown.clone(), Request::Approve { identity })).unwrap();
+                assert!(matches!(rx.recv_timeout(Duration::from_secs(20)).unwrap(), Response::Trusted(_)));
+                assert!(matches!(rx.recv_timeout(Duration::from_secs(20)).unwrap(), Response::Status(_, _)));
+                shown
+            }
+            Response::Status(_, root) => root,
+            _ => panic!("the worker must either trust the repository or report its status"),
+        }
     }
 
     #[test]
@@ -2277,8 +2289,9 @@ mod tests {
         };
         workspace.poll(root.clone());
         apply_response(&mut workspace);
-        let identity = workspace.pending_identity.clone().expect("explicit trust before status");
-        workspace.send(Request::Approve { identity });
+        if let Some(identity) = workspace.pending_identity.clone() {
+            workspace.send(Request::Approve { identity });
+        }
         while workspace.log.commits.is_empty() {
             apply_response(&mut workspace);
         }
@@ -2745,7 +2758,7 @@ mod tests {
         required();
         assert!(!marker.exists(), "automatic polls and diff requests must stay gated");
 
-        assert!(git(root, &["config", "audit.changed", "one"]));
+        assert!(git(root, &["config", "filter.hostile.clean", &format!("{command} # rotated")]));
         tx.send((shown.clone(), Request::Approve { identity: first })).unwrap();
         let current = required();
         assert!(!marker.exists(), "stale configuration approval must not execute Git");
@@ -2759,12 +2772,50 @@ mod tests {
         assert!(matches!(wait(), Response::Status(_, _)));
         assert!(marker.exists(), "the real clean filter must run only after valid approval");
         std::fs::remove_file(&marker).unwrap();
-        assert!(git(root, &["config", "audit.changed", "two"]));
+        // Only hazardous keys revoke: routine tracking keys (`branch.*`,
+        // `remote.*`) must not, or every push --set-upstream would ask again.
+        assert!(git(root, &["config", "branch.main.remote", "origin"]));
+        assert!(git(root, &["config", "remote.origin.url", "."]));
+        tx.send((shown.clone(), Request::Log)).unwrap();
+        assert!(matches!(wait(), Response::Log(_)), "tracking keys keep the approval");
+        assert!(git(root, &["config", "core.hooksPath", ".git/hooks"]));
         tx.send((shown.clone(), Request::Stage { paths: vec!["victim.txt".to_owned()], staged: true })).unwrap();
         required();
         tx.send((shown, Request::Approve { identity: current })).unwrap();
         required();
         assert!(!marker.exists(), "config changes revoke approval before staging or stale reapproval");
+    }
+
+    #[test]
+    fn trust_survives_a_second_pane_and_routine_git_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        if !git(root, &["init", "--quiet", "--initial-branch=main"]) { return; }
+        assert!(git(root, &["config", "user.email", "anvil@test"]));
+        assert!(git(root, &["config", "user.name", "ANVIL test"]));
+        assert!(git(root, &["config", "filter.hostile.clean", "cat"]));
+        let (first_tx, first_rx) = spawn_worker();
+        first_tx.send((None, Request::Refresh { cwd: root.to_owned() })).unwrap();
+        let Response::TrustRequired { identity: Some(identity), .. } = first_rx.recv_timeout(Duration::from_secs(20)).unwrap() else {
+            panic!("a clean filter must ask for trust");
+        };
+        let shown = Some(identity.root.clone());
+        assert_eq!(identity.stamp.hazards(), ["filter.hostile.clean"], "the prompt names what can run");
+        first_tx.send((shown.clone(), Request::Approve { identity })).unwrap();
+        assert!(matches!(first_rx.recv_timeout(Duration::from_secs(20)).unwrap(), Response::Trusted(_)));
+        assert!(matches!(first_rx.recv_timeout(Duration::from_secs(20)).unwrap(), Response::Status(_, _)));
+        // What `push --set-upstream` and `checkout -b` write must not re-ask.
+        assert!(git(root, &["config", "branch.main.remote", "origin"]));
+        assert!(git(root, &["config", "branch.main.merge", "refs/heads/main"]));
+        assert!(git(root, &["config", "remote.origin.url", "."]));
+        // A second pane of the same repository runs its own worker: no prompt.
+        let (second_tx, second_rx) = spawn_worker();
+        second_tx.send((None, Request::Refresh { cwd: root.to_owned() })).unwrap();
+        assert!(matches!(second_rx.recv_timeout(Duration::from_secs(20)).unwrap(), Response::Status(_, _)));
+        // A hazardous change still revokes.
+        assert!(git(root, &["config", "core.hooksPath", ".git/hooks"]));
+        second_tx.send((None, Request::Refresh { cwd: root.to_owned() })).unwrap();
+        assert!(matches!(second_rx.recv_timeout(Duration::from_secs(20)).unwrap(), Response::TrustRequired { .. }));
     }
 
     #[test]
@@ -2829,7 +2880,8 @@ mod tests {
         tx.send(Response::TrustRequired { identity: None, error: Some("configuration unavailable".to_owned()) }).unwrap();
         workspace.absorb();
         assert!(!workspace.busy && !workspace.ai_generating && workspace.trust_required);
-        assert!(workspace.log.commits.is_empty() && workspace.commit_message.is_empty() && workspace.diff_text.is_empty());
+        assert!(workspace.log.commits.is_empty() && workspace.diff_text.is_empty());
+        assert_eq!(workspace.commit_message, "old draft", "revocation must not eat the commit draft");
     }
 
     #[test]

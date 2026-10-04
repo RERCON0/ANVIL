@@ -84,7 +84,7 @@ mod recycling {
         FileOperation, IFileOperation, IFileOperationProgressSink,
         IFileOperationProgressSink_Impl, IShellItem, SHCreateItemFromParsingName,
         FOFX_ADDUNDORECORD, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE,
-        FOF_NOERRORUI, FOF_NO_CONNECTED_ELEMENTS, FOF_SILENT,
+        FOF_NOERRORUI, FOF_NOCONFIRMATION, FOF_NO_CONNECTED_ELEMENTS, FOF_SILENT,
         TSF_DELETE_RECYCLE_IF_POSSIBLE,
     };
 
@@ -163,7 +163,7 @@ mod recycling {
                 unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER) }?;
             unsafe {
                 operation.SetOperationFlags(
-                    FOFX_RECYCLEONDELETE | FOFX_ADDUNDORECORD | FOF_NOERRORUI
+                    FOFX_RECYCLEONDELETE | FOFX_ADDUNDORECORD | FOF_NOERRORUI | FOF_NOCONFIRMATION
                         | FOFX_EARLYFAILURE | FOF_SILENT | FOF_NO_CONNECTED_ELEMENTS,
                 )?;
             }

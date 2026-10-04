@@ -48,6 +48,31 @@ fn repo() -> Option<tempfile::TempDir> {
 }
 
 #[test]
+fn trust_digest_ignores_routine_keys_and_tracks_program_runners() {
+    let Some(dir) = repo() else { return };
+    let root = dir.path();
+    let clean = git::repository_stamp(root).expect("stamp");
+    assert!(clean.is_hazard_free(), "a plain repository has nothing to approve");
+    assert!(git::trust_approved(root, &clean), "nothing to run, nothing to ask");
+    // Keys `push --set-upstream`, `checkout -b`, `remote add` and the editor
+    // write are routine: they must not invalidate an approval.
+    run(root, &["config", "branch.main.remote", "origin"]);
+    run(root, &["config", "branch.main.merge", "refs/heads/main"]);
+    run(root, &["config", "remote.origin.url", "."]);
+    run(root, &["config", "core.editor", "notepad"]);
+    let after_routine = git::repository_stamp(root).expect("stamp");
+    assert_eq!(clean, after_routine, "tracking keys are not a configuration change");
+    // A filter command is not routine: it runs on status, diff and add.
+    run(root, &["config", "filter.hostile.clean", "cat"]);
+    let hazardous = git::repository_stamp(root).expect("stamp");
+    assert_ne!(after_routine, hazardous);
+    assert_eq!(hazardous.hazards(), ["filter.hostile.clean"]);
+    assert!(!git::trust_approved(root, &hazardous), "a filter needs approval");
+    git::remember_trust(root, hazardous.clone());
+    assert!(git::trust_approved(root, &hazardous), "the process remembers the approval");
+}
+
+#[test]
 fn detects_reads_stages_and_commits() {
     let Some(dir) = repo() else { return };
     let root = git::find_root(dir.path()).expect("repository root");
