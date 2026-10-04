@@ -108,6 +108,7 @@ pub struct SettingsContext<'a> {
     pub keymap_rows: Vec<(String, Vec<String>)>,
     pub profiles: Vec<(String, String)>,
     pub fonts: &'a [String],
+    pub claude_line: &'a crate::claude_setup::LineState,
 }
 
 pub struct SettingsOutcome {
@@ -478,30 +479,96 @@ fn section_hotkeys(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut Se
 }
 
 fn section_claude(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut SettingsOutcome) {
+    use crate::claude_setup::LineState;
     theme::section(ui, strings::SETTINGS_CLAUDE);
+    let (current, color) = match cx.claude_line {
+        LineState::Missing => (strings::SETTINGS_CLAUDE_LINE_MISSING.to_owned(), theme::colors().dim),
+        LineState::Anvil => (strings::SETTINGS_CLAUDE_LINE_ANVIL.to_owned(), theme::colors().status_green),
+        LineState::Foreign(command) => (format!("{} {command}", strings::SETTINGS_CLAUDE_LINE_FOREIGN), theme::colors().text),
+        LineState::Broken(error) => {
+            (format!("{} {error}", strings::SETTINGS_CLAUDE_LINE_BROKEN), theme::colors().status_yellow)
+        }
+    };
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(strings::SETTINGS_CLAUDE_NOW).color(theme::colors().dim).font(theme::font(12.0)));
+        ui.add(egui::Label::new(RichText::new(current).color(color).font(theme::field_font(12.0))).truncate());
+    });
+    ui.add_space(4.0);
+
     let enabled = cx.config.claude_status.enabled;
     if theme::choice(ui, strings::SETTINGS_CLAUDE_ENABLED, enabled).clicked() {
         cx.config.claude_status.enabled = !enabled;
         outcome.changed = true;
         outcome.install_claude = !enabled;
     }
-    let state_text = if cx.config.claude_status.declined_command.is_some() {
-        RichText::new(strings::SETTINGS_CLAUDE_DECLINED).color(theme::colors().status_yellow)
-    } else if enabled {
-        RichText::new(if cx.config.claude_status.installed_command.is_some() {
-            strings::SETTINGS_CLAUDE_CONNECTED
-        } else {
-            strings::SETTINGS_CLAUDE_PENDING
-        }).color(theme::colors().status_green)
-    } else {
-        RichText::new(strings::SETTINGS_CLAUDE_NOT_CONNECTED).color(theme::colors().dim)
-    };
-    ui.label(state_text.font(theme::font(12.0)));
+    ui.label(RichText::new(strings::SETTINGS_CLAUDE_ENABLED_HINT).color(theme::colors().faint).font(theme::font(11.5)));
+    if cx.config.claude_status.declined_command.is_some() {
+        ui.label(RichText::new(strings::SETTINGS_CLAUDE_DECLINED).color(theme::colors().status_yellow).font(theme::font(12.0)));
+    } else if enabled && cx.config.claude_status.installed_command.is_none() {
+        ui.label(RichText::new(strings::SETTINGS_CLAUDE_PENDING).color(theme::colors().status_green).font(theme::font(12.0)));
+    }
+    ui.add_space(6.0);
+
+    let badge = cx.config.claude_status.badge;
+    if theme::choice(ui, strings::SETTINGS_CLAUDE_BADGE, badge).clicked() {
+        cx.config.claude_status.badge = !badge;
+        outcome.changed = true;
+    }
+    let ours = matches!(cx.claude_line, LineState::Anvil);
+    let status = &mut cx.config.claude_status;
+    let mut changed = false;
+    egui::Grid::new("claude-fields").num_columns(3).spacing([18.0, 2.0]).show(ui, |ui| {
+        let head = |text: &str| RichText::new(text).color(theme::colors().faint).font(theme::font(11.5));
+        ui.label(head(strings::SETTINGS_CLAUDE_FIELDS));
+        ui.label(head(strings::SETTINGS_CLAUDE_IN_CLAUDE));
+        ui.label(head(strings::SETTINGS_CLAUDE_UNDER_TAB));
+        ui.end_row();
+        let line = &mut status.line_fields;
+        let tab = &mut status.badge_fields;
+        let rows: [(&str, &mut bool, Option<&mut bool>); 7] = [
+            (strings::SETTINGS_CLAUDE_FIELD_MODEL, &mut line.model, Some(&mut tab.model)),
+            (strings::SETTINGS_CLAUDE_FIELD_DIR, &mut line.dir, None),
+            (strings::SETTINGS_CLAUDE_FIELD_BRANCH, &mut line.branch, None),
+            (strings::SETTINGS_CLAUDE_FIELD_CONTEXT, &mut line.context, Some(&mut tab.context)),
+            (strings::SETTINGS_CLAUDE_FIELD_FIVE_HOUR, &mut line.five_hour, Some(&mut tab.five_hour)),
+            (strings::SETTINGS_CLAUDE_FIELD_SEVEN_DAY, &mut line.seven_day, Some(&mut tab.seven_day)),
+            (strings::SETTINGS_CLAUDE_FIELD_AGENT, &mut line.agent, Some(&mut tab.agent)),
+        ];
+        for (label, in_claude, under_tab) in rows {
+            ui.label(RichText::new(label).color(theme::colors().dim).font(theme::font(12.0)));
+            ui.add_enabled_ui(ours, |ui| {
+                if theme::choice(ui, "", *in_claude).clicked() {
+                    *in_claude = !*in_claude;
+                    changed = true;
+                }
+            });
+            match under_tab {
+                Some(value) => {
+                    ui.add_enabled_ui(ours && badge, |ui| {
+                        if theme::choice(ui, "", *value).clicked() {
+                            *value = !*value;
+                            changed = true;
+                        }
+                    });
+                }
+                None => {
+                    ui.label(RichText::new("—").color(theme::colors().faint));
+                }
+            }
+            ui.end_row();
+        }
+    });
+    outcome.changed |= changed;
+    if !ours {
+        ui.label(RichText::new(strings::SETTINGS_CLAUDE_FIELDS_NEED_ANVIL).color(theme::colors().faint).font(theme::font(11.5)));
+    }
+    ui.add_space(6.0);
     ui.label(strings::SETTINGS_CLAUDE_GLOBAL_HINT);
     if enabled && ui.add(theme::ghost_button(strings::SETTINGS_CLAUDE_INSTALL)).clicked() {
         outcome.install_claude = true;
     }
-    if !enabled && (cx.config.claude_status.installed_command.is_some() || cx.config.claude_status.previous_status_line.is_some())
+    if !enabled
+        && (cx.config.claude_status.installed_command.is_some() || cx.config.claude_status.previous_status_line.is_some())
         && ui.add(theme::ghost_button(strings::SETTINGS_CLAUDE_RESTORE)).clicked()
     {
         outcome.restore_claude = true;

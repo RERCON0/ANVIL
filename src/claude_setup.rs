@@ -65,6 +65,30 @@ fn command_of(status_line: &Value) -> String {
     }
 }
 
+/// What Claude Code's user settings currently run as their status line, for
+/// the settings page. Read only.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LineState {
+    Missing,
+    /// Any ANVIL helper, from this build or another.
+    Anvil,
+    Foreign(String),
+    Broken(String),
+}
+
+pub fn describe(settings: Option<&str>) -> LineState {
+    let Some(text) = settings else { return LineState::Missing };
+    let map = match parse_object(text) {
+        Ok(map) => map,
+        Err(e) => return LineState::Broken(e),
+    };
+    match map.get("statusLine").map(command_of) {
+        None => LineState::Missing,
+        Some(command) if is_anvil_status_command(&command) => LineState::Anvil,
+        Some(command) => LineState::Foreign(command),
+    }
+}
+
 pub fn plan(settings: Option<&str>, ours: &str, declined: Option<&str>) -> Plan {
     let Some(text) = settings else { return Plan::Install };
     let map = match parse_object(text) {
@@ -267,6 +291,22 @@ mod tests {
 
         assert_eq!(uninstall(OWNER, OURS, None).unwrap(), None, "not ours: untouched");
         assert!(uninstall("{ broken", OURS, None).is_err());
+    }
+
+    #[test]
+    fn describes_the_current_status_line() {
+        assert_eq!(describe(None), LineState::Missing);
+        assert_eq!(describe(Some("{}")), LineState::Missing);
+        assert_eq!(
+            describe(Some(r#"{"statusLine": {"type": "command", "command": "\"C:/Tools/anvil-claude-status.exe\""}}"#)),
+            LineState::Anvil
+        );
+        assert_eq!(
+            describe(Some(r#"{"statusLine": {"type": "command", "command": "node C:/scripts/statusline.mjs"}}"#)),
+            LineState::Foreign("node C:/scripts/statusline.mjs".into())
+        );
+        assert!(matches!(describe(Some("{ broken")), LineState::Broken(_)));
+        assert!(matches!(describe(Some("[]")), LineState::Broken(_)));
     }
 
     #[test]

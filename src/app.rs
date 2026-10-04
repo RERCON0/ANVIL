@@ -104,6 +104,9 @@ pub struct AnvilApp {
     window_state: Option<WindowState>,
     window_maximized: bool,
     status_dir: PathBuf,
+    /// Claude Code's statusLine as the settings page shows it, with the
+    /// settings.json mtime it was read at.
+    claude_line: (Option<SystemTime>, crate::claude_setup::LineState),
     run_dir: Option<PathBuf>,
     repaint: Option<Arc<dyn Fn() + Send + Sync>>,
     inherited_prompt_command: Option<String>,
@@ -169,6 +172,7 @@ impl AnvilApp {
             window_state: session_window.map(|w| WindowState { maximized: false, ..w }),
             window_maximized: session_window.map(|w| w.maximized).unwrap_or(false),
             status_dir,
+            claude_line: (None, crate::claude_setup::LineState::Missing),
             run_dir: None,
             repaint: None,
             inherited_prompt_command: std::env::var("PROMPT_COMMAND").ok(),
@@ -452,18 +456,35 @@ impl AnvilApp {
         }
     }
 
+    /// Re-reads Claude Code's user settings when they changed (one stat per
+    /// frame, only while the settings page is open).
+    fn refresh_claude_line(&mut self) {
+        let claude_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
+        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        let Some(path) = claude_setup::settings_path(claude_dir.as_deref(), home.as_deref()) else { return };
+        let mtime = file_mtime(&path);
+        if mtime.is_some() && mtime == self.claude_line.0 {
+            return;
+        }
+        let text = std::fs::read_to_string(&path).ok();
+        self.claude_line = (mtime, claude_setup::describe(text.as_deref()));
+    }
+
     fn show_settings(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        self.refresh_claude_line();
         let rows = self.keymap.describe();
         // Edit a copy: apply_config must compare the new values against the
         // configuration that is actually in effect, or nothing would ever
         // re-install fonts, switch the palette or rebuild the profile list.
         let mut next = self.config.clone();
         let outcome = {
+            let claude_line = self.claude_line.1.clone();
             let mut context = crate::settings_ui::SettingsContext {
                 config: &mut next,
                 keymap_rows: rows,
                 profiles: self.profiles.iter().map(|p| (p.id.clone(), p.name.clone())).collect(),
                 fonts: &self.font_families,
+                claude_line: &claude_line,
             };
             crate::settings_ui::show(ui, rect, &mut context, &mut self.settings)
         };
