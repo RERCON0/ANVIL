@@ -33,6 +33,8 @@ pub struct WorkspaceConfig {
     /// CLI that writes the commit message (claude, opencode, codex, gemini,
     /// aider or a full command line). None: detect the CLI running in the pane.
     pub ai_commit_command: Option<String>,
+    /// OpenCode `provider/model` for commit messages. None: the CLI default.
+    pub ai_commit_model: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -95,6 +97,9 @@ pub enum Bell {
     Off,
     Visual,
 }
+
+/// Largest scrollback the settings page offers (lines per pane).
+pub const MAX_SCROLLBACK: usize = 1_000_000;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -198,7 +203,7 @@ impl Config {
             }
         };
         match serde_json::from_str::<Config>(&text) {
-            Ok(config) => LoadOutcome { config, notice: None },
+            Ok(config) => LoadOutcome { config: config.sanitized(), notice: None },
             Err(e) => {
                 log::warn!("broken {}: {e}", path.display());
                 let secs = std::time::SystemTime::now()
@@ -218,7 +223,22 @@ impl Config {
     /// the file; only startup treats a broken file as corruption.
     pub fn load_for_reload(path: &Path) -> Result<Config, String> {
         let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        serde_json::from_str::<Config>(&text).map_err(|e| e.to_string())
+        serde_json::from_str::<Config>(&text).map(Config::sanitized).map_err(|e| e.to_string())
+    }
+
+    /// Values a hand-edited file may hold out of range, brought into the
+    /// ranges the settings page allows: the font size goes straight into the
+    /// font atlas (0 or 1e9 points is a crash or a giant allocation) and the
+    /// scrollback is allocated per pane.
+    fn sanitized(mut self) -> Config {
+        use crate::term::view::{MAX_FONT_SIZE, MIN_FONT_SIZE};
+        self.font.size = if self.font.size.is_finite() {
+            self.font.size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
+        } else {
+            Config::default().font.size
+        };
+        self.terminal.scrollback = self.terminal.scrollback.min(MAX_SCROLLBACK);
+        self
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
@@ -289,6 +309,21 @@ mod tests {
         assert!(c.claude_status.enabled);
     }
 
+    /// A hand-edited size went straight into the font atlas: 0 or 1e9 points
+    /// (or a huge scrollback) is a crash or a gigabyte allocation at start.
+    #[test]
+    fn out_of_range_values_are_clamped_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        for (size, expected) in [("0", 6.0), ("1e9", 48.0), ("-3", 6.0), ("14", 14.0)] {
+            std::fs::write(&path, format!(r#"{{"version":1,"font":{{"size":{size}}}}}"#)).unwrap();
+            assert_eq!(Config::load(&path).config.font.size, expected, "size {size}");
+            assert_eq!(Config::load_for_reload(&path).unwrap().font.size, expected, "reload, size {size}");
+        }
+        std::fs::write(&path, r#"{"version":1,"terminal":{"scrollback":999999999999}}"#).unwrap();
+        assert_eq!(Config::load(&path).config.terminal.scrollback, MAX_SCROLLBACK);
+    }
+
     #[test]
     fn broken_file_is_set_aside() {
         let dir = tempfile::tempdir().unwrap();
@@ -325,6 +360,17 @@ mod tests {
             serde_json::json!({"version": 1, "font": {"size": 13.0}, "hotkeys": {"split-right": ["Ctrl-Alt-S"]}})
         );
         assert_eq!(Config::load(&path).config, c);
+    }
+
+    #[test]
+    fn selected_commit_model_survives_configuration_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = Config::default();
+        config.workspace.ai_commit_command = Some("opencode".to_owned());
+        config.workspace.ai_commit_model = Some("deepseek/deepseek-flash".to_owned());
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path).config.workspace, config.workspace);
     }
 
     #[test]

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::TermMode;
 use anvil::term::pane::{bundled_conpty_loaded, Pane, PaneEvent, SpawnOptions};
 use anvil::term::style::Palette;
@@ -145,6 +146,17 @@ fn tracks_reported_working_directory() {
     let pane = probe(&["cwd"]);
     assert!(wait_until(Duration::from_secs(10), || screen_text(&pane).contains("DONE")));
     assert_eq!(pane.current_dir(), Some(PathBuf::from("C:\\Windows")));
+}
+
+/// The settings page applies at once, but a changed scrollback (and word
+/// separators) used to reach only panes opened afterwards.
+#[test]
+fn scrollback_setting_reaches_a_running_pane() {
+    let pane = spawn("cmd.exe", &["/c", "ping -n 2 127.0.0.1 >nul & for /L %i in (1,1,200) do @echo %i"]);
+    pane.set_options(alacritty_terminal::vte::ansi::CursorStyle::default(), 20, " ");
+    wait_exit(&pane);
+    let history = pane.term.lock().grid().history_size();
+    assert!(history <= 20, "history of {history} lines kept with a 20-line scrollback");
 }
 
 /// Benchmark (run with `cargo test --test conpty -- --ignored --nocapture`):

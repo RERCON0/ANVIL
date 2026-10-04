@@ -83,6 +83,7 @@ impl Status {
 /// huge output must never pin the panel's worker thread forever.
 const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const GIT_TIMEOUT_NETWORK: std::time::Duration = std::time::Duration::from_secs(120);
+const GIT_TIMEOUT_COMMIT: std::time::Duration = std::time::Duration::from_secs(600);
 const GIT_MAX_OUTPUT: usize = 8 * 1024 * 1024;
 
 /// Runs `git` in `root` and returns stdout; stderr becomes the error text.
@@ -94,30 +95,84 @@ pub fn run_git_timeout(root: &Path, args: &[&str], timeout: std::time::Duration)
     run_git_capped(root, args, timeout, GIT_MAX_OUTPUT)
 }
 
-/// Spawns `git` with prompts disabled, literal pathspecs and a hard deadline.
-fn run_git_capped(root: &Path, args: &[&str], timeout: std::time::Duration, max_bytes: usize) -> Result<Vec<u8>, String> {
+/// `git` in `root`, configured the same way for every call the panel makes.
+/// The panel follows the shell into any folder, so the repository's own
+/// config must not be able to run code on a mere poll, and the user's config
+/// must not change the output the parsers read.
+fn git_command(root: &Path) -> Command {
     let mut command = Command::new("git");
     command
-        .args(args)
+        // Command-line config wins over the repository's: a repo-local
+        // fsmonitor hook would otherwise run on every status refresh, and
+        // quotePath would C-quote non-ASCII names in diff headers.
+        .args(["-c", "core.fsmonitor=false", "-c", "core.quotePath=false"])
         .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         // Never let git ask a human: no terminal prompts, no GUI helpers, and
         // treat every path we pass as a literal, not a pathspec pattern.
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
         .env("GIT_ASKPASS", "")
-        .env("GIT_LITERAL_PATHSPECS", "1");
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        // The background poll must not take index.lock to refresh stat data:
+        // a `git add` or commit in the shell next to it would then fail.
+        .env("GIT_OPTIONAL_LOCKS", "0");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let mut child = command.spawn().map_err(|e| format!("git: {e}"))?;
+    command
+}
+
+/// Spawns `git` with prompts disabled, literal pathspecs and a hard deadline.
+fn run_git_capped(root: &Path, args: &[&str], timeout: std::time::Duration, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut command = git_command(root);
+    command.args(args);
+    let label = format!("git {}", args.first().copied().unwrap_or(""));
+    let (success, stdout, stderr) = run_bounded(command, &label, timeout, max_bytes, None)?;
+    if success {
+        Ok(stdout)
+    } else {
+        Err(String::from_utf8_lossy(&stderr).trim().to_owned())
+    }
+}
+
+/// Runs `command` without a console, feeding it `input` (or no stdin),
+/// keeping at most `max_bytes` of each output stream and killing it at
+/// `timeout`: a hung fetch, a credential prompt or a CLI that never answers
+/// must not pin the panel's worker thread. `(success, stdout, stderr)`.
+fn run_bounded(
+    mut command: Command,
+    label: &str,
+    timeout: std::time::Duration,
+    max_bytes: usize,
+    input: Option<Vec<u8>>,
+) -> Result<(bool, Vec<u8>, Vec<u8>), String> {
+    command
+        .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = command.spawn().map_err(|e| format!("{label}: {e}"))?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        // Written on its own thread: a child that answers before reading all
+        // of its input would otherwise deadlock against the full output pipe.
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&input);
+        });
+    }
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
+    // Each stream is drained on its own thread and handed over through a
+    // channel, never joined: a grandchild (a hook, ssh) that inherited the
+    // pipe can keep it open long after the process itself is gone.
     let reader = |mut stream: Box<dyn std::io::Read + Send>| {
+        let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buffer = Vec::new();
             let mut chunk = [0u8; 64 * 1024];
@@ -132,11 +187,12 @@ fn run_git_capped(root: &Path, args: &[&str], timeout: std::time::Duration, max_
                     }
                 }
             }
-            buffer
-        })
+            let _ = tx.send(buffer);
+        });
+        rx
     };
-    let stdout_reader = reader(Box::new(stdout));
-    let stderr_reader = reader(Box::new(stderr));
+    let stdout_rx = reader(Box::new(stdout));
+    let stderr_rx = reader(Box::new(stderr));
 
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
@@ -145,21 +201,21 @@ fn run_git_capped(root: &Path, args: &[&str], timeout: std::time::Duration, max_
             Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(format!("git {} не ответил за {} с", args.first().copied().unwrap_or(""), timeout.as_secs()));
+                return Err(format!("{label} не ответил за {} с", timeout.as_secs()));
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
-            Err(e) => return Err(format!("git: {e}")),
+            Err(e) => return Err(format!("{label}: {e}")),
         }
     };
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
-    if status.success() {
-        Ok(stdout)
-    } else {
-        Err(String::from_utf8_lossy(&stderr).trim().to_owned())
-    }
+    // The process has exited; its own output is complete. Wait a little for
+    // the pipes to close, but never longer than the deadline allows.
+    let collect = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        rx.recv_timeout(left.max(std::time::Duration::from_millis(500))).unwrap_or_default()
+    };
+    let stdout = collect(stdout_rx);
+    let stderr = collect(stderr_rx);
+    Ok((status.success(), stdout, stderr))
 }
 
 /// True for a full object id (sha-1 or sha-256) — the only hashes ever passed
@@ -208,7 +264,11 @@ pub fn resolve_path(root: &Path, path: &str) -> Result<PathBuf, String> {
     loop {
         match std::fs::canonicalize(&probe) {
             Ok(canonical) => {
-                if canonical == canonical_root || !canonical.starts_with(&canonical_root) {
+                // The nearest existing ancestor may be the root itself (a new
+                // file at the top level); the target itself may not be the
+                // root (a junction pointing back at it).
+                let is_root = canonical == canonical_root && probe == full;
+                if is_root || !canonical.starts_with(&canonical_root) {
                     return Err(inside.to_owned());
                 }
                 return Ok(full);
@@ -234,10 +294,10 @@ pub fn find_root(cwd: &Path) -> Option<PathBuf> {
 pub fn status(root: &Path) -> Result<Status, String> {
     let raw = run_git_bytes(root, &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"])?;
     let mut status = parse_status(&raw);
-    if let Ok(numstat) = run_git(root, &["diff", "--numstat", "-z", "--no-renames"]) {
+    if let Ok(numstat) = run_git(root, &["diff", "--no-ext-diff", "--no-textconv", "--numstat", "-z", "--no-renames"]) {
         apply_numstat(&mut status.changes, &parse_numstat(numstat.as_bytes()), false);
     }
-    if let Ok(numstat) = run_git(root, &["diff", "--cached", "--numstat", "-z", "--no-renames"]) {
+    if let Ok(numstat) = run_git(root, &["diff", "--no-ext-diff", "--no-textconv", "--cached", "--numstat", "-z", "--no-renames"]) {
         apply_numstat(&mut status.changes, &parse_numstat(numstat.as_bytes()), true);
     }
     status.additions = status.changes.iter().map(|c| c.additions).sum();
@@ -503,7 +563,7 @@ pub fn commit_detail(root: &Path, hash: &str) -> Result<CommitDetail, String> {
     // `--end-of-options` keeps a revision from ever being read as an option,
     // so every option must precede it: git rejects options that follow.
     let name_status = run_git_bytes(root, &["show", "--no-color", "--format=", "--name-status", "-z", "--end-of-options", hash])?;
-    let numstat = run_git_bytes(root, &["show", "--no-color", "--format=", "--numstat", "-z", "--end-of-options", hash])?;
+    let numstat = run_git_bytes(root, &["show", "--no-color", "--no-ext-diff", "--no-textconv", "--format=", "--numstat", "-z", "--end-of-options", hash])?;
     let stats = parse_numstat(&numstat);
     let mut files = Vec::new();
     let mut records = name_status.split(|b| *b == 0).filter(|record| !record.is_empty());
@@ -537,36 +597,71 @@ pub fn commit_detail(root: &Path, hash: &str) -> Result<CommitDetail, String> {
     let header = run_git(root, &["show", "--no-patch", "--format=%H%n%an <%ae>%n%ci%n%s%n%b", "--end-of-options", hash]).unwrap_or_default();
     let patch = run_git(
         root,
-        &["show", "--no-color", "--no-ext-diff", "--unified=3", "--format=", "-m", "--first-parent", "--end-of-options", hash],
+        &["show", "--no-color", "--no-ext-diff", "--no-textconv", "--unified=3", "--format=", "-m", "--first-parent", "--end-of-options", hash],
     )
     .unwrap_or_default();
     Ok(CommitDetail { files, patch, header })
 }
 
-/// Unified diff of one file (worktree and index sides, empty parts dropped).
-pub fn diff(root: &Path, path: &str, staged: bool) -> String {
-    let mut args = vec!["diff", "--no-ext-diff", "--no-color", "--unified=3"];
+/// Unified diff of one file as git printed it, byte for byte: hunk patches are
+/// rebuilt from these bytes, so a file in another encoding or with CRLF line
+/// ends is staged exactly. No external diff or textconv drivers (a repository
+/// could point them at any program), and fixed `a/`/`b/` prefixes whatever
+/// `diff.noprefix` or `diff.mnemonicPrefix` say, since `git apply` expects them.
+pub fn diff_bytes(root: &Path, path: &str, staged: bool) -> Vec<u8> {
+    let mut args =
+        vec!["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--unified=3", "--src-prefix=a/", "--dst-prefix=b/"];
     if staged {
         args.push("--cached");
     }
     args.push("--");
     args.push(path);
-    run_git(root, &args).unwrap_or_default()
+    run_git_bytes(root, &args).unwrap_or_default()
+}
+
+/// The same diff as text, for display.
+pub fn diff(root: &Path, path: &str, staged: bool) -> String {
+    String::from_utf8_lossy(&diff_bytes(root, path, staged)).into_owned()
 }
 
 /// Stages or unstages the given paths.
+/// Stages or unstages the given paths. They go to git on stdin, NUL
+/// separated: "stage all" in a large change set does not fit a command line
+/// (os error 206 past 32767 characters). Before the first commit there is no
+/// HEAD to restore from, so unstaging removes the paths from the index.
 pub fn stage(root: &Path, paths: &[String], staged: bool) -> Result<(), String> {
     if paths.is_empty() {
         return Ok(());
     }
-    let mut args: Vec<&str> = if staged { vec!["add", "--"] } else { vec!["restore", "--staged", "--"] };
-    args.extend(paths.iter().map(String::as_str));
-    run_git(root, &args).map(|_| ())
+    let from_stdin = ["--pathspec-from-file=-", "--pathspec-file-nul"];
+    let command: &[&str] = if staged {
+        &["add"]
+    } else if run_git(root, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok() {
+        &["restore", "--staged"]
+    } else {
+        &["rm", "--cached", "--quiet", "-r"]
+    };
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+    }
+    let mut git = git_command(root);
+    git.args(command).args(from_stdin);
+    let (success, _, stderr) = run_bounded(git, &format!("git {}", command[0]), GIT_TIMEOUT, GIT_MAX_OUTPUT, Some(input))?;
+    if success {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&stderr).trim().to_owned())
+    }
 }
 
 /// Commits staged changes; returns the short hash.
 pub fn commit(root: &Path, message: &str) -> Result<String, String> {
-    run_git(root, &["commit", "-m", message])?;
+    // Commit hooks (husky, lint-staged, a first pre-commit run) easily take
+    // longer than the polling timeout, and killing git mid-commit leaves
+    // index.lock behind.
+    run_git_timeout(root, &["commit", "-m", message], GIT_TIMEOUT_COMMIT)?;
     run_git(root, &["rev-parse", "--short", "HEAD"]).map(|hash| hash.trim().to_owned())
 }
 
@@ -588,7 +683,9 @@ pub fn ai_command(spec: &str, prompt: &str) -> Option<(String, Vec<String>)> {
         "opencode" => Some(vec!["run", prompt]),
         "codex" => Some(vec!["exec", prompt]),
         "gemini" => Some(vec!["-p", prompt]),
-        "aider" => Some(vec!["--message", prompt, "--no-auto-commits", "--yes-always"]),
+        // No --yes-always: it approves whatever the model proposes. --no-git:
+        // the CLI runs outside the repository (see ai_commit_message).
+        "aider" => Some(vec!["--message", prompt, "--no-auto-commits", "--no-git"]),
         _ => None,
     };
     if let Some(args) = formatted {
@@ -601,38 +698,207 @@ pub fn ai_command(spec: &str, prompt: &str) -> Option<(String, Vec<String>)> {
     Some((command, args))
 }
 
-/// Asks the given CLI (or the auto-detected one) for a one-line commit message.
-pub fn ai_commit_message(root: &Path, command: Option<&str>, prompt: &str) -> Result<String, String> {
-    let spec = command.unwrap_or("");
-    let (program, args) = ai_command(spec, prompt).ok_or_else(|| crate::strings::WORKSPACE_NO_AI_COMMAND.to_owned())?;
-    let mut invocation = Command::new(&program);
-    invocation
-        .args(&args)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env("GIT_TERMINAL_PROMPT", "0");
+/// Windows does not resolve an npm `.cmd` shim like an executable. OpenCode's
+/// npm package ships a native binary, so use it directly: a shell would
+/// reinterpret diff metacharacters and impose its shorter command-line limit.
+fn ai_cli_command(program: &str) -> Command {
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        invocation.creation_flags(0x0800_0000);
+    if program == "opencode" {
+        let path = std::env::var_os("PATH");
+        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+        if let Some(executable) = opencode_executable(path.as_deref(), home.as_deref(), appdata.as_deref()) {
+            return Command::new(executable);
+        }
     }
-    let output = invocation.output().map_err(|e| format!("{program}: {e}"))?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    let message = text
+    Command::new(program)
+}
+
+#[cfg(windows)]
+fn opencode_executable(path: Option<&std::ffi::OsStr>, home: Option<&Path>, appdata: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = path {
+        for dir in std::env::split_paths(path).filter(|dir| dir.is_absolute()) {
+            let native = dir.join("opencode.exe");
+            if native.is_file() {
+                return Some(native);
+            }
+            let npm = dir.join("node_modules/opencode-ai/bin/opencode.exe");
+            if npm.is_file() {
+                return Some(npm);
+            }
+        }
+    }
+    // A GUI launched before installation can have an outdated inherited PATH.
+    if let Some(home) = home {
+        let native = home.join(".opencode/bin/opencode.exe");
+        if native.is_file() {
+            return Some(native);
+        }
+    }
+    if let Some(appdata) = appdata {
+        let npm = appdata.join("npm/node_modules/opencode-ai/bin/opencode.exe");
+        if npm.is_file() {
+            return Some(npm);
+        }
+    }
+    None
+}
+
+/// How long the AI CLI may think before the panel gives up on it.
+pub const AI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The model IDs offered by the installed OpenCode and its configured providers.
+pub fn opencode_models() -> Result<Vec<String>, String> {
+    let mut command = ai_cli_command("opencode");
+    command.args(["models", "--pure"]).current_dir(ai_workdir());
+    let (success, stdout, stderr) = run_bounded(command, "opencode models", std::time::Duration::from_secs(30), 512 * 1024, None)?;
+    if !success {
+        return Err(String::from_utf8_lossy(&stderr).trim().to_owned());
+    }
+    let models = parse_opencode_models(&String::from_utf8_lossy(&stdout));
+    if models.is_empty() {
+        return Err("OpenCode не вернул список моделей".to_owned());
+    }
+    Ok(models)
+}
+
+fn parse_opencode_models(text: &str) -> Vec<String> {
+    let mut models: Vec<String> = text
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with("```") && !line.starts_with('#'))
-        .unwrap_or("")
-        .trim_matches('"')
-        .to_owned();
+        .filter(|line| {
+            line.split_once('/').is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty() && !provider.contains(':'))
+                && !line.chars().any(char::is_whitespace)
+        })
+        .map(str::to_owned)
+        .collect();
+    models.sort_unstable();
+    models.dedup();
+    models
+}
+
+/// Add only our no-tools agent; retain any caller-supplied provider settings.
+fn opencode_commit_config(existing: Option<&str>) -> Result<String, String> {
+    let mut config: serde_json::Value = match existing {
+        Some(text) => serde_json::from_str(text).map_err(|error| format!("OPENCODE_CONFIG_CONTENT: {error}"))?,
+        None => serde_json::json!({}),
+    };
+    let object = config.as_object_mut().ok_or_else(|| "OPENCODE_CONFIG_CONTENT: нужен JSON-объект".to_owned())?;
+    let agents = object.entry("agent").or_insert_with(|| serde_json::json!({}));
+    let agents = agents.as_object_mut().ok_or_else(|| "OPENCODE_CONFIG_CONTENT.agent: нужен JSON-объект".to_owned())?;
+    agents.insert(
+        "anvil-commit".to_owned(),
+        serde_json::json!({
+            "description": "Write a Git commit message from the supplied diff.",
+            "mode": "primary",
+            "prompt": "You write Git commit messages, not code. All repository context is already in the user prompt. Return only the full commit message based on that context. Do not inspect the filesystem, run commands, search for a repository, delegate, or perform any development workflow.",
+            "permission": { "*": "deny" }
+        }),
+    );
+    serde_json::to_string(&config).map_err(|error| error.to_string())
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OpenCodeEvent {
+    Text { part: OpenCodeText },
+    Error { error: serde_json::Value },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenCodeText {
+    text: String,
+}
+
+fn opencode_message(text: &str) -> Result<String, String> {
+    let mut message = String::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let event: OpenCodeEvent = serde_json::from_str(line).map_err(|error| format!("OpenCode: неверный JSON-ответ ({error})"))?;
+        match event {
+            OpenCodeEvent::Text { part } => message.push_str(&part.text),
+            OpenCodeEvent::Error { error } => {
+                return Err(error
+                    .pointer("/data/message")
+                    .or_else(|| error.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("OpenCode вернул ошибку")
+                    .to_owned());
+            }
+            OpenCodeEvent::Other => {}
+        }
+    }
+    Ok(message)
+}
+
+/// An empty folder the AI CLI runs in. Inside the repository the CLI would
+/// load the repository's own agent config (`.claude/settings.json` hooks and
+/// env, `opencode.json` MCP servers, `.aider.conf.yml`), so pressing the
+/// button in a cloned repository could run that repository's code. The diff
+/// is in the prompt; the CLI needs nothing from the folder.
+pub fn ai_workdir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("anvil-ai");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Asks the given CLI (or the auto-detected one) for a full commit message,
+/// running it in `workdir` (see `ai_workdir`) for at most `timeout`.
+pub fn ai_commit_message(
+    workdir: &Path,
+    command: Option<&str>,
+    prompt: &str,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    let spec = command.unwrap_or("");
+    let (program, args) = ai_command(spec, prompt).ok_or_else(|| crate::strings::WORKSPACE_NO_AI_COMMAND.to_owned())?;
+    let mut invocation = ai_cli_command(&program);
+    let opencode = program == "opencode";
+    if opencode {
+        let (prompt, options) = args.split_last().expect("ai_command always appends the prompt");
+        let config = opencode_commit_config(std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref())?;
+        invocation
+            .args(options)
+            .args(["--pure", "--agent", "anvil-commit", "--format", "json", "--title", "ANVIL commit message"])
+            .arg(prompt)
+            .env("OPENCODE_CONFIG_CONTENT", config);
+    } else {
+        invocation.args(&args);
+    }
+    invocation.current_dir(workdir).env("GIT_TERMINAL_PROMPT", "0");
+    let (success, stdout, stderr) = run_bounded(invocation, &program, timeout, 64 * 1024, None)?;
+    if opencode && !success {
+        let stderr = String::from_utf8_lossy(&stderr);
+        return Err(if stderr.trim().is_empty() {
+            opencode_message(&String::from_utf8_lossy(&stdout)).err().unwrap_or_else(|| "OpenCode завершился с ошибкой".to_owned())
+        } else {
+            stderr.trim().to_owned()
+        });
+    }
+    let text = String::from_utf8_lossy(&stdout);
+    let text = if opencode { opencode_message(&text)?.into() } else { text };
+    let message = clean_ai_message(&text);
     if message.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&stderr);
         let fallback = crate::strings::WORKSPACE_AI_EMPTY.to_owned();
         return Err(if stderr.trim().is_empty() { fallback } else { stderr.trim().to_owned() });
     }
-    Ok(message.chars().take(200).collect())
+    Ok(message.to_owned())
+}
+
+/// Remove an optional outer CLI/Markdown wrapper, not the message's body.
+fn clean_ai_message(text: &str) -> &str {
+    let text = text.trim();
+    let text = if text.starts_with("```") {
+        text.split_once('\n')
+            .and_then(|(_, body)| body.trim_end().strip_suffix("```"))
+            .map(str::trim)
+            .unwrap_or(text)
+    } else {
+        text
+    };
+    text.strip_prefix('"').and_then(|body| body.strip_suffix('"')).unwrap_or(text).trim()
 }
 
 /// Tracked plus untracked-but-not-ignored files, sorted.
@@ -669,22 +935,37 @@ pub fn read_file(root: &Path, path: &str, max_bytes: usize) -> Result<(String, b
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hunk {
     pub header: String,
-    /// ` `, `-` and `+` lines, without the trailing newline.
+    /// ` `, `-` and `+` lines, without the trailing newline (for display).
     pub lines: Vec<String>,
+    /// The header and the lines exactly as git printed them, `\r` included:
+    /// the patch is rebuilt from these, never from the display text.
+    raw: Vec<Vec<u8>>,
 }
 
 /// One file's part of a unified diff.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileDiff {
     pub path: String,
-    /// `diff --git` / `---` / `+++` lines, used to rebuild a patch.
+    /// `diff --git` / `---` / `+++` lines (for display).
     pub header: Vec<String>,
     pub hunks: Vec<Hunk>,
     pub staged: bool,
+    /// The header lines as git printed them, used to rebuild a patch.
+    raw_header: Vec<Vec<u8>>,
 }
 
-/// Splits a unified diff into files and hunks.
-pub fn parse_diff(text: &str, staged: bool) -> Vec<FileDiff> {
+/// Display text of one diff line: lossy UTF-8 without the CR of a CRLF line.
+fn display_line(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw.strip_suffix(b"\r").unwrap_or(raw)).into_owned()
+}
+
+/// Splits a unified diff into files and hunks. Lines are split on `\n` only:
+/// `str::lines()` would also drop the `\r` of CRLF content, and lossy UTF-8
+/// would replace bytes of other encodings, so a rebuilt patch no longer
+/// matched the file (or, for added lines, staged altered text).
+pub fn parse_diff(diff: impl AsRef<[u8]>, staged: bool) -> Vec<FileDiff> {
+    let bytes = diff.as_ref();
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     let mut files: Vec<FileDiff> = Vec::new();
     let mut current: Option<FileDiff> = None;
     let mut hunk: Option<Hunk> = None;
@@ -693,32 +974,42 @@ pub fn parse_diff(text: &str, staged: bool) -> Vec<FileDiff> {
             file.hunks.push(hunk);
         }
     };
-    for line in text.lines() {
+    for raw in bytes.split(|byte| *byte == b'\n') {
+        if bytes.is_empty() {
+            break;
+        }
+        let line = display_line(raw);
         if line.starts_with("diff --git ") {
             flush_hunk(&mut current, &mut hunk);
             if let Some(file) = current.take() {
                 files.push(file);
             }
-            current = Some(FileDiff { path: path_from_diff_header(line), header: vec![line.to_owned()], hunks: Vec::new(), staged });
+            current = Some(FileDiff {
+                path: path_from_diff_header(&line),
+                header: vec![line],
+                hunks: Vec::new(),
+                staged,
+                raw_header: vec![raw.to_vec()],
+            });
             continue;
         }
         let Some(file) = current.as_mut() else { continue };
         if line.starts_with("@@") {
             flush_hunk(&mut current, &mut hunk);
-            hunk = Some(Hunk { header: line.to_owned(), lines: Vec::new() });
-        } else if hunk.is_some() {
+            hunk = Some(Hunk { header: line, lines: Vec::new(), raw: vec![raw.to_vec()] });
+        } else if let Some(hunk) = hunk.as_mut() {
             // "\ No newline at end of file" markers are kept: the rebuilt patch
             // must carry them or `git apply` rejects (or silently alters) the file.
-            if let Some(hunk) = hunk.as_mut() {
-                hunk.lines.push(line.to_owned());
-            }
+            hunk.lines.push(line);
+            hunk.raw.push(raw.to_vec());
         } else {
             // The b-side of the +++ line is authoritative for the file name
             // (the diff --git line is ambiguous when a path contains " b/").
             if let Some(path) = line.strip_prefix("+++ b/") {
                 file.path = path.to_owned();
             }
-            file.header.push(line.to_owned());
+            file.header.push(line);
+            file.raw_header.push(raw.to_vec());
         }
     }
     flush_hunk(&mut current, &mut hunk);
@@ -737,22 +1028,23 @@ fn path_from_diff_header(line: &str) -> String {
     rest.split_whitespace().last().unwrap_or("").trim_start_matches("a/").to_owned()
 }
 
-/// Rebuilds a patch containing only the selected hunks (all when empty).
-pub fn hunk_patch(file: &FileDiff, selection: &[usize]) -> String {
-    let mut out = String::new();
-    for line in &file.header {
-        out.push_str(line);
-        out.push('\n');
+/// Rebuilds a patch containing only the selected hunks (all when empty), from
+/// the bytes git printed.
+pub fn hunk_patch(file: &FileDiff, selection: &[usize]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut push = |line: &[u8]| {
+        out.extend_from_slice(line);
+        out.push(b'\n');
+    };
+    for line in &file.raw_header {
+        push(line);
     }
     for (index, hunk) in file.hunks.iter().enumerate() {
         if !selection.is_empty() && !selection.contains(&index) {
             continue;
         }
-        out.push_str(&hunk.header);
-        out.push('\n');
-        for line in &hunk.lines {
-            out.push_str(line);
-            out.push('\n');
+        for line in &hunk.raw {
+            push(line);
         }
     }
     out
@@ -763,29 +1055,23 @@ pub fn hunk_patch(file: &FileDiff, selection: &[usize]) -> String {
 pub fn apply_hunks(root: &Path, file: &FileDiff, selection: &[usize], from_index: bool) -> Result<(), String> {
     use std::io::Write;
     let patch = hunk_patch(file, selection);
-    if patch.trim().is_empty() {
+    if patch.trim_ascii().is_empty() {
         return Ok(());
     }
-    let mut command = Command::new("git");
+    let mut command = git_command(root);
     command
         .args(["apply", "--cached", "--whitespace=nowarn"])
         .args(if from_index { vec!["--reverse"] } else { vec![] })
         .arg("-")
-        .current_dir(root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
-    }
     let mut child = command.spawn().map_err(|e| format!("git apply: {e}"))?;
     child
         .stdin
         .as_mut()
         .ok_or_else(|| "git apply: no stdin".to_owned())?
-        .write_all(patch.as_bytes())
+        .write_all(&patch)
         .map_err(|e| e.to_string())?;
     let output = child.wait_with_output().map_err(|e| e.to_string())?;
     if output.status.success() {
@@ -797,7 +1083,7 @@ pub fn apply_hunks(root: &Path, file: &FileDiff, selection: &[usize], from_index
 
 /// Fetches and prunes the remote of the current branch (git resolves it).
 pub fn fetch(root: &Path) -> Result<String, String> {
-    let remote = run_git(root, &["config", "--get", "branch", &format!("{}.remote", current_branch(root)?)])
+    let remote = run_git(root, &["config", "--get", &format!("branch.{}.remote", current_branch(root)?)])
         .map(|text| text.trim().to_owned())
         .unwrap_or_default();
     let remote = if remote.is_empty() { "origin".to_owned() } else { remote };
@@ -836,11 +1122,30 @@ pub fn push(root: &Path) -> Result<String, String> {
 }
 
 /// The prompt sent to the AI CLI, built from the diff and recent subjects.
+/// Appended where the prompt's status or diff was cut.
+pub const AI_TRUNCATED: &str = "[… truncated]";
+
+/// At most `limit` characters of `text`, marked when cut.
+fn clip(text: &str, limit: usize) -> std::borrow::Cow<'_, str> {
+    match text.char_indices().nth(limit) {
+        Some((end, _)) => format!("{}\n{AI_TRUNCATED}", &text[..end]).into(),
+        None => text.into(),
+    }
+}
+
+/// The prompt goes to the CLI on its command line, which Windows caps at
+/// 32767 characters, so the status and the diff are cut well below that.
 pub fn ai_prompt(status_text: &str, diff_text: &str, recent: &[String]) -> String {
+    const STATUS_LIMIT: usize = 3_000;
+    const DIFF_LIMIT: usize = 20_000;
+    const LOG_LIMIT: usize = 2_000;
+    let status_text = clip(status_text, STATUS_LIMIT);
+    let diff_text = clip(diff_text, DIFF_LIMIT);
     let log = recent.join("\n");
+    let log = clip(&log, LOG_LIMIT);
     [
         "Write a Git commit message for the following changes.".to_owned(),
-        "Respond with the commit message only: a single line of at most 72 characters, no quotes, no code fences, no explanations.".to_owned(),
+        "Respond with the full commit message only, without surrounding quotes, code fences or commentary. Write a descriptive subject, then a blank line and a detailed body organized into bullet points for each meaningful group of changes. Explain what changed and why when the diff supports it; include important behavior changes and compatibility implications. Match the language and style of the recent commits. Do not impose a character or line limit or compress a substantial diff into one sentence. Scale the detail to the changes: be thorough for large changes, avoid padding for small ones, and do not invent facts absent from the diff.".to_owned(),
         if log.is_empty() { String::new() } else { format!("Recent commit subjects for style reference (do not repeat them):\n{log}") },
         if status_text.is_empty() { String::new() } else { format!("Git status:\n{status_text}") },
         if diff_text.is_empty() { "The diff is empty.".to_owned() } else { format!("Diff:\n{diff_text}") },
@@ -974,9 +1279,10 @@ index 111..222 100644\n\
     #[test]
     fn hunk_patch_selects_only_requested_hunks() {
         let files = parse_diff(SAMPLE_DIFF, false);
-        let all = hunk_patch(&files[0], &[]);
+        let patch = |selection: &[usize]| String::from_utf8(hunk_patch(&files[0], selection)).unwrap();
+        let all = patch(&[]);
         assert!(all.contains("@@ -1,3 +1,4 @@") && all.contains("@@ -10,2 +11,2 @@"));
-        let second = hunk_patch(&files[0], &[1]);
+        let second = patch(&[1]);
         assert!(!second.contains("@@ -1,3 +1,4 @@"));
         assert!(second.contains("@@ -10,2 +11,2 @@"));
         assert!(second.starts_with("diff --git a/src/main.rs b/src/main.rs"));
@@ -1046,7 +1352,7 @@ index 111..222 100644\n\
         let text = "diff --git a/x.txt b/x.txt\n--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n";
         let files = parse_diff(text, false);
         assert_eq!(files[0].hunks[0].lines.len(), 4, "both markers are kept");
-        let patch = hunk_patch(&files[0], &[]);
+        let patch = String::from_utf8(hunk_patch(&files[0], &[])).unwrap();
         assert!(patch.contains("\\ No newline at end of file"));
         assert_eq!(patch, text, "the rebuilt patch is byte-identical");
     }
@@ -1063,15 +1369,109 @@ index 111..222 100644\n\
         }
         assert!(resolve_path(root, "").is_err());
         assert!(resolve_path(root, ".").is_err(), "the root itself is not a file target");
+        // A file that does not exist yet (a new file, a rename target) right
+        // in the root used to be rejected: its nearest existing ancestor is
+        // the root itself.
+        assert_eq!(resolve_path(root, "new.txt"), Ok(root.join("new.txt")));
+        assert_eq!(resolve_path(root, "new/deeper.txt"), Ok(root.join("new").join("deeper.txt")));
     }
 
     #[test]
-    fn ai_prompt_contents() {
-        let prompt = ai_prompt(" M a.rs", "diff --git", &["feat: past".to_owned()]);
-        assert!(prompt.contains("at most 72 characters"));
-        assert!(prompt.contains("feat: past"));
-        assert!(prompt.contains("Diff:\ndiff --git"));
-        let empty = ai_prompt("", "", &[]);
-        assert!(empty.contains("The diff is empty."));
+    fn ai_message_preserves_the_full_body_and_removes_outer_wrappers() {
+        let message = "Describe the terminal rendering and detailed AI commit workflow without cutting the subject short\n\n\
+            - Preserve blank lines and all of the generated body, including explanations longer than the old 200-character cap.\n\
+            - Показывать состояние генерации до завершения CLI, не сбрасывая его при обновлении git-панели.\n\
+              Keep indented continuation lines intact.\n\n\
+            Compatibility: existing manually written messages remain unchanged.";
+        assert_eq!(clean_ai_message(&format!("\n```text\n{message}\n```\n")), message);
+        assert_eq!(clean_ai_message(&format!("\"{message}\"")), message);
+        assert_eq!(clean_ai_message(" \r\n\t "), "");
+        assert_eq!(clean_ai_message("```\n\n```"), "");
+    }
+
+    /// The prompt travels on the command line, which Windows caps at 32767
+    /// characters: a real diff (up to 16 MB) failed with os error 206.
+    #[test]
+    fn ai_prompt_fits_a_command_line() {
+        let diff = "+ строка изменений\n".repeat(200_000);
+        let status = " M file.rs\n".repeat(10_000);
+        let prompt = ai_prompt(&status, &diff, &["feat: past".to_owned()]);
+        assert!(prompt.chars().count() < 30_000, "prompt of {} chars", prompt.chars().count());
+        assert!(prompt.contains(AI_TRUNCATED), "the model is told the diff was cut");
+        assert!(prompt.contains("Diff:\n+ строка изменений"));
+    }
+
+    #[test]
+    fn aider_does_not_confirm_everything() {
+        let (program, args) = ai_command("aider", "p").unwrap();
+        assert_eq!(program, "aider");
+        assert!(!args.iter().any(|arg| arg == "--yes-always"), "{args:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn opencode_lookup_resolves_npm_without_losing_path_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("npm install with spaces");
+        let second = dir.path().join("native install");
+        let npm = first.join("node_modules/opencode-ai/bin/opencode.exe");
+        std::fs::create_dir_all(npm.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("opencode.cmd"), "npm shim").unwrap();
+        std::fs::write(&npm, []).unwrap();
+        std::fs::write(second.join("opencode.exe"), []).unwrap();
+        let path = std::env::join_paths([&first, &second]).unwrap();
+        assert_eq!(opencode_executable(Some(&path), None, None), Some(npm));
+
+        let native = first.join("opencode.exe");
+        std::fs::write(&native, []).unwrap();
+        assert_eq!(opencode_executable(Some(&path), None, None), Some(native));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn opencode_lookup_finds_installs_missing_from_the_inherited_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("user home");
+        let appdata = dir.path().join("roaming");
+        let native = home.join(".opencode/bin/opencode.exe");
+        let npm = appdata.join("npm/node_modules/opencode-ai/bin/opencode.exe");
+        std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(npm.parent().unwrap()).unwrap();
+        std::fs::write(&native, []).unwrap();
+        std::fs::write(&npm, []).unwrap();
+        let path = std::env::join_paths([dir.path().join("old path")]).unwrap();
+        assert_eq!(opencode_executable(Some(&path), Some(&home), Some(&appdata)), Some(native.clone()));
+        std::fs::remove_file(native).unwrap();
+        assert_eq!(opencode_executable(Some(&path), Some(&home), Some(&appdata)), Some(npm));
+    }
+
+    #[test]
+    fn opencode_catalog_keeps_nested_model_ids_without_cli_diagnostics() {
+        let models = parse_opencode_models("Available models:\nopenrouter/deepseek/deepseek-r1\ndeepseek/deepseek-flash\nhttps://example.com/error\nprovider/model with spaces\ndeepseek/deepseek-flash\n");
+        assert_eq!(models, ["deepseek/deepseek-flash", "openrouter/deepseek/deepseek-r1"]);
+    }
+
+    #[test]
+    fn opencode_json_response_excludes_reasoning_and_surfaces_provider_errors() {
+        let response = concat!(
+            "{\"type\":\"step_start\",\"part\":{\"type\":\"step-start\"}}\n",
+            "{\"type\":\"reasoning\",\"part\":{\"text\":\"private reasoning\"}}\n",
+            "{\"type\":\"text\",\"part\":{\"text\":\"Detailed subject\\n\\n- Preserve the complete message.\"}}\n",
+            "{\"type\":\"step_finish\",\"part\":{\"tokens\":{\"input\":10}}}\n"
+        );
+        assert_eq!(opencode_message(response).unwrap(), "Detailed subject\n\n- Preserve the complete message.");
+        assert_eq!(
+            opencode_message("{\"type\":\"error\",\"error\":{\"data\":{\"message\":\"Provider authentication failed\"}}}"),
+            Err("Provider authentication failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn commit_agent_overlay_preserves_existing_provider_configuration() {
+        let source = r#"{"provider":{"custom":{"options":{"baseURL":"https://example.com"}}},"agent":{"review":{"mode":"subagent"}}}"#;
+        let config: serde_json::Value = serde_json::from_str(&opencode_commit_config(Some(source)).unwrap()).unwrap();
+        assert_eq!(config.pointer("/provider/custom/options/baseURL").unwrap(), "https://example.com");
+        assert_eq!(config.pointer("/agent/review/mode").unwrap(), "subagent");
     }
 }

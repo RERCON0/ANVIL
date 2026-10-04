@@ -20,7 +20,7 @@ use crate::term::links;
 use crate::term::mouse::{self, ClickCounter, MouseAction, MouseButton, MouseModes};
 use crate::term::pane::Pane;
 use crate::term::render::{cell_metrics, paint, snapshot, CellMetrics, GlyphCache, Highlight, PaintOptions};
-use crate::term::search::search_pattern;
+use crate::term::search::{search_pattern, RegexCache};
 use crate::term::style::Palette;
 use crate::theme;
 
@@ -52,6 +52,7 @@ pub struct SearchState {
     /// (row, first column, end column exclusive) in viewport coordinates.
     pub current: Option<(usize, usize, usize)>,
     pub focus_requested: bool,
+    compiled: RegexCache,
 }
 
 pub struct TerminalView {
@@ -133,6 +134,12 @@ impl TerminalView {
         self.blink_epoch = Instant::now();
     }
 
+    /// The terminal font family changed: which characters the primary face
+    /// can draw must be asked again, or glyphs stay routed for the old face.
+    pub fn font_changed(&mut self) {
+        self.glyphs = GlyphCache::default();
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, rect: Rect, pane: &mut Pane, input: &ViewInput) -> ViewOutput {
         let ctx = ui.ctx().clone();
         let fonts = TermFonts::new(self.font_size);
@@ -176,8 +183,11 @@ impl TerminalView {
         } else {
             None
         };
-        if hovered_link.is_some() {
+        if let Some(url) = &hovered_link {
             ctx.set_cursor_icon(CursorIcon::PointingHand);
+            // An OSC 8 label is whatever the program printed: show where
+            // Ctrl+click actually goes before it is clicked.
+            let _ = response.clone().on_hover_text_at_pointer(url.as_str());
         }
 
         let modes = mouse_modes(pane.term.lock().mode());
@@ -353,11 +363,11 @@ impl TerminalView {
         let mut highlights: Vec<Highlight> = Vec::new();
         if self.search.open && !self.search.query.is_empty() {
             let pattern = search_pattern(&self.search.query, self.search.regex, self.search.case_sensitive);
-            match RegexSearch::new(&pattern) {
-                Ok(mut regex) => {
+            match self.search.compiled.get(&pattern) {
+                Some(regex) => {
                     self.search.error = false;
                     let term = pane.term.lock();
-                    let found = collect_matches(&*term, &mut regex, lines as usize, columns as usize, display_offset);
+                    let found = collect_matches(&*term, regex, lines as usize, columns as usize, display_offset);
                     let current = self.search.current.filter(|c| found.contains(c));
                     self.search.current = current;
                     for (row, start, end) in found {
@@ -365,7 +375,7 @@ impl TerminalView {
                         highlights.push((row, start, end, is_current));
                     }
                 }
-                Err(_) => {
+                None => {
                     self.search.error = true;
                     self.search.current = None;
                 }
@@ -402,26 +412,7 @@ impl TerminalView {
             })
             .collect();
         // OSC 8 targets per row, so Ctrl+click works on hyperlinked labels too.
-        self.last_links.clear();
-        for (row, cells) in frame.rows.iter().enumerate() {
-            let mut run: Option<(usize, String)> = None;
-            for (col, cell) in cells.iter().enumerate() {
-                let uri = cell.hyperlink.as_deref().map(str::to_owned).filter(|value| !value.is_empty());
-                let continues = matches!((&run, &uri), (Some((_, current)), Some(next)) if current == next);
-                if continues {
-                    continue;
-                }
-                if let Some((start, current)) = run.take() {
-                    self.last_links.push((row, start, col, current));
-                }
-                if let Some(next) = uri {
-                    run = Some((col, next));
-                }
-            }
-            if let Some((start, current)) = run.take() {
-                self.last_links.push((row, start, cells.len(), current));
-            }
-        }
+        self.last_links = link_runs(&frame.rows);
 
         let cursor_on = if (input.cursor_blink || self.app_blink) && input.focused {
             let elapsed = self.blink_epoch.elapsed().as_millis();
@@ -566,7 +557,7 @@ impl TerminalView {
             return;
         }
         let pattern = search_pattern(&self.search.query, self.search.regex, self.search.case_sensitive);
-        let Ok(mut regex) = RegexSearch::new(&pattern) else {
+        let Some(regex) = self.search.compiled.get(&pattern) else {
             self.search.error = true;
             return;
         };
@@ -595,13 +586,13 @@ impl TerminalView {
             }
         };
         let direction = if forward { Direction::Right } else { Direction::Left };
-        let found = term.search_next(&mut regex, origin, direction, Side::Left, None).or_else(|| {
+        let found = term.search_next(regex, origin, direction, Side::Left, None).or_else(|| {
             let wrap = if forward {
                 Point::new(Line(-history), Column(0))
             } else {
                 Point::new(Line(last_line), Column(total_columns - 1))
             };
-            term.search_next(&mut regex, wrap, direction, Side::Left, None)
+            term.search_next(regex, wrap, direction, Side::Left, None)
         });
         if let Some(found) = found {
             term.scroll_to_point(*found.start());
@@ -752,4 +743,66 @@ fn collect_matches<L: EventListener>(
         }
     }
     out
+}
+
+
+/// `(row, first column, end column, target)` of every OSC 8 link on screen.
+/// Cells of one link share its target (one OSC 8 sequence), so a run is
+/// recognised by identity and its target copied once, not compared and
+/// copied per cell.
+pub fn link_runs(rows: &[Vec<crate::term::style::RenderCell>]) -> Vec<(usize, usize, usize, String)> {
+    let mut links = Vec::new();
+    for (row, cells) in rows.iter().enumerate() {
+        let mut run: Option<(usize, &str)> = None;
+        for (col, cell) in cells.iter().enumerate() {
+            let uri = cell.hyperlink.as_ref().map(|link| link.uri()).filter(|uri| !uri.is_empty());
+            let continues = matches!((run, uri), (Some((_, current)), Some(next)) if std::ptr::eq(current, next));
+            if continues {
+                continue;
+            }
+            if let Some((start, current)) = run.take() {
+                links.push((row, start, col, current.to_owned()));
+            }
+            run = uri.map(|next| (col, next));
+        }
+        if let Some((start, current)) = run {
+            links.push((row, start, cells.len(), current.to_owned()));
+        }
+    }
+    links
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::term::style::{CellStyle, RenderCell, Underline};
+    use alacritty_terminal::term::cell::Hyperlink;
+    use egui::Color32;
+
+    fn cell(ch: char, hyperlink: Option<Hyperlink>) -> RenderCell {
+        let style = CellStyle { fg: Color32::WHITE, bg: Color32::BLACK, bold: false, italic: false, underline: Underline::None, strike: false };
+        RenderCell { ch, combining: None, style, wide: false, spacer: false, in_primary_font: true, hyperlink }
+    }
+
+    #[test]
+    fn hyperlinked_cells_form_one_target_per_link() {
+        let a = Hyperlink::new(None::<String>, "https://a.example".to_owned());
+        let b = Hyperlink::new(None::<String>, "https://b.example".to_owned());
+        let row = vec![
+            cell('x', None),
+            cell('a', Some(a.clone())),
+            cell('a', Some(a.clone())),
+            cell('b', Some(b)),
+            cell('y', None),
+            cell('a', Some(a)),
+        ];
+        assert_eq!(
+            link_runs(&[row]),
+            vec![
+                (0, 1, 3, "https://a.example".to_owned()),
+                (0, 3, 4, "https://b.example".to_owned()),
+                (0, 5, 6, "https://a.example".to_owned()),
+            ]
+        );
+    }
 }

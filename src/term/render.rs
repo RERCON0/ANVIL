@@ -9,7 +9,7 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::Term;
 use alacritty_terminal::vte::ansi::CursorShape;
 use egui::text::LayoutJob;
-use egui::{Color32, Painter, Pos2, Rect, Stroke, TextFormat, Vec2};
+use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, TextFormat, Vec2};
 
 use crate::fonts::TermFonts;
 use crate::term::style::{bg_spans, cell_style, text_runs, Palette, RenderCell, Underline};
@@ -35,6 +35,15 @@ pub fn cell_metrics(ctx: &egui::Context, fonts: &TermFonts) -> CellMetrics {
     CellMetrics { width: snap_to_pixels(advance, ppp), height: snap_to_pixels(row, ppp) }
 }
 
+/// Longest OSC 8 target treated as a link. Real URLs are far shorter; a
+/// hostile one of megabytes is ignored rather than carried into every frame.
+pub const MAX_LINK_URI: usize = 2048;
+
+/// `link` when its target is short enough to act on.
+pub fn usable_link(link: alacritty_terminal::term::cell::Hyperlink) -> Option<alacritty_terminal::term::cell::Hyperlink> {
+    (link.uri().len() <= MAX_LINK_URI).then_some(link)
+}
+
 /// Remembers which non-ASCII characters the primary font can draw.
 #[derive(Default)]
 pub struct GlyphCache {
@@ -47,17 +56,65 @@ pub fn is_block_element(ch: char) -> bool {
     ('\u{2580}'..='\u{259F}').contains(&ch)
 }
 
-/// Cell-sized shapes for the block elements: the font's own glyph sits inside
+/// `v` points moved onto the nearest physical pixel boundary.
+pub fn snap(v: f32, pixels_per_point: f32) -> f32 {
+    (v * pixels_per_point).round() / pixels_per_point
+}
+
+/// Solid cell fills (backgrounds, selection, search matches, block elements)
+/// collected into one mesh. A mesh is drawn as is, while `rect_filled` gets an
+/// anti-aliased fringe: two fringed rects meeting at a cell edge each cover
+/// that pixel only partly, which left a hairline through every bar and through
+/// block-element art. Edges are snapped to physical pixels, so neighbouring
+/// fills meet exactly instead of overlapping or leaving a gap.
+pub struct CellFills {
+    mesh: egui::Mesh,
+    pixels_per_point: f32,
+}
+
+impl CellFills {
+    pub fn new(pixels_per_point: f32) -> CellFills {
+        CellFills { mesh: egui::Mesh::default(), pixels_per_point }
+    }
+
+    pub fn rect(&mut self, rect: Rect, color: Color32) {
+        let ppp = self.pixels_per_point;
+        let rect = Rect::from_min_max(
+            Pos2::new(snap(rect.min.x, ppp), snap(rect.min.y, ppp)),
+            Pos2::new(snap(rect.max.x, ppp), snap(rect.max.y, ppp)),
+        );
+        if rect.width() > 0.0 && rect.height() > 0.0 {
+            self.mesh.add_colored_rect(rect, color);
+        }
+    }
+
+    pub fn into_shape(self) -> egui::Shape {
+        egui::Shape::mesh(self.mesh)
+    }
+}
+
+/// Cell-sized fills for the block elements: the font's own glyph sits inside
 /// its em box, so rows and columns of them leave seams and ASCII art (the
 /// Claude Code mascot, meters, bars) falls apart instead of forming a picture.
-pub fn block_shape(ch: char, rect: Rect, color: Color32) -> Option<egui::Shape> {
-    let fill = |x: f32, y: f32, w: f32, h: f32| {
-        egui::Shape::rect_filled(Rect::from_min_size(rect.min + Vec2::new(x, y), Vec2::new(w, h)), 0.0, color)
+/// False for characters that are not block elements.
+pub fn block_fills(ch: char, rect: Rect, color: Color32, fills: &mut CellFills) -> bool {
+    let shade = match ch {
+        '\u{2591}' => Some(0.25), // ░
+        '\u{2592}' => Some(0.5),  // ▒
+        '\u{2593}' => Some(0.75), // ▓
+        _ => None,
+    };
+    if let Some(alpha) = shade {
+        fills.rect(rect, Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), (alpha * 255.0) as u8));
+        return true;
+    }
+    let mut fill = |x: f32, y: f32, w: f32, h: f32| {
+        fills.rect(Rect::from_min_size(rect.min + Vec2::new(x, y), Vec2::new(w, h)), color);
     };
     let (w, h) = (rect.width(), rect.height());
     let (hx, hy) = (w / 2.0, h / 2.0);
     let (ex, ey) = (w / 8.0, h / 8.0);
-    Some(match ch {
+    match ch {
         '\u{2580}' => fill(0.0, 0.0, w, hy),                       // ▀
         '\u{2581}' => fill(0.0, h - ey, w, ey),                    // ▁
         '\u{2582}' => fill(0.0, h - 2.0 * ey, w, 2.0 * ey),        // ▂
@@ -75,32 +132,36 @@ pub fn block_shape(ch: char, rect: Rect, color: Color32) -> Option<egui::Shape> 
         '\u{258E}' => fill(0.0, 0.0, 2.0 * ex, h),                 // ▎
         '\u{258F}' => fill(0.0, 0.0, ex, h),                       // ▏
         '\u{2590}' => fill(hx, 0.0, hx, h),                        // ▐
-        '\u{2591}' | '\u{2592}' | '\u{2593}' => {                  // ░▒▓
-            let alpha = match ch {
-                '\u{2591}' => 0.25,
-                '\u{2592}' => 0.5,
-                _ => 0.75,
-            };
-            egui::Shape::rect_filled(
-                rect,
-                0.0,
-                Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), (alpha * 255.0) as u8),
-            )
-        }
         '\u{2594}' => fill(0.0, 0.0, w, ey),                       // ▔
         '\u{2595}' => fill(w - ex, 0.0, ex, h),                    // ▕
         '\u{2596}' => fill(0.0, hy, hx, hy),                       // ▖
         '\u{2597}' => fill(hx, hy, hx, hy),                        // ▗
         '\u{2598}' => fill(0.0, 0.0, hx, hy),                      // ▘
-        '\u{2599}' => egui::Shape::Vec(vec![fill(0.0, 0.0, hx, hy), fill(0.0, hy, w, hy)]), // ▙
-        '\u{259A}' => egui::Shape::Vec(vec![fill(0.0, 0.0, hx, hy), fill(hx, hy, hx, hy)]), // ▚
-        '\u{259B}' => egui::Shape::Vec(vec![fill(0.0, 0.0, w, hy), fill(0.0, hy, hx, hy)]), // ▛
-        '\u{259C}' => egui::Shape::Vec(vec![fill(0.0, 0.0, w, hy), fill(hx, hy, hx, hy)]),  // ▜
+        '\u{2599}' => { fill(0.0, 0.0, hx, hy); fill(0.0, hy, w, hy) } // ▙
+        '\u{259A}' => { fill(0.0, 0.0, hx, hy); fill(hx, hy, hx, hy) } // ▚
+        '\u{259B}' => { fill(0.0, 0.0, w, hy); fill(0.0, hy, hx, hy) } // ▛
+        '\u{259C}' => { fill(0.0, 0.0, w, hy); fill(hx, hy, hx, hy) }  // ▜
         '\u{259D}' => fill(hx, 0.0, hx, hy),                       // ▝
-        '\u{259E}' => egui::Shape::Vec(vec![fill(hx, 0.0, hx, hy), fill(0.0, hy, hx, hy)]), // ▞
-        '\u{259F}' => egui::Shape::Vec(vec![fill(hx, 0.0, hx, hy), fill(0.0, hy, w, hy)]),  // ▟
-        _ => return None,
-    })
+        '\u{259E}' => { fill(hx, 0.0, hx, hy); fill(0.0, hy, hx, hy) } // ▞
+        '\u{259F}' => { fill(hx, 0.0, hx, hy); fill(0.0, hy, w, hy) }  // ▟
+        _ => return false,
+    }
+    true
+}
+
+/// A smaller `font` for a standalone glyph whose ink is `ink` points large
+/// and has to fit the `room` of its cells, or None when it already fits.
+/// Fallback faces are not monospaced to the terminal font: Segoe UI Symbol's
+/// ↺ and ⏵ or the circles of Claude Code's spinner are wider than a Consolas
+/// cell, and the cell clip used to cut them in half. The ink, not the advance,
+/// is what has to fit: those faces pad their symbols with wide side bearings,
+/// and fitting the advance shrank ⏵ to a speck.
+pub fn fit_font(font: &FontId, ink: Vec2, room: Vec2) -> Option<FontId> {
+    if !(ink.x > 0.0 && ink.y > 0.0 && ink.x.is_finite() && ink.y.is_finite()) {
+        return None;
+    }
+    let scale = (room.x / ink.x).min(room.y / ink.y);
+    (ink.x > room.x + 0.5 || ink.y > room.y + 0.5).then(|| FontId::new(font.size * scale, font.family.clone()))
 }
 
 impl GlyphCache {
@@ -164,7 +225,7 @@ pub fn snapshot<L: EventListener>(
             wide: flags.contains(Flags::WIDE_CHAR),
             spacer: flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
             in_primary_font: glyphs.in_primary(cell.c, has_glyph),
-            hyperlink: cell.hyperlink().map(|h| h.uri().to_owned().into_boxed_str()),
+            hyperlink: cell.hyperlink().and_then(usable_link),
         });
     }
 
@@ -230,23 +291,33 @@ pub struct PaintOptions<'a> {
 
 pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions) {
     let (cw, ch) = (opt.metrics.width, opt.metrics.height);
+    let ppp = painter.ctx().pixels_per_point();
+    // Cells come from grid lines snapped to physical pixels: the edge two
+    // neighbours share is computed once, so their fills meet exactly.
     let cell_rect = |row: usize, col: usize, cells: usize| {
-        Rect::from_min_size(origin + Vec2::new(col as f32 * cw, row as f32 * ch), Vec2::new(cw * cells as f32, ch))
+        Rect::from_min_max(
+            Pos2::new(snap(origin.x + col as f32 * cw, ppp), snap(origin.y + row as f32 * ch, ppp)),
+            Pos2::new(snap(origin.x + (col + cells) as f32 * cw, ppp), snap(origin.y + (row + 1) as f32 * ch, ppp)),
+        )
     };
 
+    let mut fills = CellFills::new(ppp);
     for (r, row) in frame.rows.iter().enumerate() {
         for (col, len, color) in bg_spans(row, frame.default_bg) {
-            painter.rect_filled(cell_rect(r, col, len), 0.0, color);
+            fills.rect(cell_rect(r, col, len), color);
         }
     }
     for &(r, a, b) in &frame.selection {
-        painter.rect_filled(cell_rect(r, a, b - a), 0.0, SELECTION);
+        fills.rect(cell_rect(r, a, b - a), SELECTION);
     }
     for &(r, a, b, current) in opt.highlights {
-        painter.rect_filled(cell_rect(r, a, b.saturating_sub(a)), 0.0, if current { MATCH_CURRENT } else { MATCH });
+        fills.rect(cell_rect(r, a, b.saturating_sub(a)), if current { MATCH_CURRENT } else { MATCH });
     }
+    painter.add(fills.into_shape());
+    let mut blocks = CellFills::new(ppp);
 
     let advance = |bold: bool, italic: bool| painter.ctx().fonts(|f| f.glyph_width(opt.fonts.for_style(bold, italic), 'M'));
+    let mut primary_ink_center = None;
     for (r, row) in frame.rows.iter().enumerate() {
         for run in text_runs(row) {
             let s = run.style;
@@ -254,15 +325,36 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
             let span = cell_rect(r, run.col, run.cells);
             if run.standalone {
                 let mut chars = run.text.chars();
-                let block = chars.next().filter(|_| chars.next().is_none()).and_then(|ch| block_shape(ch, span, s.fg));
-                if let Some(shape) = block {
-                    painter.add(shape);
+                let single = chars.next().filter(|_| chars.next().is_none());
+                if single.is_some_and(|ch| block_fills(ch, span, s.fg, &mut blocks)) {
+                    // Painted with the other block fills after the text.
                 } else {
-                    let galley = painter.layout_no_wrap(run.text.clone(), font, s.fg);
-                    let pos = Pos2::new(
+                    let mut galley = painter.layout_no_wrap(run.text.clone(), font.clone(), s.fg);
+                    if let Some(smaller) = fit_font(&font, galley.mesh_bounds.size(), span.size()) {
+                        galley = painter.layout_no_wrap(run.text.clone(), smaller, s.fg);
+                    }
+                    // Fitting a fallback glyph changes its baseline and row
+                    // height. Align its ink to the primary font's cap-height
+                    // centre, not the (taller) terminal row box. Wide text and
+                    // combining marks keep their text baseline.
+                    let ink = galley.mesh_bounds;
+                    let mut pos = Pos2::new(
                         span.min.x + ((span.width() - galley.size().x) / 2.0).max(0.0),
                         span.min.y + (ch - galley.size().y) / 2.0,
                     );
+                    if ink.is_positive() && ink.is_finite() {
+                        pos.x = span.center().x - ink.center().x;
+                        let cell = &row[run.col];
+                        if !cell.in_primary_font && !cell.wide && cell.combining.is_none() {
+                            let center = *primary_ink_center.get_or_insert_with(|| {
+                                painter.layout_no_wrap("M".to_owned(), opt.fonts.primary.clone(), s.fg).mesh_bounds.center().y
+                            });
+                            pos.y = span.min.y + center - ink.center().y;
+                        }
+                        if pos.y + ink.min.y < span.min.y || pos.y + ink.max.y > span.max.y {
+                            pos.y = span.center().y - ink.center().y;
+                        }
+                    }
                     painter.with_clip_rect(span).galley(pos, galley, s.fg);
                 }
             } else {
@@ -279,6 +371,7 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
             paint_underline(painter, span, s.underline, s.fg);
         }
     }
+    painter.add(blocks.into_shape());
 
     if let Some(c) = frame.cursor {
         let rect = cell_rect(c.row, c.col, if c.wide { 2 } else { 1 });
@@ -355,6 +448,173 @@ mod tests {
         assert_eq!(snap_to_pixels(0.1, 1.0), 1.0, "never zero");
     }
 
+    /// Bars and block art (the Claude Code mascot, the context meter) showed a
+    /// hairline between every pair of cells: each cell was a separately
+    /// anti-aliased rect at a fractional position, so the shared edge pixel
+    /// was only partly covered. Cell fills must tessellate to opaque quads on
+    /// whole physical pixels.
+    #[test]
+    fn block_cells_tessellate_without_seams() {
+        let ppp = 1.25;
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(ppp);
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        let _ = ctx.run(Default::default(), |_| {});
+        let fonts = TermFonts::new(14.0);
+        let metrics = cell_metrics(&ctx, &fonts);
+        let style = |bg: Color32| crate::term::style::CellStyle {
+            fg: Color32::WHITE,
+            bg,
+            bold: false,
+            italic: false,
+            underline: Underline::None,
+            strike: false,
+        };
+        let cell = |ch: char, bg: Color32| RenderCell {
+            ch,
+            combining: None,
+            style: style(bg),
+            wide: false,
+            spacer: false,
+            in_primary_font: true,
+            hyperlink: None,
+        };
+        let blue = Color32::from_rgb(0, 0, 200);
+        let rows = vec![
+            "██▌▐▓▓▀▄".chars().map(|ch| cell(ch, Color32::BLACK)).collect::<Vec<_>>(),
+            "        ".chars().map(|ch| cell(ch, blue)).collect(),
+            "        ".chars().map(|ch| cell(ch, blue)).collect(),
+        ];
+        let frame = Frame {
+            rows,
+            columns: 8,
+            lines: 3,
+            cursor: None,
+            selection: vec![(1, 0, 8), (2, 0, 8)],
+            display_offset: 0,
+            history_size: 0,
+            default_bg: Color32::BLACK,
+        };
+        let output = ctx.run(Default::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            let palette = Palette::hardcore();
+            let opt = PaintOptions { metrics, fonts: &fonts, palette: &palette, focused: true, cursor_on: true, highlights: &[] };
+            paint(&painter, Pos2::new(10.3, 7.7), &frame, &opt);
+        });
+        let primitives = ctx.tessellate(output.shapes, ppp);
+        let mut vertices = 0;
+        for primitive in &primitives {
+            let egui::epaint::Primitive::Mesh(mesh) = &primitive.primitive else { continue };
+            for vertex in &mesh.vertices {
+                vertices += 1;
+                assert_ne!(vertex.color.a(), 0, "an anti-aliasing fringe around a cell fill at {:?}", vertex.pos);
+                for v in [vertex.pos.x, vertex.pos.y] {
+                    let px = v * ppp;
+                    assert!((px - px.round()).abs() < 1e-3, "cell edge off the pixel grid: {v} pt = {px} px");
+                }
+            }
+        }
+        assert!(vertices > 0, "the cells were painted");
+    }
+
+    #[test]
+    fn wide_fallback_glyphs_shrink_to_their_cells() {
+        let font = FontId::new(14.0, egui::FontFamily::Name("term".into()));
+        let cell = Vec2::new(8.0, 16.0);
+        let smaller = fit_font(&font, Vec2::new(12.0, 10.0), cell).expect("12 pt of ink does not fit an 8 pt cell");
+        assert!((smaller.size - 14.0 * 8.0 / 12.0).abs() < 1e-4);
+        assert_eq!(smaller.family, font.family);
+        let short = fit_font(&font, Vec2::new(6.0, 32.0), cell).expect("too tall");
+        assert!((short.size - 14.0 * 0.5).abs() < 1e-4, "height limits too");
+        assert_eq!(fit_font(&font, Vec2::new(8.0, 16.0), cell), None, "a glyph that fits keeps its size");
+        assert_eq!(fit_font(&font, Vec2::new(8.3, 9.0), cell), None, "sub-pixel overhang is not worth a smaller glyph");
+        assert_eq!(fit_font(&font, Vec2::splat(f32::NEG_INFINITY), cell), None, "no ink (a space) stays as is");
+    }
+
+    /// Paints `ch` as a fallback glyph in one cell: (ink bounds, clip, cell).
+    fn paint_fallback_glyph(ch: char) -> (Rect, Rect, CellMetrics) {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), true);
+        let _ = ctx.run(Default::default(), |_| {});
+        let fonts = TermFonts::new(14.0);
+        let cell = cell_metrics(&ctx, &fonts);
+        let output = ctx.run(Default::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            let cells = vec![RenderCell {
+                ch,
+                combining: None,
+                style: crate::term::style::CellStyle {
+                    fg: Color32::WHITE,
+                    bg: Color32::BLACK,
+                    bold: false,
+                    italic: false,
+                    underline: Underline::None,
+                    strike: false,
+                },
+                wide: false,
+                spacer: false,
+                in_primary_font: ch.is_ascii(),
+                hyperlink: None,
+            }];
+            let frame = Frame {
+                rows: vec![cells],
+                columns: 1,
+                lines: 1,
+                cursor: None,
+                selection: Vec::new(),
+                display_offset: 0,
+                history_size: 0,
+                default_bg: Color32::BLACK,
+            };
+            let palette = Palette::hardcore();
+            let opt = PaintOptions { metrics: cell, fonts: &fonts, palette: &palette, focused: true, cursor_on: true, highlights: &[] };
+            paint(&painter, Pos2::ZERO, &frame, &opt);
+        });
+        let (bounds, clip) = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some((text.visual_bounding_rect(), clipped.clip_rect)),
+                _ => None,
+            })
+            .expect("the glyph is painted");
+        (bounds, clip, cell)
+    }
+
+    /// Real fonts: Segoe UI Symbol's ↺, ⏵ and ◯ are wider than a Consolas
+    /// cell and were cut in half by the cell clip (the Claude Code status
+    /// line, its permission-mode arrows and the agent spinner).
+    #[test]
+    fn wide_fallback_glyphs_are_drawn_whole() {
+        for ch in ['↺', '⏵', '◯'] {
+            let (bounds, clip, cell) = paint_fallback_glyph(ch);
+            assert!(bounds.width() <= cell.width + 0.5, "{ch}: ink {bounds:?} wider than its cell {cell:?}");
+            assert!(clip.contains_rect(bounds.shrink(0.25)), "{ch}: ink {bounds:?} is cut by the clip {clip:?}");
+        }
+        // Fitted by its ink, not its padded advance: it still fills the cell.
+        let (bounds, _, cell) = paint_fallback_glyph('↺');
+        assert!(bounds.width() >= cell.width * 0.75, "↺ shrunk to {bounds:?} in a {cell:?} cell");
+    }
+
+    #[test]
+    fn permission_arrows_align_with_primary_text_instead_of_the_row_box() {
+        let (arrow, clip, _) = paint_fallback_glyph('⏵');
+        let (text, _, _) = paint_fallback_glyph('M');
+        assert!((arrow.center().y - text.center().y).abs() <= 0.5, "permission arrow {arrow:?} sits below primary text {text:?}");
+        assert!(clip.contains_rect(arrow.shrink(0.25)), "aligned arrow {arrow:?} is clipped by {clip:?}");
+    }
+
+    /// OSC 8 targets come from any program's output; a multi-megabyte URI on
+    /// every cell was copied per cell per frame (tens of GB a frame).
+    #[test]
+    fn overlong_link_targets_are_ignored() {
+        use alacritty_terminal::term::cell::Hyperlink;
+        let short = Hyperlink::new(None::<String>, "https://example.com".to_owned());
+        assert_eq!(usable_link(short.clone()), Some(short));
+        let long = Hyperlink::new(None::<String>, format!("https://example.com/{}", "a".repeat(MAX_LINK_URI)));
+        assert_eq!(usable_link(long), None);
+    }
+
     #[test]
     fn glyph_cache_asks_once_and_trusts_ascii() {
         let mut cache = GlyphCache::default();
@@ -372,13 +632,18 @@ mod tests {
     #[test]
     fn block_elements_fill_their_cell() {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(8.0, 16.0));
-        let bounds = |ch: char| block_shape(ch, rect, Color32::WHITE).expect("block").visual_bounding_rect();
+        let fills = |ch: char| {
+            let mut fills = CellFills::new(1.0);
+            block_fills(ch, rect, Color32::WHITE, &mut fills).then(|| fills.into_shape())
+        };
+        let bounds = |ch: char| fills(ch).expect("block").visual_bounding_rect();
         assert_eq!(bounds('\u{2588}'), rect, "a full block covers the whole cell");
         assert_eq!(bounds('\u{2580}'), Rect::from_min_size(Pos2::ZERO, Vec2::new(8.0, 8.0)), "upper half");
         assert_eq!(bounds('\u{2590}'), Rect::from_min_size(Pos2::new(4.0, 0.0), Vec2::new(4.0, 16.0)), "right half");
         assert_eq!(bounds('\u{259D}'), Rect::from_min_size(Pos2::new(4.0, 0.0), Vec2::new(4.0, 8.0)), "upper right quadrant");
         assert_eq!(bounds('\u{259B}'), Rect::from_min_size(Pos2::ZERO, Vec2::new(8.0, 16.0)), "three quadrants reach every edge");
-        assert!(block_shape('A', rect, Color32::WHITE).is_none(), "letters stay with the font");
-        assert!(block_shape('\u{2500}', rect, Color32::WHITE).is_none(), "box drawing stays with the font");
+        assert_eq!(bounds('\u{2593}'), rect, "shades fill the cell");
+        assert!(fills('A').is_none(), "letters stay with the font");
+        assert!(fills('\u{2500}').is_none(), "box drawing stays with the font");
     }
 }

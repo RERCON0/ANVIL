@@ -103,7 +103,7 @@ impl EventListener for Listener {
                 self.shared.output.store(true, Ordering::Relaxed);
                 (self.repaint)();
             }
-            Event::Title(title) => self.queue(PaneEvent::Title(title)),
+            Event::Title(title) => self.queue(PaneEvent::Title(clip_title(title))),
             Event::ResetTitle => self.queue(PaneEvent::ResetTitle),
             Event::Bell => self.queue(PaneEvent::Bell),
             Event::ClipboardStore(_, text) => self.queue(PaneEvent::Clipboard(text)),
@@ -245,14 +245,21 @@ impl Pane {
         *self.shared.palette.write().unwrap_or_else(|e| e.into_inner()) = palette;
     }
 
-    /// Changes the cursor shape new applications see; a running application's
-    /// own DECSCUSR request still wins until it resets to the default.
-    pub fn set_cursor_style(&self, style: CursorStyle) {
+    /// Applies the terminal settings to the running terminal: the cursor shape
+    /// new applications see (a running application's own DECSCUSR request
+    /// still wins until it resets to the default), the scrollback length and
+    /// the word separators of double-click selection.
+    pub fn set_options(&self, style: CursorStyle, scrollback: usize, word_separators: &str) {
         let mut config = self.config.lock().unwrap_or_else(|e| e.into_inner());
-        if config.default_cursor_style == style {
+        if config.default_cursor_style == style
+            && config.scrolling_history == scrollback
+            && config.semantic_escape_chars == word_separators
+        {
             return;
         }
         config.default_cursor_style = style;
+        config.scrolling_history = scrollback;
+        config.semantic_escape_chars = word_separators.to_owned();
         self.term.lock().set_options(config.clone());
     }
 
@@ -284,5 +291,32 @@ impl Drop for Pane {
         // Closing the pseudoconsole ends the console processes in this pane.
         // The reader thread drops the PTY itself; never join it from the UI.
         let _ = self.notifier.0.send(Msg::Shutdown);
+    }
+}
+
+
+/// Longest window title kept from a program.
+pub const MAX_TITLE_CHARS: usize = 256;
+
+/// A title set by the program (OSC 0/2), cut to `MAX_TITLE_CHARS`: any
+/// output can set it, and the tab list lays it out on every frame.
+pub fn clip_title(title: String) -> String {
+    match title.char_indices().nth(MAX_TITLE_CHARS) {
+        Some((end, _)) => title[..end].to_owned(),
+        None => title,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Titles come from any program's output: a megabyte title was cloned and
+    /// laid out in full on every frame.
+    #[test]
+    fn titles_are_clipped() {
+        let long = "заголовок ".repeat(10_000);
+        assert_eq!(clip_title(long).chars().count(), MAX_TITLE_CHARS);
+        assert_eq!(clip_title("short".to_owned()), "short");
     }
 }

@@ -107,6 +107,8 @@ pub struct Tab {
     pub has_activity: bool,
     /// Cursor rectangle of the focused pane, for the IME candidate window.
     pub ime_area: Option<Rect>,
+    /// Terminal area of every live pane as last drawn, for `pane_at`.
+    pub terminal_rects: Vec<(PaneId, Rect)>,
 }
 
 impl Tab {
@@ -125,7 +127,53 @@ impl Tab {
             custom_title: None,
             has_activity: false,
             ime_area: None,
+            terminal_rects: Vec::new(),
         }
+    }
+
+    /// Moves the focus to `id`. The focused pane must be on screen, so a
+    /// maximized view of another pane ends.
+    pub fn set_focus(&mut self, id: PaneId) {
+        self.focused = id;
+        if self.maximized.is_some_and(|maximized| maximized != id) {
+            self.maximized = None;
+        }
+    }
+
+    /// Removes pane `id`; true when it was the tab's last pane, so the caller
+    /// closes the tab instead. The layout cannot lose its last leaf: when the
+    /// pane is the only one left in it while others sit collapsed, a collapsed
+    /// one is brought back first, or the tab would keep a leaf without a pane.
+    pub fn remove_pane(&mut self, id: PaneId) -> bool {
+        if !self.panes.contains_key(&id) {
+            return false;
+        }
+        if self.panes.len() <= 1 {
+            return true;
+        }
+        if self.tree.panes() == [id] && !self.collapsed.is_empty() {
+            let (restored, anchor) = self.collapsed.remove(0);
+            self.tree.restore(restored, anchor, id);
+        }
+        let anchor = self.tree.remove(id);
+        self.panes.remove(&id);
+        self.collapsed.retain(|(pane, _)| *pane != id);
+        if self.focused == id {
+            self.focused = anchor
+                .map(|a| a.neighbor)
+                .filter(|neighbor| self.panes.contains_key(neighbor) && self.tree.contains(*neighbor))
+                .or_else(|| self.tree.panes().first().copied())
+                .unwrap_or(id);
+        }
+        if self.maximized == Some(id) {
+            self.maximized = None;
+        }
+        false
+    }
+
+    /// The pane whose terminal area contains `pos` (as drawn last frame).
+    pub fn pane_at(&self, pos: Pos2) -> Option<PaneId> {
+        self.terminal_rects.iter().find(|(_, rect)| rect.contains(pos)).map(|(id, _)| *id)
     }
 
     /// The title shown in the tab list: custom, else the focused pane's.
@@ -173,6 +221,7 @@ impl Tab {
         let mut actions = Vec::new();
         let mut layout_rect = rect;
         let focused = self.focused;
+        self.terminal_rects.clear();
 
         if !self.collapsed.is_empty() {
             let strip = Rect::from_min_size(rect.min, Vec2::new(rect.width(), COLLAPSED_STRIP_HEIGHT));
@@ -247,6 +296,7 @@ impl Tab {
                     } else {
                         (*pane_rect, None)
                     };
+                    self.terminal_rects.push((*id, terminal_rect));
                     let output = entry.view.show(ui, terminal_rect, pane, &input);
                     // The pane that is not focused is dimmed so the eye lands on
                     // the one being typed into.
@@ -403,4 +453,69 @@ fn tree_rect(rect: Rect) -> crate::layout::split_tree::Rect {
 
 fn egui_rect(rect: crate::layout::split_tree::Rect) -> Rect {
     Rect::from_min_size(Pos2::new(rect.x, rect.y), Vec2::new(rect.w, rect.h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry() -> PaneEntry {
+        PaneEntry {
+            content: PaneContent::Error(String::new()),
+            view: TerminalView::new(14.0),
+            workspace: crate::workspace::Workspace::default(),
+            start_cwd: None,
+            profile_id: String::new(),
+            profile_name: String::new(),
+            title: String::new(),
+            exited: false,
+            claude: None,
+            claude_mtime: None,
+            has_claude: false,
+        }
+    }
+
+    fn two_panes() -> Tab {
+        let mut tree = SplitTree::new(1);
+        assert!(tree.insert(1, 2, Dir::Row, true));
+        Tab::new(tree, HashMap::from([(1, entry()), (2, entry())]), 1)
+    }
+
+    #[test]
+    fn removing_a_pane_keeps_the_tab_consistent() {
+        let mut tab = two_panes();
+        assert!(!tab.remove_pane(1), "one pane is left");
+        assert_eq!(tab.tree.panes(), vec![2]);
+        assert_eq!(tab.focused, 2);
+        assert!(tab.remove_pane(2), "the last pane closes the tab");
+        assert!(!tab.remove_pane(99), "an unknown pane changes nothing");
+    }
+
+    /// Splitting or moving between panes while one is maximized put the focus
+    /// on a pane that was not drawn: typing went to an invisible terminal.
+    #[test]
+    fn focusing_another_pane_ends_the_maximized_view() {
+        let mut tab = two_panes();
+        tab.maximized = Some(1);
+        tab.set_focus(1);
+        assert_eq!(tab.maximized, Some(1), "focusing the maximized pane keeps it maximized");
+        tab.set_focus(2);
+        assert_eq!((tab.focused, tab.maximized), (2, None));
+    }
+
+    /// Closing the only visible pane while another one sat collapsed left a
+    /// leaf without a pane: the layout cannot lose its last leaf, but the
+    /// pane was dropped anyway, so the tab showed nothing and typing went
+    /// nowhere. The collapsed pane comes back instead.
+    #[test]
+    fn closing_the_last_visible_pane_brings_a_collapsed_one_back() {
+        let mut tab = two_panes();
+        let anchor = tab.tree.remove(2).expect("pane 2 collapses");
+        tab.collapsed.push((2, anchor));
+        assert!(!tab.remove_pane(1), "pane 2 still lives");
+        assert_eq!(tab.tree.panes(), vec![2], "the collapsed pane is back in the layout");
+        assert!(tab.collapsed.is_empty());
+        assert_eq!(tab.focused, 2);
+        assert!(tab.panes.contains_key(&2) && !tab.panes.contains_key(&1));
+    }
 }

@@ -72,6 +72,9 @@ pub struct ClosedTab {
     pub state: TabState,
 }
 
+/// Command-line flag of a window opened with Ctrl+Shift+N.
+pub const NEW_WINDOW_ARG: &str = "--new-window";
+
 pub struct AnvilApp {
     config: Config,
     config_mtime: Option<SystemTime>,
@@ -88,6 +91,9 @@ pub struct AnvilApp {
     tabbar: tabbar::TabbarState,
     settings: crate::settings_ui::SettingsState,
     session: SessionState,
+    /// Opened with Ctrl+Shift+N: starts with one tab and never writes
+    /// session.json, which belongs to the first window.
+    extra_window: bool,
     session_dirty: Option<Instant>,
     /// Last geometry while not maximized, plus the maximized flag.
     window_state: Option<WindowState>,
@@ -124,7 +130,12 @@ impl AnvilApp {
         let has_problems = !problems.is_empty();
         let palette = scheme_palette(&config);
         let status_dir = status_dir();
-        let session = SessionState::load(&SessionState::path());
+        // A window opened with Ctrl+Shift+N: the first window owns the session.
+        let extra_window = std::env::args().skip(1).any(|arg| arg == NEW_WINDOW_ARG);
+        let mut session = SessionState::load(&SessionState::path());
+        if extra_window {
+            session = session.for_extra_window();
+        }
         let session_window = session.window;
         let mut app = AnvilApp {
             config,
@@ -142,6 +153,7 @@ impl AnvilApp {
             tabbar: tabbar::TabbarState::default(),
             settings: crate::settings_ui::SettingsState::default(),
             session,
+            extra_window,
             session_dirty: None,
             window_state: session_window.map(|w| WindowState { maximized: false, ..w }),
             window_maximized: session_window.map(|w| w.maximized).unwrap_or(false),
@@ -330,7 +342,7 @@ impl AnvilApp {
     /// activity dot instead of growing an unconsumed queue.
     fn poll_panes(&mut self, ctx: &egui::Context) {
         let active = self.active;
-        let mut close: Vec<(usize, PaneId)> = Vec::new();
+        let mut close: Vec<PaneId> = Vec::new();
         let mut bells = 0usize;
         for (index, tab) in self.tabs.iter_mut().enumerate() {
             for (id, entry) in tab.panes.iter_mut() {
@@ -347,7 +359,7 @@ impl AnvilApp {
                             entry.view.app_blink = pane.term.lock().cursor_style().blinking;
                         }
                         PaneEvent::Exited(code) => match code {
-                            Some(0) => close.push((index, *id)),
+                            Some(0) => close.push(*id),
                             other => {
                                 let message = format!("\r\n\x1b[90m{}\x1b[0m\r\n", strings::process_exited(other));
                                 let mut term = pane.term.lock();
@@ -366,8 +378,9 @@ impl AnvilApp {
         if bells > 0 && self.config.terminal.bell == Bell::Visual {
             self.toast(strings::BELL.to_owned());
         }
-        for (index, id) in close {
-            self.close_pane_in(index, id);
+        // By id: closing one tab shifts the indices of the tabs after it.
+        for id in close {
+            self.close_pane_anywhere(id);
         }
     }
 
@@ -526,7 +539,9 @@ impl AnvilApp {
     // ---- terminal input -------------------------------------------------
 
     pub fn send_key(&mut self, press: &KeyPress) {
-        if self.tabs.get(self.active).is_some_and(Tab::focused_exited) {
+        // Ctrl or Alt alone is not "a key": it may start Ctrl+Shift+C on the
+        // exit message.
+        if !press.is_modifier_only() && self.tabs.get(self.active).is_some_and(Tab::focused_exited) {
             let id = self.tabs[self.active].focused;
             self.close_pane(id);
             return;
@@ -600,7 +615,7 @@ impl AnvilApp {
             }
             Action::NewWindow => {
                 if let Ok(exe) = std::env::current_exe() {
-                    if let Err(e) = std::process::Command::new(exe).spawn() {
+                    if let Err(e) = std::process::Command::new(exe).arg(NEW_WINDOW_ARG).spawn() {
                         log::warn!("cannot start a new window: {e}");
                     }
                 }
@@ -760,18 +775,20 @@ impl AnvilApp {
     /// CLI for AI commit messages: the configured one, else the AI CLI found
     /// in the focused pane's process tree (claude, opencode, codex, …).
     fn ai_command(&self) -> Option<String> {
-        if let Some(command) = self.config.workspace.ai_commit_command.clone() {
-            return Some(command);
+        let command = self.config.workspace.ai_commit_command.clone().or_else(|| {
+            let pane = self.focused_pane()?;
+            // Asked every frame: one walk, not one per candidate name.
+            let names = crate::procs::descendant_names(&self.proc_snapshot, pane.shell_pid);
+            ["claude", "opencode", "codex", "gemini", "aider"]
+                .into_iter()
+                .find(|candidate| names.contains(&format!("{candidate}.exe")) || names.contains(*candidate))
+                .map(str::to_owned)
+        })?;
+        match self.config.workspace.ai_commit_model.as_deref().filter(|model| !model.is_empty()) {
+            Some(model) if command.trim() == "opencode" => Some(format!("opencode run --model {model}")),
+            Some(model) if command.starts_with("opencode ") => Some(format!("{command} --model {model}")),
+            _ => Some(command),
         }
-        let pane = self.focused_pane()?;
-        for candidate in ["claude", "opencode", "codex", "gemini", "aider"] {
-            if crate::procs::has_descendant_named(&self.proc_snapshot, pane.shell_pid, &format!("{candidate}.exe"))
-                || crate::procs::has_descendant_named(&self.proc_snapshot, pane.shell_pid, candidate)
-            {
-                return Some(candidate.to_owned());
-            }
-        }
-        None
     }
 
     fn focused_cwd(&self) -> Option<PathBuf> {
@@ -805,7 +822,7 @@ impl AnvilApp {
                 pane.write(b"\x1b[O".to_vec());
             }
         }
-        tab.focused = id;
+        tab.set_focus(id);
         if let Some(pane) = tab.pane(id).and_then(PaneEntry::live) {
             if pane.term.lock().mode().contains(TermMode::FOCUS_IN_OUT) {
                 pane.write(b"\x1b[I".to_vec());
@@ -835,7 +852,7 @@ impl AnvilApp {
         };
         if inserted {
             tab.panes.insert(id, entry);
-            tab.focused = id;
+            tab.set_focus(id);
         }
         self.mark_session_dirty();
     }
@@ -845,26 +862,20 @@ impl AnvilApp {
     }
 
     fn close_pane_in(&mut self, index: usize, id: PaneId) {
-        let last = self.tabs.get(index).is_some_and(|t| t.panes.len() <= 1);
-        if last {
+        let Some(tab) = self.tabs.get_mut(index) else { return };
+        if tab.remove_pane(id) {
             self.close_tab(index);
             return;
         }
-        let Some(tab) = self.tabs.get_mut(index) else { return };
-        let anchor = tab.tree.remove(id);
-        tab.panes.remove(&id);
-        tab.collapsed.retain(|(pane, _)| *pane != id);
-        if tab.focused == id {
-            tab.focused = anchor
-                .map(|a| a.neighbor)
-                .filter(|neighbor| tab.panes.contains_key(neighbor))
-                .or_else(|| tab.tree.panes().first().copied())
-                .unwrap_or(id);
-        }
-        if tab.maximized == Some(id) {
-            tab.maximized = None;
-        }
         self.mark_session_dirty();
+    }
+
+    /// Closes pane `id` wherever it lives now. Pane ids are unique across
+    /// tabs, while tab indices shift as soon as an earlier tab closes.
+    fn close_pane_anywhere(&mut self, id: PaneId) {
+        if let Some(index) = self.tabs.iter().position(|tab| tab.panes.contains_key(&id)) {
+            self.close_pane_in(index, id);
+        }
     }
 
     fn collapse_pane(&mut self, id: PaneId) {
@@ -942,6 +953,29 @@ impl AnvilApp {
         let bytes = paste::prepare_paste(&text, bracketed);
         pane.term.lock().scroll_display(Scroll::Bottom);
         pane.write(bytes);
+    }
+
+    /// A file or folder dropped on the window (Helm's path drop): its path,
+    /// quoted for the pane's shell, is typed into the pane under the drop point
+    /// (else the focused one), which takes the focus.
+    pub fn drop_path(&mut self, path: &Path, at: Option<Pos2>) {
+        if self.settings_open {
+            return;
+        }
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let id = at.and_then(|pos| tab.pane_at(pos)).unwrap_or(tab.focused);
+        let Some(entry) = tab.pane(id) else { return };
+        let quoting = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == entry.profile_id)
+            .map_or(paste::PathQuoting::Unix, profiles::path_quoting);
+        let Some(pane) = entry.live() else { return };
+        let bracketed = pane.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        let bytes = paste::prepare_paste(&paste::quote_path(&path.to_string_lossy(), quoting), bracketed);
+        pane.term.lock().scroll_display(Scroll::Bottom);
+        pane.write(bytes);
+        self.focus_pane(id);
     }
 
     fn select_all(&mut self, id: PaneId) {
@@ -1039,6 +1073,7 @@ impl AnvilApp {
             return;
         }
         let tab = self.tabs.remove(index);
+        self.tabbar.tab_removed(index);
         let state = self.tab_state(&tab);
         self.closed_tabs.push(ClosedTab { state });
         if self.closed_tabs.len() > 10 {
@@ -1061,6 +1096,9 @@ impl AnvilApp {
     fn close_other_tabs(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
+        }
+        for closed in (0..self.tabs.len()).rev().filter(|closed| *closed != index) {
+            self.tabbar.tab_removed(closed);
         }
         let keep = self.tabs.remove(index);
         let others: Vec<Tab> = self.tabs.drain(..).collect();
@@ -1233,15 +1271,20 @@ impl AnvilApp {
         }
         let palette = self.palette.clone();
         let style = cursor_style(&self.config.terminal.cursor);
+        let scrollback = self.config.terminal.scrollback;
+        let word_separators = self.config.terminal.word_separators.clone();
         let font_size = self.config.font.size;
         for tab in &mut self.tabs {
             for entry in tab.panes.values_mut() {
                 entry.view.font_size = font_size;
+                if family_changed {
+                    entry.view.font_changed();
+                }
                 if let Some(pane) = entry.live() {
                     if scheme_changed {
                         pane.set_palette(palette.clone());
                     }
-                    pane.set_cursor_style(style);
+                    pane.set_options(style, scrollback, &word_separators);
                 }
             }
         }
@@ -1314,6 +1357,9 @@ impl AnvilApp {
     }
 
     fn save_session(&mut self) {
+        if self.extra_window {
+            return;
+        }
         let states: Vec<TabState> = {
             let tabs = &self.tabs;
             tabs.iter().map(|tab| self.tab_state(tab)).collect()
@@ -1464,10 +1510,10 @@ impl AnvilApp {
                     _ => {}
                 }
                 if entry.claude.is_some() {
-                    let alive = crate::procs::has_descendant_named(snapshot, shell_pid, "claude.exe")
+                    let alive = crate::procs::runs_claude(snapshot, shell_pid)
                         // A stale snapshot must not delete a live pane's status:
                         // re-check with a fresh one before deciding it is gone.
-                        || crate::procs::has_descendant_named(&crate::procs::snapshot(), shell_pid, "claude.exe");
+                        || crate::procs::runs_claude(&crate::procs::snapshot(), shell_pid);
                     entry.has_claude = alive;
                     if !alive {
                         entry.claude = None;

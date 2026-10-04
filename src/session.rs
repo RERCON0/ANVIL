@@ -76,6 +76,16 @@ impl SessionState {
         }
     }
 
+    /// What a window opened with Ctrl+Shift+N starts from: the size of the
+    /// saved window, moved down and right so the two do not cover each other,
+    /// and no tabs. Restoring the tabs cloned the first window's whole
+    /// session (and started a second copy of every shell).
+    pub fn for_extra_window(self) -> SessionState {
+        const CASCADE: i32 = 32;
+        let window = self.window.map(|w| WindowState { x: w.x + CASCADE, y: w.y + CASCADE, maximized: false, ..w });
+        SessionState { window, active_tab: 0, tabs: Vec::new() }
+    }
+
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let text = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
         atomic_write(path, text.as_bytes())
@@ -113,6 +123,28 @@ pub fn usable_cwd(saved: Option<&Path>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_extra_window_starts_empty_and_offset() {
+        let session = SessionState {
+            window: Some(WindowState { x: 100, y: 50, width: 1200, height: 800, maximized: true }),
+            active_tab: 2,
+            tabs: vec![TabState {
+                layout: SavedNode::Pane(PaneState {
+                    profile_id: "pwsh".into(),
+                    cwd: None,
+                    workspace_open: false,
+                    workspace_width: None,
+                    workspace_tab: None,
+                }),
+                focused: 0,
+                custom_title: None,
+            }],
+        };
+        let extra = session.for_extra_window();
+        assert!(extra.tabs.is_empty() && extra.active_tab == 0);
+        assert_eq!(extra.window, Some(WindowState { x: 132, y: 82, width: 1200, height: 800, maximized: false }));
+    }
 
     fn pane(profile: &str, cwd: Option<&str>) -> PaneState {
         PaneState {

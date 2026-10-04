@@ -11,9 +11,8 @@ use image::codecs::ico::{IcoEncoder, IcoFrame};
 use image::imageops::FilterType;
 use image::{ExtendedColorType, RgbaImage};
 
-/// The icon artwork: a rounded dark tile with the accent mark on a
-/// transparent field.
-const SOURCE: &str = "forge_20261003_173719.png";
+/// The supplied terminal mark on a transparent field.
+const SOURCE: &str = "forge_20261003_213013_nobg.png";
 const SIZES: [u32; 7] = [16, 24, 32, 48, 64, 128, 256];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

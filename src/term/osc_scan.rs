@@ -107,7 +107,19 @@ pub fn parse_cwd(payload: &[u8]) -> Option<PathBuf> {
     } else {
         return None;
     };
-    (!path.is_empty()).then(|| PathBuf::from(path))
+    local_drive_path(&path).map(PathBuf::from)
+}
+
+/// `path` with `\` separators when it is an absolute path on a local drive
+/// (`C:\...`). Anything a program prints can claim a directory: a UNC or
+/// device path (`\\host\share`, `\\?\UNC\...`) would make the panel's git
+/// and new tabs reach out to that host, and relative or drive-relative paths
+/// mean nothing outside the program that sent them.
+fn local_drive_path(path: &str) -> Option<String> {
+    let path = path.replace('/', "\\");
+    let bytes = path.as_bytes();
+    let absolute = bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\';
+    (absolute && !path.chars().any(char::is_control)).then_some(path)
 }
 
 fn file_url_path(url: &str) -> Option<String> {
@@ -213,6 +225,28 @@ mod tests {
         seq.push(0x07);
         assert_eq!(scan(&[&seq]), None);
         assert_eq!(scan(&[&seq, b"\x1b]1337;CurrentDir=C:\\ok\x07"]), Some(PathBuf::from("C:\\ok")));
+    }
+
+    /// Any program's output can send these: a UNC report made the panel run git
+    /// (and new tabs start) on \\host\share, an outgoing SMB login that leaks
+    /// the user's NTLM hash. Only absolute paths on a local drive are taken.
+    #[test]
+    fn only_local_drive_paths_are_accepted() {
+        for bad in [
+            &b"\x1b]1337;CurrentDir=\\\\attacker\\share\x07"[..],
+            b"\x1b]1337;CurrentDir=//attacker/share\x07",
+            b"\x1b]1337;CurrentDir=\\\\?\\UNC\\attacker\\share\x07",
+            b"\x1b]1337;CurrentDir=\\\\.\\pipe\\x\x07",
+            b"\x1b]9;9;\"\\\\attacker\\share\"\x07",
+            b"\x1b]7;file://attacker//share/x\x07",
+            b"\x1b]1337;CurrentDir=relative\\dir\x07",
+            b"\x1b]1337;CurrentDir=\\rooted\x07",
+            b"\x1b]1337;CurrentDir=C:relative\x07",
+            b"\x1b]7;file://host/home/user\x07",
+        ] {
+            assert_eq!(scan(&[bad]), None, "{:?}", String::from_utf8_lossy(bad));
+        }
+        assert_eq!(scan(&[b"\x1b]1337;CurrentDir=d:/work\x07"]), Some(PathBuf::from("d:\\work")));
     }
 
     #[test]

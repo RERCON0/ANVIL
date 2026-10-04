@@ -1,4 +1,4 @@
-//! Test helper for tests/conpty.rs: a tiny console program that behaves like
+//! Test helper for tests/conpty.rs and tests/git.rs: a tiny console program that behaves like
 //! the applications ANVIL must serve (omp, opencode). Not shipped.
 //!
 //! anvil-probe stdin <out>   raw VT stdin + CSI ? 9001 h; records stdin until 'q'
@@ -6,6 +6,8 @@
 //! anvil-probe queries <out> asks DA1 and CPR, records the replies
 //! anvil-probe size <out>    waits for 's', writes "COLSxROWS"
 //! anvil-probe cwd           reports C:\Windows via OSC 1337 and exits
+//! anvil-probe pwd           prints its working directory (the AI-message runner)
+//! anvil-probe sleep         sleeps for a minute (the AI-message timeout)
 
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
@@ -103,6 +105,8 @@ fn main() {
             out("DONE\r\n");
             std::thread::sleep(Duration::from_millis(300));
         }
+        "pwd" => out(&std::env::current_dir().unwrap().to_string_lossy()),
+        "sleep" => std::thread::sleep(Duration::from_secs(60)),
         _ => {
             eprintln!("unknown scenario");
             std::process::exit(2);

@@ -198,8 +198,8 @@ pub struct RenderCell {
     pub spacer: bool,
     /// The primary terminal font has this glyph.
     pub in_primary_font: bool,
-    /// OSC 8 link attached to the cell.
-    pub hyperlink: Option<Box<str>>,
+    /// OSC 8 link attached to the cell (shared, not copied per cell).
+    pub hyperlink: Option<alacritty_terminal::term::cell::Hyperlink>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -1,5 +1,24 @@
 //! Search query -> pattern for alacritty's `RegexSearch`.
 
+use alacritty_terminal::term::search::RegexSearch;
+
+/// The compiled search for the last pattern. `RegexSearch::new` builds four
+/// lazy DFAs: too much to redo on every frame while the search bar is open.
+#[derive(Default)]
+pub struct RegexCache {
+    entry: Option<(String, Option<RegexSearch>)>,
+}
+
+impl RegexCache {
+    /// The search for `pattern`, compiled once; None when it does not compile.
+    pub fn get(&mut self, pattern: &str) -> Option<&mut RegexSearch> {
+        if self.entry.as_ref().is_none_or(|(key, _)| key != pattern) {
+            self.entry = Some((pattern.to_owned(), RegexSearch::new(pattern).ok()));
+        }
+        self.entry.as_mut().and_then(|(_, regex)| regex.as_mut())
+    }
+}
+
 /// Plain queries are escaped; case-insensitive search uses the `(?i)` flag.
 pub fn search_pattern(query: &str, regex: bool, case_sensitive: bool) -> String {
     let body = if regex { query.to_owned() } else { escape_regex(query) };
@@ -26,6 +45,16 @@ pub fn escape_regex(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pattern_is_compiled_once() {
+        let mut cache = RegexCache::default();
+        let first = cache.get("(?i)error").map(|regex| regex as *const RegexSearch).expect("compiles");
+        let again = cache.get("(?i)error").map(|regex| regex as *const RegexSearch).expect("compiles");
+        assert!(std::ptr::eq(first, again), "the same pattern reuses the compiled search");
+        assert!(cache.get("(").is_none(), "an invalid pattern");
+        assert!(cache.get("(?i)warn").is_some(), "a new pattern compiles again");
+    }
 
     #[test]
     fn plain_queries_are_escaped() {

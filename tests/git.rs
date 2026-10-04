@@ -2,6 +2,7 @@
 //! read the status, stage, diff and commit.
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 use std::process::Command;
 
 use anvil::git;
@@ -109,6 +110,126 @@ fn stages_and_unstages_a_single_hunk() {
     assert!(git::diff(&root, "big.txt", true).trim().is_empty(), "index is clean again");
     let unstaged = git::diff(&root, "big.txt", false);
     assert!(unstaged.contains("+FIRST change") && unstaged.contains("+SECOND change"));
+}
+
+fn output(dir: &Path, args: &[&str]) -> Vec<u8> {
+    let mut command = Command::new("git");
+    command.args(args).current_dir(dir);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let out = command.output().expect("git");
+    assert!(out.status.success(), "git {args:?} failed");
+    out.stdout
+}
+
+/// Regression: the hunk patch was rebuilt from a lossy UTF-8 string split
+/// with `str::lines()`, so a CP1251 line reached the index as U+FFFD and a
+/// CRLF line lost its CR. The index must get the worktree bytes exactly.
+#[test]
+fn staging_a_hunk_keeps_the_exact_bytes() {
+    let Some(dir) = repo() else { return };
+    let root = git::find_root(dir.path()).expect("root");
+    run(dir.path(), &["config", "core.autocrlf", "false"]);
+    // "Привет" and "Строка" in CP1251, CRLF line ends.
+    let base: &[u8] = b"first\r\n\xcf\xf0\xe8\xe2\xe5\xf2\r\nlast\r\n";
+    std::fs::write(dir.path().join("cp1251.txt"), base).unwrap();
+    run(dir.path(), &["add", "cp1251.txt"]);
+    run(dir.path(), &["commit", "--quiet", "-m", "add cp1251.txt"]);
+    let changed: &[u8] = b"first\r\n\xd1\xf2\xf0\xee\xea\xe0\r\n\xcf\xf0\xe8\xe2\xe5\xf2\r\nlast\r\n";
+    std::fs::write(dir.path().join("cp1251.txt"), changed).unwrap();
+
+    let files = git::parse_diff(git::diff_bytes(&root, "cp1251.txt", false), false);
+    git::apply_hunks(&root, &files[0], &[0], false).expect("stage the hunk");
+    assert_eq!(output(dir.path(), &["show", ":cp1251.txt"]), changed, "the index holds the worktree bytes");
+
+    let staged = git::parse_diff(git::diff_bytes(&root, "cp1251.txt", true), true);
+    git::apply_hunks(&root, &staged[0], &[0], true).expect("unstage the hunk");
+    assert_eq!(output(dir.path(), &["show", ":cp1251.txt"]), base, "unstaging restores the committed bytes");
+}
+
+/// A Cyrillic file name: with git's default core.quotePath the diff header
+/// was `"a/\320\244..."`, so the parsed path never matched the file.
+#[test]
+fn hunks_of_a_cyrillic_file_name_can_be_staged() {
+    let Some(dir) = repo() else { return };
+    let root = git::find_root(dir.path()).expect("root");
+    std::fs::write(dir.path().join("файл.txt"), "one\n").unwrap();
+    run(dir.path(), &["add", "файл.txt"]);
+    run(dir.path(), &["commit", "--quiet", "-m", "add файл.txt"]);
+    std::fs::write(dir.path().join("файл.txt"), "one\ntwo\n").unwrap();
+
+    let files = git::parse_diff(git::diff_bytes(&root, "файл.txt", false), false);
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "файл.txt");
+    git::apply_hunks(&root, &files[0], &[0], false).expect("stage the hunk");
+    assert_eq!(output(dir.path(), &["show", ":файл.txt"]), b"one\ntwo\n");
+}
+
+/// Regression: the branch's remote was looked up as `config --get branch
+/// <b>.remote` (key "branch"), which always failed, so fetch went to origin.
+#[test]
+fn fetch_uses_the_remote_of_the_current_branch() {
+    let Some(dir) = repo() else { return };
+    let root = git::find_root(dir.path()).expect("root");
+    let remote = tempfile::tempdir().unwrap();
+    run(remote.path(), &["init", "--quiet", "--bare"]);
+    let remote_path = remote.path().to_string_lossy().into_owned();
+    run(dir.path(), &["remote", "add", "upstream", &remote_path]);
+    let branch = String::from_utf8(output(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"])).unwrap();
+    run(dir.path(), &["config", &format!("branch.{}.remote", branch.trim()), "upstream"]);
+    assert_eq!(git::fetch(&root), Ok("fetch upstream".to_owned()));
+}
+
+/// The AI CLI used to run inside the repository, where it loads the
+/// repository's own agent config (`.claude/settings.json` hooks, an
+/// `opencode.json` MCP server): a cloned repository could run code on a
+/// button press. It runs in the given neutral folder, with a deadline.
+#[test]
+fn ai_message_runs_outside_the_repository_with_a_deadline() {
+    let probe = env!("CARGO_BIN_EXE_anvil-probe");
+    let work = tempfile::tempdir().unwrap();
+    let message = git::ai_commit_message(work.path(), Some(&format!("{probe} pwd")), "prompt", Duration::from_secs(20))
+        .expect("the probe answers");
+    assert_eq!(Path::new(&message).canonicalize().unwrap(), work.path().canonicalize().unwrap());
+
+    let started = Instant::now();
+    let hung = git::ai_commit_message(work.path(), Some(&format!("{probe} sleep")), "prompt", Duration::from_millis(500));
+    assert!(hung.is_err(), "a CLI that never answers is an error, got {hung:?}");
+    assert!(started.elapsed() < Duration::from_secs(10), "the deadline holds: {:?}", started.elapsed());
+}
+
+/// "Stage all" passed every path on the command line (os error 206 past
+/// ~32K characters), and unstaging used `restore --staged`, which cannot
+/// resolve HEAD in a repository without commits.
+#[test]
+fn staging_many_paths_and_unstaging_before_the_first_commit() {
+    if !git_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    run(dir.path(), &["init", "--quiet"]);
+    let root = git::find_root(dir.path()).expect("root");
+    let folder = "a-rather-long-folder-name-to-make-the-command-line-long";
+    std::fs::create_dir_all(dir.path().join(folder)).unwrap();
+    let paths: Vec<String> = (0..600)
+        .map(|index| {
+            let path = format!("{folder}/file-number-{index:04}-with-a-long-name.txt");
+            std::fs::write(dir.path().join(&path), "x\n").unwrap();
+            path
+        })
+        .collect();
+    assert!(paths.iter().map(|path| path.len() + 1).sum::<usize>() > 40_000, "longer than a command line");
+
+    git::stage(&root, &paths, true).expect("stage all");
+    let staged = git::status(&root).expect("status");
+    assert_eq!(staged.changes.iter().filter(|change| change.staged()).count(), paths.len());
+
+    git::stage(&root, &paths[..2], false).expect("unstage without a HEAD");
+    let after = git::status(&root).expect("status");
+    assert_eq!(after.changes.iter().filter(|change| change.staged()).count(), paths.len() - 2);
 }
 
 #[test]

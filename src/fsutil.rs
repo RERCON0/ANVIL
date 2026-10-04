@@ -24,7 +24,9 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     tmp_name.push(format!(".{}.{tag}.tmp", std::process::id()));
     let tmp = target.with_file_name(tmp_name);
     let result = (|| -> io::Result<()> {
-        let mut file = fs::File::create(&tmp)?;
+        // create_new: never write through something already at the temp name
+        // (a leftover or a planted link), as docs/DECISIONS.md records.
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);

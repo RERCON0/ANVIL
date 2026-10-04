@@ -85,6 +85,13 @@ pub const SETTINGS_OPEN_CONFIG: &str = "Открыть config.json";
 pub const SETTINGS_WORKSPACE: &str = "Панель git";
 pub const SETTINGS_AI_COMMAND: &str = "AI-команда коммита";
 pub const SETTINGS_AI_HINT: &str = "claude / opencode / codex / gemini / aider, пусто — определить из процесса";
+pub const SETTINGS_AI_MODEL: &str = "Модель OpenCode для коммитов";
+pub const SETTINGS_AI_MODEL_DEFAULT: &str = "По умолчанию в OpenCode";
+pub const SETTINGS_AI_MODEL_SEARCH: &str = "Поиск модели, например DeepSeek";
+pub const SETTINGS_AI_MODEL_REFRESH: &str = "Обновить модели";
+pub const SETTINGS_AI_MODEL_LOADING: &str = "Загрузка моделей…";
+pub const SETTINGS_AI_MODEL_HINT: &str = "Выбор модели использует OpenCode и его подключённые провайдеры. Ключи — через opencode auth login.";
+pub const SETTINGS_AI_MODEL_NO_MATCH: &str = "Модели не найдены по этому запросу.";
 pub const SETTINGS_CLAUDE: &str = "Claude Code";
 pub const SETTINGS_CLAUDE_ENABLED: &str = "Статус Claude Code";
 pub const SETTINGS_CLAUDE_CONNECTED: &str = "Подключён";
@@ -115,6 +122,7 @@ pub const WORKSPACE_DIFF_SIDE: &str = "Индекс / рабочее дерев�
 pub const WORKSPACE_COMMIT_HINT: &str = "Сообщение коммита (Ctrl+Enter)";
 pub const WORKSPACE_COMMIT: &str = "Зафиксировать";
 pub const WORKSPACE_AI: &str = "AI-сообщение";
+pub const WORKSPACE_AI_GENERATING: &str = "Генерация сообщения…";
 pub const WORKSPACE_DIFF_STAGED: &str = "Индекс/дерево";
 pub const WORKSPACE_TOGGLE_HINT: &str = "Панель git";
 pub const WORKSPACE_TAB_CHANGES: &str = "Изменения";
@@ -169,6 +177,7 @@ pub const WORKSPACE_PATH_INSIDE_REPO: &str = "нужен путь внутри �
 pub const WORKSPACE_FILE_EXISTS: &str = "файл уже существует";
 pub const WORKSPACE_NO_SUCH_FILE: &str = "нет такого файла";
 pub const WORKSPACE_DIFF_STALE: &str = "файл изменился — обновите панель";
+pub const WORKSPACE_REPO_CHANGED: &str = "репозиторий сменился — действие отменено";
 
 /// Russian relative time of a unix timestamp, as the commit list shows it.
 pub fn relative_time(now_secs: i64, then_secs: i64) -> String {

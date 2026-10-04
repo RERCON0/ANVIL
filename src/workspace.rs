@@ -35,7 +35,9 @@ const FOLDER_ICON: (char, egui::Color32) = ('\u{e032}', egui::Color32::from_rgb(
 
 pub enum Request {
     Refresh { cwd: PathBuf },
-    Diff { path: String },
+    /// `side`: Some(true) the index, Some(false) the worktree, None the
+    /// index when it has changes for the file, else the worktree.
+    Diff { path: String, side: Option<bool> },
     Stage { paths: Vec<String>, staged: bool },
     Commit { message: String },
     AiMessage { command: Option<String> },
@@ -55,13 +57,35 @@ pub enum Request {
     DeletePath { path: String },
 }
 
+impl Request {
+    /// Acts on the repository: refused when the worker has moved on to
+    /// another repository since the panel showed the one the user meant.
+    fn acts_on_repository(&self) -> bool {
+        matches!(
+            self,
+            Request::Stage { .. }
+                | Request::Commit { .. }
+                | Request::AiMessage { .. }
+                | Request::ApplyHunks { .. }
+                | Request::Fetch
+                | Request::Push
+                | Request::WritePath { .. }
+                | Request::RenamePath { .. }
+                | Request::DeletePath { .. }
+        )
+    }
+}
+
+/// A request plus the repository root the panel showed when it was made.
+type Envelope = (Option<PathBuf>, Request);
+
 pub enum Response {
     /// Status plus the resolved repository root (None: not a repository).
     Status(Status, Option<PathBuf>),
     Diff { path: String, files: Vec<FileDiff>, text: String, staged: bool },
     Refreshed,
     Committed(String),
-    AiMessage(String),
+    AiMessage(Result<String, String>),
     Log(CommitLog),
     CommitDetail { hash: String, detail: git::CommitDetail },
     Files(Vec<String>),
@@ -122,6 +146,8 @@ pub struct Workspace {
     pub diff_text: String,
     pub diff_files: Vec<FileDiff>,
     pub diff_from_index: bool,
+    /// The side the user picked with the index/worktree button (None: auto).
+    pub diff_side: Option<bool>,
     pub commit_message: String,
     pub notice: Option<(String, bool)>,
     pub busy: bool,
@@ -138,7 +164,8 @@ pub struct Workspace {
     pub file_preview: Option<(String, String, bool)>,
     pub prompt: Option<Prompt>,
     ai_command: Option<String>,
-    tx: Option<Sender<Request>>,
+    ai_generating: bool,
+    tx: Option<Sender<Envelope>>,
     rx: Option<Receiver<Response>>,
 }
 
@@ -156,6 +183,7 @@ impl Default for Workspace {
             diff_text: String::new(),
             diff_files: Vec::new(),
             diff_from_index: false,
+            diff_side: None,
             commit_message: String::new(),
             notice: None,
             busy: false,
@@ -170,6 +198,7 @@ impl Default for Workspace {
             file_preview: None,
             prompt: None,
             ai_command: None,
+            ai_generating: false,
             tx: None,
             rx: None,
         }
@@ -184,7 +213,7 @@ impl Workspace {
             self.tx = Some(tx);
             self.rx = Some(rx);
         }
-        if self.busy || self.last_poll.elapsed() < POLL_INTERVAL {
+        if self.busy || self.ai_generating || self.last_poll.elapsed() < POLL_INTERVAL {
             return;
         }
         self.last_poll = Instant::now();
@@ -199,7 +228,7 @@ impl Workspace {
 
     fn send(&self, request: Request) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send(request);
+            let _ = tx.send((self.root.clone(), request));
         }
     }
 
@@ -232,6 +261,9 @@ impl Workspace {
                         self.file_preview = None;
                         self.log = CommitLog::default();
                         self.graph.clear();
+                        // A delete/rename prompt names a path of the old one.
+                        self.prompt = None;
+                        self.diff_side = None;
                     }
                     self.root = root;
                     self.status = status;
@@ -242,7 +274,7 @@ impl Workspace {
                             self.diff_text.clear();
                             self.diff_files.clear();
                         } else {
-                            self.send(Request::Diff { path });
+                            self.send(Request::Diff { path, side: self.diff_side });
                         }
                     }
                     if root_changed || self.log.commits.is_empty() {
@@ -275,9 +307,13 @@ impl Workspace {
                     self.send(Request::Log);
                     self.last_poll = Instant::now() - POLL_INTERVAL;
                 }
-                Response::AiMessage(message) => {
+                Response::AiMessage(result) => {
                     self.busy = false;
-                    self.commit_message = message;
+                    self.ai_generating = false;
+                    match result {
+                        Ok(message) => self.commit_message = message,
+                        Err(message) => self.notice = Some((message, true)),
+                    }
                 }
                 Response::Log(log) => {
                     self.busy = false;
@@ -316,6 +352,7 @@ impl Workspace {
                 }
             }
         }
+        self.busy |= self.ai_generating;
         repaint
     }
 
@@ -390,13 +427,14 @@ impl Workspace {
         if self.detail_view(ui) {
             return;
         }
-        ScrollArea::vertical().id_salt("workspace-column").auto_shrink([false, false]).show(ui, |ui| {
-            self.repo_row(ui);
-            self.commit_box(ui);
-            self.change_rows(ui);
-            ui.add_space(6.0);
-            self.commits_section(ui);
-        });
+        // Repo row, commit box and changes stay put; the commit history fills
+        // the rest of the column and scrolls on its own (Helm's layout), so
+        // scrolling the history never carries the header away.
+        self.repo_row(ui);
+        self.commit_box(ui);
+        self.change_rows(ui);
+        ui.add_space(6.0);
+        self.commits_section(ui);
     }
 
     /// Repo name, branch, counters and the publish/fetch actions.
@@ -445,36 +483,67 @@ impl Workspace {
     }
 
     fn commit_box(&mut self, ui: &mut egui::Ui) {
-        let commit = ui.add(
-            egui::TextEdit::multiline(&mut self.commit_message)
-                .font(theme::field_font(12.0))
-                .desired_rows(3)
-                .hint_text(strings::WORKSPACE_COMMIT_HINT)
-                .desired_width(f32::INFINITY),
-        );
+        let editor = egui::Frame::none()
+            .fill(ui.visuals().extreme_bg_color)
+            .inner_margin(egui::Margin::symmetric(4.0, 2.0))
+            .show(ui, |ui| {
+                ui.style_mut().spacing.scroll.foreground_color = true;
+                ScrollArea::vertical()
+                    .id_salt("workspace-commit-message")
+                    .max_height(120.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.add_enabled(
+                            !self.ai_generating,
+                            egui::TextEdit::multiline(&mut self.commit_message)
+                                .frame(false)
+                                .margin(egui::Margin::same(0.0))
+                                .font(theme::field_font(12.0))
+                                .desired_rows(6)
+                                .hint_text(strings::WORKSPACE_COMMIT_HINT)
+                                .desired_width(f32::INFINITY),
+                        )
+                    })
+                    .inner
+            });
+        let commit = editor.inner;
+        let visuals = ui.style().interact(&commit);
+        let stroke = if commit.has_focus() { ui.visuals().selection.stroke } else { visuals.bg_stroke };
+        ui.painter().rect_stroke(editor.response.rect, visuals.rounding, stroke);
         let ctrl_enter = commit.has_focus() && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter));
         ui.horizontal_wrapped(|ui| {
-            let can_commit = !self.commit_message.trim().is_empty() && self.status.changes.iter().any(Change::staged);
+            let can_commit = !self.ai_generating && !self.commit_message.trim().is_empty() && self.status.changes.iter().any(Change::staged);
             if ui.add_enabled(can_commit, theme::accent_button(strings::WORKSPACE_COMMIT)).clicked() || (can_commit && ctrl_enter) {
                 self.busy = true;
                 self.notice = None;
                 self.send(Request::Commit { message: self.commit_message.clone() });
             }
             let ai_label = match &self.ai_command {
-                Some(command) => strings::workspace_ai(command),
+                Some(command) => strings::workspace_ai(command.split_whitespace().next().unwrap_or(command)),
                 None => strings::WORKSPACE_AI.to_owned(),
             };
-            let ai = self.ai_command.clone();
-            if ui.add(theme::ghost_button(ai_label)).clicked() {
+            let ai = ui
+                .add_enabled(!self.ai_generating, theme::ghost_button(ai_label))
+                .on_hover_text(self.ai_command.as_deref().unwrap_or(strings::WORKSPACE_NO_AI_COMMAND));
+            if ai.clicked() {
+                self.ai_generating = true;
                 self.busy = true;
                 self.notice = None;
-                self.send(Request::AiMessage { command: ai });
+                self.send(Request::AiMessage { command: self.ai_command.clone() });
+                ui.ctx().request_repaint();
             }
         });
+        if self.ai_generating {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0).color(theme::ACCENT));
+                ui.label(RichText::new(strings::WORKSPACE_AI_GENERATING).color(theme::ACCENT).font(theme::font(11.5)));
+            });
+        }
         ui.add_space(4.0);
     }
 
-    /// `[ КОММИТЫ ]` header plus the graph list, inline in the same column.
+    /// `[ КОММИТЫ ]` header plus the graph list, which fills the rest of the
+    /// column and scrolls under the header.
     fn commits_section(&mut self, ui: &mut egui::Ui) {
         let ahead = self.status.ahead;
         ui.horizontal(|ui| {
@@ -491,10 +560,25 @@ impl Workspace {
             ui.label(RichText::new(strings::WORKSPACE_NO_COMMITS).color(theme::FAINT).font(theme::font(11.5)));
             return;
         }
+        ScrollArea::vertical()
+            .id_salt("workspace-commits")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.commit_rows(ui));
+    }
+
+    fn commit_rows(&mut self, ui: &mut egui::Ui) {
         let mut current_section = None;
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         const ROW_HEIGHT: f32 = 22.0;
-        for (index, commit) in self.log.commits.clone().iter().enumerate() {
+        // Rows sit edge to edge: each draws its lane segments only inside its
+        // own rect, so any item spacing between rows is a gap in every lane.
+        // The section labels keep the spacing they had around them.
+        let gap = ui.spacing().item_spacing.y;
+        ui.spacing_mut().item_spacing.y = 0.0;
+        // Read in place (the log is not cloned every frame); a click is
+        // handled after the loop.
+        let mut opened: Option<String> = None;
+        for (index, commit) in self.log.commits.iter().enumerate() {
             if current_section != Some(commit.section) {
                 current_section = Some(commit.section);
                 let label = match commit.section {
@@ -502,8 +586,9 @@ impl Workspace {
                     git::Section::Incoming => strings::WORKSPACE_SECTION_INCOMING,
                     git::Section::History => strings::WORKSPACE_SECTION_HISTORY,
                 };
-                ui.add_space(4.0);
+                ui.add_space(if index > 0 { gap + 4.0 } else { 4.0 });
                 ui.label(RichText::new(label).color(theme::FAINT).font(theme::font(10.5)));
+                ui.add_space(gap);
             }
             let row = self.graph.get(index).cloned().unwrap_or(graph::Row { lane: 0, lane_count: 1, segments: Vec::new() });
             let width = ui.available_width();
@@ -611,9 +696,12 @@ impl Workspace {
                 let _ = response.clone().on_hover_text(tooltip);
             }
             if response.clicked() {
-                self.busy = true;
-                self.send(Request::CommitDetail { hash: commit.hash.clone() });
+                opened = Some(commit.hash.clone());
             }
+        }
+        if let Some(hash) = opened {
+            self.busy = true;
+            self.send(Request::CommitDetail { hash });
         }
     }
 
@@ -704,19 +792,23 @@ impl Workspace {
         });
         const ROW_HEIGHT: f32 = 21.0;
         const INDENT: f32 = 12.0;
-        let rows = self.rows();
-        // With many files the tree gets its own bounded scroll, so the commit
-        // section below stays reachable; short lists stay inline.
+        // Built once per frame and handed to the drawing closure.
+        let mut rows = Some(self.rows());
+        let count = rows.as_ref().map_or(0, Vec::len);
+        // A long tree gets its own bounded scroll, short lists stay inline. The
+        // bound is a share of the column, so the commit history below always
+        // keeps room for its own scroll.
+        let limit = (ui.available_height() * 0.45).clamp(ROW_HEIGHT * 3.0, 300.0);
         let bounded = |ui: &mut egui::Ui, body: &mut dyn FnMut(&mut egui::Ui)| {
-            if rows.len() > 12 {
-                ScrollArea::vertical().id_salt("workspace-changes").max_height(300.0).auto_shrink([false, false]).show(ui, body);
+            if count as f32 * (ROW_HEIGHT + ui.spacing().item_spacing.y) > limit {
+                ScrollArea::vertical().id_salt("workspace-changes").max_height(limit).auto_shrink([false, false]).show(ui, body);
             } else {
                 body(ui);
             }
         };
         {
             bounded(ui, &mut |ui: &mut egui::Ui| {
-                for row in self.rows() {
+                for row in rows.take().unwrap_or_default() {
                     let width = ui.available_width();
                     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, ROW_HEIGHT), Sense::click());
                     let painter = ui.painter_at(rect);
@@ -811,8 +903,9 @@ impl Workspace {
                                     self.diff_path = Some(path.clone());
                                     self.diff_text.clear();
                                     self.diff_files.clear();
+                                    self.diff_side = None;
                                     self.busy = true;
-                                    self.send(Request::Diff { path });
+                                    self.send(Request::Diff { path, side: None });
                                 }
                             }
                         }
@@ -837,8 +930,9 @@ impl Workspace {
                 if ui.add(theme::ghost_button(strings::WORKSPACE_DIFF_STAGED)).clicked() {
                     self.diff_text.clear();
                     self.diff_files.clear();
+                    self.diff_side = Some(!self.diff_from_index);
                     self.busy = true;
-                    self.send(Request::Diff { path: path.clone() });
+                    self.send(Request::Diff { path: path.clone(), side: self.diff_side });
                 }
             });
         });
@@ -872,19 +966,23 @@ impl Workspace {
 
     /// Commit detail replaces the column while open.
     fn detail_view(&mut self, ui: &mut egui::Ui) -> bool {
-        match self.detail.clone() {
-            Some((hash, detail)) => {
-                self.commit_detail_view(ui, &hash, &detail);
-                true
-            }
-            None => false,
+        // Taken out and put back rather than cloned: the patch can be 8 MB.
+        let Some((hash, detail)) = self.detail.take() else { return false };
+        let back = commit_detail_view(ui, &hash, &detail);
+        if !back {
+            self.detail = Some((hash, detail));
         }
+        true
     }
+}
 
-    fn commit_detail_view(&mut self, ui: &mut egui::Ui, hash: &str, detail: &git::CommitDetail) {
+/// The open commit; true when "back" was pressed.
+fn commit_detail_view(ui: &mut egui::Ui, hash: &str, detail: &git::CommitDetail) -> bool {
+    let mut back = false;
+    {
         ui.horizontal(|ui| {
             if ui.add(theme::ghost_button(strings::WORKSPACE_BACK)).clicked() {
-                self.detail = None;
+                back = true;
             }
             if ui.add(theme::ghost_button(strings::WORKSPACE_COPY_HASH)).clicked() {
                 copy_to_clipboard(hash);
@@ -924,7 +1022,10 @@ impl Workspace {
             }
         });
     }
+    back
+}
 
+impl Workspace {
     // ---- files -----------------------------------------------------------
 
     /// Rows of the file tree, honouring the expanded folders (the tree starts
@@ -1119,10 +1220,10 @@ impl Workspace {
             self.busy = true;
             self.send(Request::ReadFile { path });
         }
-        if let Some((path, text, truncated)) = self.file_preview.clone() {
+        if let Some((path, text, truncated)) = self.file_preview.as_ref() {
             ui.add_space(2.0);
             theme::hairline(ui);
-            ui.label(RichText::new(&path).color(theme::DIM).font(theme::field_font(11.0)));
+            ui.label(RichText::new(path).color(theme::DIM).font(theme::field_font(11.0)));
             // The preview ends on a whole line and takes the space the list
             // leaves: a height that is not a multiple of the line height cut
             // the last line in half, and the old half-of-the-rest cap left the
@@ -1133,11 +1234,11 @@ impl Workspace {
             let markdown = path.ends_with(".md") || path.ends_with(".markdown");
             ScrollArea::vertical().id_salt("workspace-file-preview").max_height(height).auto_shrink([false, false]).show(ui, |ui| {
                 if markdown {
-                    markdown_view(ui, &text);
+                    markdown_view(ui, text);
                 } else {
-                    code_view(ui, &text);
+                    code_view(ui, text);
                 }
-                if truncated {
+                if *truncated {
                     ui.label(RichText::new(strings::WORKSPACE_FILE_TRUNCATED).color(theme::STATUS_YELLOW).font(theme::font(11.0)));
                 }
             });
@@ -1589,10 +1690,31 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
+/// Opens a repository file with its associated application. Programs,
+/// scripts and shortcuts are shown in Explorer instead: the default verb of
+/// a `.js`, `.bat` or `.lnk` from a cloned repository runs it.
 fn open_external(root: &Option<PathBuf>, path: &str) {
-    if let Some(root) = root {
+    if runs_when_opened(path) {
+        reveal_in_explorer(root, path);
+    } else if let Some(root) = root {
         crate::settings_ui::open_path(&root.join(path.replace('/', std::path::MAIN_SEPARATOR_STR)));
     }
+}
+
+/// True when the shell's default action for `path` executes it.
+fn runs_when_opened(path: &str) -> bool {
+    const RUNNABLE: &[&str] = &[
+        "exe", "com", "bat", "cmd", "ps1", "psm1", "psd1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "ws", "hta", "msi",
+        "msp", "msc", "lnk", "url", "scr", "pif", "cpl", "reg", "jar", "py", "pyw", "appref-ms", "application", "gadget",
+        "inf", "scf", "chm", "settingcontent-ms", "library-ms", "search-ms",
+    ];
+    let Some((_, extension)) = path.rsplit_once('.') else { return false };
+    let extension = extension.to_ascii_lowercase();
+    if extension.contains(['/', '\\']) {
+        return false;
+    }
+    let pathext = std::env::var("PATHEXT").unwrap_or_default().to_ascii_lowercase();
+    RUNNABLE.contains(&extension.as_str()) || pathext.split(';').any(|known| known.trim_start_matches('.') == extension)
 }
 
 fn reveal_in_explorer(root: &Option<PathBuf>, path: &str) {
@@ -1608,16 +1730,23 @@ fn reveal_in_explorer(root: &Option<PathBuf>, path: &str) {
     let _ = command.spawn();
 }
 
-fn spawn_worker() -> (Sender<Request>, Receiver<Response>) {
-    let (request_tx, request_rx) = mpsc::channel::<Request>();
+fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
+    let (request_tx, request_rx) = mpsc::channel::<Envelope>();
     let (response_tx, response_rx) = mpsc::channel::<Response>();
     std::thread::spawn(move || {
         let mut root: Option<PathBuf> = None;
         let mut cwd: Option<PathBuf> = None;
-        while let Ok(request) = request_rx.recv() {
+        while let Ok((expected_root, request)) = request_rx.recv() {
             let send = |response: Response| {
                 let _ = response_tx.send(response);
             };
+            // Paths are resolved against the repository refreshed last: an
+            // action the user meant for another one must not run here.
+            if request.acts_on_repository() && expected_root != root {
+                let error = strings::WORKSPACE_REPO_CHANGED.to_owned();
+                send(if matches!(request, Request::AiMessage { .. }) { Response::AiMessage(Err(error)) } else { Response::Error(error) });
+                continue;
+            }
             match request {
                 Request::Refresh { cwd: new_cwd } => {
                     if cwd.as_ref() != Some(&new_cwd) || root.is_none() {
@@ -1632,15 +1761,21 @@ fn spawn_worker() -> (Sender<Request>, Receiver<Response>) {
                         None => send(Response::Status(Status::default(), None)),
                     }
                 }
-                Request::Diff { path } => match &root {
+                Request::Diff { path, side } => match &root {
                     Some(root) => {
-                        let staged = git::diff(root, &path, true);
-                        let (text, from_index) = if staged.trim().is_empty() {
-                            (git::diff(root, &path, false), false)
-                        } else {
-                            (staged, true)
+                        let (bytes, from_index) = match side {
+                            Some(staged) => (git::diff_bytes(root, &path, staged), staged),
+                            None => {
+                                let staged = git::diff_bytes(root, &path, true);
+                                if staged.trim_ascii().is_empty() {
+                                    (git::diff_bytes(root, &path, false), false)
+                                } else {
+                                    (staged, true)
+                                }
+                            }
                         };
-                        let files = git::parse_diff(&text, from_index);
+                        let files = git::parse_diff(&bytes, from_index);
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
                         send(Response::Diff { path, files, text, staged: from_index });
                     }
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
@@ -1661,19 +1796,16 @@ fn spawn_worker() -> (Sender<Request>, Receiver<Response>) {
                 },
                 Request::AiMessage { command } => {
                     let result = root.as_ref().map(|root| {
-                        let staged = git::run_git(root, &["diff", "--cached", "--no-color", "--unified=1"]).unwrap_or_default();
-                        let unstaged = git::run_git(root, &["diff", "--no-color", "--unified=1"]).unwrap_or_default();
+                        let diff_args = ["--no-ext-diff", "--no-textconv", "--no-color", "--unified=1"];
+                        let staged = git::run_git(root, &[&["diff", "--cached"][..], &diff_args].concat()).unwrap_or_default();
+                        let unstaged = git::run_git(root, &[&["diff"][..], &diff_args].concat()).unwrap_or_default();
                         let status = git::run_git(root, &["status", "--porcelain"]).unwrap_or_default();
                         let recent = git::recent_subjects(root, 8);
                         let diff = format!("{staged}\n{unstaged}");
                         let prompt = git::ai_prompt(&status, diff.trim(), &recent);
-                        git::ai_commit_message(root, command.as_deref(), &prompt)
+                        git::ai_commit_message(&git::ai_workdir(), command.as_deref(), &prompt, git::AI_TIMEOUT)
                     });
-                    match result {
-                        Some(Ok(message)) => send(Response::AiMessage(message)),
-                        Some(Err(e)) => send(Response::Error(e)),
-                        None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
-                    }
+                    send(Response::AiMessage(result.unwrap_or_else(|| Err(strings::WORKSPACE_NO_REPO.to_owned()))));
                 }
                 Request::Log => match &root {
                     Some(root) => match git::log(root) {
@@ -1730,8 +1862,7 @@ fn spawn_worker() -> (Sender<Request>, Receiver<Response>) {
                 },
                 Request::ApplyHunks { path, index, header, from_index } => match &root {
                     Some(root) => {
-                        let text = git::diff(root, &path, from_index);
-                        let files = git::parse_diff(&text, from_index);
+                        let files = git::parse_diff(git::diff_bytes(root, &path, from_index), from_index);
                         let result = files
                             .iter()
                             .find(|file| file.path == path)
@@ -1812,6 +1943,14 @@ fn rename_path(root: &Path, from: &str, to: &str) -> Result<(), String> {
     if !from.exists() {
         return Err(strings::WORKSPACE_NO_SUCH_FILE.to_owned());
     }
+    // std::fs::rename replaces an existing target on Windows. A target that
+    // resolves to the source itself is a case-only rename and is allowed.
+    if to.symlink_metadata().is_ok() {
+        let same = matches!((from.canonicalize(), to.canonicalize()), (Ok(a), Ok(b)) if a == b);
+        if !same {
+            return Err(strings::WORKSPACE_FILE_EXISTS.to_owned());
+        }
+    }
     std::fs::rename(&from, &to).map_err(|e| e.to_string())
 }
 
@@ -1859,6 +1998,7 @@ mod tests {
             ..Default::default()
         };
         workspace.selected.insert("old.txt".to_owned());
+        workspace.prompt = Some(Prompt { kind: PromptKind::Delete("src".to_owned()), text: String::new(), focus: false });
 
         let (request_tx, request_rx) = mpsc::channel();
         let (response_tx, response_rx) = mpsc::channel();
@@ -1871,8 +2011,86 @@ mod tests {
         assert!(workspace.log.commits.is_empty(), "the other repository's commits must be dropped");
         assert!(workspace.graph.is_empty() && workspace.files.is_empty() && workspace.detail.is_none());
         assert!(workspace.selected.is_empty() && workspace.file_preview.is_none());
-        let requests: Vec<Request> = request_rx.try_iter().collect();
+        assert!(workspace.prompt.is_none(), "a delete/rename prompt of the old repository must not survive");
+        let requests: Vec<Request> = request_rx.try_iter().map(|(_, request)| request).collect();
         assert!(requests.iter().any(|request| matches!(request, Request::Log)), "the new repository must be read again");
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> bool {
+        let mut command = std::process::Command::new("git");
+        command.args(args).current_dir(dir);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        command.output().is_ok_and(|out| out.status.success())
+    }
+
+    /// The "index / worktree" button asked for the same automatic side again,
+    /// so the worktree hunks of a partly staged file could never be shown.
+    #[test]
+    fn the_diff_side_can_be_chosen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        if !git(root, &["init", "--quiet"]) {
+            eprintln!("git is not installed; skipping");
+            return;
+        }
+        assert!(git(root, &["config", "user.email", "anvil@test"]) && git(root, &["config", "user.name", "ANVIL test"]));
+        std::fs::write(root.join("f.txt"), "one\n").unwrap();
+        assert!(git(root, &["add", "f.txt"]) && git(root, &["commit", "--quiet", "-m", "init"]));
+        std::fs::write(root.join("f.txt"), "one\nstaged\n").unwrap();
+        assert!(git(root, &["add", "f.txt"]));
+        std::fs::write(root.join("f.txt"), "one\nstaged\nworktree\n").unwrap();
+
+        let (tx, rx) = spawn_worker();
+        let wait = || rx.recv_timeout(std::time::Duration::from_secs(20)).expect("a worker response");
+        tx.send((None, Request::Refresh { cwd: root.to_path_buf() })).unwrap();
+        let Response::Status(_, shown) = wait() else { panic!("status first") };
+        let diff = |side: Option<bool>| {
+            tx.send((shown.clone(), Request::Diff { path: "f.txt".to_owned(), side })).unwrap();
+            match wait() {
+                Response::Diff { text, staged, .. } => (text, staged),
+                _ => panic!("a diff"),
+            }
+        };
+        let (text, staged) = diff(None);
+        assert!(staged && text.contains("+staged"), "the index side first: {text}");
+        let (text, staged) = diff(Some(false));
+        assert!(!staged && text.contains("+worktree") && !text.contains("+staged"), "the worktree side on request: {text}");
+    }
+
+    /// The worker resolves paths against the repository it last refreshed. A
+    /// delete confirmed for one repository after the shell had moved to
+    /// another one used to run there; it must be refused instead.
+    #[test]
+    fn actions_meant_for_another_repository_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "--quiet"]).current_dir(dir.path());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            init.creation_flags(0x0800_0000);
+        }
+        if !init.status().is_ok_and(|status| status.success()) {
+            eprintln!("git is not installed; skipping");
+            return;
+        }
+        std::fs::write(dir.path().join("keep.txt"), "x").unwrap();
+        let (tx, rx) = spawn_worker();
+        let wait = || rx.recv_timeout(std::time::Duration::from_secs(20)).expect("a worker response");
+        tx.send((None, Request::Refresh { cwd: dir.path().to_path_buf() })).unwrap();
+        let Response::Status(_, Some(_)) = wait() else { panic!("the folder is a repository") };
+
+        let elsewhere = Some(PathBuf::from("C:/some/other/repo"));
+        tx.send((elsewhere, Request::DeletePath { path: "keep.txt".to_owned() })).unwrap();
+        match wait() {
+            Response::Error(message) => assert_eq!(message, strings::WORKSPACE_REPO_CHANGED),
+            _ => panic!("the delete must be refused"),
+        }
+        assert!(dir.path().join("keep.txt").exists(), "nothing was deleted");
     }
 
     fn changed_file(path: &str) -> git::Change {
@@ -1897,6 +2115,15 @@ mod tests {
     }
 
     fn panel_frame(workspace: &mut Workspace, tab: PanelTab, pane: crate::layout::split_tree::PaneId, rect: egui::Rect) -> Vec<egui::Shape> {
+        panel_frame_clipped(workspace, tab, pane, rect).into_iter().map(|clipped| clipped.shape).collect()
+    }
+
+    fn panel_frame_clipped(
+        workspace: &mut Workspace,
+        tab: PanelTab,
+        pane: crate::layout::split_tree::PaneId,
+        rect: egui::Rect,
+    ) -> Vec<egui::epaint::ClippedShape> {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
         workspace.tab = tab;
@@ -1909,7 +2136,47 @@ mod tests {
                 let _ = workspace.show(ui, rect, pane, None);
             });
         });
-        output.shapes.into_iter().map(|clipped| clipped.shape).collect()
+        output.shapes
+    }
+
+    /// Helm's layout: the history scrolls in its own viewport under the
+    /// `[ КОММИТЫ ]` header, so the repo row and the commit box never scroll
+    /// away with it.
+    #[test]
+    fn scrolling_the_history_keeps_the_header_in_place() {
+        let commits: Vec<git::Commit> = (0..200).map(|i| commit(&format!("{i:010}"), git::Section::History)).collect();
+        let mut workspace = Workspace {
+            status: Status { branch: "main".to_owned(), changes: vec![changed_file("src/lib.rs")], ..Default::default() },
+            graph: graph::compute(&commits),
+            log: CommitLog { commits, upstream: None, truncated: false },
+            tab: PanelTab::Changes,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(600.0, 700.0));
+        let commit_button = strings::WORKSPACE_COMMIT.to_owned();
+        let mut frame = |events: Vec<egui::Event>, time: f64| {
+            let input = egui::RawInput { screen_rect: Some(rect), time: Some(time), events, ..Default::default() };
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = workspace.show(ui, rect, 1, None);
+                });
+            });
+            output.shapes.iter().find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text() == commit_button => Some(text.pos.y),
+                _ => None,
+            })
+        };
+        let before = frame(Vec::new(), 0.0).expect("the commit button is drawn");
+        let over_history = egui::Pos2::new(300.0, 650.0);
+        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::Vec2::new(0.0, -400.0), modifiers: Default::default() };
+        let mut after = Some(before);
+        for step in 1..30 {
+            let events = if step == 1 { vec![egui::Event::PointerMoved(over_history), wheel.clone()] } else { Vec::new() };
+            after = frame(events, step as f64 * 0.05);
+        }
+        assert_eq!(after, Some(before), "scrolling the history moved the commit box");
     }
 
     /// Two widgets sharing one id make egui paint a red clash overlay over the
@@ -1938,6 +2205,75 @@ mod tests {
             assert!(clashes.is_empty(), "egui reported an id clash in the {tab:?} tab: {clashes:?}");
         }
 
+    }
+
+    /// "Open in the system" runs ShellExecute's default verb: for a script or
+    /// a shortcut from a cloned repository that is running it, not viewing it.
+    #[test]
+    fn programs_and_scripts_are_not_opened() {
+        for path in ["setup.exe", "run.BAT", "a/b/tool.cmd", "x.ps1", "x.js", "x.vbs", "x.wsf", "x.hta", "x.lnk", "x.url", "x.py", "x.reg", "x.msi"] {
+            assert!(runs_when_opened(path), "{path}");
+        }
+        for path in ["README.md", "src/main.rs", "image.png", "notes.txt", "Makefile", "data.json"] {
+            assert!(!runs_when_opened(path), "{path}");
+        }
+    }
+
+    /// std::fs::rename replaces an existing target on Windows: renaming onto
+    /// another file used to destroy it. A case-only rename is still allowed.
+    #[test]
+    fn renaming_never_overwrites_another_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        std::fs::write(root.join("b.txt"), "b").unwrap();
+        assert_eq!(rename_path(root, "a.txt", "b.txt"), Err(strings::WORKSPACE_FILE_EXISTS.to_owned()));
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "b", "the target is untouched");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "a");
+        rename_path(root, "a.txt", "A.txt").expect("a case-only rename");
+        let names: Vec<String> =
+            std::fs::read_dir(root).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert!(names.contains(&"A.txt".to_owned()), "{names:?}");
+        rename_path(root, "A.txt", "c.txt").expect("a plain rename");
+        assert_eq!(std::fs::read_to_string(root.join("c.txt")).unwrap(), "a");
+    }
+
+    /// The lane of a linear history is one unbroken line: rows sit edge to edge,
+    /// with no item spacing between them for the line to skip.
+    #[test]
+    fn the_commit_graph_line_has_no_gaps_between_rows() {
+        let hashes = ["3333333333", "2222222222", "1111111111", "0000000000"];
+        let commits: Vec<git::Commit> = hashes
+            .iter()
+            .enumerate()
+            .map(|(i, hash)| git::Commit {
+                parents: hashes.get(i + 1).map(|p| vec![(*p).to_owned()]).unwrap_or_default(),
+                ..commit(hash, git::Section::History)
+            })
+            .collect();
+        let mut workspace = Workspace {
+            status: Status { branch: "main".to_owned(), ..Default::default() },
+            graph: graph::compute(&commits),
+            log: CommitLog { commits, upstream: None, truncated: false },
+            ..Default::default()
+        };
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(600.0, 700.0));
+        let shapes = panel_frame(&mut workspace, PanelTab::Changes, 1, rect);
+        let colour = egui::epaint::ColorMode::Solid(section_color(git::Section::History));
+        let mut spans: Vec<(f32, f32)> = shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::LineSegment { points, stroke } if stroke.color == colour && points[0].x == points[1].x => {
+                    Some((points[0].y.min(points[1].y), points[0].y.max(points[1].y)))
+                }
+                _ => None,
+            })
+            .collect();
+        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(spans.len(), 7, "up+down for every row but the root, which only reaches up: {spans:?}");
+        for pair in spans.windows(2) {
+            assert!(pair[1].0 <= pair[0].1 + 0.01, "gap in the lane between {:?} and {:?}", pair[0], pair[1]);
+        }
     }
 
     /// Two panes live under one ui, each with its own panel: without the pane
@@ -2039,5 +2375,41 @@ mod tests {
                 (0, "tests".to_owned(), true),
             ]
         );
+    }
+
+    #[test]
+    fn ai_generation_survives_unrelated_responses_until_its_result() {
+        let (tx, rx) = mpsc::channel();
+        let mut workspace = Workspace { rx: Some(rx), ai_generating: true, busy: true, ..Default::default() };
+        tx.send(Response::Log(CommitLog::default())).unwrap();
+        tx.send(Response::Error("unrelated git error".to_owned())).unwrap();
+        workspace.absorb();
+        assert!(workspace.ai_generating);
+        assert!(workspace.busy);
+
+        let message = "Detailed subject\n\n- First change\n- Second change".to_owned();
+        tx.send(Response::AiMessage(Ok(message.clone()))).unwrap();
+        workspace.absorb();
+        assert!(!workspace.ai_generating);
+        assert!(!workspace.busy);
+        assert_eq!(workspace.commit_message, message);
+    }
+
+    #[test]
+    fn ai_failure_stops_generation_without_erasing_the_draft() {
+        let (tx, rx) = mpsc::channel();
+        let mut workspace = Workspace {
+            rx: Some(rx),
+            ai_generating: true,
+            busy: true,
+            commit_message: "Existing draft".to_owned(),
+            ..Default::default()
+        };
+        tx.send(Response::AiMessage(Err("CLI timed out".to_owned()))).unwrap();
+        workspace.absorb();
+        assert!(!workspace.ai_generating);
+        assert!(!workspace.busy);
+        assert_eq!(workspace.commit_message, "Existing draft");
+        assert_eq!(workspace.notice, Some(("CLI timed out".to_owned(), true)));
     }
 }

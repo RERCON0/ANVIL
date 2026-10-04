@@ -4,6 +4,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
+use crate::term::paste::PathQuoting;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProfileKind {
     GitBash,
@@ -248,9 +250,42 @@ pub fn detect_builtin() -> Vec<Profile> {
     out
 }
 
+/// How a path dropped on a pane of `profile` is quoted. A custom profile is
+/// judged by its program (`pwsh`, `powershell`, `cmd`); anything else gets
+/// POSIX quoting, as in Helm.
+pub fn path_quoting(profile: &Profile) -> PathQuoting {
+    match profile.kind {
+        ProfileKind::PowerShell => PathQuoting::PowerShell,
+        ProfileKind::Cmd => PathQuoting::Cmd,
+        ProfileKind::GitBash | ProfileKind::Wsl => PathQuoting::Unix,
+        ProfileKind::Custom => {
+            let program = Path::new(&profile.command)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            match program.as_str() {
+                "pwsh" | "powershell" => PathQuoting::PowerShell,
+                "cmd" => PathQuoting::Cmd,
+                _ => PathQuoting::Unix,
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_paths_follow_the_profile_shell() {
+        assert_eq!(path_quoting(&profile(ProfileKind::PowerShell)), PathQuoting::PowerShell);
+        assert_eq!(path_quoting(&profile(ProfileKind::Cmd)), PathQuoting::Cmd);
+        assert_eq!(path_quoting(&profile(ProfileKind::GitBash)), PathQuoting::Unix);
+        let custom = |command: &str| Profile { command: command.into(), ..profile(ProfileKind::Custom) };
+        assert_eq!(path_quoting(&custom(r"C:\Program Files\PowerShell\7\pwsh.exe")), PathQuoting::PowerShell);
+        assert_eq!(path_quoting(&custom("CMD.EXE")), PathQuoting::Cmd);
+        assert_eq!(path_quoting(&custom("nu")), PathQuoting::Unix);
+    }
 
     fn profile(kind: ProfileKind) -> Profile {
         Profile {

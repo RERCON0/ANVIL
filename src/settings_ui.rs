@@ -54,11 +54,52 @@ pub struct SettingsState {
     pub editing: Option<usize>,
     pub adding: bool,
     pub draft: ProfileConfig,
+    model_catalog: ModelCatalog,
+    model_filter: String,
 }
 
 impl Default for SettingsState {
     fn default() -> Self {
-        SettingsState { section: SettingsSection::default(), editing: None, adding: false, draft: draft_profile() }
+        SettingsState {
+            section: SettingsSection::default(),
+            editing: None,
+            adding: false,
+            draft: draft_profile(),
+            model_catalog: ModelCatalog::default(),
+            model_filter: String::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+enum ModelCatalog {
+    #[default]
+    NotLoaded,
+    Loading(std::sync::mpsc::Receiver<Result<Vec<String>, String>>),
+    Ready(Result<Vec<String>, String>),
+}
+
+impl SettingsState {
+    fn load_models(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.model_catalog = ModelCatalog::Loading(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::git::opencode_models());
+            ctx.request_repaint();
+        });
+    }
+
+    fn absorb_models(&mut self) {
+        if let ModelCatalog::Loading(rx) = &self.model_catalog {
+            match rx.try_recv() {
+                Ok(result) => self.model_catalog = ModelCatalog::Ready(result),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.model_catalog = ModelCatalog::Ready(Err(strings::WORKSPACE_AI_EMPTY.to_owned()));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
     }
 }
 
@@ -128,7 +169,7 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, cx: &mut SettingsContext, state: &mut
                     SettingsSection::Appearance => section_appearance(ui, cx, &mut outcome),
                     SettingsSection::Terminal => section_terminal(ui, cx, &mut outcome),
                     SettingsSection::Profiles => section_profiles(ui, cx, state, &mut outcome),
-                    SettingsSection::Workspace => section_git(ui, cx, &mut outcome),
+                    SettingsSection::Workspace => section_git(ui, cx, state, &mut outcome),
                     SettingsSection::Hotkeys => section_hotkeys(ui, cx, &mut outcome),
                     SettingsSection::Claude => section_claude(ui, cx, &mut outcome),
                 }
@@ -136,6 +177,25 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, cx: &mut SettingsContext, state: &mut
         });
     });
     outcome
+}
+
+/// The font family typed by hand. While the field has focus the text is a
+/// draft kept in egui's memory; it is returned on Enter or when the focus
+/// leaves, if it differs from `current`. Applying every keystroke reinstalled
+/// the fonts (100 MB of fallbacks once loaded) and rewrote config.json.
+fn font_family_field(ui: &mut egui::Ui, id: egui::Id, current: &str) -> Option<String> {
+    let mut family = ui.data_mut(|data| data.get_temp::<String>(id)).unwrap_or_else(|| current.to_owned());
+    let response =
+        ui.add(egui::TextEdit::singleline(&mut family).id(id).font(theme::field_font(13.0)).desired_width(180.0));
+    if response.lost_focus() {
+        ui.data_mut(|data| data.remove::<String>(id));
+        let family = family.trim();
+        return (!family.is_empty() && family != current).then(|| family.to_owned());
+    }
+    if response.has_focus() {
+        ui.data_mut(|data| data.insert_temp(id, family));
+    }
+    None
 }
 
 fn section_appearance(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut SettingsOutcome) {
@@ -153,11 +213,8 @@ fn section_appearance(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut
                     }
                 }
             });
-        let mut family = cx.config.font.family.clone();
-        if ui
-            .add(egui::TextEdit::singleline(&mut family).font(theme::field_font(13.0)).desired_width(180.0))
-            .changed()
-        {
+        let id = ui.id().with("font-family-field");
+        if let Some(family) = font_family_field(ui, id, &cx.config.font.family) {
             cx.config.font.family = family;
             outcome.changed = true;
         }
@@ -194,7 +251,7 @@ fn section_appearance(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut
 fn section_terminal(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut SettingsOutcome) {
     theme::section(ui, strings::SETTINGS_TERMINAL);
     theme::tag(ui, strings::SETTINGS_SCROLLBACK);
-    outcome.changed |= theme::stepper(ui, &mut cx.config.terminal.scrollback, 0, 1_000_000, 1000);
+    outcome.changed |= theme::stepper(ui, &mut cx.config.terminal.scrollback, 0, crate::config::MAX_SCROLLBACK, 1000);
     theme::tag(ui, strings::SETTINGS_CURSOR);
     ui.horizontal(|ui| {
         for (shape, label) in [
@@ -321,7 +378,7 @@ fn section_profiles(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Set
     }
 }
 
-fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut SettingsOutcome) {
+fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut SettingsState, outcome: &mut SettingsOutcome) {
     theme::section(ui, strings::SETTINGS_WORKSPACE);
     theme::tag(ui, strings::SETTINGS_AI_COMMAND);
     let mut ai = cx.config.workspace.ai_commit_command.clone().unwrap_or_default();
@@ -334,6 +391,61 @@ fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut Settin
         outcome.changed = true;
     }
     ui.label(RichText::new(strings::SETTINGS_AI_HINT).color(theme::FAINT).font(theme::font(11.5)));
+    ui.add_space(14.0);
+    theme::tag(ui, strings::SETTINGS_AI_MODEL);
+    ui.label(RichText::new(strings::SETTINGS_AI_MODEL_HINT).color(theme::FAINT).font(theme::font(11.5)));
+    state.absorb_models();
+    if matches!(state.model_catalog, ModelCatalog::NotLoaded) {
+        state.load_models(ui.ctx());
+    }
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut state.model_filter)
+                .font(theme::field_font(13.0))
+                .hint_text(strings::SETTINGS_AI_MODEL_SEARCH)
+                .desired_width(320.0),
+        );
+        if ui.add_enabled(!matches!(state.model_catalog, ModelCatalog::Loading(_)), theme::ghost_button(strings::SETTINGS_AI_MODEL_REFRESH)).clicked() {
+            state.load_models(ui.ctx());
+        }
+    });
+    match &state.model_catalog {
+        ModelCatalog::Loading(_) => {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0).color(theme::ACCENT));
+                ui.label(strings::SETTINGS_AI_MODEL_LOADING);
+            });
+        }
+        ModelCatalog::Ready(Err(error)) => {
+            ui.label(RichText::new(error).color(theme::STATUS_RED).font(theme::font(11.5)));
+        }
+        ModelCatalog::Ready(Ok(models)) => {
+            let query = state.model_filter.trim();
+            let matching = models.iter().filter(|model| {
+                query.is_empty() || model.as_bytes().windows(query.len()).any(|part| part.eq_ignore_ascii_case(query.as_bytes()))
+            });
+            let has_matches = matching.clone().next().is_some();
+            egui::ComboBox::from_id_salt("ai-commit-model")
+                .width(ui.available_width().min(560.0))
+                .selected_text(cx.config.workspace.ai_commit_model.as_deref().unwrap_or(strings::SETTINGS_AI_MODEL_DEFAULT))
+                .show_ui(ui, |ui| {
+                    outcome.changed |= ui
+                        .selectable_value(&mut cx.config.workspace.ai_commit_model, None, strings::SETTINGS_AI_MODEL_DEFAULT)
+                        .changed();
+                    for model in matching {
+                        if ui.selectable_label(cx.config.workspace.ai_commit_model.as_deref() == Some(model.as_str()), model).clicked() {
+                            cx.config.workspace.ai_commit_model = Some(model.clone());
+                            cx.config.workspace.ai_commit_command = Some("opencode".to_owned());
+                            outcome.changed = true;
+                        }
+                    }
+                });
+            if !has_matches && !query.is_empty() {
+                ui.label(RichText::new(strings::SETTINGS_AI_MODEL_NO_MATCH).color(theme::FAINT).font(theme::font(11.5)));
+            }
+        }
+        ModelCatalog::NotLoaded => {}
+    }
 }
 
 fn section_hotkeys(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut SettingsOutcome) {
@@ -487,6 +599,37 @@ pub fn open_path(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every keystroke in the family field used to reinstall the fonts (with
+    /// the 100 MB of fallbacks once loaded) and rewrite config.json; the typed
+    /// name is a draft until Enter or the field loses focus.
+    #[test]
+    fn the_font_family_applies_on_enter_not_per_keystroke() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        let _ = ctx.run(Default::default(), |_| {});
+        let id = egui::Id::new("family-test");
+        let frame = |events: Vec<egui::Event>| {
+            let mut committed = None;
+            let _ = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| committed = font_family_field(ui, id, "Consolas"));
+            });
+            committed
+        };
+        assert_eq!(frame(Vec::new()), None);
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        assert_eq!(frame(Vec::new()), None);
+        assert_eq!(frame(vec![egui::Event::Text(" X".to_owned())]), None, "typing is not applied");
+        assert_eq!(frame(Vec::new()), None, "the draft survives the next frame");
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        assert_eq!(frame(vec![enter]), Some("Consolas X".to_owned()), "Enter applies the name");
+    }
 
     #[test]
     fn arguments_round_trip_through_the_text_field() {

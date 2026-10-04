@@ -54,6 +54,30 @@ fn resize_direction(edge: Edge) -> ResizeDirection {
     }
 }
 
+/// Where a drag-and-drop was released, in egui points. Windows sends the
+/// window no mouse moves during an OLE drag, so the pointer position egui last
+/// saw is where the cursor entered the window, not where the file landed.
+#[cfg(windows)]
+fn drop_point(window: &winit::window::Window, pixels_per_point: f32) -> Option<egui::Pos2> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut cursor = POINT { x: 0, y: 0 };
+    // SAFETY: GetCursorPos only writes the POINT it is given.
+    if unsafe { GetCursorPos(&mut cursor) } == 0 {
+        return None;
+    }
+    let origin = window.inner_position().ok()?;
+    Some(egui::Pos2::new(
+        (cursor.x - origin.x) as f32 / pixels_per_point,
+        (cursor.y - origin.y) as f32 / pixels_per_point,
+    ))
+}
+
+#[cfg(not(windows))]
+fn drop_point(_window: &winit::window::Window, _pixels_per_point: f32) -> Option<egui::Pos2> {
+    None
+}
+
 impl Host {
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let Host { gl, egui, app, .. } = self;
@@ -175,6 +199,13 @@ impl ApplicationHandler<UserEvent> for Host {
                     }
                     KeyRoute::Egui => {}
                 }
+            }
+            WindowEvent::DroppedFile(path) => {
+                let ctx = self.egui.as_ref().expect("egui").egui_ctx.clone();
+                let at = drop_point(&self.gl.as_ref().expect("window").window, ctx.pixels_per_point());
+                self.app.drop_path(path, at);
+                ctx.request_repaint();
+                return;
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
                 let ctx = self.egui.as_ref().expect("egui").egui_ctx.clone();

@@ -14,6 +14,34 @@ pub struct TabbarState {
     hover_index: Option<usize>,
 }
 
+impl TabbarState {
+    /// Tab `index` was closed: a rename or drag in progress follows its tab
+    /// (indices after it shift down) or ends when its own tab is gone.
+    pub fn tab_removed(&mut self, index: usize) {
+        let shift = |slot: usize| match slot.cmp(&index) {
+            std::cmp::Ordering::Less => Some(slot),
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => Some(slot - 1),
+        };
+        if let Some(rename) = self.rename.as_mut() {
+            match shift(rename.tab) {
+                Some(tab) => rename.tab = tab,
+                None => self.rename = None,
+            }
+        }
+        match self.drag_from.and_then(shift) {
+            Some(from) => {
+                self.drag_from = Some(from);
+                self.hover_index = self.hover_index.and_then(shift);
+            }
+            None => {
+                self.drag_from = None;
+                self.hover_index = None;
+            }
+        }
+    }
+}
+
 pub struct RenameEdit {
     pub tab: usize,
     pub text: String,
@@ -292,5 +320,29 @@ fn threshold_color(pct: f64) -> Color32 {
         theme::STATUS_YELLOW
     } else {
         theme::STATUS_GREEN
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rename or drag in progress names a tab by index: when an earlier tab
+    /// closes (a pane exiting in the background), it must follow its tab, not
+    /// land on the neighbour that slid into its place.
+    #[test]
+    fn closing_a_tab_keeps_rename_and_drag_on_their_tabs() {
+        let mut state = TabbarState {
+            rename: Some(RenameEdit { tab: 3, text: "x".to_owned(), focus: false }),
+            drag_from: Some(2),
+            hover_index: Some(1),
+        };
+        state.tab_removed(0);
+        assert_eq!(state.rename.as_ref().map(|r| r.tab), Some(2));
+        assert_eq!((state.drag_from, state.hover_index), (Some(1), Some(0)));
+        state.tab_removed(2);
+        assert!(state.rename.is_none(), "the renamed tab itself closed");
+        state.tab_removed(1);
+        assert_eq!((state.drag_from, state.hover_index), (None, None), "the dragged tab closed");
     }
 }

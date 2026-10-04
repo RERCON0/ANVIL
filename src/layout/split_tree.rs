@@ -315,6 +315,9 @@ fn remove_in(node: &mut Node, id: PaneId) -> Option<Anchor> {
 fn collapse(node: &mut Node) {
     if let Node::Split { children, .. } = node {
         children.iter_mut().for_each(|(_, c)| collapse(c));
+        // A split with no panes (a hand-edited session.json) has no first or
+        // last leaf to anchor to: drop it rather than panic on it later.
+        children.retain(|(_, c)| !matches!(c, Node::Split { children, .. } if children.is_empty()));
         if children.len() == 1 {
             let only = children.pop().expect("one child").1;
             *node = only;
@@ -393,6 +396,27 @@ mod tests {
     }
     fn leaf(id: PaneId) -> Node {
         Node::Leaf(id)
+    }
+
+    /// A hand-edited session.json with an empty split used to panic on the UI
+    /// thread at start (first_leaf indexed children[0]), on every launch.
+    #[test]
+    fn empty_splits_from_a_session_are_dropped() {
+        let empty = || Node::Split { dir: Dir::Column, children: Vec::new() };
+        let root = Node::Split {
+            dir: Dir::Row,
+            children: vec![
+                (0.25, empty()),
+                (0.25, Node::Leaf(1)),
+                (0.25, Node::Leaf(2)),
+                (0.25, Node::Split { dir: Dir::Column, children: vec![(1.0, empty())] }),
+            ],
+        };
+        let mut t = SplitTree::from_root(root);
+        assert_eq!(t.panes(), vec![1, 2]);
+        let anchor = t.remove(1).expect("pane 1 is removed");
+        assert_eq!(anchor.neighbor, 2, "its neighbour is a real pane, not an empty split");
+        assert_eq!(t.panes(), vec![2]);
     }
 
     #[test]

@@ -13,6 +13,14 @@ pub struct KeyPress {
     pub altgr: bool,
 }
 
+impl KeyPress {
+    /// Ctrl, Alt, Shift or Win pressed on its own: no key the terminal knows
+    /// and no text.
+    pub fn is_modifier_only(&self) -> bool {
+        self.key.is_none() && self.text.as_deref().is_none_or(str::is_empty)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InputModes {
     /// DECCKM (`TermMode::APP_CURSOR`).
@@ -39,10 +47,28 @@ pub fn encode(press: &KeyPress, modes: InputModes) -> Option<Vec<u8>> {
     }
     if !m.ctrl {
         if let Some(text) = printable(press) {
+            if m.alt {
+                if let Some(latin) = alt_latin_letter(press.key, text) {
+                    return Some(with_alt(true, &[latin]));
+                }
+            }
             return Some(with_alt(m.alt, text.as_bytes()));
         }
     }
     None
+}
+
+/// Alt+letter on a non-Latin layout (Russian Alt+М): applications bind Meta
+/// shortcuts to Latin letters (Claude Code's Alt+V image paste, readline's
+/// Alt+B/F), so send the physical key's letter in the case the layout typed,
+/// the way Ctrl+letter already uses the physical key. Latin layouts keep their
+/// own letter (QWERTZ Alt+Y stays ESC z).
+fn alt_latin_letter(key: Option<KeyName>, text: &str) -> Option<u8> {
+    let KeyName::Letter(letter) = key? else { return None };
+    let mut chars = text.chars();
+    let typed = chars.next().filter(|c| chars.next().is_none() && c.is_alphabetic() && !c.is_ascii())?;
+    let letter = letter as u8;
+    Some(if typed.is_uppercase() { letter.to_ascii_uppercase() } else { letter.to_ascii_lowercase() })
 }
 
 fn printable(press: &KeyPress) -> Option<&str> {
@@ -134,6 +160,7 @@ mod tests {
     const CTRL: Mods = Mods { ctrl: true, alt: false, shift: false, meta: false };
     const CTRL_ALT: Mods = Mods { ctrl: true, alt: true, shift: false, meta: false };
     const CTRL_SHIFT: Mods = Mods { ctrl: true, alt: false, shift: true, meta: false };
+    const ALT_SHIFT: Mods = Mods { ctrl: false, alt: true, shift: true, meta: false };
 
     fn key(k: KeyName, mods: Mods) -> KeyPress {
         KeyPress { key: Some(k), mods, text: None, altgr: false }
@@ -226,6 +253,22 @@ mod tests {
         assert_eq!(enc(press), "\x03");
     }
 
+    /// Alt+letter shortcuts (Claude Code's Alt+V image paste, readline's
+    /// Alt+B/F) are Latin: on the Russian layout Alt+М must still send ESC v,
+    /// exactly like Ctrl+М already sends ^V.
+    #[test]
+    fn alt_letter_on_russian_layout_uses_physical_key() {
+        assert_eq!(enc(text(Some(KeyName::Letter('V')), ALT, "м")), "\x1bv");
+        assert_eq!(enc(text(Some(KeyName::Letter('V')), ALT_SHIFT, "М")), "\x1bV", "Shift keeps the case");
+        assert_eq!(enc(text(Some(KeyName::Letter('F')), ALT, "а")), "\x1bf");
+        // Only letters: punctuation keys keep what the layout typed.
+        assert_eq!(enc(text(Some(KeyName::Comma), ALT, "б")), "\x1bб");
+        // Without Alt the layout's text is typed as is.
+        assert_eq!(enc(text(Some(KeyName::Letter('V')), NONE, "м")), "м");
+        // A Latin layout that moves letters (QWERTZ) keeps its own letter.
+        assert_eq!(enc(text(Some(KeyName::Letter('Y')), ALT, "z")), "\x1bz");
+    }
+
     #[test]
     fn text_and_alt_prefix() {
         assert_eq!(enc(text(Some(KeyName::Letter('A')), NONE, "a")), "a");
@@ -242,6 +285,16 @@ mod tests {
         assert_eq!(enc(press), "@");
         let not_altgr = KeyPress { key: Some(KeyName::Letter('Q')), mods: CTRL_ALT, text: Some("q".into()), altgr: false };
         assert_eq!(enc(not_altgr), "\x1b\x11");
+    }
+
+    /// "Press any key" after a failed exit must not count Ctrl or Alt alone:
+    /// pressing Ctrl to start Ctrl+Shift+C closed the pane before its error
+    /// text could be copied.
+    #[test]
+    fn modifier_keys_alone_are_not_key_presses() {
+        assert!(KeyPress { key: None, mods: CTRL, text: None, altgr: false }.is_modifier_only());
+        assert!(!key(KeyName::Letter('C'), CTRL_SHIFT).is_modifier_only());
+        assert!(!text(None, NONE, "é").is_modifier_only(), "a dead-key result is typing");
     }
 
     #[test]

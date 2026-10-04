@@ -35,6 +35,9 @@ Copy-Item (Join-Path $root 'LICENSES\egui-default-fonts\*') (Join-Path $stage 'L
 # GPL-3.0 section 6: point at the Corresponding Source for this exact build.
 $commit = (git rev-parse HEAD).Trim()
 $remote = (git config --get remote.origin.url)
+# A remote like https://user:token@host/repo carries credentials: the archive
+# is for distribution, so only scheme, host and path go into it.
+if ($remote) { $remote = $remote -replace '^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@]*@', '$1' }
 if (-not $remote) { $remote = '<the project repository>' }
 @(
     "ANVIL $version (GPL-3.0-or-later)"
