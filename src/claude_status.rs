@@ -90,24 +90,31 @@ pub fn basename(dir: &str) -> &str {
     trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed)
 }
 
+use crate::config::ClaudeLineFields;
+
 /// The statusLine text. `branch` comes from git (see `git_branch`).
 pub fn format_line(p: &Payload, branch: Option<&str>, now_ms: i64) -> String {
+    format_line_with(p, branch, now_ms, &ClaudeLineFields::default())
+}
+
+/// The statusLine text with only the pieces `fields` allows.
+pub fn format_line_with(p: &Payload, branch: Option<&str>, now_ms: i64, fields: &ClaudeLineFields) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(model) = &p.model {
+    if let Some(model) = p.model.as_ref().filter(|_| fields.model) {
         parts.push(format!("{CYAN}[{model}]{RESET}"));
     }
-    if let Some(dir) = &p.dir {
+    if let Some(dir) = p.dir.as_ref().filter(|_| fields.dir) {
         parts.push(basename(dir).to_owned());
     }
-    if let Some(branch) = branch.filter(|b| !b.is_empty()) {
+    if let Some(branch) = branch.filter(|b| !b.is_empty() && fields.branch) {
         let color = if branch == "main" || branch == "master" { RED } else { GREEN };
         parts.push(format!("{color}{branch}{RESET}"));
     }
-    if let Some(ctx) = p.context_pct.map(clamp_pct) {
+    if let Some(ctx) = p.context_pct.filter(|_| fields.context).map(clamp_pct) {
         let c = heat(ctx);
         parts.push(format!("{c}{}{RESET} {c}{}%{RESET}", bar(ctx), js_round(ctx)));
     }
-    if let Some(five) = p.five_hour_pct.map(clamp_pct) {
+    if let Some(five) = p.five_hour_pct.filter(|_| fields.five_hour).map(clamp_pct) {
         let c = heat(five);
         let mut text = format!("5h: {c}{}%{RESET}", js_round(five));
         if five >= 60.0 {
@@ -117,10 +124,10 @@ pub fn format_line(p: &Payload, branch: Option<&str>, now_ms: i64) -> String {
         }
         parts.push(text);
     }
-    if let Some(week) = p.seven_day_pct.map(clamp_pct) {
+    if let Some(week) = p.seven_day_pct.filter(|_| fields.seven_day).map(clamp_pct) {
         parts.push(format!("7d: {}{}%{RESET}", heat(week), js_round(week)));
     }
-    if let Some(agent) = &p.agent {
+    if let Some(agent) = p.agent.as_ref().filter(|_| fields.agent) {
         parts.push(format!("{MAGENTA}{agent}{RESET}"));
     }
     parts.join(&format!("{DIM} | {RESET}"))
@@ -248,6 +255,33 @@ mod tests {
         let p = Payload { dir: Some("C:/x/proj".into()), ..Payload::default() };
         assert_eq!(format_line(&p, Some("main"), 0), "proj\x1b[2m | \x1b[0m\x1b[31mmain\x1b[0m");
         assert_eq!(format_line(&p, Some("dev"), 0), "proj\x1b[2m | \x1b[0m\x1b[32mdev\x1b[0m");
+    }
+
+    #[test]
+    fn fields_switch_pieces_off_and_keep_the_separators() {
+        use crate::config::ClaudeLineFields;
+        let json = r#"{"model":{"display_name":"Opus 5"},"workspace":{"current_dir":"C:/anvil-nonexistent/seller"},
+            "context_window":{"used_percentage":37.4},
+            "rate_limits":{"five_hour":{"used_percentage":17.2,"resets_at":1755500000},"seven_day":{"used_percentage":63.8}}}"#;
+        let p = Payload::parse(json).unwrap();
+        assert_eq!(format_line_with(&p, None, 0, &ClaudeLineFields::default()), format_line(&p, None, 0));
+        let fields = ClaudeLineFields { dir: false, five_hour: false, ..ClaudeLineFields::default() };
+        assert_eq!(
+            format_line_with(&p, None, 0, &fields),
+            "\x1b[36m[Opus 5]\x1b[0m\x1b[2m | \x1b[0m\x1b[32m▓▓▓▓░░░░░░\x1b[0m \x1b[32m37%\x1b[0m\x1b[2m | \x1b[0m7d: \x1b[33m64%\x1b[0m"
+        );
+        let none = ClaudeLineFields {
+            model: false, dir: false, branch: false, context: false, five_hour: false, seven_day: false, agent: false,
+        };
+        assert_eq!(format_line_with(&p, Some("main"), 0, &none), "");
+    }
+
+    #[test]
+    fn branch_field_hides_the_branch() {
+        use crate::config::ClaudeLineFields;
+        let p = Payload { dir: Some("C:/x/proj".into()), ..Payload::default() };
+        let fields = ClaudeLineFields { branch: false, ..ClaudeLineFields::default() };
+        assert_eq!(format_line_with(&p, Some("main"), 0, &fields), "proj");
     }
 
     #[test]

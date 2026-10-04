@@ -5,7 +5,8 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anvil::claude_status::{format_line, git_branch, Payload, StatusRecord};
+use anvil::claude_status::{format_line_with, git_branch, Payload, StatusRecord};
+use anvil::config::Config;
 
 fn main() {
     let mut input = String::new();
@@ -13,13 +14,20 @@ fn main() {
         return;
     }
     let Some(payload) = Payload::parse(&input) else { return };
-    let branch = payload
-        .dir
-        .as_deref()
-        .and_then(|d| git_branch(std::path::Path::new(d), Duration::from_millis(800)));
+    // The fields chosen in ANVIL's settings; an absent or unreadable config.json
+    // (never quarantined from here) means every field, as before.
+    let fields = Config::load_for_reload(&Config::path()).map(|c| c.claude_status.line_fields).unwrap_or_default();
+    let branch = if fields.branch {
+        payload
+            .dir
+            .as_deref()
+            .and_then(|d| git_branch(std::path::Path::new(d), Duration::from_millis(800)))
+    } else {
+        None
+    };
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
 
-    let line = format_line(&payload, branch.as_deref(), now_ms);
+    let line = format_line_with(&payload, branch.as_deref(), now_ms, &fields);
     let mut out = std::io::stdout();
     let _ = out.write_all(line.as_bytes());
     let _ = out.flush();
