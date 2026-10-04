@@ -466,7 +466,6 @@ pub struct CommitLog {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommitDetail {
     pub files: Vec<(char, String, u32, u32)>,
-    pub patch: String,
     pub header: String,
 }
 
@@ -555,15 +554,15 @@ pub fn log(root: &Path) -> Result<CommitLog, String> {
     Ok(CommitLog { commits, upstream, truncated })
 }
 
-/// Files and patch of one commit (first parent, as in VS Code's history view).
+/// Files and message of one commit, relative to its first parent.
 pub fn commit_detail(root: &Path, hash: &str) -> Result<CommitDetail, String> {
     if !is_object_hash(hash) {
         return Err(crate::strings::WORKSPACE_NO_SUCH_FILE.to_owned());
     }
     // `--end-of-options` keeps a revision from ever being read as an option,
     // so every option must precede it: git rejects options that follow.
-    let name_status = run_git_bytes(root, &["show", "--no-color", "--format=", "--name-status", "-z", "--end-of-options", hash])?;
-    let numstat = run_git_bytes(root, &["show", "--no-color", "--no-ext-diff", "--no-textconv", "--format=", "--numstat", "-z", "--end-of-options", hash])?;
+    let name_status = run_git_bytes(root, &["show", "--no-color", "--format=", "--first-parent", "--diff-merges=first-parent", "--name-status", "-z", "--end-of-options", hash])?;
+    let numstat = run_git_bytes(root, &["show", "--no-color", "--no-ext-diff", "--no-textconv", "--format=", "--first-parent", "--diff-merges=first-parent", "--numstat", "-z", "--end-of-options", hash])?;
     let stats = parse_numstat(&numstat);
     let mut files = Vec::new();
     let mut records = name_status.split(|b| *b == 0).filter(|record| !record.is_empty());
@@ -595,12 +594,22 @@ pub fn commit_detail(root: &Path, hash: &str) -> Result<CommitDetail, String> {
         files.push((status, path, additions, deletions));
     }
     let header = run_git(root, &["show", "--no-patch", "--format=%H%n%an <%ae>%n%ci%n%s%n%b", "--end-of-options", hash]).unwrap_or_default();
-    let patch = run_git(
+    Ok(CommitDetail { files, header })
+}
+
+/// Load only the selected commit file; paths remain literal even with glob characters.
+pub fn commit_file_diff(root: &Path, hash: &str, path: &str) -> Result<String, String> {
+    if !is_object_hash(hash) {
+        return Err(crate::strings::WORKSPACE_NO_SUCH_FILE.to_owned());
+    }
+    run_git(
         root,
-        &["show", "--no-color", "--no-ext-diff", "--no-textconv", "--unified=3", "--format=", "-m", "--first-parent", "--end-of-options", hash],
+        &[
+            "show", "--no-color", "--no-ext-diff", "--no-textconv", "--unified=3", "--format=",
+            "--src-prefix=a/", "--dst-prefix=b/", "--first-parent", "--diff-merges=first-parent",
+            "--end-of-options", hash, "--", path,
+        ],
     )
-    .unwrap_or_default();
-    Ok(CommitDetail { files, patch, header })
 }
 
 /// Unified diff of one file as git printed it, byte for byte: hunk patches are

@@ -43,6 +43,7 @@ pub enum Request {
     AiMessage { command: Option<String> },
     Log,
     CommitDetail { hash: String },
+    CommitDiff { hash: String, path: String },
     Files,
     /// Lines of every tracked file of the repository.
     CountLines,
@@ -88,6 +89,7 @@ pub enum Response {
     AiMessage(Result<String, String>),
     Log(CommitLog),
     CommitDetail { hash: String, detail: git::CommitDetail },
+    CommitDiff { hash: String, path: String, patch: Result<String, String> },
     Files(Vec<String>),
     LineCount { files: usize, lines: u64 },
     FileText { path: String, text: String, truncated: bool },
@@ -134,6 +136,11 @@ pub struct Prompt {
     pub focus: bool,
 }
 
+struct CommitFile {
+    path: String,
+    patch: Option<Result<String, String>>,
+}
+
 pub struct Workspace {
     pub open: bool,
     pub width: f32,
@@ -155,6 +162,7 @@ pub struct Workspace {
     pub log: CommitLog,
     pub graph: Vec<graph::Row>,
     pub detail: Option<(String, git::CommitDetail)>,
+    detail_file: Option<CommitFile>,
     pub files: Vec<String>,
     /// Folders of the file tree that the user opened; the tree starts folded.
     pub file_expanded: HashSet<String>,
@@ -191,6 +199,7 @@ impl Default for Workspace {
             log: CommitLog::default(),
             graph: Vec::new(),
             detail: None,
+            detail_file: None,
             files: Vec::new(),
             file_expanded: HashSet::new(),
             line_count: None,
@@ -256,6 +265,7 @@ impl Workspace {
                         self.diff_text.clear();
                         self.diff_files.clear();
                         self.detail = None;
+                        self.detail_file = None;
                         self.files.clear();
                         self.line_count = None;
                         self.file_preview = None;
@@ -323,6 +333,15 @@ impl Workspace {
                 Response::CommitDetail { hash, detail } => {
                     self.busy = false;
                     self.detail = Some((hash, detail));
+                    self.detail_file = None;
+                }
+                Response::CommitDiff { hash, path, patch } => {
+                    if self.detail.as_ref().is_some_and(|(current, _)| current == &hash) {
+                        if let Some(file) = self.detail_file.as_mut().filter(|file| file.path == path) {
+                            file.patch = Some(patch);
+                            self.busy = false;
+                        }
+                    }
                 }
                 Response::Files(files) => {
                     self.busy = false;
@@ -966,63 +985,105 @@ impl Workspace {
 
     /// Commit detail replaces the column while open.
     fn detail_view(&mut self, ui: &mut egui::Ui) -> bool {
-        // Taken out and put back rather than cloned: the patch can be 8 MB.
         let Some((hash, detail)) = self.detail.take() else { return false };
-        let back = commit_detail_view(ui, &hash, &detail);
-        if !back {
-            self.detail = Some((hash, detail));
+        let action = commit_detail_view(ui, &hash, &detail, self.detail_file.as_ref());
+        if matches!(action, Some(CommitDetailAction::Back)) && self.detail_file.is_none() {
+            return true;
         }
+        match action {
+            Some(CommitDetailAction::Back) => self.detail_file = None,
+            Some(CommitDetailAction::OpenFile(path)) => {
+                self.detail_file = Some(CommitFile { path: path.clone(), patch: None });
+                self.busy = true;
+                self.send(Request::CommitDiff { hash: hash.clone(), path });
+            }
+            None => {}
+        }
+        self.detail = Some((hash, detail));
         true
     }
 }
 
-/// The open commit; true when "back" was pressed.
-fn commit_detail_view(ui: &mut egui::Ui, hash: &str, detail: &git::CommitDetail) -> bool {
-    let mut back = false;
-    {
-        ui.horizontal(|ui| {
-            if ui.add(theme::ghost_button(strings::WORKSPACE_BACK)).clicked() {
-                back = true;
+enum CommitDetailAction {
+    Back,
+    OpenFile(String),
+}
+
+/// The commit overview or one selected file; navigation stays outside the scroll.
+fn commit_detail_view(ui: &mut egui::Ui, hash: &str, detail: &git::CommitDetail, file: Option<&CommitFile>) -> Option<CommitDetailAction> {
+    let mut action = None;
+    ui.horizontal(|ui| {
+        if ui.add(theme::ghost_button(strings::WORKSPACE_BACK)).clicked() {
+            action = Some(CommitDetailAction::Back);
+        }
+        if ui.add(theme::ghost_button(strings::WORKSPACE_COPY_HASH)).clicked() {
+            copy_to_clipboard(hash);
+        }
+        if let Some(file) = file {
+            let patch = file.patch.as_ref().and_then(|result| result.as_ref().ok());
+            if ui.add_enabled(patch.is_some(), theme::ghost_button(strings::WORKSPACE_COPY_PATCH)).clicked() {
+                if let Some(patch) = patch {
+                    copy_to_clipboard(patch);
+                }
             }
-            if ui.add(theme::ghost_button(strings::WORKSPACE_COPY_HASH)).clicked() {
-                copy_to_clipboard(hash);
-            }
-            if ui.add(theme::ghost_button(strings::WORKSPACE_COPY_PATCH)).clicked() {
-                copy_to_clipboard(&detail.patch);
+        }
+    });
+    if let Some(file) = file {
+        ui.label(RichText::new(display(&file.path, file.path.len())).color(theme::TEXT).font(theme::font(12.5)));
+        ScrollArea::vertical().id_salt(("workspace-commit-file", hash, &file.path)).auto_shrink([false, false]).show(ui, |ui| {
+            match &file.patch {
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(14.0).color(theme::ACCENT));
+                        ui.label(strings::WORKSPACE_DIFF_LOADING);
+                    });
+                }
+                Some(Err(error)) => {
+                    ui.label(RichText::new(error).color(theme::STATUS_RED));
+                }
+                Some(Ok(patch)) => {
+                    let mut numbers = PatchNumbers::default();
+                    for line in patch.lines() {
+                        let number = numbers.line(line);
+                        patch_line(ui, line, number);
+                    }
+                }
             }
         });
-        let mut lines = detail.header.lines();
-        let full_hash = lines.next().unwrap_or("").to_owned();
-        let author = lines.next().unwrap_or("").to_owned();
-        let date = lines.next().unwrap_or("").to_owned();
-        let subject = display(lines.next().unwrap_or(""), 300);
-        let body: String = display_multiline(&lines.collect::<Vec<_>>().join("\n"), 2000);
+        return action;
+    }
+    // The complete message and file list share the remaining viewport.
+    ScrollArea::vertical().id_salt(("workspace-commit-detail", hash)).auto_shrink([false, false]).show(ui, |ui| {
+        let mut fields = detail.header.splitn(5, '\n');
+        let full_hash = fields.next().unwrap_or("");
+        let author = fields.next().unwrap_or("");
+        let date = fields.next().unwrap_or("");
+        let subject = fields.next().unwrap_or("");
+        let body = fields.next().unwrap_or("").trim();
+        let subject = display(subject, subject.len());
+        let body = display_multiline(body, body.len());
         ui.label(RichText::new(subject).color(theme::TEXT).font(theme::font(12.5)));
-        ui.label(RichText::new(format!("{} · {}", display(&author, 80), display(&date, 40))).color(theme::FAINT).font(theme::font(10.5)));
+        ui.label(RichText::new(format!("{} · {}", display(author, 80), display(date, 40))).color(theme::FAINT).font(theme::font(10.5)));
         ui.label(RichText::new(full_hash).color(theme::FAINT).font(theme::field_font(10.5)));
-        if !body.trim().is_empty() {
-            ui.label(RichText::new(body.trim()).color(theme::DIM).font(theme::font(11.0)));
+        if !body.is_empty() {
+            ui.label(RichText::new(body).color(theme::DIM).font(theme::font(11.0)));
         }
         theme::hairline(ui);
         for (status, path, additions, deletions) in &detail.files {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(status.to_string()).color(status_color(*status)).font(theme::field_font(11.5)));
-                ui.label(RichText::new(display(path, 120)).color(theme::TEXT).font(theme::font(11.5)));
+                if ui.selectable_label(false, RichText::new(display(path, 120)).color(theme::TEXT).font(theme::font(11.5)))
+                    .on_hover_text(path).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+                {
+                    action = Some(CommitDetailAction::OpenFile(path.clone()));
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(RichText::new(format!("+{additions} −{deletions}")).color(theme::FAINT).font(theme::field_font(10.5)));
                 });
             });
         }
-        theme::hairline(ui);
-        ScrollArea::vertical().id_salt("workspace-commit-patch").auto_shrink([false, false]).show(ui, |ui| {
-            let mut numbers = PatchNumbers::default();
-            for line in detail.patch.lines() {
-                let number = numbers.line(line);
-                patch_line(ui, line, number);
-            }
-        });
-    }
-    back
+    });
+    action
 }
 
 impl Workspace {
@@ -1821,6 +1882,15 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                     },
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
                 },
+                Request::CommitDiff { hash, path } => {
+                    let patch = if expected_root != root {
+                        Err(strings::WORKSPACE_REPO_CHANGED.to_owned())
+                    } else {
+                        root.as_ref().ok_or_else(|| strings::WORKSPACE_NO_REPO.to_owned())
+                            .and_then(|root| git::commit_file_diff(root, &hash, &path))
+                    };
+                    send(Response::CommitDiff { hash, path, patch });
+                }
                 Request::Files => match &root {
                     Some(root) => match git::ls_files(root) {
                         Ok(files) => send(Response::Files(files)),
@@ -1994,7 +2064,7 @@ mod tests {
             log: CommitLog { commits: vec![commit("0123456789", git::Section::History)], upstream: None, truncated: false },
             files: vec!["old.txt".to_owned()],
             file_preview: Some(("old.txt".to_owned(), "text".to_owned(), false)),
-            detail: Some(("0123456789".to_owned(), git::CommitDetail { files: Vec::new(), patch: String::new(), header: String::new() })),
+            detail: Some(("0123456789".to_owned(), git::CommitDetail { files: Vec::new(), header: String::new() })),
             ..Default::default()
         };
         workspace.selected.insert("old.txt".to_owned());

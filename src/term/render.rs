@@ -374,9 +374,24 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
     painter.add(blocks.into_shape());
 
     if let Some(c) = frame.cursor {
-        let rect = cell_rect(c.row, c.col, if c.wide { 2 } else { 1 });
+        let cell = cell_rect(c.row, c.col, if c.wide { 2 } else { 1 });
         let color = opt.palette.cursor;
         let shape = if opt.focused { c.shape } else { CursorShape::HollowBlock };
+        let rect = if matches!(shape, CursorShape::Block | CursorShape::HollowBlock) && (opt.cursor_on || !opt.focused) {
+            // Font rows include descender space below the visible capitals.
+            // Keep the cursor's size, but centre it on the text rather than
+            // that taller row; character redraws retain their original baseline.
+            let center = *primary_ink_center.get_or_insert_with(|| {
+                painter.layout_no_wrap("M".to_owned(), opt.fonts.primary.clone(), color).mesh_bounds.center().y
+            });
+            let offset = center - ch / 2.0;
+            Rect::from_min_max(
+                Pos2::new(cell.min.x, snap(cell.min.y + offset, ppp)),
+                Pos2::new(cell.max.x, snap(cell.max.y + offset, ppp)),
+            )
+        } else {
+            cell
+        };
         match shape {
             _ if !opt.cursor_on && opt.focused => {}
             CursorShape::Block => {
@@ -384,7 +399,7 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
                 if c.ch != ' ' {
                     let font = opt.fonts.regular.clone();
                     let galley = painter.layout_no_wrap(c.ch.to_string(), font, frame.default_bg);
-                    painter.galley(rect.min, galley, frame.default_bg);
+                    painter.galley(cell.min, galley, frame.default_bg);
                 }
             }
             CursorShape::Beam => {

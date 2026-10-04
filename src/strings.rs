@@ -124,6 +124,7 @@ pub const WORKSPACE_COMMIT: &str = "Зафиксировать";
 pub const WORKSPACE_AI: &str = "AI-сообщение";
 pub const WORKSPACE_AI_GENERATING: &str = "Генерация сообщения…";
 pub const WORKSPACE_DIFF_STAGED: &str = "Индекс/дерево";
+pub const WORKSPACE_DIFF_LOADING: &str = "Загрузка diff…";
 pub const WORKSPACE_TOGGLE_HINT: &str = "Панель git";
 pub const WORKSPACE_TAB_CHANGES: &str = "Изменения";
 pub const WORKSPACE_TAB_COMMITS: &str = "коммиты";

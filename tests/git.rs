@@ -242,11 +242,13 @@ fn non_repository_is_reported_as_such() {
 }
 
 #[test]
-fn commit_detail_lists_files_and_patch() {
+fn commit_detail_lists_files_and_loads_only_the_selected_patch() {
     let Some(dir) = repo() else { return };
     let root = git::find_root(dir.path()).expect("root");
     std::fs::write(dir.path().join("tracked.txt"), "one\ntwo\n").unwrap();
-    run(dir.path(), &["add", "tracked.txt"]);
+    std::fs::write(dir.path().join("файл[1].txt"), "literal-only\n").unwrap();
+    std::fs::write(dir.path().join("файл1.txt"), "other-only\n").unwrap();
+    run(dir.path(), &["add", "-A"]);
     run(dir.path(), &["commit", "--quiet", "-m", "add a line"]);
 
     let head = git::log(&root).expect("log").commits.first().expect("a commit").hash.clone();
@@ -256,12 +258,16 @@ fn commit_detail_lists_files_and_patch() {
         "files: {:?}",
         detail.files
     );
-    assert!(detail.patch.contains("+two"), "patch: {}", detail.patch);
+    let patch = git::commit_file_diff(&root, &head, "tracked.txt").expect("selected file diff");
+    assert!(patch.contains("+two") && !patch.contains("literal-only") && !patch.contains("other-only"), "patch: {patch}");
+    let literal_patch = git::commit_file_diff(&root, &head, "файл[1].txt").expect("literal path diff");
+    assert!(literal_patch.contains("+literal-only") && !literal_patch.contains("other-only"), "patch: {literal_patch}");
     assert!(detail.header.contains("add a line"), "header: {}", detail.header);
 
     // A root commit has no parent and must still show its files and patch.
     let first_hash = git::log(&root).expect("log").commits.last().expect("a commit").hash.clone();
     let first = git::commit_detail(&root, &first_hash).expect("root commit detail");
     assert!(first.files.iter().any(|(_, path, _, _)| path == "src/lib.rs"), "files: {:?}", first.files);
-    assert!(first.patch.contains("+pub fn a() {}"), "patch: {}", first.patch);
+    let first_patch = git::commit_file_diff(&root, &first_hash, "src/lib.rs").expect("root commit file diff");
+    assert!(first_patch.contains("+pub fn a() {}") && !first_patch.contains("+one"), "patch: {first_patch}");
 }
