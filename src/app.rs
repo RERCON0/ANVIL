@@ -134,6 +134,7 @@ impl AnvilApp {
         let (keymap, problems) = Keymap::with_overrides(&config.hotkeys);
         let has_problems = !problems.is_empty();
         let palette = scheme_palette(&config);
+        theme::set_scheme(&palette);
         let status_dir = status_dir();
         // A window opened with Ctrl+Shift+N: the first window owns the session.
         let extra_window = std::env::args().skip(1).any(|arg| arg == NEW_WINDOW_ARG);
@@ -271,7 +272,7 @@ impl AnvilApp {
         resize_borders(ctx, maximized, &mut commands);
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(theme::CHROME_BG))
+            .frame(egui::Frame::none().fill(theme::colors().chrome_bg))
             .show(ctx, |ui| {
                 if self.ui.dialog.is_some() {
                     ui.disable();
@@ -282,7 +283,7 @@ impl AnvilApp {
                 let body = Rect::from_min_max(Pos2::new(full.min.x, title.max.y), full.max);
                 let tabbar_rect = Rect::from_min_size(body.min, Vec2::new(theme::TABBAR_WIDTH, body.height()));
                 let area = Rect::from_min_max(Pos2::new(body.min.x + theme::TABBAR_WIDTH, body.min.y), body.max);
-                ui.painter().vline(tabbar_rect.max.x - 0.5, tabbar_rect.y_range(), egui::Stroke::new(1.0, theme::BORDER));
+                ui.painter().vline(tabbar_rect.max.x - 0.5, tabbar_rect.y_range(), egui::Stroke::new(1.0, theme::colors().border));
 
                 let infos: Vec<TabInfo> = (0..self.tabs.len())
                     .map(|i| TabInfo {
@@ -323,7 +324,7 @@ impl AnvilApp {
                 Align2::RIGHT_TOP,
                 format!("{:.1} ms", self.frame_ms),
                 FontId::monospace(11.0),
-                theme::ACCENT,
+                theme::colors().accent,
             );
         }
         // The config watcher and the Claude status poll are periodic: keep a
@@ -1331,6 +1332,9 @@ impl AnvilApp {
         }
         if scheme_changed {
             self.palette = scheme_palette(&self.config);
+            // The chrome follows the scheme, as the terminal does.
+            theme::set_scheme(&self.palette);
+            theme::apply(&ctx);
         }
         let palette = self.palette.clone();
         let style = cursor_style(&self.config.terminal.cursor);
@@ -1672,8 +1676,8 @@ impl AnvilApp {
             .interactable(false)
             .show(ctx, |ui| {
                 for toast in &self.ui.toasts {
-                    egui::Frame::popup(ui.style()).fill(theme::TAB_ACTIVE_BG).show(ui, |ui| {
-                        ui.label(egui::RichText::new(&toast.text).color(theme::TEXT).font(theme::font(12.0)));
+                    egui::Frame::popup(ui.style()).fill(theme::colors().tab_active_bg).show(ui, |ui| {
+                        ui.label(egui::RichText::new(&toast.text).color(theme::colors().text).font(theme::font(12.0)));
                     });
                 }
             });

@@ -94,7 +94,7 @@ impl Host {
         // SAFETY: the GL context is current on this thread.
         unsafe {
             use glow::HasContext as _;
-            let [r, g, b, _] = theme::CHROME_BG.to_normalized_gamma_f32();
+            let [r, g, b, _] = theme::colors().chrome_bg.to_normalized_gamma_f32();
             egui.painter.gl().clear_color(r, g, b, 1.0);
             egui.painter.gl().clear(glow::COLOR_BUFFER_BIT);
         }

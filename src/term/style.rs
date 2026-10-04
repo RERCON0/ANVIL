@@ -64,6 +64,12 @@ impl Palette {
         .expect("built-in scheme")
     }
 
+    /// Dark text on a light background: the background is the brighter of
+    /// the two, Tabby's test.
+    pub fn is_light(&self) -> bool {
+        luminance(self.background) > luminance(self.foreground)
+    }
+
     /// The xterm 256-colour palette with this scheme's first 16 colours.
     pub fn indexed(&self, i: u8) -> Color32 {
         match i {
@@ -87,6 +93,77 @@ fn override_or(colors: &Colors, index: usize, fallback: Color32) -> Color32 {
         None => fallback,
     }
 }
+
+/// WCAG relative luminance of an sRGB colour.
+pub fn luminance(c: Color32) -> f32 {
+    static LINEAR: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    let linear = LINEAR.get_or_init(|| {
+        std::array::from_fn(|v| {
+            let s = v as f32 / 255.0;
+            if s <= 0.03928 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        })
+    });
+    0.2126 * linear[c.r() as usize] + 0.7152 * linear[c.g() as usize] + 0.0722 * linear[c.b() as usize]
+}
+
+/// WCAG contrast ratio of two colours, 1 to 21.
+pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// `fg` moved until it stands out `ratio`:1 against `bg`, the way xterm.js
+/// (Tabby's renderer) enforces its minimum contrast: towards black when it is
+/// the darker of the two and towards white otherwise, in 10 % steps, turning
+/// the other way when one direction runs out before the ratio is reached.
+pub fn ensure_contrast(bg: Color32, fg: Color32, ratio: f32) -> Color32 {
+    if contrast_ratio(bg, fg) >= ratio {
+        return fg;
+    }
+    let darker = |fg: Color32| {
+        let mut c = fg;
+        while contrast_ratio(bg, c) < ratio && c != Color32::BLACK {
+            let step = |v: u8| v - (v as f32 * 0.1).ceil() as u8;
+            c = Color32::from_rgb(step(c.r()), step(c.g()), step(c.b()));
+        }
+        c
+    };
+    let lighter = |fg: Color32| {
+        let mut c = fg;
+        while contrast_ratio(bg, c) < ratio && c != Color32::WHITE {
+            let step = |v: u8| v + ((255 - v) as f32 * 0.1).ceil() as u8;
+            c = Color32::from_rgb(step(c.r()), step(c.g()), step(c.b()));
+        }
+        c
+    };
+    let toward_black = luminance(fg) < luminance(bg);
+    let first = if toward_black { darker(fg) } else { lighter(fg) };
+    if contrast_ratio(bg, first) >= ratio {
+        return first;
+    }
+    let second = if toward_black { lighter(fg) } else { darker(fg) };
+    if contrast_ratio(bg, first) > contrast_ratio(bg, second) {
+        first
+    } else {
+        second
+    }
+}
+
+/// Characters xterm.js leaves out of its contrast demands: box drawing, block
+/// elements and Powerline separators are shapes that meet a neighbouring
+/// background, not text that has to be read against their own.
+fn contrast_exempt(ch: char) -> bool {
+    ('\u{2500}'..='\u{259F}').contains(&ch) || ('\u{E0A4}'..='\u{E0D6}').contains(&ch)
+}
+
+/// Text stands out at least this much from its cell, as Tabby asks of
+/// xterm.js; dim text needs half of it, so it still reads as dim. Colours that
+/// already do are drawn exactly as programs ask for them.
+pub const MIN_CONTRAST: f32 = 4.0;
 
 /// Half way between `c` and `toward`.
 pub fn blend(c: Color32, toward: Color32) -> Color32 {
@@ -148,12 +225,14 @@ pub struct CellStyle {
     pub strike: bool,
 }
 
-/// Final colours and decorations of a cell (bold-bright, dim, inverse, hidden).
-pub fn cell_style(fg: Color, bg: Color, flags: Flags, colors: &Colors, palette: &Palette) -> CellStyle {
+/// Final colours and decorations of cell `ch` (bold-bright, dim, inverse,
+/// hidden, minimum contrast).
+pub fn cell_style(ch: char, fg: Color, bg: Color, flags: Flags, colors: &Colors, palette: &Palette) -> CellStyle {
     let bold = flags.contains(Flags::BOLD);
     let mut f = resolve(fg, colors, palette, bold);
     let mut b = resolve(bg, colors, palette, false);
-    if flags.contains(Flags::DIM) {
+    let dim = flags.contains(Flags::DIM);
+    if dim {
         f = blend(f, b);
     }
     if flags.contains(Flags::INVERSE) {
@@ -161,6 +240,8 @@ pub fn cell_style(fg: Color, bg: Color, flags: Flags, colors: &Colors, palette: 
     }
     if flags.contains(Flags::HIDDEN) {
         f = b;
+    } else if !contrast_exempt(ch) {
+        f = ensure_contrast(b, f, if dim { MIN_CONTRAST / 2.0 } else { MIN_CONTRAST });
     }
     let underline = if flags.contains(Flags::UNDERCURL) {
         Underline::Curly
@@ -345,14 +426,54 @@ mod tests {
         let c = Colors::default();
         let fg = Color::Named(NamedColor::Foreground);
         let bg = Color::Named(NamedColor::Background);
-        let s = cell_style(fg, bg, Flags::INVERSE, &c, &p);
+        let s = cell_style('x', fg, bg, Flags::INVERSE, &c, &p);
         assert_eq!((s.fg, s.bg), (p.background, p.foreground));
-        let s = cell_style(fg, bg, Flags::HIDDEN, &c, &p);
+        let s = cell_style('x', fg, bg, Flags::HIDDEN, &c, &p);
         assert_eq!(s.fg, s.bg);
-        let s = cell_style(fg, bg, Flags::DIM, &c, &p);
+        let s = cell_style('x', fg, bg, Flags::DIM, &c, &p);
         assert_eq!(s.fg, blend(p.foreground, p.background));
-        let s = cell_style(fg, bg, Flags::UNDERCURL | Flags::UNDERLINE | Flags::STRIKEOUT, &c, &p);
+        let s = cell_style('x', fg, bg, Flags::UNDERCURL | Flags::UNDERLINE | Flags::STRIKEOUT, &c, &p);
         assert_eq!((s.underline, s.strike), (Underline::Curly, true));
+    }
+
+    /// 3024 Day's yellow and light cyan vanished into its white background,
+    /// Hardcore's colour 0 into its black one. Every colour reaches 4:1
+    /// against its cell and dim text 2:1; colours that already read are left
+    /// exactly as they are, and box drawing keeps its colour.
+    #[test]
+    fn every_scheme_keeps_text_legible() {
+        let c = Colors::default();
+        let bg = Color::Named(NamedColor::Background);
+        let (day, dark) = (Palette::day_3024(), Palette::hardcore());
+        assert!(day.is_light() && !dark.is_light());
+        assert!(contrast_ratio(day.ansi[3], day.background) < 2.0, "the yellow this is about");
+        assert!(contrast_ratio(dark.ansi[0], dark.background) < 1.2, "the black this is about");
+        for p in [&day, &dark] {
+            for i in 0..16u8 {
+                let s = cell_style('x', Color::Indexed(i), bg, Flags::empty(), &c, p);
+                assert!(contrast_ratio(s.fg, s.bg) >= MIN_CONTRAST, "colour {i}: {:?} on {:?}", s.fg, s.bg);
+                if contrast_ratio(p.ansi[i as usize], p.background) >= MIN_CONTRAST {
+                    assert_eq!(s.fg, p.ansi[i as usize], "colour {i} already reads");
+                }
+                let dim = cell_style('x', Color::Indexed(i), bg, Flags::DIM, &c, p);
+                assert!(contrast_ratio(dim.fg, dim.bg) >= MIN_CONTRAST / 2.0, "dim colour {i}");
+            }
+        }
+        let yellow = Color::Indexed(3);
+        assert_eq!(cell_style('\u{2500}', yellow, bg, Flags::empty(), &c, &day).fg, day.ansi[3], "box drawing");
+    }
+
+    #[test]
+    fn contrast_is_raised_only_as_far_as_needed() {
+        let white = Color32::from_rgb(0xf7, 0xf7, 0xf7);
+        let black = Color32::BLACK;
+        assert_eq!(ensure_contrast(white, black, MIN_CONTRAST), black, "already legible");
+        let yellow = ensure_contrast(white, Color32::from_rgb(0xfd, 0xed, 0x02), MIN_CONTRAST);
+        assert!(contrast_ratio(white, yellow) >= MIN_CONTRAST);
+        assert!(yellow.r() > yellow.b() && yellow.g() > yellow.b(), "still a yellow: {yellow:?}");
+        let grey = Color32::from_rgb(0x30, 0x30, 0x30);
+        let lifted = ensure_contrast(Color32::from_rgb(0x12, 0x12, 0x12), grey, MIN_CONTRAST);
+        assert!(luminance(lifted) > luminance(grey), "lightened on a dark cell");
     }
 
     #[test]

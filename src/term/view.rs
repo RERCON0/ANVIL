@@ -454,7 +454,7 @@ impl TerminalView {
                     Pos2::new(track.min.x, track.min.y + top * track.height()),
                     Vec2::new(track.width(), (visible * track.height()).max(12.0)),
                 );
-                painter.rect_filled(thumb, 0.0, theme::DIVIDER_HOVER);
+                painter.rect_filled(thumb, 0.0, theme::colors().divider_hover);
             }
             if response.dragged() {
                 if let Some(pos) = response.interact_pointer_pos() {

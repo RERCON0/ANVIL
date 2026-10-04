@@ -76,7 +76,7 @@ pub fn show(
 ) -> Vec<TabbarAction> {
     let mut actions = Vec::new();
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, theme::CHROME_BG);
+    painter.rect_filled(rect, 0.0, theme::colors().chrome_bg);
     let mut y = rect.min.y;
     state.hover_index = None;
 
@@ -92,9 +92,9 @@ pub fn show(
             state.hover_index = Some(index);
         }
         if tab.active {
-            painter.rect_filled(row, 0.0, theme::TAB_ACTIVE_BG);
+            painter.rect_filled(row, 0.0, theme::colors().tab_active_bg);
         } else if response.hovered() {
-            painter.rect_filled(row, 0.0, theme::TAB_HOVER_BG);
+            painter.rect_filled(row, 0.0, theme::colors().tab_hover_bg);
         }
 
         if let Some(rename) = state.rename.as_mut().filter(|rename| rename.tab == index) {
@@ -120,7 +120,7 @@ pub fn show(
             continue;
         }
 
-        let number_color = if tab.active { theme::TAB_ACTIVE_NUMBER } else { theme::TAB_NUMBER };
+        let number_color = if tab.active { theme::colors().tab_active_number } else { theme::colors().tab_number };
         painter.text(
             Pos2::new(row.min.x + 14.0 + 11.0, row.min.y + 17.0),
             Align2::CENTER_CENTER,
@@ -129,9 +129,9 @@ pub fn show(
             number_color,
         );
         if tab.activity {
-            painter.circle_filled(Pos2::new(row.min.x + 7.0, row.min.y + 17.0), 2.0, theme::ACCENT);
+            painter.circle_filled(Pos2::new(row.min.x + 7.0, row.min.y + 17.0), 2.0, theme::colors().accent);
         }
-        let text_color = if tab.active { theme::TAB_ACTIVE_TEXT } else { theme::TAB_TEXT };
+        let text_color = if tab.active { theme::colors().tab_active_text } else { theme::colors().tab_text };
         let title_rect = Rect::from_min_size(Pos2::new(row.min.x + 36.0, row.min.y), Vec2::new(row.width() - 58.0, theme::TAB_ROW_HEIGHT));
         let title_font = theme::font(12.5);
         let title = elide(&painter, &tab.title, title_font.clone(), title_rect.width());
@@ -152,7 +152,7 @@ pub fn show(
         let pointer = ui.input(|i| i.pointer.hover_pos());
         let close_hovered = response.hovered() && pointer.is_some_and(|pos| close_rect.contains(pos));
         if response.hovered() {
-            let color = if close_hovered { theme::TAB_ACTIVE_TEXT } else { theme::TAB_TEXT };
+            let color = if close_hovered { theme::colors().tab_active_text } else { theme::colors().tab_text };
             painter.text(close_rect.center(), Align2::CENTER_CENTER, "×", theme::font(14.0), color);
         }
 
@@ -220,14 +220,14 @@ pub fn show(
     let y = y.max(rect.min.y);
     let plus_rect = Rect::from_min_size(Pos2::new(rect.min.x + 8.0, y + 8.0), Vec2::new(28.0, 24.0));
     let plus = ui.interact(plus_rect, ui.id().with("tab-new"), Sense::click());
-    let plus_color = if plus.hovered() { theme::ICON_HOVER } else { theme::ICON };
+    let plus_color = if plus.hovered() { theme::colors().icon_hover } else { theme::colors().icon };
     painter.text(plus_rect.center(), Align2::CENTER_CENTER, "+", theme::font(17.0), plus_color);
     if plus.on_hover_text(strings::TAB_NEW).clicked() {
         actions.push(TabbarAction::NewTab);
     }
     let profile_rect = Rect::from_min_size(Pos2::new(rect.min.x + 44.0, y + 8.0), Vec2::new(28.0, 24.0));
     let profile = ui.interact(profile_rect, ui.id().with("tab-profiles"), Sense::click());
-    let profile_color = if profile.hovered() { theme::ICON_HOVER } else { theme::ICON };
+    let profile_color = if profile.hovered() { theme::colors().icon_hover } else { theme::colors().icon };
     painter.text(profile_rect.center(), Align2::CENTER_CENTER, "»", theme::font(14.0), profile_color);
     if profile.on_hover_text(strings::TAB_PROFILES).clicked() {
         actions.push(TabbarAction::Profiles);
@@ -236,9 +236,9 @@ pub fn show(
     let settings_rect = Rect::from_min_size(Pos2::new(rect.min.x + 8.0, rect.max.y - 30.0), Vec2::new(rect.width() - 16.0, 24.0));
     let settings = ui.interact(settings_rect, ui.id().with("tab-settings"), Sense::click());
     if settings_open {
-        painter.rect_filled(settings_rect, 0.0, theme::TAB_ACTIVE_BG);
+        painter.rect_filled(settings_rect, 0.0, theme::colors().tab_active_bg);
     }
-    let settings_color = if settings_open || settings.hovered() { theme::ICON_HOVER } else { theme::ICON };
+    let settings_color = if settings_open || settings.hovered() { theme::colors().icon_hover } else { theme::colors().icon };
     painter.text(
         Pos2::new(settings_rect.min.x + 10.0, settings_rect.center().y),
         Align2::LEFT_CENTER,
@@ -283,7 +283,7 @@ fn paint_claude_line(painter: &egui::Painter, row: Rect, record: &StatusRecord) 
     let font = FontId::proportional(11.0);
     let mut parts: Vec<(String, Color32)> = Vec::new();
     if let Some(model) = &record.model {
-        parts.push((model.clone(), theme::TAB_TEXT));
+        parts.push((model.clone(), theme::colors().tab_text));
     }
     if let Some(pct) = record.context_pct {
         let filled = js_round(pct / 10.0).clamp(0, 10) as usize;
@@ -297,7 +297,7 @@ fn paint_claude_line(painter: &egui::Painter, row: Rect, record: &StatusRecord) 
         parts.push((format!("7d {}", js_round(pct)), threshold_color(pct)));
     }
     if let Some(agent) = &record.agent {
-        parts.push((agent.clone(), theme::TAB_TEXT));
+        parts.push((agent.clone(), theme::colors().tab_text));
     }
     let limit = row.max.x - 10.0;
     for (index, (text, color)) in parts.iter().enumerate() {
@@ -315,11 +315,11 @@ fn paint_claude_line(painter: &egui::Painter, row: Rect, record: &StatusRecord) 
 
 fn threshold_color(pct: f64) -> Color32 {
     if pct >= 85.0 {
-        theme::STATUS_RED
+        theme::colors().status_red
     } else if pct >= 60.0 {
-        theme::STATUS_YELLOW
+        theme::colors().status_yellow
     } else {
-        theme::STATUS_GREEN
+        theme::colors().status_green
     }
 }
 

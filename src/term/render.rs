@@ -249,7 +249,7 @@ pub fn snapshot<L: EventListener>(
                 .zerowidth()
                 .filter(|marks| !marks.is_empty())
                 .map(|marks| marks.iter().collect::<String>().into_boxed_str()),
-            style: cell_style(cell.fg, cell.bg, flags, colors, palette),
+            style: cell_style(cell.c, cell.fg, cell.bg, flags, colors, palette),
             wide: flags.contains(Flags::WIDE_CHAR),
             spacer: flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
             in_primary_font: glyphs.in_primary(cell.c, has_glyph),

@@ -225,7 +225,7 @@ impl Tab {
 
         if !self.collapsed.is_empty() {
             let strip = Rect::from_min_size(rect.min, Vec2::new(rect.width(), COLLAPSED_STRIP_HEIGHT));
-            ui.painter().rect_filled(strip, 0.0, theme::CHROME_BG);
+            ui.painter().rect_filled(strip, 0.0, theme::colors().chrome_bg);
             let mut x = strip.min.x + 6.0;
             let mut chips = Vec::new();
             for (id, _) in &self.collapsed {
@@ -233,18 +233,18 @@ impl Tab {
                 chips.push((*id, title));
             }
             for (id, title) in chips {
-                let galley = ui.painter().layout_no_wrap(title, FontId::proportional(12.0), theme::TAB_TEXT);
+                let galley = ui.painter().layout_no_wrap(title, FontId::proportional(12.0), theme::colors().tab_text);
                 let chip = Rect::from_min_size(
                     Pos2::new(x, strip.min.y + 3.0),
                     Vec2::new(galley.size().x + 18.0, strip.height() - 6.0),
                 );
                 let response = ui.interact(chip, ui.id().with(("collapsed", id)), Sense::click());
-                let fill = if response.hovered() { theme::TAB_ACTIVE_BG } else { theme::TAB_HOVER_BG };
+                let fill = if response.hovered() { theme::colors().tab_active_bg } else { theme::colors().tab_hover_bg };
                 ui.painter().rect_filled(chip, 0.0, fill);
                 ui.painter().galley(
                     Pos2::new(chip.min.x + 9.0, chip.center().y - galley.size().y / 2.0),
                     galley,
-                    theme::TAB_TEXT,
+                    theme::colors().tab_text,
                 );
                 if response.hovered() {
                     if let Some(preview) = self.panes.get(&id).and_then(PaneEntry::live).map(screen_tail) {
@@ -301,7 +301,7 @@ impl Tab {
                     // The pane that is not focused is dimmed so the eye lands on
                     // the one being typed into.
                     if focused != *id {
-                        ui.painter().rect_filled(terminal_rect, 0.0, theme::PANE_DIM);
+                        ui.painter().rect_filled(terminal_rect, 0.0, theme::colors().pane_dim);
                     }
                     if focused == *id {
                         self.ime_area = output.cursor_rect;
@@ -326,9 +326,9 @@ impl Tab {
                         );
                         let response = ui.interact(button, ui.id().with(("workspace-toggle", *id)), Sense::click());
                         let painter = ui.painter_at(button);
-                        let color = if response.hovered() { theme::ICON_HOVER } else { theme::ICON };
+                        let color = if response.hovered() { theme::colors().icon_hover } else { theme::colors().icon };
                         if response.hovered() {
-                            painter.rect_filled(button, 0.0, theme::TAB_HOVER_BG);
+                            painter.rect_filled(button, 0.0, theme::colors().tab_hover_bg);
                         }
                         painter.text(button.center(), Align2::CENTER_CENTER, "≡", theme::font(14.0), color);
                         let _ = response.clone().on_hover_text(strings::WORKSPACE_TOGGLE_HINT);
@@ -372,16 +372,16 @@ impl Tab {
                         Align2::LEFT_TOP,
                         &*message,
                         theme::font(12.5),
-                        theme::TAB_TEXT,
+                        theme::colors().tab_text,
                     );
                     let button = Rect::from_min_size(
                         Pos2::new(pane_rect.min.x + theme::PANE_PADDING, pane_rect.min.y + theme::PANE_PADDING + 24.0),
                         Vec2::new(90.0, 24.0),
                     );
                     let response = ui.interact(button, ui.id().with(("pane-error-close", id)), Sense::click());
-                    let fill = if response.hovered() { theme::TAB_ACTIVE_BG } else { theme::TAB_HOVER_BG };
+                    let fill = if response.hovered() { theme::colors().tab_active_bg } else { theme::colors().tab_hover_bg };
                     painter.rect_filled(button, 0.0, fill);
-                    painter.text(button.center(), Align2::CENTER_CENTER, strings::PANE_CLOSE, theme::font(12.5), theme::TAB_ACTIVE_TEXT);
+                    painter.text(button.center(), Align2::CENTER_CENTER, strings::PANE_CLOSE, theme::font(12.5), theme::colors().tab_active_text);
                     if response.clicked() {
                         actions.push(TabAction::ClosePane(*id));
                     }
@@ -397,7 +397,7 @@ impl Tab {
                     ui.id().with(("divider", divider.path.clone(), divider.index)),
                     Sense::click_and_drag(),
                 );
-                let color = if response.hovered() || response.dragged() { theme::DIVIDER_HOVER } else { theme::DIVIDER };
+                let color = if response.hovered() || response.dragged() { theme::colors().divider_hover } else { theme::colors().divider };
                 ui.painter().rect_filled(divider_rect, 0.0, color);
                 if response.hovered() {
                     ui.ctx().set_cursor_icon(match divider.dir {

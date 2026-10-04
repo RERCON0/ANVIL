@@ -16,7 +16,7 @@ enum Button {
 
 pub fn title_bar(ui: &mut egui::Ui, rect: Rect, maximized: bool, commands: &mut Vec<WindowCommand>) {
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, theme::CHROME_BG);
+    painter.rect_filled(rect, 0.0, theme::colors().chrome_bg);
     let buttons_width = theme::WINDOW_BUTTON_WIDTH * 3.0;
     let drag_rect = Rect::from_min_max(rect.min, Pos2::new(rect.max.x - buttons_width, rect.max.y));
     let drag = ui.interact(drag_rect, ui.id().with("titlebar-drag"), Sense::click_and_drag());
@@ -30,9 +30,9 @@ pub fn title_bar(ui: &mut egui::Ui, rect: Rect, maximized: bool, commands: &mut 
         Align2::LEFT_CENTER,
         strings::APP_TITLE,
         theme::title_font(12.5),
-        theme::TITLE_TEXT,
+        theme::colors().title_text,
     );
-    painter.hline(rect.x_range(), rect.max.y - 0.5, Stroke::new(1.0, theme::BORDER));
+    painter.hline(rect.x_range(), rect.max.y - 0.5, Stroke::new(1.0, theme::colors().border));
 
     let mut x = rect.max.x - buttons_width;
     for kind in [Button::Minimize, Button::Maximize, Button::Close] {
@@ -41,9 +41,9 @@ pub fn title_bar(ui: &mut egui::Ui, rect: Rect, maximized: bool, commands: &mut 
         let response = ui.interact(r, ui.id().with(("window-button", kind)), Sense::click());
         let hovered = response.hovered();
         if hovered {
-            painter.rect_filled(r, 0.0, if kind == Button::Close { theme::CLOSE_HOVER } else { theme::WINDOW_BUTTON_HOVER });
+            painter.rect_filled(r, 0.0, if kind == Button::Close { theme::colors().close_hover } else { theme::colors().window_button_hover });
         }
-        let color = if hovered && kind == Button::Close { Color32::WHITE } else { theme::WINDOW_ICON };
+        let color = if hovered && kind == Button::Close { Color32::WHITE } else { theme::colors().window_icon };
         // Plain glyphs, as in the owner's other apps: they need no icon font.
         let (label, tooltip) = match kind {
             Button::Minimize => ("─", strings::WINDOW_MINIMIZE),

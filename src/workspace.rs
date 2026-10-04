@@ -308,22 +308,22 @@ impl Workspace {
     }
 
     fn trust_view(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new(strings::WORKSPACE_TRUST_TITLE).color(theme::STATUS_YELLOW).font(theme::font(13.0)));
+        ui.label(RichText::new(strings::WORKSPACE_TRUST_TITLE).color(theme::colors().status_yellow).font(theme::font(13.0)));
         if let Some(identity) = &self.pending_identity {
-            ui.label(RichText::new(display(&identity.root.to_string_lossy(), 240)).color(theme::TEXT).font(theme::field_font(11.5)));
+            ui.label(RichText::new(display(&identity.root.to_string_lossy(), 240)).color(theme::colors().text).font(theme::field_font(11.5)));
         }
-        ui.label(RichText::new(strings::WORKSPACE_TRUST_HINT).color(theme::DIM).font(theme::font(12.0)));
+        ui.label(RichText::new(strings::WORKSPACE_TRUST_HINT).color(theme::colors().dim).font(theme::font(12.0)));
         if let Some(identity) = &self.pending_identity {
             let hazards = identity.stamp.hazards();
             if !hazards.is_empty() {
-                ui.label(RichText::new(strings::WORKSPACE_TRUST_HAZARDS).color(theme::TEXT).font(theme::font(11.5)));
+                ui.label(RichText::new(strings::WORKSPACE_TRUST_HAZARDS).color(theme::colors().text).font(theme::font(11.5)));
                 for hazard in hazards {
-                    ui.label(RichText::new(format!("· {hazard}")).color(theme::STATUS_YELLOW).font(theme::field_font(11.0)));
+                    ui.label(RichText::new(format!("· {hazard}")).color(theme::colors().status_yellow).font(theme::field_font(11.0)));
                 }
             }
         }
         if let Some((notice, _)) = &self.notice {
-            ui.label(RichText::new(notice).color(theme::STATUS_RED).font(theme::font(11.5)));
+            ui.label(RichText::new(notice).color(theme::colors().status_red).font(theme::font(11.5)));
         }
         if ui.add_enabled(self.pending_identity.is_some() && !self.trust_approval_pending, theme::accent_button(strings::WORKSPACE_TRUST_APPROVE)).clicked() {
             if let Some(identity) = self.pending_identity.clone() {
@@ -514,8 +514,8 @@ impl Workspace {
         self.ai_command = ai_command.map(str::to_owned);
         let mut actions = Vec::new();
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, theme::LIFT);
-        painter.vline(rect.min.x + 0.5, rect.y_range(), Stroke::new(1.0, theme::LINE));
+        painter.rect_filled(rect, 0.0, theme::colors().lift);
+        painter.vline(rect.min.x + 0.5, rect.y_range(), Stroke::new(1.0, theme::colors().line));
         let inner = rect.shrink2(Vec2::new(10.0, 8.0));
         // Every pane has its own panel with its own widgets: without the pane
         // in the salt two panels share one id, and egui paints a clash overlay
@@ -534,7 +534,7 @@ impl Workspace {
                     // Framed like the other panel chips, with the selection dot
                     // of the settings rows inside.
                     let selected = self.tab == tab;
-                    let (dot, color) = if selected { ("●", theme::ACCENT) } else { ("○", theme::DIM) };
+                    let (dot, color) = if selected { ("●", theme::colors().accent) } else { ("○", theme::colors().dim) };
                     let text = egui::RichText::new(format!("{dot} {label}")).font(theme::field_font(12.5)).color(color);
                     if ui.add(egui::Button::new(text)).clicked() {
                         self.tab = tab;
@@ -578,7 +578,7 @@ impl Workspace {
     fn changes_mode(&mut self, ui: &mut egui::Ui) {
         if self.status.changes.is_empty() && self.status.branch.is_empty() {
             ui.add_space(4.0);
-            ui.label(RichText::new(strings::WORKSPACE_NO_REPO_HINT).color(theme::FAINT).font(theme::font(12.0)));
+            ui.label(RichText::new(strings::WORKSPACE_NO_REPO_HINT).color(theme::colors().faint).font(theme::font(12.0)));
             return;
         }
         if self.detail_view(ui) {
@@ -602,14 +602,14 @@ impl Workspace {
             .and_then(|root| root.file_name().map(|name| name.to_string_lossy().into_owned()))
             .unwrap_or_default();
         ui.horizontal(|ui| {
-            ui.label(RichText::new(name).color(theme::TEXT).font(theme::font(12.5)));
+            ui.label(RichText::new(name).color(theme::colors().text).font(theme::font(12.5)));
             if !self.status.branch.is_empty() {
-                ui.label(RichText::new(&self.status.branch).color(theme::ACCENT).font(theme::field_font(12.0)));
+                ui.label(RichText::new(&self.status.branch).color(theme::colors().accent).font(theme::field_font(12.0)));
                 if self.status.ahead > 0 {
-                    ui.label(RichText::new(format!("↑{}", self.status.ahead)).color(theme::ACCENT).font(theme::field_font(11.5)));
+                    ui.label(RichText::new(format!("↑{}", self.status.ahead)).color(theme::colors().accent).font(theme::field_font(11.5)));
                 }
                 if self.status.behind > 0 {
-                    ui.label(RichText::new(format!("↓{}", self.status.behind)).color(theme::STATUS_YELLOW).font(theme::field_font(11.5)));
+                    ui.label(RichText::new(format!("↓{}", self.status.behind)).color(theme::colors().status_yellow).font(theme::field_font(11.5)));
                 }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -628,12 +628,12 @@ impl Workspace {
         let additions: u32 = self.status.changes.iter().map(|c| c.additions).sum();
         let deletions: u32 = self.status.changes.iter().map(|c| c.deletions).sum();
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("+{additions}")).color(theme::STATUS_GREEN).font(theme::field_font(11.5)));
-            ui.label(RichText::new(format!("−{deletions}")).color(theme::STATUS_RED).font(theme::field_font(11.5)));
-            ui.label(RichText::new(strings::workspace_staged(self.counts().0, self.counts().1)).color(theme::FAINT).font(theme::font(11.0)));
+            ui.label(RichText::new(format!("+{additions}")).color(theme::colors().status_green).font(theme::field_font(11.5)));
+            ui.label(RichText::new(format!("−{deletions}")).color(theme::colors().status_red).font(theme::field_font(11.5)));
+            ui.label(RichText::new(strings::workspace_staged(self.counts().0, self.counts().1)).color(theme::colors().faint).font(theme::font(11.0)));
         });
         if let Some((notice, error)) = &self.notice {
-            let colour = if *error { theme::STATUS_RED } else { theme::STATUS_GREEN };
+            let colour = if *error { theme::colors().status_red } else { theme::colors().status_green };
             ui.label(RichText::new(notice).color(colour).font(theme::font(11.5)));
         }
         theme::hairline(ui);
@@ -693,8 +693,8 @@ impl Workspace {
         });
         if self.ai_generating {
             ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(14.0).color(theme::ACCENT));
-                ui.label(RichText::new(strings::WORKSPACE_AI_GENERATING).color(theme::ACCENT).font(theme::font(11.5)));
+                ui.add(egui::Spinner::new().size(14.0).color(theme::colors().accent));
+                ui.label(RichText::new(strings::WORKSPACE_AI_GENERATING).color(theme::colors().accent).font(theme::font(11.5)));
             });
         }
         ui.add_space(4.0);
@@ -705,17 +705,17 @@ impl Workspace {
     fn commits_section(&mut self, ui: &mut egui::Ui) {
         let ahead = self.status.ahead;
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("[ {} ]", strings::WORKSPACE_COMMITS_TITLE)).color(theme::FAINT).font(theme::font(11.5)));
+            ui.label(RichText::new(format!("[ {} ]", strings::WORKSPACE_COMMITS_TITLE)).color(theme::colors().faint).font(theme::font(11.5)));
             if ahead > 0 {
-                ui.label(RichText::new(format!("↑{ahead}")).color(theme::ACCENT).font(theme::field_font(11.5)));
+                ui.label(RichText::new(format!("↑{ahead}")).color(theme::colors().accent).font(theme::field_font(11.5)));
             }
             if self.log.truncated {
-                ui.label(RichText::new(strings::WORKSPACE_TRUNCATED).color(theme::FAINT).font(theme::font(10.5)));
+                ui.label(RichText::new(strings::WORKSPACE_TRUNCATED).color(theme::colors().faint).font(theme::font(10.5)));
             }
         });
         theme::hairline(ui);
         if self.log.commits.is_empty() {
-            ui.label(RichText::new(strings::WORKSPACE_NO_COMMITS).color(theme::FAINT).font(theme::font(11.5)));
+            ui.label(RichText::new(strings::WORKSPACE_NO_COMMITS).color(theme::colors().faint).font(theme::font(11.5)));
             return;
         }
         ScrollArea::vertical()
@@ -745,7 +745,7 @@ impl Workspace {
                     git::Section::History => strings::WORKSPACE_SECTION_HISTORY,
                 };
                 ui.add_space(if index > 0 { gap + 4.0 } else { 4.0 });
-                ui.label(RichText::new(label).color(theme::FAINT).font(theme::font(10.5)));
+                ui.label(RichText::new(label).color(theme::colors().faint).font(theme::font(10.5)));
                 ui.add_space(gap);
             }
             let row = self.graph.get(index).cloned().unwrap_or(graph::Row { lane: 0, lane_count: 1, segments: Vec::new() });
@@ -753,7 +753,7 @@ impl Workspace {
             let (rect, response) = ui.allocate_exact_size(Vec2::new(width, ROW_HEIGHT), Sense::click());
             let painter = ui.painter_at(rect);
             if response.hovered() {
-                painter.rect_filled(rect, 0.0, theme::TAB_HOVER_BG);
+                painter.rect_filled(rect, 0.0, theme::colors().tab_hover_bg);
             }
             let lane_x = |lane: usize| rect.min.x + lane as f32 * LANE_WIDTH + LANE_WIDTH / 2.0;
             let mid = rect.center().y;
@@ -806,25 +806,25 @@ impl Workspace {
             let graph_width = row.lane_count as f32 * LANE_WIDTH;
             let text_x = rect.min.x + graph_width + 7.0;
             let time_text = crate::strings::relative_time(now, commit.time);
-            let time_galley = painter.layout_no_wrap(time_text.clone(), theme::font(10.0), theme::FAINT);
-            let hash_galley = painter.layout_no_wrap(commit.short.clone(), theme::field_font(10.0), theme::FAINT);
+            let time_galley = painter.layout_no_wrap(time_text.clone(), theme::font(10.0), theme::colors().faint);
+            let hash_galley = painter.layout_no_wrap(commit.short.clone(), theme::field_font(10.0), theme::colors().faint);
             let right_width = time_galley.size().x + hash_galley.size().x + 12.0;
             let right_x = rect.max.x - 2.0;
             painter.galley(
                 egui::Pos2::new(right_x - time_galley.size().x, mid - time_galley.size().y / 2.0),
                 time_galley,
-                theme::FAINT,
+                theme::colors().faint,
             );
             painter.galley(
                 egui::Pos2::new(right_x - right_width, mid - hash_galley.size().y / 2.0),
                 hash_galley,
-                theme::FAINT,
+                theme::colors().faint,
             );
             let mut badge_x = text_x;
             for reference in &commit.refs {
                 let name = display(reference.strip_prefix("HEAD -> ").unwrap_or(reference), 40);
                 let colour = ref_color(&name);
-                let galley = painter.layout_no_wrap(name, theme::field_font(10.0), theme::CHROME_BG);
+                let galley = painter.layout_no_wrap(name, theme::field_font(10.0), theme::colors().chrome_bg);
                 let badge = Rect::from_min_size(
                     egui::Pos2::new(badge_x, mid - 7.0),
                     Vec2::new(galley.size().x + 10.0, 14.0),
@@ -835,7 +835,7 @@ impl Workspace {
                     break;
                 }
                 painter.rect_filled(badge, egui::Rounding::same(3.0), colour);
-                painter.galley(egui::Pos2::new(badge.min.x + 5.0, badge.min.y + 1.0), galley, theme::CHROME_BG);
+                painter.galley(egui::Pos2::new(badge.min.x + 5.0, badge.min.y + 1.0), galley, theme::colors().chrome_bg);
                 badge_x = badge.max.x + 4.0;
             }
             let subject_limit = rect.max.x - right_width - 8.0 - badge_x;
@@ -846,7 +846,7 @@ impl Workspace {
                     Align2::LEFT_CENTER,
                     subject,
                     theme::font(12.0),
-                    theme::TEXT,
+                    theme::colors().text,
                 );
             }
             if response.hovered() {
@@ -871,10 +871,10 @@ impl Workspace {
             PromptKind::Rename(path) => format!("{}: {path}", strings::WORKSPACE_RENAME),
             PromptKind::Delete { path, .. } => format!("{}: {path}", strings::WORKSPACE_DELETE),
         };
-        ui.label(RichText::new(label).color(theme::DIM).font(theme::font(11.5)));
+        ui.label(RichText::new(label).color(theme::colors().dim).font(theme::font(11.5)));
         if let PromptKind::Delete { folder, .. } = prompt.kind {
             let hint = if folder { strings::WORKSPACE_DELETE_HINT } else { strings::WORKSPACE_DELETE_FILE_HINT };
-            ui.label(RichText::new(hint).color(theme::FAINT).font(theme::font(11.5)));
+            ui.label(RichText::new(hint).color(theme::colors().faint).font(theme::font(11.5)));
         }
         let mut commit = false;
         let mut cancel = false;
@@ -976,7 +976,7 @@ impl Workspace {
                     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, ROW_HEIGHT), Sense::click());
                     let painter = ui.painter_at(rect);
                     if response.hovered() {
-                        painter.rect_filled(rect, 0.0, theme::TAB_HOVER_BG);
+                        painter.rect_filled(rect, 0.0, theme::colors().tab_hover_bg);
                     }
                     match row {
                         Row::Folder { path, depth, count } => {
@@ -988,14 +988,14 @@ impl Workspace {
                                 Align2::LEFT_CENTER,
                                 format!("{caret} {name}/"),
                                 theme::font(12.0),
-                                theme::DIM,
+                                theme::colors().dim,
                             );
                             painter.text(
                                 egui::Pos2::new(rect.max.x, rect.center().y),
                                 Align2::RIGHT_CENTER,
                                 count.to_string(),
                                 theme::field_font(11.0),
-                                theme::FAINT,
+                                theme::colors().faint,
                             );
                             if response.clicked() {
                                 if collapsed {
@@ -1016,7 +1016,7 @@ impl Workspace {
                                 Align2::LEFT_CENTER,
                                 if selected { "[×]" } else { "[ ]" },
                                 theme::field_font(12.0),
-                                if selected { theme::ACCENT } else { theme::FAINT },
+                                if selected { theme::colors().accent } else { theme::colors().faint },
                             );
                             let (icon, icon_color) = crate::file_icons::for_file(change.file_name());
                             painter.text(
@@ -1031,7 +1031,7 @@ impl Workspace {
                                 Align2::LEFT_CENTER,
                                 display(change.file_name(), 60),
                                 theme::font(12.0),
-                                theme::TEXT,
+                                theme::colors().text,
                             );
                             let letter = change.letter();
                             let letter_galley = painter.layout_no_wrap(letter.to_string(), theme::field_font(11.5), status_color(letter));
@@ -1053,7 +1053,7 @@ impl Workspace {
                                 Align2::RIGHT_CENTER,
                                 stat,
                                 theme::field_font(10.5),
-                                theme::FAINT,
+                                theme::colors().faint,
                             );
                             if response.clicked() {
                                 let checkbox_hit = response.interact_pointer_pos().is_some_and(|pos| pos.x < box_x + 28.0);
@@ -1094,7 +1094,7 @@ impl Workspace {
         ui.add_space(4.0);
         theme::hairline(ui);
         ui.horizontal(|ui| {
-            ui.label(RichText::new(display(&path, 120)).color(theme::DIM).font(theme::field_font(11.5)));
+            ui.label(RichText::new(display(&path, 120)).color(theme::colors().dim).font(theme::field_font(11.5)));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.add(theme::ghost_button(strings::WORKSPACE_DIFF_STAGED)).clicked() {
                     self.diff_text.clear();
@@ -1126,8 +1126,8 @@ impl Workspace {
                     if let Some(hunk_index) = row.hunk {
                         let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), TEXT_ROW_HEIGHT), Sense::click());
                         let label = if self.diff_from_index { "◂" } else { "▸" };
-                        ui.painter().text(rect.left_center(), Align2::LEFT_CENTER, label, theme::font(12.0), theme::ACCENT);
-                        paint_text_row(ui, rect, line, None, theme::DIFF_HUNK);
+                        ui.painter().text(rect.left_center(), Align2::LEFT_CENTER, label, theme::font(12.0), theme::colors().accent);
+                        paint_text_row(ui, rect, line, None, theme::colors().diff_hunk);
                         if response.clicked() {
                             if let Some(header) = self.diff_rows.iter().find(|row| row.hunk == Some(hunk_index)) {
                                 hunks_to_apply = Some((hunk_index, self.diff_text[header.bytes.clone()].to_owned(), self.diff_from_index));
@@ -1191,16 +1191,16 @@ fn commit_detail_view(ui: &mut egui::Ui, hash: &str, detail: &git::CommitDetail,
         }
     });
     if let Some(file) = file.as_mut() {
-        ui.label(RichText::new(display(&file.path, file.path.len())).color(theme::TEXT).font(theme::font(12.5)));
+        ui.label(RichText::new(display(&file.path, file.path.len())).color(theme::colors().text).font(theme::font(12.5)));
         match &file.patch {
                 None => {
                     ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new().size(14.0).color(theme::ACCENT));
+                        ui.add(egui::Spinner::new().size(14.0).color(theme::colors().accent));
                         ui.label(strings::WORKSPACE_DIFF_LOADING);
                     });
                 }
                 Some(Err(error)) => {
-                    ui.label(RichText::new(error).color(theme::STATUS_RED));
+                    ui.label(RichText::new(error).color(theme::colors().status_red));
                 }
                 Some(Ok(patch)) => {
                     file.wrapped.prepare(ui, patch, &file.rows);
@@ -1229,23 +1229,23 @@ fn commit_detail_view(ui: &mut egui::Ui, hash: &str, detail: &git::CommitDetail,
         let body = fields.next().unwrap_or("").trim();
         let subject = display(subject, subject.len());
         let body = display_multiline(body, body.len());
-        ui.label(RichText::new(subject).color(theme::TEXT).font(theme::font(12.5)));
-        ui.label(RichText::new(format!("{} · {}", display(author, 80), display(date, 40))).color(theme::FAINT).font(theme::font(10.5)));
-        ui.label(RichText::new(full_hash).color(theme::FAINT).font(theme::field_font(10.5)));
+        ui.label(RichText::new(subject).color(theme::colors().text).font(theme::font(12.5)));
+        ui.label(RichText::new(format!("{} · {}", display(author, 80), display(date, 40))).color(theme::colors().faint).font(theme::font(10.5)));
+        ui.label(RichText::new(full_hash).color(theme::colors().faint).font(theme::field_font(10.5)));
         if !body.is_empty() {
-            ui.label(RichText::new(body).color(theme::DIM).font(theme::font(11.0)));
+            ui.label(RichText::new(body).color(theme::colors().dim).font(theme::font(11.0)));
         }
         theme::hairline(ui);
         for (status, path, additions, deletions) in &detail.files {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(status.to_string()).color(status_color(*status)).font(theme::field_font(11.5)));
-                if ui.selectable_label(false, RichText::new(display(path, 120)).color(theme::TEXT).font(theme::font(11.5)))
+                if ui.selectable_label(false, RichText::new(display(path, 120)).color(theme::colors().text).font(theme::font(11.5)))
                     .on_hover_text(path).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
                 {
                     action = Some(CommitDetailAction::OpenFile(path.clone()));
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(format!("+{additions} −{deletions}")).color(theme::FAINT).font(theme::field_font(10.5)));
+                    ui.label(RichText::new(format!("+{additions} −{deletions}")).color(theme::colors().faint).font(theme::field_font(10.5)));
                 });
             });
         }
@@ -1320,7 +1320,7 @@ impl Workspace {
         let (rect, response) = ui.allocate_exact_size(Vec2::new(width, FILE_ROW_HEIGHT), Sense::click());
         let painter = ui.painter_at(rect);
         if response.hovered() {
-            painter.rect_filled(rect, 0.0, theme::TAB_HOVER_BG);
+            painter.rect_filled(rect, 0.0, theme::colors().tab_hover_bg);
         }
         let indent = row.depth as f32 * 12.0;
         let mut opened = None;
@@ -1333,7 +1333,7 @@ impl Workspace {
                 Align2::LEFT_CENTER,
                 if open { "▾" } else { "▸" },
                 theme::font(12.5),
-                theme::DIM,
+                theme::colors().dim,
             );
             painter.text(
                 egui::Pos2::new(rect.min.x + 18.0 + indent, rect.center().y),
@@ -1348,7 +1348,7 @@ impl Workspace {
                 Align2::LEFT_CENTER,
                 name,
                 theme::font(11.5),
-                theme::TEXT,
+                theme::colors().text,
             );
             if response.clicked() {
                 self.toggle_file_folder(&row.path);
@@ -1367,17 +1367,17 @@ impl Workspace {
             let mut x = rect.min.x + 20.0 + indent;
             let limit = (rect.width() - indent - 24.0).max(24.0);
             let name = elide(&painter, &row.name, theme::font(11.5), limit);
-            let name_width = painter.layout_no_wrap(name.clone(), theme::font(11.5), theme::TEXT).size().x;
+            let name_width = painter.layout_no_wrap(name.clone(), theme::font(11.5), theme::colors().text).size().x;
             if let Some(dir) = &row.dir {
                 let dir_limit = (limit - name_width).max(0.0);
                 if dir_limit > 10.0 {
                     let dir = elide_front(&painter, dir, theme::font(11.0), dir_limit);
-                    let galley = painter.layout_no_wrap(dir, theme::font(11.0), theme::FAINT);
-                    painter.galley(egui::Pos2::new(x, rect.center().y - galley.size().y / 2.0), galley.clone(), theme::FAINT);
+                    let galley = painter.layout_no_wrap(dir, theme::font(11.0), theme::colors().faint);
+                    painter.galley(egui::Pos2::new(x, rect.center().y - galley.size().y / 2.0), galley.clone(), theme::colors().faint);
                     x += galley.size().x;
                 }
             }
-            painter.text(egui::Pos2::new(x, rect.center().y), Align2::LEFT_CENTER, name, theme::font(11.5), theme::TEXT);
+            painter.text(egui::Pos2::new(x, rect.center().y), Align2::LEFT_CENTER, name, theme::font(11.5), theme::colors().text);
             if response.clicked() {
                 opened = Some(row.path.clone());
             }
@@ -1421,7 +1421,7 @@ impl Workspace {
                 self.send(Request::CountLines);
             }
             if let Some((files, lines)) = self.line_count {
-                ui.label(RichText::new(strings::workspace_line_count(files, lines)).color(theme::ACCENT).font(theme::font(11.0)));
+                ui.label(RichText::new(strings::workspace_line_count(files, lines)).color(theme::colors().accent).font(theme::font(11.0)));
             }
         });
         ui.add(
@@ -1460,7 +1460,7 @@ impl Workspace {
         if let Some((path, text, truncated)) = self.file_preview.as_ref() {
             ui.add_space(2.0);
             theme::hairline(ui);
-            ui.label(RichText::new(path).color(theme::DIM).font(theme::field_font(11.0)));
+            ui.label(RichText::new(path).color(theme::colors().dim).font(theme::field_font(11.0)));
             // The preview ends on a whole line and takes the space the list
             // leaves: a height that is not a multiple of the line height cut
             // the last line in half, and the old half-of-the-rest cap left the
@@ -1482,13 +1482,13 @@ impl Workspace {
                         for index in visible {
                             let row = &self.preview_wrapped.rows[index];
                             let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), TEXT_ROW_HEIGHT), Sense::hover());
-                            paint_text_row(ui, rect, &text[row.bytes.clone()], row.number, theme::DIM);
+                            paint_text_row(ui, rect, &text[row.bytes.clone()], row.number, theme::colors().dim);
                         }
                     });
                 ui.spacing_mut().item_spacing.y = spacing;
             }
             if *truncated {
-                ui.label(RichText::new(strings::WORKSPACE_FILE_TRUNCATED).color(theme::STATUS_YELLOW).font(theme::font(11.0)));
+                ui.label(RichText::new(strings::WORKSPACE_FILE_TRUNCATED).color(theme::colors().status_yellow).font(theme::font(11.0)));
             }
         }
     }
@@ -1748,7 +1748,7 @@ impl MarkdownCache {
                 continue;
             }
             if fenced {
-                let galley = ui.painter().layout(line.to_owned(), theme::field_font(11.0), theme::DIM, width);
+                let galley = ui.painter().layout(line.to_owned(), theme::field_font(11.0), theme::colors().dim, width);
                 self.push(vec![(0.0, galley)], 2.0, false, false);
             } else if plain.is_empty() {
                 self.push(Vec::new(), 6.0, false, false);
@@ -1757,7 +1757,7 @@ impl MarkdownCache {
                 let title = plain[level..].trim().trim_end_matches('#').trim();
                 let size = match level { 1 => 15.0, 2 => 13.5, _ => 12.5 };
                 self.push(Vec::new(), 6.0, false, false);
-                let galley = ui.painter().layout(title.to_owned(), theme::title_font(size), theme::TEXT, width);
+                let galley = ui.painter().layout(title.to_owned(), theme::title_font(size), theme::colors().text, width);
                 self.push(vec![(0.0, galley)], 2.0, false, false);
             } else if matches!(plain, "---" | "***" | "___") {
                 self.push(Vec::new(), 6.0, false, true);
@@ -1771,7 +1771,7 @@ impl MarkdownCache {
                 let gap = 10.0_f32.min(width / (columns * 2) as f32);
                 let column = ((width - gap * (columns - 1) as f32) / columns as f32).max(1.0);
                 for (index, row) in rows.into_iter().enumerate() {
-                    let colour = if index == 0 { theme::TEXT } else { theme::DIM };
+                    let colour = if index == 0 { theme::colors().text } else { theme::colors().dim };
                     let cells = row.iter().enumerate().map(|(cell, text)| {
                         (cell as f32 * (column + gap), ui.painter().layout_job(inline_job(text, 11.5, colour, column)))
                     }).collect();
@@ -1780,10 +1780,10 @@ impl MarkdownCache {
                 self.push(Vec::new(), 6.0, false, false);
             } else {
                 let (text, colour) = if let Some(rest) = plain.strip_prefix("> ") {
-                    (format!("│ {rest}"), theme::FAINT)
+                    (format!("│ {rest}"), theme::colors().faint)
                 } else if let Some(rest) = plain.strip_prefix("- ").or_else(|| plain.strip_prefix("* ")).or_else(|| plain.strip_prefix("+ ")) {
-                    (format!("• {rest}"), theme::DIM)
-                } else { (plain.to_owned(), theme::DIM) };
+                    (format!("• {rest}"), theme::colors().dim)
+                } else { (plain.to_owned(), theme::colors().dim) };
                 let galley = ui.painter().layout_job(inline_job(&text, 11.5, colour, width));
                 self.push(vec![(0.0, galley)], 2.0, false, false);
             }
@@ -1804,14 +1804,14 @@ impl MarkdownCache {
                 for index in self.visible(viewport.min.y, viewport.max.y) {
                     let row = &self.rows[index];
                     let rect = Rect::from_min_size(origin + Vec2::new(0.0, row.top), Vec2::new(ui.available_width(), row.height));
-                    if row.header { ui.painter().rect_filled(rect, 0.0, theme::TAB_ACTIVE_BG); }
+                    if row.header { ui.painter().rect_filled(rect, 0.0, theme::colors().tab_active_bg); }
                     for cell in &row.cells {
                         let visible = cell.visible(viewport.min.y - row.top, viewport.max.y - row.top);
                         for index in visible {
-                            ui.painter().galley(rect.min + Vec2::new(cell.x, 0.0), cell.lines[index].clone(), theme::DIM);
+                            ui.painter().galley(rect.min + Vec2::new(cell.x, 0.0), cell.lines[index].clone(), theme::colors().dim);
                         }
                     }
-                    if row.rule { ui.painter().hline(rect.x_range(), rect.max.y - 1.0, Stroke::new(1.0, theme::LINE)); }
+                    if row.rule { ui.painter().hline(rect.x_range(), rect.max.y - 1.0, Stroke::new(1.0, theme::colors().line)); }
                 }
             });
     }
@@ -1822,8 +1822,8 @@ impl MarkdownCache {
 fn inline_job(text: &str, size: f32, colour: egui::Color32, width: f32) -> egui::text::LayoutJob {
     use egui::text::{LayoutJob, TextFormat};
     let plain = TextFormat { font_id: theme::font(size), color: colour, ..Default::default() };
-    let bold = TextFormat { font_id: theme::font(size), color: theme::TEXT, extra_letter_spacing: 0.2, ..Default::default() };
-    let code = TextFormat { font_id: theme::field_font(size - 0.5), color: theme::TEXT, background: theme::TAB_ACTIVE_BG, ..Default::default() };
+    let bold = TextFormat { font_id: theme::font(size), color: theme::colors().text, extra_letter_spacing: 0.2, ..Default::default() };
+    let code = TextFormat { font_id: theme::field_font(size - 0.5), color: theme::colors().text, background: theme::colors().tab_active_bg, ..Default::default() };
     let mut job = LayoutJob::default();
     job.wrap.max_width = width;
     let mut rest = text;
@@ -1878,10 +1878,10 @@ fn patch_line(ui: &mut egui::Ui, line: &str, number: Option<u64>, kind: PatchKin
     // The bands must tile: any item spacing would show as a gap between lines.
     ui.spacing_mut().item_spacing.y = 0.0;
     let (band, colour) = match kind {
-        PatchKind::Add => (Some(theme::DIFF_ADD_BG), theme::STATUS_GREEN),
-        PatchKind::Remove => (Some(theme::DIFF_REMOVE_BG), theme::STATUS_RED),
-        PatchKind::Hunk => (None, theme::DIFF_HUNK),
-        PatchKind::Context => (None, theme::DIM),
+        PatchKind::Add => (Some(theme::colors().diff_add_bg), theme::colors().status_green),
+        PatchKind::Remove => (Some(theme::colors().diff_remove_bg), theme::colors().status_red),
+        PatchKind::Hunk => (None, theme::colors().diff_hunk),
+        PatchKind::Context => (None, theme::colors().dim),
     };
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(Vec2::new(width, TEXT_ROW_HEIGHT), Sense::hover());
@@ -1898,7 +1898,7 @@ fn paint_text_row(ui: &egui::Ui, rect: Rect, line: &str, number: Option<u64>, co
     if let Some(number) = number {
         painter.text(
             egui::Pos2::new(rect.min.x + GUTTER - 8.0, rect.min.y + 1.0),
-            Align2::RIGHT_TOP, number.to_string(), theme::field_font(10.5), theme::FAINT,
+            Align2::RIGHT_TOP, number.to_string(), theme::field_font(10.5), theme::colors().faint,
         );
     }
     let galley = painter.layout_no_wrap(line.to_owned(), theme::field_font(11.0), colour);
@@ -2063,11 +2063,11 @@ fn ref_color(reference: &str) -> egui::Color32 {
 
 fn status_color(letter: char) -> egui::Color32 {
     match letter {
-        'A' | '?' => theme::STATUS_GREEN,
-        'D' | 'U' => theme::STATUS_RED,
-        'M' | 'T' => theme::STATUS_YELLOW,
-        'R' | 'C' => theme::ACCENT,
-        _ => theme::DIM,
+        'A' | '?' => theme::colors().status_green,
+        'D' | 'U' => theme::colors().status_red,
+        'M' | 'T' => theme::colors().status_yellow,
+        'R' | 'C' => theme::colors().accent,
+        _ => theme::colors().dim,
     }
 }
 
@@ -2585,7 +2585,7 @@ mod tests {
                 cache.prepare(ui, &text);
                 assert!(cache.rows.iter().any(|row| row.header && row.cells.len() == 2));
                 assert!(cache.rows.iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.lines)
-                    .flat_map(|line| &line.job.sections).any(|section| section.format.background == theme::TAB_ACTIVE_BG),
+                    .flat_map(|line| &line.job.sections).any(|section| section.format.background == theme::colors().tab_active_bg),
                     "inline code retains its rich background");
                 let last = cache.rows.last().unwrap();
                 assert_eq!(last.cells[0].lines[0].rows[0].text(), "last marker");

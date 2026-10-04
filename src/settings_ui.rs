@@ -131,10 +131,10 @@ fn draft_profile() -> ProfileConfig {
 
 pub fn show(ui: &mut egui::Ui, rect: Rect, cx: &mut SettingsContext, state: &mut SettingsState) -> SettingsOutcome {
     let mut outcome = SettingsOutcome { changed: false, open_config: false, refresh_fonts: false, install_claude: false, restore_claude: false };
-    ui.painter_at(rect).rect_filled(rect, 0.0, theme::CHROME_BG);
+    ui.painter_at(rect).rect_filled(rect, 0.0, theme::colors().chrome_bg);
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink2(Vec2::new(18.0, 12.0))).id_salt("settings-page"), |ui| {
-        ui.label(RichText::new(strings::TAB_SETTINGS).color(theme::TEXT).font(theme::title_font(15.0)));
-        ui.label(RichText::new(strings::SETTINGS_APPLY_HINT).color(theme::FAINT).font(theme::font(11.5)));
+        ui.label(RichText::new(strings::TAB_SETTINGS).color(theme::colors().text).font(theme::title_font(15.0)));
+        ui.label(RichText::new(strings::SETTINGS_APPLY_HINT).color(theme::colors().faint).font(theme::font(11.5)));
         ui.add_space(10.0);
 
         // One section at a time: the list on the left, its rows on the right.
@@ -146,12 +146,12 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, cx: &mut SettingsContext, state: &mut
                 let selected = state.section == section;
                 let (row, response) = ui.allocate_exact_size(Vec2::new(nav_rect.width(), 26.0), Sense::click());
                 if selected {
-                    ui.painter().rect_filled(row, 0.0, theme::TAB_ACTIVE_BG);
-                    ui.painter().rect_stroke(row, 0.0, Stroke::new(1.0, theme::LINE));
+                    ui.painter().rect_filled(row, 0.0, theme::colors().tab_active_bg);
+                    ui.painter().rect_stroke(row, 0.0, Stroke::new(1.0, theme::colors().line));
                 } else if response.hovered() {
-                    ui.painter().rect_filled(row, 0.0, theme::TAB_HOVER_BG);
+                    ui.painter().rect_filled(row, 0.0, theme::colors().tab_hover_bg);
                 }
-                let color = if selected { theme::ACCENT } else { theme::DIM };
+                let color = if selected { theme::colors().accent } else { theme::colors().dim };
                 ui.painter().text(
                     egui::Pos2::new(row.min.x + 10.0, row.center().y),
                     egui::Align2::LEFT_CENTER,
@@ -243,7 +243,7 @@ fn section_appearance(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut
             });
         let palette = crate::app::scheme_palette(cx.config);
         let (response, painter) = ui.allocate_painter(Vec2::new(16.0 * 15.0 + 2.0, 15.0), Sense::hover());
-        painter.rect_stroke(response.rect, 0.0, Stroke::new(1.0, theme::LINE));
+        painter.rect_stroke(response.rect, 0.0, Stroke::new(1.0, theme::colors().line));
         for (index, color) in palette.ansi.iter().enumerate() {
             let cell = Rect::from_min_size(
                 response.rect.min + Vec2::new(1.0 + index as f32 * 15.0, 1.0),
@@ -341,13 +341,13 @@ fn section_profiles(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Set
             }
         });
     if cx.config.profiles.is_empty() && !state.adding {
-        ui.label(RichText::new(strings::SETTINGS_NO_PROFILES).color(theme::FAINT).font(theme::font(12.0)));
+        ui.label(RichText::new(strings::SETTINGS_NO_PROFILES).color(theme::colors().faint).font(theme::font(12.0)));
     }
     let mut delete: Option<usize> = None;
     for (index, profile) in cx.config.profiles.iter().enumerate() {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(&profile.name).color(theme::TEXT).font(theme::font(12.5)));
-            ui.label(RichText::new(&profile.command).color(theme::FAINT).font(theme::field_font(12.0)));
+            ui.label(RichText::new(&profile.name).color(theme::colors().text).font(theme::font(12.5)));
+            ui.label(RichText::new(&profile.command).color(theme::colors().faint).font(theme::field_font(12.0)));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.add(theme::ghost_button(strings::SETTINGS_DELETE)).clicked() {
                     delete = Some(index);
@@ -400,10 +400,10 @@ fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Settings
         cx.config.workspace.ai_commit_command = (!trimmed.is_empty()).then_some(trimmed);
         outcome.changed = true;
     }
-    ui.label(RichText::new(strings::SETTINGS_AI_HINT).color(theme::FAINT).font(theme::font(11.5)));
+    ui.label(RichText::new(strings::SETTINGS_AI_HINT).color(theme::colors().faint).font(theme::font(11.5)));
     ui.add_space(14.0);
     theme::tag(ui, strings::SETTINGS_AI_MODEL);
-    ui.label(RichText::new(strings::SETTINGS_AI_MODEL_HINT).color(theme::FAINT).font(theme::font(11.5)));
+    ui.label(RichText::new(strings::SETTINGS_AI_MODEL_HINT).color(theme::colors().faint).font(theme::font(11.5)));
     state.absorb_models();
     if matches!(state.model_catalog, ModelCatalog::NotLoaded) {
         state.load_models(ui.ctx());
@@ -422,12 +422,12 @@ fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Settings
     match &state.model_catalog {
         ModelCatalog::Loading(_) => {
             ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(14.0).color(theme::ACCENT));
+                ui.add(egui::Spinner::new().size(14.0).color(theme::colors().accent));
                 ui.label(strings::SETTINGS_AI_MODEL_LOADING);
             });
         }
         ModelCatalog::Ready(Err(error)) => {
-            ui.label(RichText::new(error).color(theme::STATUS_RED).font(theme::font(11.5)));
+            ui.label(RichText::new(error).color(theme::colors().status_red).font(theme::font(11.5)));
         }
         ModelCatalog::Ready(Ok(models)) => {
             let query = state.model_filter.trim();
@@ -451,7 +451,7 @@ fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Settings
                     }
                 });
             if !has_matches && !query.is_empty() {
-                ui.label(RichText::new(strings::SETTINGS_AI_MODEL_NO_MATCH).color(theme::FAINT).font(theme::font(11.5)));
+                ui.label(RichText::new(strings::SETTINGS_AI_MODEL_NO_MATCH).color(theme::colors().faint).font(theme::font(11.5)));
             }
         }
         ModelCatalog::NotLoaded => {}
@@ -460,13 +460,13 @@ fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Settings
 
 fn section_hotkeys(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut SettingsOutcome) {
     theme::section(ui, strings::SETTINGS_HOTKEYS);
-    ui.label(RichText::new(strings::SETTINGS_HOTKEYS_HINT).color(theme::FAINT).font(theme::font(11.5)));
+    ui.label(RichText::new(strings::SETTINGS_HOTKEYS_HINT).color(theme::colors().faint).font(theme::font(11.5)));
     ui.add_space(2.0);
     for (action, chords) in &cx.keymap_rows {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(action).color(theme::DIM).font(theme::font(12.0)));
+            ui.label(RichText::new(action).color(theme::colors().dim).font(theme::font(12.0)));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new(chords.join(", ")).color(theme::TEXT).font(theme::field_font(12.0)));
+                ui.label(RichText::new(chords.join(", ")).color(theme::colors().text).font(theme::field_font(12.0)));
             });
         });
         theme::hairline(ui);
@@ -486,15 +486,15 @@ fn section_claude(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut Set
         outcome.install_claude = !enabled;
     }
     let state_text = if cx.config.claude_status.declined_command.is_some() {
-        RichText::new(strings::SETTINGS_CLAUDE_DECLINED).color(theme::STATUS_YELLOW)
+        RichText::new(strings::SETTINGS_CLAUDE_DECLINED).color(theme::colors().status_yellow)
     } else if enabled {
         RichText::new(if cx.config.claude_status.installed_command.is_some() {
             strings::SETTINGS_CLAUDE_CONNECTED
         } else {
             strings::SETTINGS_CLAUDE_PENDING
-        }).color(theme::STATUS_GREEN)
+        }).color(theme::colors().status_green)
     } else {
-        RichText::new(strings::SETTINGS_CLAUDE_NOT_CONNECTED).color(theme::DIM)
+        RichText::new(strings::SETTINGS_CLAUDE_NOT_CONNECTED).color(theme::colors().dim)
     };
     ui.label(state_text.font(theme::font(12.0)));
     ui.label(strings::SETTINGS_CLAUDE_GLOBAL_HINT);
@@ -515,7 +515,7 @@ fn profile_editor(ui: &mut egui::Ui, state: &mut SettingsState, cx: &mut Setting
     ui.painter().rect_stroke(
         ui.max_rect().shrink(1.0),
         0.0,
-        Stroke::new(1.0, theme::LINE),
+        Stroke::new(1.0, theme::colors().line),
     );
     ui.add_space(4.0);
     theme::tag(ui, strings::SETTINGS_NAME);
