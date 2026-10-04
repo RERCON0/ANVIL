@@ -167,7 +167,7 @@ git прямо в пейне и статус Claude Code — без Electron, No
 cargo build --release          # target\release\anvil.exe, без бэкенда Codex
 cargo build --release --features codex   # + нативный Codex (HTTP-клиент с TLS)
 cargo test                     # юнит-тесты, ConPTY и интеграционные git-тесты
-cargo run --example gen_icons  # пересобрать иконки из исходного арта в корне
+cargo run --example gen_icons  # пересобрать иконки из icons/source/mark-chevron.png
 ```
 
 По умолчанию Codex не входит в сборку: его HTTP-клиент (`reqwest`/`tokio`/
@@ -176,8 +176,9 @@ AI-бэкенды обходятся штатными CLI. Ключ `--features 
 Responses-протокол; без него выбор Codex в настройках даёт понятную ошибку со
 ссылкой на флаг.
 
-Исходник логотипа — `forge_20261003_213013_nobg.png`: генератор сохраняет
-прозрачность, обновляет иконку окна и ICO с размерами 16–256 пикселей.
+Исходник логотипа — `icons/source/mark-chevron.png`: белый знак с тёмным
+контуром без подложки. Генератор сохраняет прозрачность, обновляет иконку окна
+и ICO с десятью размерами 16–256 пикселей. См. [описание иконки](icons/README.md).
 
 Портативный архив с лицензиями и `SOURCE.txt`:
 

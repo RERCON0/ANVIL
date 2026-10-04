@@ -1,0 +1,8 @@
+Use case: precise-object-edit.
+Asset type: final transparent PNG master for a Windows application icon.
+Input image 1: edit target, the selected ANVIL concept 04. Preserve this EXACT open folded-chevron silhouette, proportions, rounded upper-left turn, broad upper diagonal, rounded right turn, grounded broad lower arm, and uncluttered central negative space. Do not invent another symbol.
+Primary request: turn this exact green mark into a pristine flat WHITE icon with a narrow DARK CHARCOAL contour, on genuinely transparent alpha. It must remain easy to recognize over both light and dark desktop wallpapers without an enclosing tile.
+Fill: uniform solid near-white #FAFAF8. Outline: uniform near-black #111316 precisely following the outside AND inside edges, about 3% of the glyph's width, continuous and smoothly antialiased. White remains the dominant visual surface; dark contour is only a boundary, not a panel or shadow.
+Composition: square canvas, centered optically, symbol occupies about 80% of the canvas, consistent transparent safety margin. All open areas are genuinely transparent. Clean away every stray speck and green fringe from the input.
+Style: impeccably crisp flat vector-like graphic, plain white and charcoal, purposeful bold geometry.
+Invariants: retain the selected silhouette and its personality. No anvil. No background tile, box, rounded square, badge, halo, dropped shadow, glow, gradient, sheen, 3D, texture, letters, text or watermark. Background truly transparent.
