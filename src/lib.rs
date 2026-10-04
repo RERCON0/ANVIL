@@ -16,6 +16,7 @@ pub mod logging;
 pub mod procs;
 pub(crate) mod process;
 pub mod profiles;
+pub mod quota;
 pub mod session;
 pub mod settings_ui;
 pub mod strings;

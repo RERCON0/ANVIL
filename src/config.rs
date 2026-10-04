@@ -23,6 +23,7 @@ pub struct Config {
     /// Per-action overrides of the default hotkey table.
     pub hotkeys: BTreeMap<String, Vec<String>>,
     pub claude_status: ClaudeStatusConfig,
+    pub quota: QuotaConfig,
     pub restore_session: bool,
     pub workspace: WorkspaceConfig,
 }
@@ -115,7 +116,50 @@ pub struct TerminalConfig {
     pub bell: Bell,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// Pieces of the status line the helper prints inside Claude Code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ClaudeLineFields {
+    pub model: bool,
+    pub dir: bool,
+    pub branch: bool,
+    pub context: bool,
+    pub five_hour: bool,
+    pub seven_day: bool,
+    pub agent: bool,
+}
+
+impl Default for ClaudeLineFields {
+    fn default() -> Self {
+        ClaudeLineFields { model: true, dir: true, branch: true, context: true, five_hour: true, seven_day: true, agent: true }
+    }
+}
+
+/// Pieces of the line under a tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ClaudeBadgeFields {
+    pub model: bool,
+    pub context: bool,
+    pub five_hour: bool,
+    pub seven_day: bool,
+    pub agent: bool,
+}
+
+impl Default for ClaudeBadgeFields {
+    fn default() -> Self {
+        ClaudeBadgeFields { model: true, context: true, five_hour: true, seven_day: true, agent: true }
+    }
+}
+
+impl ClaudeBadgeFields {
+    /// False when every piece is off: the tab then gets no extra line at all.
+    pub fn any(&self) -> bool {
+        self.model || self.context || self.five_hour || self.seven_day || self.agent
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ClaudeStatusConfig {
     pub enabled: bool,
@@ -126,6 +170,83 @@ pub struct ClaudeStatusConfig {
     /// Exact helper command installed with consent, including its original path.
     pub installed_command: Option<String>,
     pub installed_settings_path: Option<PathBuf>,
+    /// Show the Claude line under tabs (display only; Claude Code is untouched).
+    pub badge: bool,
+    /// Pieces the helper prints inside Claude Code.
+    pub line_fields: ClaudeLineFields,
+    /// Pieces of the line under a tab.
+    pub badge_fields: ClaudeBadgeFields,
+}
+
+impl Default for ClaudeStatusConfig {
+    fn default() -> Self {
+        ClaudeStatusConfig {
+            enabled: false,
+            declined_command: None,
+            previous_status_line: None,
+            installed_command: None,
+            installed_settings_path: None,
+            badge: true,
+            line_fields: ClaudeLineFields::default(),
+            badge_fields: ClaudeBadgeFields::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct QuotaConfig {
+    pub enabled: bool,
+    pub collapsed: bool,
+    /// By provider key (`claude`, `zai`…): only what the user changed.
+    pub providers: BTreeMap<String, QuotaProviderPrefs>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct QuotaProviderPrefs {
+    /// `None`: automatic (on when a login is found).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Window key → visible, only where it differs from the default.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub windows: BTreeMap<String, bool>,
+}
+
+impl QuotaConfig {
+    pub fn provider_enabled(&self, provider: &str) -> Option<bool> {
+        self.providers.get(provider).and_then(|p| p.enabled)
+    }
+
+    pub fn window_visible(&self, provider: &str, window: &str) -> bool {
+        self.providers
+            .get(provider)
+            .and_then(|p| p.windows.get(window))
+            .copied()
+            .unwrap_or_else(|| crate::quota::model::window_visible_by_default(window))
+    }
+
+    pub fn set_provider_enabled(&mut self, provider: &str, enabled: Option<bool>) {
+        self.providers.entry(provider.to_owned()).or_default().enabled = enabled;
+        self.prune(provider);
+    }
+
+    pub fn set_window_visible(&mut self, provider: &str, window: &str, visible: bool) {
+        let windows = &mut self.providers.entry(provider.to_owned()).or_default().windows;
+        if visible == crate::quota::model::window_visible_by_default(window) {
+            windows.remove(window);
+        } else {
+            windows.insert(window.to_owned(), visible);
+        }
+        self.prune(provider);
+    }
+
+    /// An entry that says nothing is dropped, so config.json stays minimal.
+    fn prune(&mut self, provider: &str) {
+        if self.providers.get(provider).is_some_and(|p| p.enabled.is_none() && p.windows.is_empty()) {
+            self.providers.remove(provider);
+        }
+    }
 }
 
 impl Default for Config {
@@ -140,6 +261,7 @@ impl Default for Config {
             terminal: TerminalConfig::default(),
             hotkeys: BTreeMap::new(),
             claude_status: ClaudeStatusConfig::default(),
+            quota: QuotaConfig::default(),
             restore_session: true,
             workspace: WorkspaceConfig::default(),
         }
@@ -377,5 +499,68 @@ mod tests {
     #[test]
     fn default_config_saves_as_version_only() {
         assert_eq!(Config::default().to_minimal_json(), serde_json::json!({"version": 1}));
+    }
+
+    #[test]
+    fn new_settings_default_to_current_behaviour() {
+        let c = Config::default();
+        assert!(c.claude_status.badge);
+        assert_eq!(c.claude_status.line_fields, ClaudeLineFields::default());
+        assert!(c.claude_status.line_fields.branch && c.claude_status.line_fields.five_hour);
+        assert!(c.claude_status.badge_fields.any());
+        assert!(!c.quota.enabled && !c.quota.collapsed && c.quota.providers.is_empty());
+        assert_eq!(c.to_minimal_json(), serde_json::json!({"version": 1}));
+    }
+
+    #[test]
+    fn claude_fields_and_quota_prefs_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut c = Config::default();
+        c.claude_status.badge = false;
+        c.claude_status.line_fields.branch = false;
+        c.claude_status.badge_fields.seven_day = false;
+        c.quota.enabled = true;
+        c.quota.set_provider_enabled("kimi", Some(false));
+        c.quota.set_window_visible("chatgpt", "review", true);
+        c.save(&path).unwrap();
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({"version": 1,
+                "claudeStatus": {"badge": false, "lineFields": {"branch": false}, "badgeFields": {"sevenDay": false}},
+                "quota": {"enabled": true, "providers": {"chatgpt": {"windows": {"review": true}}, "kimi": {"enabled": false}}}})
+        );
+        assert_eq!(Config::load(&path).config, c);
+    }
+
+    #[test]
+    fn quota_prefs_stay_minimal() {
+        let mut quota = QuotaConfig::default();
+        assert!(quota.window_visible("chatgpt", "5h"));
+        assert!(!quota.window_visible("chatgpt", "review"));
+        quota.set_window_visible("chatgpt", "review", true);
+        quota.set_provider_enabled("kimi", Some(false));
+        assert!(quota.window_visible("chatgpt", "review"));
+        assert_eq!(quota.provider_enabled("kimi"), Some(false));
+        quota.set_window_visible("chatgpt", "review", false);
+        quota.set_provider_enabled("kimi", None);
+        assert!(quota.providers.is_empty(), "{:?}", quota.providers);
+    }
+
+    #[test]
+    fn provider_prefs_serialize_only_what_is_set() {
+        let mut quota = QuotaConfig::default();
+        quota.set_window_visible("chatgpt", "review", true);
+        quota.set_provider_enabled("kimi", Some(false));
+        assert_eq!(
+            serde_json::to_value(&quota.providers).unwrap(),
+            serde_json::json!({"chatgpt": {"windows": {"review": true}}, "kimi": {"enabled": false}})
+        );
+        let back: BTreeMap<String, QuotaProviderPrefs> = serde_json::from_value(
+            serde_json::json!({"chatgpt": {"windows": {"review": true}}, "kimi": {"enabled": false}}),
+        )
+        .unwrap();
+        assert_eq!(back, quota.providers);
     }
 }
