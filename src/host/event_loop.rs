@@ -84,7 +84,7 @@ impl Host {
         let (Some(gl), Some(egui)) = (gl.as_ref(), egui.as_mut()) else { return };
         let maximized = gl.window.is_maximized();
         let mut commands = Vec::new();
-        egui.run(&gl.window, |ctx| commands = app.frame(ctx, maximized));
+        egui.run(&gl.window, |ui| commands = app.frame(ui, maximized));
         if let Some(area) = app.ime_area() {
             gl.window.set_ime_cursor_area(
                 winit::dpi::LogicalPosition::new(area.min.x, area.min.y),

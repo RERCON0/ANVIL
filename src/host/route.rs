@@ -16,7 +16,7 @@ pub enum KeyRoute {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KeyFocus {
-    /// `egui::Context::wants_keyboard_input()` from the last frame.
+    /// `egui::Context::egui_wants_keyboard_input()` from the last frame.
     pub egui_wants_keyboard: bool,
     /// A terminal pane owns the keyboard (ANVIL state, not an egui widget).
     pub terminal_focused: bool,

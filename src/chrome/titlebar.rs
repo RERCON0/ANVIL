@@ -69,7 +69,7 @@ pub fn resize_borders(ctx: &egui::Context, maximized: bool, commands: &mut Vec<W
     if maximized {
         return false;
     }
-    let screen = ctx.screen_rect();
+    let screen = ctx.content_rect();
     let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else { return false };
     let local = (pos.x - screen.min.x, pos.y - screen.min.y);
     let Some(edge) = edge_at(local, (screen.width(), screen.height()), theme::RESIZE_BORDER) else { return false };

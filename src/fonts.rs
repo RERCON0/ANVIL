@@ -188,18 +188,18 @@ pub fn install(ctx: &egui::Context, family: &str, entries: &[(String, String)], 
     let (italic, italic_source) = face(&files.italic);
     let (bold_italic, bold_italic_source) = face(&files.bold_italic);
     let faces = TermFaces { regular: regular_source, bold: bold_source, italic: italic_source, bold_italic: bold_italic_source };
-    defs.font_data.insert("term-regular".into(), FontData::from_owned(regular));
-    defs.font_data.insert("term-bold".into(), FontData::from_owned(bold));
-    defs.font_data.insert("term-italic".into(), FontData::from_owned(italic));
-    defs.font_data.insert("term-bold-italic".into(), FontData::from_owned(bold_italic));
-    defs.font_data.insert("term-cascadia".into(), FontData::from_static(CASCADIA));
+    defs.font_data.insert("term-regular".into(), FontData::from_owned(regular).into());
+    defs.font_data.insert("term-bold".into(), FontData::from_owned(bold).into());
+    defs.font_data.insert("term-italic".into(), FontData::from_owned(italic).into());
+    defs.font_data.insert("term-bold-italic".into(), FontData::from_owned(bold_italic).into());
+    defs.font_data.insert("term-cascadia".into(), FontData::from_static(CASCADIA).into());
 
     let mut extra: Vec<String> = Vec::new();
     if fallbacks {
         for (name, file) in [("fallback-symbols", "seguisym.ttf"), ("fallback-emoji", "seguiemj.ttf"), ("fallback-cjk", "msyh.ttc")] {
             match std::fs::read(dir.join(file)) {
                 Ok(bytes) => {
-                    defs.font_data.insert(name.into(), FontData::from_owned(bytes));
+                    defs.font_data.insert(name.into(), FontData::from_owned(bytes).into());
                     extra.push(name.to_owned());
                 }
                 Err(_) => report.missing.push(file.to_owned()),
@@ -231,7 +231,7 @@ pub fn install(ctx: &egui::Context, family: &str, entries: &[(String, String)], 
         (name.to_owned(), data)
     };
     for (name, data) in [ui("ui", 0.0), ui("ui-tight", 0.0), ui("ui-title", -0.08)] {
-        defs.font_data.insert(name.clone(), data);
+        defs.font_data.insert(name.clone(), data.into());
     }
     let default_proportional = defs.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     for name in ["ui", "ui-tight", "ui-title"] {
@@ -243,7 +243,7 @@ pub fn install(ctx: &egui::Context, family: &str, entries: &[(String, String)], 
     defs.families.entry(FontFamily::Monospace).or_default().insert(0, "ui-tight".into());
 
     // File-type icons (Seti): private-use codepoints, so a dedicated family.
-    defs.font_data.insert("seti".into(), FontData::from_static(SETI));
+    defs.font_data.insert("seti".into(), FontData::from_static(SETI).into());
     defs.families.insert(FontFamily::Name("icons".into()), vec!["seti".to_owned()]);
     ctx.set_fonts(defs);
     crate::term::glyphs::install(ctx, faces);
@@ -275,12 +275,12 @@ mod tests {
         let ctx = egui::Context::default();
         install(&ctx, "Consolas", &registry_font_entries(), false);
         // Fonts become available with the first frame.
-        let _ = ctx.run(Default::default(), |_| {});
+        let _ = ctx.run_ui(Default::default(), |_| {});
         // Exactly the symbols src/strings.rs and the chrome paint.
         let used = "≡×↑↓▸▾◂⟳‹›·—…−─□»↺▓░";
         let missing: Vec<char> = used
             .chars()
-            .filter(|c| !ctx.fonts(|fonts| fonts.has_glyph(&FontId::new(13.0, FontFamily::Name("ui".into())), *c)))
+            .filter(|c| !ctx.fonts_mut(|fonts| fonts.has_glyph(&FontId::new(13.0, FontFamily::Name("ui".into())), *c)))
             .collect();
         assert!(missing.is_empty(), "glyphs missing from the ui family: {missing:?}");
     }

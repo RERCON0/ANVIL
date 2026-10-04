@@ -147,7 +147,7 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, cx: &mut SettingsContext, state: &mut
                 let (row, response) = ui.allocate_exact_size(Vec2::new(nav_rect.width(), 26.0), Sense::click());
                 if selected {
                     ui.painter().rect_filled(row, 0.0, theme::colors().tab_active_bg);
-                    ui.painter().rect_stroke(row, 0.0, Stroke::new(1.0, theme::colors().line));
+                    ui.painter().rect_stroke(row, 0.0, Stroke::new(1.0, theme::colors().line), egui::StrokeKind::Middle);
                 } else if response.hovered() {
                     ui.painter().rect_filled(row, 0.0, theme::colors().tab_hover_bg);
                 }
@@ -243,7 +243,7 @@ fn section_appearance(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut
             });
         let palette = crate::app::scheme_palette(cx.config);
         let (response, painter) = ui.allocate_painter(Vec2::new(16.0 * 15.0 + 2.0, 15.0), Sense::hover());
-        painter.rect_stroke(response.rect, 0.0, Stroke::new(1.0, theme::colors().line));
+        painter.rect_stroke(response.rect, 0.0, Stroke::new(1.0, theme::colors().line), egui::StrokeKind::Middle);
         for (index, color) in palette.ansi.iter().enumerate() {
             let cell = Rect::from_min_size(
                 response.rect.min + Vec2::new(1.0 + index as f32 * 15.0, 1.0),
@@ -516,6 +516,7 @@ fn profile_editor(ui: &mut egui::Ui, state: &mut SettingsState, cx: &mut Setting
         ui.max_rect().shrink(1.0),
         0.0,
         Stroke::new(1.0, theme::colors().line),
+        egui::StrokeKind::Middle,
     );
     ui.add_space(4.0);
     theme::tag(ui, strings::SETTINGS_NAME);
@@ -631,12 +632,12 @@ mod tests {
     fn the_font_family_applies_on_enter_not_per_keystroke() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
-        let _ = ctx.run(Default::default(), |_| {});
+        let _ = ctx.run_ui(Default::default(), |_| {});
         let id = egui::Id::new("family-test");
         let frame = |events: Vec<egui::Event>| {
             let mut committed = None;
-            let _ = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| committed = font_family_field(ui, id, "Consolas"));
+            let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                egui::CentralPanel::default().show_inside(ui, |ui| committed = font_family_field(ui, id, "Consolas"));
             });
             committed
         };

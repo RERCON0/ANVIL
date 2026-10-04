@@ -640,9 +640,9 @@ impl Workspace {
     }
 
     fn commit_box(&mut self, ui: &mut egui::Ui) {
-        let editor = egui::Frame::none()
+        let editor = egui::Frame::NONE
             .fill(ui.visuals().extreme_bg_color)
-            .inner_margin(egui::Margin::symmetric(4.0, 2.0))
+            .inner_margin(egui::Margin::symmetric(4, 2))
             .show(ui, |ui| {
                 ui.style_mut().spacing.scroll.foreground_color = true;
                 ScrollArea::vertical()
@@ -653,8 +653,8 @@ impl Workspace {
                         ui.add_enabled(
                             !self.ai_generating,
                             egui::TextEdit::multiline(&mut self.commit_message)
-                                .frame(false)
-                                .margin(egui::Margin::same(0.0))
+                                .frame(egui::Frame::NONE)
+                                .margin(egui::Margin::same(0))
                                 .font(theme::field_font(12.0))
                                 .desired_rows(6)
                                 .hint_text(strings::WORKSPACE_COMMIT_HINT)
@@ -666,7 +666,7 @@ impl Workspace {
         let commit = editor.inner;
         let visuals = ui.style().interact(&commit);
         let stroke = if commit.has_focus() { ui.visuals().selection.stroke } else { visuals.bg_stroke };
-        ui.painter().rect_stroke(editor.response.rect, visuals.rounding, stroke);
+        ui.painter().rect_stroke(editor.response.rect, visuals.corner_radius, stroke, egui::StrokeKind::Middle);
         let ctrl_enter = commit.has_focus() && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter));
         ui.horizontal_wrapped(|ui| {
             let has_staged = self.status.changes.iter().any(Change::staged);
@@ -834,7 +834,7 @@ impl Workspace {
                 if badge.max.x > rect.max.x - right_width - 10.0 - MIN_SUBJECT_WIDTH {
                     break;
                 }
-                painter.rect_filled(badge, egui::Rounding::same(3.0), colour);
+                painter.rect_filled(badge, egui::CornerRadius::same(3), colour);
                 painter.galley(egui::Pos2::new(badge.min.x + 5.0, badge.min.y + 1.0), galley, theme::colors().chrome_bg);
                 badge_x = badge.max.x + 4.0;
             }
@@ -1386,19 +1386,19 @@ impl Workspace {
         response.context_menu(|ui| {
             if ui.button(strings::WORKSPACE_OPEN_EXTERNAL).clicked() {
                 open_external(&self.root, &path);
-                ui.close_menu();
+                ui.close();
             }
             if ui.button(strings::WORKSPACE_REVEAL).clicked() {
                 reveal_in_explorer(&self.root, &path);
-                ui.close_menu();
+                ui.close();
             }
             if ui.button(strings::WORKSPACE_RENAME).clicked() {
                 self.prompt = Some(Prompt { kind: PromptKind::Rename(path.clone()), text: path.clone(), focus: true });
-                ui.close_menu();
+                ui.close();
             }
             if ui.button(strings::WORKSPACE_DELETE).clicked() {
                 self.prompt = Some(Prompt { kind: PromptKind::Delete { path: path.clone(), folder: row.folder }, text: String::new(), focus: false });
-                ui.close_menu();
+                ui.close();
             }
         });
         opened
@@ -1465,7 +1465,7 @@ impl Workspace {
             // leaves: a height that is not a multiple of the line height cut
             // the last line in half, and the old half-of-the-rest cap left the
             // panel empty below (minus a hair, so no sliver shows).
-            let line = ui.fonts(|f| f.row_height(&theme::field_font(11.0)));
+            let line = ui.fonts_mut(|f| f.row_height(&theme::field_font(11.0)));
             let room = (ui.available_height() - 6.0).max(line);
             let height = (room / line).floor().max(1.0) * line - 1.0;
             let markdown = is_markdown(path);
@@ -1570,44 +1570,63 @@ impl PatchKind {
     }
 }
 
+type FontCacheKey = (u32, u32, usize);
+
+// The empty galley stays in egui's layout cache while used. Atlas, font and
+// text-option resets recreate that cache; retaining the Arc prevents pointer
+// reuse from hiding a reset of the UV coordinates in cached Markdown.
+fn font_cache_key(ui: &egui::Ui, width: f32) -> (FontCacheKey, std::sync::Arc<egui::Galley>) {
+    let font_generation = ui.fonts_mut(|fonts| fonts.layout_job(egui::text::LayoutJob::default()));
+    let key = (
+        width.to_bits(),
+        ui.ctx().pixels_per_point().to_bits(),
+        std::sync::Arc::as_ptr(&font_generation) as usize,
+    );
+    (key, font_generation)
+}
+
 #[derive(Default)]
 struct WrappedRows {
-    key: Option<(u32, u32, usize)>,
-    fonts: Option<egui::epaint::text::Fonts>,
+    key: Option<FontCacheKey>,
+    font_generation: Option<std::sync::Arc<egui::Galley>>,
     rows: Vec<TextRow>,
 }
 
 impl WrappedRows {
     fn prepare(&mut self, ui: &egui::Ui, text: &str, source: &[TextRow]) {
         let width = (ui.available_width() - GUTTER - 4.0 - ui.spacing().scroll.bar_width - ui.spacing().scroll.bar_outer_margin).max(20.0);
-        let fonts = ui.fonts(Clone::clone);
-        let atlas = fonts.texture_atlas();
-        let key = (width.to_bits(), ui.ctx().pixels_per_point().to_bits(), std::sync::Arc::as_ptr(&atlas) as usize);
+        let (key, font_generation) = font_cache_key(ui, width);
         if self.key == Some(key) { return; }
         self.key = Some(key);
-        self.fonts = Some(fonts.clone());
+        self.font_generation = Some(font_generation);
         self.rows.clear();
         let font = theme::field_font(11.0);
-        let mut widths = std::collections::HashMap::new();
-        for row in source {
-            let mut start = row.bytes.start;
-            let mut used = 0.0;
-            let mut first = true;
-            for (offset, ch) in text[row.bytes.clone()].char_indices() {
-                let at = row.bytes.start + offset;
-                let advance = *widths.entry(ch).or_insert_with(|| {
-                    if ch == '\t' { fonts.glyph_width(&font, ' ') * 4.0 } else { fonts.glyph_width(&font, ch) }
-                });
-                if at > start && used + advance > width {
-                    self.rows.push(TextRow { bytes: start..at, number: if first { row.number } else { None }, hunk: if first { row.hunk } else { None }, kind: row.kind });
-                    first = false;
-                    start = at;
-                    used = 0.0;
+        ui.fonts_mut(|fonts| {
+            let mut widths = std::collections::HashMap::new();
+            for row in source {
+                let mut start = row.bytes.start;
+                let mut used = 0.0;
+                let mut first = true;
+                for (offset, ch) in text[row.bytes.clone()].char_indices() {
+                    let at = row.bytes.start + offset;
+                    let advance = if let Some(advance) = widths.get(&ch) {
+                        *advance
+                    } else {
+                        let advance = if ch == '\t' { fonts.glyph_width(&font, ' ') * 4.0 } else { fonts.glyph_width(&font, ch) };
+                        widths.insert(ch, advance);
+                        advance
+                    };
+                    if at > start && used + advance > width {
+                        self.rows.push(TextRow { bytes: start..at, number: if first { row.number } else { None }, hunk: if first { row.hunk } else { None }, kind: row.kind });
+                        first = false;
+                        start = at;
+                        used = 0.0;
+                    }
+                    used += advance;
                 }
-                used += advance;
+                self.rows.push(TextRow { bytes: start..row.bytes.end, number: if first { row.number } else { None }, hunk: if first { row.hunk } else { None }, kind: row.kind });
             }
-            self.rows.push(TextRow { bytes: start..row.bytes.end, number: if first { row.number } else { None }, hunk: if first { row.hunk } else { None }, kind: row.kind });
-        }
+        });
     }
 }
 
@@ -1673,11 +1692,11 @@ fn is_markdown(path: &str) -> bool {
 
 /// Rich Markdown rows retain their laid-out cells, with cumulative heights for
 /// binary-searching the viewport. A table is split into rows, never one giant
-/// off-screen widget. The font atlas identity changes on font reinstalls.
+/// off-screen widget.
 #[derive(Default)]
 struct MarkdownCache {
-    key: Option<(u32, u32, usize)>,
-    fonts: Option<egui::epaint::text::Fonts>,
+    key: Option<FontCacheKey>,
+    font_generation: Option<std::sync::Arc<egui::Galley>>,
     rows: Vec<MarkdownRow>,
     height: f32,
 }
@@ -1692,37 +1711,68 @@ struct MarkdownRow {
 
 struct MarkdownCell {
     x: f32,
-    lines: Vec<std::sync::Arc<egui::Galley>>,
+    lines: Vec<MarkdownLine>,
+}
+
+struct MarkdownLine {
+    x: f32,
+    top: f32,
+    bottom: f32,
+    galley: Option<std::sync::Arc<egui::Galley>>,
 }
 
 impl MarkdownCell {
-    fn new(x: f32, galley: std::sync::Arc<egui::Galley>) -> Self {
-        // A cached single-line paint object prevents egui from scanning every
-        // wrapped row of a huge paragraph during tessellation.
-        let lines = galley.rows.iter().map(|row| std::sync::Arc::new(egui::Galley {
-            job: galley.job.clone(),
-            rows: vec![row.clone()],
-            elided: true,
-            rect: row.rect,
-            mesh_bounds: row.visuals.mesh_bounds,
-            num_vertices: row.visuals.mesh.vertices.len(),
-            num_indices: row.visuals.mesh.indices.len(),
-            pixels_per_point: galley.pixels_per_point,
-        })).collect();
+    fn new(x: f32, galley: std::sync::Arc<egui::Galley>, painter: &egui::Painter) -> Self {
+        // A cached one-row galley avoids tessellating every wrapped line when only visible lines paint.
+        let mut byte_offset = 0;
+        let lines = galley.rows.iter().map(|placed_row| {
+            let row = &placed_row.row;
+            let byte_end = byte_offset + galley.job.text[byte_offset..].chars().take(row.glyphs.len()).map(char::len_utf8).sum::<usize>();
+            let line_galley = (byte_offset < byte_end).then(|| {
+                painter.layout_job(markdown_row_job(&galley.job, byte_offset..byte_end))
+            });
+            byte_offset = byte_end;
+            if placed_row.ends_with_newline && galley.job.text.as_bytes().get(byte_offset) == Some(&b'\n') {
+                byte_offset += 1;
+            }
+            MarkdownLine {
+                x: placed_row.pos.x,
+                top: placed_row.pos.y,
+                bottom: placed_row.pos.y + row.size.y,
+                galley: line_galley,
+            }
+        }).collect();
         Self { x, lines }
     }
 
     fn visible(&self, top: f32, bottom: f32) -> std::ops::Range<usize> {
-        let start = self.lines.partition_point(|line| line.rows[0].rect.max.y <= top);
-        let end = self.lines.partition_point(|line| line.rows[0].rect.min.y < bottom);
+        let start = self.lines.partition_point(|line| line.bottom <= top);
+        let end = self.lines.partition_point(|line| line.top < bottom);
         start..end.max(start)
     }
 }
 
+fn markdown_row_job(source: &egui::text::LayoutJob, range: std::ops::Range<usize>) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = f32::INFINITY;
+    job.halign = source.halign;
+    job.justify = source.justify;
+    job.round_output_to_gui = source.round_output_to_gui;
+    let first = source.sections.partition_point(|section| section.byte_range.end <= range.start);
+    for section in source.sections[first..].iter().take_while(|section| section.byte_range.start < range.end) {
+        let start = range.start.max(section.byte_range.start);
+        let end = range.end.min(section.byte_range.end);
+        if start < end {
+            job.append(&source.text[start..end], 0.0, section.format.clone());
+        }
+    }
+    job
+}
+
 impl MarkdownCache {
-    fn push(&mut self, cells: Vec<(f32, std::sync::Arc<egui::Galley>)>, padding: f32, header: bool, rule: bool) {
+    fn push(&mut self, ui: &egui::Ui, cells: Vec<(f32, std::sync::Arc<egui::Galley>)>, padding: f32, header: bool, rule: bool) {
         let height = cells.iter().map(|(_, galley)| galley.size().y).fold(0.0, f32::max) + padding;
-        let cells = cells.into_iter().map(|(x, galley)| MarkdownCell::new(x, galley)).collect();
+        let cells = cells.into_iter().map(|(x, galley)| MarkdownCell::new(x, galley, ui.painter())).collect();
         self.rows.push(MarkdownRow { top: self.height, height, cells, header, rule });
         self.height += height;
     }
@@ -1731,12 +1781,10 @@ impl MarkdownCache {
         // Account for the solid vertical scrollbar before layout, so the
         // cached wrapping width is the viewport width, not the parent width.
         let width = (ui.available_width() - ui.spacing().scroll.bar_width - ui.spacing().scroll.bar_outer_margin).max(40.0);
-        let fonts = ui.fonts(Clone::clone);
-        let atlas = fonts.texture_atlas();
-        let key = (width.to_bits(), ui.ctx().pixels_per_point().to_bits(), std::sync::Arc::as_ptr(&atlas) as usize);
+        let (key, font_generation) = font_cache_key(ui, width);
         if self.key == Some(key) { return; }
         self.key = Some(key);
-        self.fonts = Some(fonts);
+        self.font_generation = Some(font_generation);
         self.rows.clear();
         self.height = 0.0;
         let mut lines = text.lines().peekable();
@@ -1749,18 +1797,18 @@ impl MarkdownCache {
             }
             if fenced {
                 let galley = ui.painter().layout(line.to_owned(), theme::field_font(11.0), theme::colors().dim, width);
-                self.push(vec![(0.0, galley)], 2.0, false, false);
+                self.push(ui, vec![(0.0, galley)], 2.0, false, false);
             } else if plain.is_empty() {
-                self.push(Vec::new(), 6.0, false, false);
+                self.push(ui, Vec::new(), 6.0, false, false);
             } else if plain.starts_with('#') {
                 let level = plain.chars().take_while(|c| *c == '#').count().min(6);
                 let title = plain[level..].trim().trim_end_matches('#').trim();
                 let size = match level { 1 => 15.0, 2 => 13.5, _ => 12.5 };
-                self.push(Vec::new(), 6.0, false, false);
+                self.push(ui, Vec::new(), 6.0, false, false);
                 let galley = ui.painter().layout(title.to_owned(), theme::title_font(size), theme::colors().text, width);
-                self.push(vec![(0.0, galley)], 2.0, false, false);
+                self.push(ui, vec![(0.0, galley)], 2.0, false, false);
             } else if matches!(plain, "---" | "***" | "___") {
-                self.push(Vec::new(), 6.0, false, true);
+                self.push(ui, Vec::new(), 6.0, false, true);
             } else if is_table_row(plain) && lines.peek().is_some_and(|next| is_table_separator(next)) {
                 let mut rows = vec![table_cells(plain)];
                 lines.next();
@@ -1775,9 +1823,9 @@ impl MarkdownCache {
                     let cells = row.iter().enumerate().map(|(cell, text)| {
                         (cell as f32 * (column + gap), ui.painter().layout_job(inline_job(text, 11.5, colour, column)))
                     }).collect();
-                    self.push(cells, 3.0, index == 0, true);
+                    self.push(ui, cells, 3.0, index == 0, true);
                 }
-                self.push(Vec::new(), 6.0, false, false);
+                self.push(ui, Vec::new(), 6.0, false, false);
             } else {
                 let (text, colour) = if let Some(rest) = plain.strip_prefix("> ") {
                     (format!("│ {rest}"), theme::colors().faint)
@@ -1785,7 +1833,7 @@ impl MarkdownCache {
                     (format!("• {rest}"), theme::colors().dim)
                 } else { (plain.to_owned(), theme::colors().dim) };
                 let galley = ui.painter().layout_job(inline_job(&text, 11.5, colour, width));
-                self.push(vec![(0.0, galley)], 2.0, false, false);
+                self.push(ui, vec![(0.0, galley)], 2.0, false, false);
             }
         }
     }
@@ -1808,7 +1856,10 @@ impl MarkdownCache {
                     for cell in &row.cells {
                         let visible = cell.visible(viewport.min.y - row.top, viewport.max.y - row.top);
                         for index in visible {
-                            ui.painter().galley(rect.min + Vec2::new(cell.x, 0.0), cell.lines[index].clone(), theme::colors().dim);
+                            let line = &cell.lines[index];
+                            if let Some(galley) = &line.galley {
+                                ui.painter().galley(rect.min + Vec2::new(cell.x + line.x, line.top), galley.clone(), theme::colors().dim);
+                            }
                         }
                     }
                     if row.rule { ui.painter().hline(rect.x_range(), rect.max.y - 1.0, Stroke::new(1.0, theme::colors().line)); }
@@ -2558,8 +2609,8 @@ mod tests {
         let source = text_rows(text, true);
         let mut cache = WrappedRows::default();
         for width in [180.0, 700.0] {
-            let _ = ctx.run(Default::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = ctx.run_ui(Default::default(), |ui| {
+                egui::CentralPanel::default().show_inside(ui, |ui| {
                     ui.set_max_width(width);
                     cache.prepare(ui, text, &source);
                     assert_eq!(cache.rows.iter().map(|row| &text[row.bytes.clone()]).collect::<String>(), text.replace('\n', ""));
@@ -2579,21 +2630,21 @@ mod tests {
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
         let text = format!("# Heading\n| Name | Value |\n| --- | --- |\n| **bold** | `code` |\n{}\nlast marker", "paragraph with wrapping and **bold** text\n".repeat(2_000));
         let mut cache = MarkdownCache::default();
-        let _ = ctx.run(Default::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            egui::CentralPanel::default().show_inside(ui, |ui| {
                 ui.set_max_width(300.0);
                 cache.prepare(ui, &text);
                 assert!(cache.rows.iter().any(|row| row.header && row.cells.len() == 2));
                 assert!(cache.rows.iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.lines)
-                    .flat_map(|line| &line.job.sections).any(|section| section.format.background == theme::colors().tab_active_bg),
+                    .filter_map(|line| line.galley.as_ref()).flat_map(|galley| &galley.job.sections).any(|section| section.format.background == theme::colors().tab_active_bg),
                     "inline code retains its rich background");
                 let last = cache.rows.last().unwrap();
-                assert_eq!(last.cells[0].lines[0].rows[0].text(), "last marker");
+                assert_eq!(last.cells[0].lines[0].galley.as_ref().unwrap().text(), "last marker");
                 let visible = cache.visible(last.top, cache.height);
                 assert!(visible.contains(&(cache.rows.len() - 1)));
                 assert!(visible.len() < 10, "scrolling to the end does not render the whole document");
                 cache.prepare(ui, &text);
-                assert_eq!(cache.rows.last().unwrap().cells[0].lines[0].rows[0].text(), "last marker");
+                assert_eq!(cache.rows.last().unwrap().cells[0].lines[0].galley.as_ref().unwrap().text(), "last marker");
             });
         });
     }
@@ -2856,8 +2907,8 @@ mod tests {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(900.0, 700.0))),
             ..Default::default()
         };
-        let output = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show_inside(ui, |ui| {
                 let _ = workspace.show(ui, rect, pane, None);
             });
         });
@@ -2883,8 +2934,8 @@ mod tests {
         let commit_button = strings::WORKSPACE_COMMIT.to_owned();
         let mut frame = |events: Vec<egui::Event>, time: f64| {
             let input = egui::RawInput { screen_rect: Some(rect), time: Some(time), events, ..Default::default() };
-            let output = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            let output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show_inside(ui, |ui| {
                     let _ = workspace.show(ui, rect, 1, None);
                 });
             });
@@ -2895,7 +2946,7 @@ mod tests {
         };
         let before = frame(Vec::new(), 0.0).expect("the commit button is drawn");
         let over_history = egui::Pos2::new(300.0, 650.0);
-        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::Vec2::new(0.0, -400.0), modifiers: Default::default() };
+        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::Vec2::new(0.0, -400.0), phase: egui::TouchPhase::Move, modifiers: Default::default() };
         let mut after = Some(before);
         for step in 1..30 {
             let events = if step == 1 { vec![egui::Event::PointerMoved(over_history), wheel.clone()] } else { Vec::new() };
@@ -3014,7 +3065,7 @@ mod tests {
         };
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(600.0, 700.0));
         let shapes = panel_frame(&mut workspace, PanelTab::Changes, 1, rect);
-        let colour = egui::epaint::ColorMode::Solid(section_color(git::Section::History));
+        let colour = section_color(git::Section::History);
         let mut spans: Vec<(f32, f32)> = shapes
             .iter()
             .filter_map(|shape| match shape {
@@ -3048,8 +3099,8 @@ mod tests {
         };
         let mut left = panel("src/lib.rs");
         let mut right = panel("README.md");
-        let output = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show_inside(ui, |ui| {
                 let left_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(400.0, 700.0));
                 let right_rect = egui::Rect::from_min_size(egui::Pos2::new(500.0, 0.0), egui::Vec2::new(380.0, 700.0));
                 let _ = left.show(ui, left_rect, 1, None);

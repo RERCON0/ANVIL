@@ -153,7 +153,7 @@ impl TerminalView {
         let ppp = ctx.pixels_per_point();
         pane.resize(columns, lines, (metrics.width * ppp).round() as u16, (metrics.height * ppp).round() as u16);
 
-        let response = ui.interact(rect, ui.id().with(("pane", pane.id)), Sense { click: true, drag: true, focusable: false });
+        let response = ui.interact(rect, ui.id().with(("pane", pane.id)), Sense::CLICK | Sense::DRAG);
         let mut commands = Vec::new();
         let now_ms = (ui.input(|i| i.time) * 1000.0) as u64;
         let (ctrl, shift, alt) = ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift, i.modifiers.alt));
@@ -268,7 +268,16 @@ impl TerminalView {
         }
 
         if hovered {
-            let dy = ui.input(|i| i.raw_scroll_delta.y);
+            // Terminal mouse reports need each raw tick, not egui's smoothed tail.
+            let line_speed = ctx.options(|o| o.input_options.line_scroll_speed);
+            let dy = ui.input(|i| i.events.iter().filter_map(|event| match event {
+                egui::Event::MouseWheel { unit, delta, modifiers, .. } if !modifiers.shift => Some(delta.y * match unit {
+                    egui::MouseWheelUnit::Point => 1.0,
+                    egui::MouseWheelUnit::Line => line_speed,
+                    egui::MouseWheelUnit::Page => i.viewport_rect().height(),
+                }),
+                _ => None,
+            }).sum::<f32>());
             if dy != 0.0 {
                 if app_mouse {
                     self.wheel_report(pane, dy, metrics.height, mods, modes);
@@ -323,37 +332,37 @@ impl TerminalView {
         }
         let menu_id = ui.id().with(("pane-menu", pane.id));
         if std::mem::take(&mut self.menu_open) {
-            ui.memory_mut(|m| m.open_popup(menu_id));
+            egui::Popup::open_id(&ctx, menu_id);
         }
-        egui::popup::popup_below_widget(ui, menu_id, &response, egui::PopupCloseBehavior::CloseOnClick, |ui| {
+        egui::Popup::from_response(&response).id(menu_id).open_memory(None).close_behavior(egui::PopupCloseBehavior::CloseOnClick).show(|ui| {
             if ui.button(strings::MENU_COPY).clicked() {
                 commands.push(PaneCommand::Copy);
-                ui.close_menu();
+                ui.close();
             }
             if ui.button(strings::MENU_PASTE).clicked() {
                 commands.push(PaneCommand::Paste);
-                ui.close_menu();
+                ui.close();
             }
             if ui.button(strings::MENU_SELECT_ALL).clicked() {
                 commands.push(PaneCommand::SelectAll);
-                ui.close_menu();
+                ui.close();
             }
             if ui.button(strings::MENU_CLEAR).clicked() {
                 commands.push(PaneCommand::Clear);
-                ui.close_menu();
+                ui.close();
             }
             ui.separator();
             if ui.button(strings::MENU_SPLIT_RIGHT).clicked() {
                 commands.push(PaneCommand::SplitRight);
-                ui.close_menu();
+                ui.close();
             }
             if ui.button(strings::MENU_SPLIT_DOWN).clicked() {
                 commands.push(PaneCommand::SplitDown);
-                ui.close_menu();
+                ui.close();
             }
             if ui.button(strings::MENU_CLOSE_PANE).clicked() {
                 commands.push(PaneCommand::ClosePane);
-                ui.close_menu();
+                ui.close();
             }
         });
 
@@ -385,7 +394,7 @@ impl TerminalView {
         let frame = {
             let term = pane.term.lock_unfair();
             let primary = fonts.primary.clone();
-            ctx.fonts(|f| snapshot(&term, input.palette, &mut self.glyphs, &mut |c| f.has_glyph(&primary, c)))
+            ctx.fonts_mut(|f| snapshot(&term, input.palette, &mut self.glyphs, &mut |c| f.has_glyph(&primary, c)))
         };
         self.last_rows.resize_with(frame.rows.len(), || (String::new(), Vec::new()));
         for (row, (text, cols)) in frame.rows.iter().zip(&mut self.last_rows) {

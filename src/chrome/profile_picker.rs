@@ -112,7 +112,7 @@ mod tests {
     fn run(ctx: &egui::Context, picker: &mut PickerState, input: egui::RawInput) -> PickerOutcome {
         let profiles = profiles();
         let mut outcome = PickerOutcome::None;
-        let _ = ctx.run(input, |ctx| outcome = show(ctx, picker, &profiles));
+        let _ = ctx.run_ui(input, |ui| outcome = show(ui.ctx(), picker, &profiles));
         outcome
     }
 
@@ -125,7 +125,8 @@ mod tests {
         let profiles = profiles();
         let mut picker = PickerState { filter: String::new(), selected: 0, focus: true, opened_pass: 0 };
         let mut outcomes = Vec::new();
-        let _ = ctx.run(click(egui::Pos2::new(300.0, 300.0)), |ctx| {
+        let _ = ctx.run_ui(click(egui::Pos2::new(300.0, 300.0)), |ui| {
+            let ctx = ui.ctx();
             // The panel action re-arms `opened_pass` in every pass of the
             // frame, exactly like the tabbar button that opened the picker.
             if ctx.input(|i| i.pointer.any_click()) {

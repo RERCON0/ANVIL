@@ -261,19 +261,20 @@ impl AnvilApp {
         }
     }
 
-    pub fn frame(&mut self, ctx: &egui::Context, maximized: bool) -> Vec<WindowCommand> {
+    pub fn frame(&mut self, ui: &mut egui::Ui, maximized: bool) -> Vec<WindowCommand> {
+        let ctx = ui.ctx().clone();
         let started = Instant::now();
         let mut commands = Vec::new();
-        self.check_config(ctx);
+        self.check_config(&ctx);
         self.absorb_wsl_profiles();
-        self.poll_panes(ctx);
+        self.poll_panes(&ctx);
         self.poll_statuses();
         self.expire_toasts();
-        resize_borders(ctx, maximized, &mut commands);
+        resize_borders(&ctx, maximized, &mut commands);
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(theme::colors().chrome_bg))
-            .show(ctx, |ui| {
+            .frame(egui::Frame::NONE.fill(theme::colors().chrome_bg))
+            .show_inside(ui, |ui| {
                 if self.ui.dialog.is_some() {
                     ui.disable();
                 }
@@ -295,20 +296,20 @@ impl AnvilApp {
                     .collect();
                 let tabbar_actions = tabbar::show(ui, tabbar_rect, &mut self.tabbar, &infos, self.settings_open);
                 for action in tabbar_actions {
-                    self.apply_tabbar_action(action, ctx);
+                    self.apply_tabbar_action(action, &ctx);
                 }
 
                 if self.settings_open {
                     self.ime_area = None;
                     self.show_settings(ui, area);
                 } else {
-                    self.show_active_tab(ui, area, ctx);
+                    self.show_active_tab(ui, area, &ctx);
                 }
             });
 
-        self.show_toasts(ctx);
-        self.show_picker(ctx);
-        self.show_dialog(ctx);
+        self.show_toasts(&ctx);
+        self.show_picker(&ctx);
+        self.show_dialog(&ctx);
         if let Some(at) = self.session_dirty {
             if at.elapsed() >= Duration::from_secs(1) {
                 self.save_session();
@@ -320,7 +321,7 @@ impl AnvilApp {
         }
         if self.debug_frame {
             ctx.debug_painter().text(
-                ctx.screen_rect().right_top() + Vec2::new(-8.0, 8.0),
+                ctx.content_rect().right_top() + Vec2::new(-8.0, 8.0),
                 Align2::RIGHT_TOP,
                 format!("{:.1} ms", self.frame_ms),
                 FontId::monospace(11.0),
@@ -347,7 +348,7 @@ impl AnvilApp {
         // otherwise Esc would reach the shell and leave a stuck popup.
         let overlay = self.ui.picker.is_some() || self.ui.dialog.is_some();
         KeyFocus {
-            egui_wants_keyboard: ctx.wants_keyboard_input() || overlay,
+            egui_wants_keyboard: ctx.egui_wants_keyboard_input() || overlay,
             terminal_focused: !self.settings_open && self.tabs.get(self.active).is_some(),
         }
     }

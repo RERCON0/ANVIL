@@ -215,6 +215,9 @@ cargo test                     # юнит-тесты, ConPTY и интеграц
 cargo run --example gen_icons  # пересобрать иконки из icons/source/mark-chevron.png
 ```
 
+Тулчейн закреплён в `rust-toolchain.toml` (Rust 1.92): rustup подставляет его
+сам, отдельная настройка не нужна.
+
 По умолчанию Codex не входит в сборку: его HTTP-клиент (`reqwest`/`tokio`/
 `hyper`/`rustls`) добавляет заметную часть размера release-exe, а остальные
 AI-бэкенды обходятся штатными CLI. Ключ `--features codex` включает нативный

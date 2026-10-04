@@ -42,14 +42,14 @@ pub fn snap_to_pixels(points: f32, pixels_per_point: f32) -> f32 {
 
 pub fn cell_metrics(ctx: &egui::Context, fonts: &TermFonts) -> CellMetrics {
     let ppp = ctx.pixels_per_point();
-    let (advance, row, line, ascent) = ctx.fonts(|f| {
+    let (advance, row, line, ascent) = ctx.fonts_mut(|f| {
         // The full block is what a terminal cell means: programs tile regions
         // with it, so the face draws it exactly as tall as its line box. The
         // heavy vertical is no reference — Cascadia draws it a third taller on
         // purpose, so borders overlap — and epaint exposes no font table.
         let line = f.layout_no_wrap("\u{2588}".to_owned(), fonts.primary.clone(), Color32::WHITE);
         // epaint's baseline, already snapped to a physical pixel.
-        let ascent = line.rows.first().and_then(|r| r.glyphs.first()).map_or(0.0, |g| g.pos.y);
+        let ascent = line.rows.first().and_then(|r| r.glyphs.first().map(|g| r.pos.y + g.pos.y)).unwrap_or(0.0);
         (f.glyph_width(&fonts.regular, 'M'), f.row_height(&fonts.regular), line.mesh_bounds, ascent)
     });
     // epaint pads every glyph in its atlas by one physical pixel per side.
@@ -403,7 +403,7 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
     let mut hinted_mesh = egui::Mesh::default();
     let pixel = |points: f32| (points * ppp).round() as i32;
 
-    let advance = |bold: bool, italic: bool| painter.ctx().fonts(|f| f.glyph_width(opt.fonts.for_style(bold, italic), 'M'));
+    let advance = |bold: bool, italic: bool| painter.ctx().fonts_mut(|f| f.glyph_width(opt.fonts.for_style(bold, italic), 'M'));
     let mut primary_ink_center = None;
     for (r, row) in frame.rows.iter().enumerate() {
         for run in text_runs(row) {
@@ -527,7 +527,7 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
                 painter.rect_filled(Rect::from_min_size(Pos2::new(rect.min.x, rect.max.y - 2.0), Vec2::new(rect.width(), 2.0)), 0.0, color);
             }
             CursorShape::HollowBlock => {
-                painter.rect_stroke(rect.shrink(0.5), 0.0, Stroke::new(1.0, color));
+                painter.rect_stroke(rect.shrink(0.5), 0.0, Stroke::new(1.0, color), egui::StrokeKind::Middle);
             }
             CursorShape::Hidden => {}
         }
@@ -643,7 +643,7 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(ppp);
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
-        let _ = ctx.run(Default::default(), |_| {});
+        let _ = ctx.run_ui(Default::default(), |_| {});
         let fonts = TermFonts::new(14.0);
         let metrics = cell_metrics(&ctx, &fonts);
         let style = crate::term::style::CellStyle {
@@ -661,8 +661,8 @@ mod tests {
         ];
         let frame = Frame { rows, columns: 2, lines: 2, cursor: None, selection: Vec::new(), display_offset: 0, history_size: 0, default_bg: Color32::BLACK };
         let origin = Pos2::new(4.0, 4.0);
-        let output = ctx.run(Default::default(), |ctx| {
-            let painter = ctx.layer_painter(egui::LayerId::background());
+        let output = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.ctx().layer_painter(egui::LayerId::background());
             let palette = Palette::hardcore();
             let opt = PaintOptions { metrics, fonts: &fonts, palette: &palette, focused: true, cursor_on: true, highlights: &[] };
             paint(&painter, origin, &frame, &opt);
@@ -705,7 +705,7 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(ppp);
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
-        let _ = ctx.run(Default::default(), |_| {});
+        let _ = ctx.run_ui(Default::default(), |_| {});
         let fonts = TermFonts::new(14.0);
         let metrics = cell_metrics(&ctx, &fonts);
         let style = |bg: Color32| crate::term::style::CellStyle {
@@ -741,8 +741,8 @@ mod tests {
             history_size: 0,
             default_bg: Color32::BLACK,
         };
-        let output = ctx.run(Default::default(), |ctx| {
-            let painter = ctx.layer_painter(egui::LayerId::background());
+        let output = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.ctx().layer_painter(egui::LayerId::background());
             let palette = Palette::hardcore();
             let opt = PaintOptions { metrics, fonts: &fonts, palette: &palette, focused: true, cursor_on: true, highlights: &[] };
             paint(&painter, Pos2::new(10.3, 7.7), &frame, &opt);
@@ -781,11 +781,11 @@ mod tests {
     fn paint_fallback_glyph(ch: char) -> (Rect, Rect, CellMetrics) {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), true);
-        let _ = ctx.run(Default::default(), |_| {});
+        let _ = ctx.run_ui(Default::default(), |_| {});
         let fonts = TermFonts::new(14.0);
         let cell = cell_metrics(&ctx, &fonts);
-        let output = ctx.run(Default::default(), |ctx| {
-            let painter = ctx.layer_painter(egui::LayerId::background());
+        let output = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.ctx().layer_painter(egui::LayerId::background());
             let cells = vec![RenderCell {
                 ch,
                 combining: None,
@@ -866,7 +866,7 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(ppp);
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
-        let _ = ctx.run(Default::default(), |_| {});
+        let _ = ctx.run_ui(Default::default(), |_| {});
         let fonts = TermFonts::new(15.0);
         let metrics = cell_metrics(&ctx, &fonts);
         let style = |bold: bool| crate::term::style::CellStyle {
@@ -893,8 +893,8 @@ mod tests {
         let columns = row.len();
         let cursor = Some(CursorDraw { row: 0, col: 1, shape: CursorShape::Block, ch: 'b', wide: false });
         let frame = Frame { rows: vec![row], columns, lines: 1, cursor, selection: Vec::new(), display_offset: 0, history_size: 0, default_bg: Color32::BLACK };
-        let output = ctx.run(Default::default(), |ctx| {
-            let painter = ctx.layer_painter(egui::LayerId::background());
+        let output = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.ctx().layer_painter(egui::LayerId::background());
             let palette = Palette::hardcore();
             let opt = PaintOptions { metrics, fonts: &fonts, palette: &palette, focused: true, cursor_on: true, highlights: &[] };
             paint(&painter, Pos2::new(10.3, 7.7), &frame, &opt);

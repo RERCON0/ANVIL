@@ -217,8 +217,8 @@ pub fn icon_font(size: f32) -> FontId {
 fn visuals() -> egui::Visuals {
     let c = colors();
     let mut v = if c.light { egui::Visuals::light() } else { egui::Visuals::dark() };
-    v.window_rounding = egui::Rounding::ZERO;
-    v.menu_rounding = egui::Rounding::ZERO;
+    v.window_corner_radius = egui::CornerRadius::ZERO;
+    v.menu_corner_radius = egui::CornerRadius::ZERO;
     v.window_fill = c.lift;
     v.window_stroke = Stroke::new(1.0, c.line);
     v.window_shadow = egui::Shadow::NONE;
@@ -232,11 +232,11 @@ fn visuals() -> egui::Visuals {
     v.error_fg_color = c.status_red;
     v.selection.bg_fill = Color32::from_rgba_unmultiplied(c.accent.r(), c.accent.g(), c.accent.b(), 45);
     v.selection.stroke = Stroke::new(1.0, c.accent);
-    v.widgets.noninteractive.rounding = egui::Rounding::ZERO;
-    v.widgets.inactive.rounding = egui::Rounding::ZERO;
-    v.widgets.hovered.rounding = egui::Rounding::ZERO;
-    v.widgets.active.rounding = egui::Rounding::ZERO;
-    v.widgets.open.rounding = egui::Rounding::ZERO;
+    v.widgets.noninteractive.corner_radius = egui::CornerRadius::ZERO;
+    v.widgets.inactive.corner_radius = egui::CornerRadius::ZERO;
+    v.widgets.hovered.corner_radius = egui::CornerRadius::ZERO;
+    v.widgets.active.corner_radius = egui::CornerRadius::ZERO;
+    v.widgets.open.corner_radius = egui::CornerRadius::ZERO;
     for w in [
         &mut v.widgets.noninteractive,
         &mut v.widgets.inactive,
@@ -278,7 +278,7 @@ pub fn apply(ctx: &egui::Context) {
         style.spacing.item_spacing = Vec2::new(8.0, 6.0);
         style.spacing.button_padding = Vec2::new(12.0, 8.0);
         style.spacing.interact_size.y = 26.0;
-        style.spacing.window_margin = egui::Margin::symmetric(10.0, 12.0);
+        style.spacing.window_margin = egui::Margin::symmetric(10, 12);
         style.spacing.scroll = egui::style::ScrollStyle { foreground_color: true, ..egui::style::ScrollStyle::solid() };
         let mut text = style.text_styles.clone();
         text.insert(egui::TextStyle::Body, font(13.0));

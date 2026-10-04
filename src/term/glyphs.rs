@@ -1,16 +1,13 @@
-//! Hinted terminal glyphs. epaint rasterizes with ab_glyph, which ignores a
-//! font's hinting: a stem that falls between two pixels comes out as two grey
-//! columns and one that lands on the grid as a single bright one, so the same
-//! line of Consolas looked bold in one letter and thin in the next. Grid text
-//! is rasterized by DirectWrite instead, with the hinting and the rendering
-//! mode the font asks for (what Windows Terminal and Chromium draw), into an
-//! atlas the terminal paints from. Coverage still becomes alpha the way epaint
-//! does it for all other text: the atlas is an epaint font image.
+//! Native hinted terminal glyphs. epaint uses Skrifa for UI and fallback text;
+//! terminal grid text keeps DirectWrite's native hinting and rendering mode
+//! (as used by Windows Terminal and Chromium), in its own texture atlas.
+//! Coverage becomes premultiplied white alpha with the same gamma as the former
+//! FontImage path, preserving terminal weight across the renderer migration.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
-use egui::epaint::FontImage;
+use egui::epaint::{AlphaFromCoverage, ColorImage};
 use egui::{Color32, Context, Id, Mesh, Pos2, Rect, TextureHandle, TextureId, TextureOptions, Vec2};
 
 use crate::fonts::TermFaces;
@@ -23,6 +20,9 @@ pub const ATLAS: usize = 1024;
 // Missing/blank glyphs consume no atlas texels, so texture capacity alone does
 // not bound the map, especially across many physical font sizes.
 const MAX_CACHED_GLYPHS: usize = 16_384;
+
+// Coverage is 8-bit: evaluate the gamma transfer once, not per uploaded texel.
+static COVERAGE_COLORS: LazyLock<[Color32; 256]> = LazyLock::new(|| std::array::from_fn(|coverage| AlphaFromCoverage::Gamma(0.55).color_from_coverage(coverage as f32 / 255.0)));
 
 /// One of the four faces of `TermFaces`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -185,12 +185,13 @@ impl TermGlyphs {
         // An empty texel right of and below every glyph keeps neighbours apart.
         let texel = self.shelves.place(w + 1, h + 1)?;
         let texture = self.texture.get_or_insert_with(|| {
-            ctx.load_texture("term-glyphs", FontImage::new([ATLAS, ATLAS]), TextureOptions::NEAREST)
+            ctx.load_texture("term-glyphs", ColorImage::filled([ATLAS, ATLAS], Color32::TRANSPARENT), TextureOptions::NEAREST)
         });
-        let mut image = FontImage::new([w + 1, h + 1]);
+        let mut image = ColorImage::filled([w + 1, h + 1], Color32::TRANSPARENT);
+        let colors = &*COVERAGE_COLORS;
         for y in 0..h {
             for x in 0..w {
-                image.pixels[y * (w + 1) + x] = bitmap.coverage[y * w + x] as f32 / 255.0;
+                image.pixels[y * (w + 1) + x] = colors[bitmap.coverage[y * w + x] as usize];
             }
         }
         texture.set_partial(texel, image, TextureOptions::NEAREST);

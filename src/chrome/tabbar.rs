@@ -174,19 +174,19 @@ pub fn show(
         response.context_menu(|ui| {
             if ui.button(strings::TAB_RENAME).clicked() {
                 state.rename = Some(RenameEdit { tab: index, text: tab.title.clone(), focus: true });
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             if ui.button(strings::TAB_DUPLICATE).clicked() {
                 actions.push(TabbarAction::Duplicate(index));
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             if ui.button(strings::TAB_CLOSE).clicked() {
                 actions.push(TabbarAction::Close(index));
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
             if ui.button(strings::TAB_CLOSE_OTHERS).clicked() {
                 actions.push(TabbarAction::CloseOthers(index));
-                ui.close_menu();
+                ui.close_kind(egui::UiKind::Menu);
             }
         });
     }
