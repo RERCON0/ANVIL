@@ -29,26 +29,7 @@ fn read_json(path: &Path) -> Result<Option<serde_json::Value>, String> {
 }
 
 fn jwt_claim(jwt: &str, key: &str) -> Option<String> {
-    let payload = jwt.split('.').nth(1)?;
-    let mut bytes = Vec::new();
-    let mut value = 0u32;
-    let mut bits = 0u32;
-    for byte in payload.bytes() {
-        match byte {
-            b'A'..=b'Z' => value = value << 6 | u32::from(byte - b'A'),
-            b'a'..=b'z' => value = value << 6 | u32::from(byte - b'a' + 26),
-            b'0'..=b'9' => value = value << 6 | u32::from(byte - b'0' + 52),
-            b'-' => value = value << 6 | 62,
-            b'_' => value = value << 6 | 63,
-            _ => continue,
-        }
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            bytes.push((value >> bits) as u8);
-        }
-    }
-    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let claims = crate::jwt::payload(jwt)?;
     let value = claims.get(key)?;
     value.as_str().map(str::to_owned).or_else(|| value.as_bool().map(|flag| flag.to_string()))
 }

@@ -10,6 +10,7 @@ pub mod git;
 pub mod graph;
 pub mod host;
 pub mod hotkeys;
+pub mod jwt;
 pub mod layout;
 pub mod logging;
 pub mod procs;
