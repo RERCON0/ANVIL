@@ -629,6 +629,17 @@ fn invalid_nested_git_markers_follow_real_git() {
     );
     assert_eq!(git::find_root(&junk).unwrap().canonicalize().unwrap(), junk.canonicalize().unwrap());
 
+    // `ref:` is followed by whitespace, and git skips newlines and tabs there
+    // too: a HEAD broken across lines still names a ref for both.
+    std::fs::write(junk.join(".git/HEAD"), "ref:\r\n\t refs/heads/main\n").unwrap();
+    assert_eq!(
+        PathBuf::from(git_toplevel(&junk)).canonicalize().unwrap(),
+        junk.canonicalize().unwrap(),
+        "whitespace between ref: and the name is skipped by git"
+    );
+    assert_eq!(git::find_root(&junk).unwrap().canonicalize().unwrap(), junk.canonicalize().unwrap());
+    std::fs::write(junk.join(".git/HEAD"), format!("{}\n", "a".repeat(40))).unwrap();
+
     // A `.git` file whose target is not a git directory: git refuses the
     // repository instead of walking up, so ANVIL must not promote it either.
     let bogus = outer.join("sub-bogus");

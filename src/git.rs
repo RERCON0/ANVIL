@@ -1188,16 +1188,22 @@ fn valid_git_dir(git_dir: &Path, scan: &mut ConfigScan) -> Result<Option<PathBuf
 }
 
 /// `HEAD` content git accepts, probed against git 2.54: either `ref:` followed
-/// by spaces and a name under `refs/`, or an object name — the first forty bytes
-/// must be hex digits, and git ignores whatever follows them. A leading space,
-/// `ref: HEAD`, a short hash and an empty file are all rejected by git, and a
-/// rejected marker means "not a repository here, keep walking up".
+/// by whitespace and a name under `refs/`, or an object name — the first forty
+/// bytes must be hex digits, and git ignores whatever follows them. The
+/// whitespace set is exactly space, tab, newline and carriage return: vertical
+/// tab and form feed are *not* skipped, a leading space before `ref:` is not
+/// skipped either, and `ref: HEAD`, a short hash and an empty file are all
+/// rejected — a rejected marker means "not a repository here, keep walking up".
 fn head_reference(text: &str) -> bool {
     if let Some(name) = text.strip_prefix("ref:") {
-        return name.trim_start_matches([' ', '\t']).starts_with("refs/");
+        return name.trim_start_matches(is_ref_space).starts_with("refs/");
     }
     let bytes = text.as_bytes();
     bytes.len() >= 40 && bytes[..40].iter().all(u8::is_ascii_hexdigit)
+}
+
+fn is_ref_space(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\n' | '\r')
 }
 
 fn discover_repository(cwd: &Path, scan: &mut ConfigScan) -> Result<Option<RepositoryPaths>, String> {
@@ -2635,6 +2641,45 @@ index 111..222 100644\n\
         assert!(!is_object_hash("--output=C:/x"));
         assert!(!is_object_hash("0123456789abcdef0123456789abcdef0123456"));
         assert!(!is_object_hash("0123456789abcdef0123456789abcdef0123456g"));
+    }
+
+    /// Values pinned by probing git 2.54: every accepted string kept
+    /// `git rev-parse --show-toplevel` inside the directory that held this
+    /// `HEAD`, every rejected one made git walk up to the parent.
+    #[test]
+    fn head_reference_matches_git_probes() {
+        let hex = "a".repeat(40);
+        for accepted in [
+            "ref: refs/heads/main\n",
+            "ref:refs/heads/main\n",
+            "ref:\nrefs/heads/main\n",
+            "ref:\r\n\t refs/heads/main\n",
+            "ref: refs/\n",
+            &hex,
+            &format!("{hex}ZZ"),
+            &format!("{}\n", "a".repeat(64)),
+        ] {
+            assert!(head_reference(accepted), "{accepted:?} is a repository marker");
+        }
+        for rejected in [
+            "",
+            "\n",
+            "garbage\n",
+            "HEAD\n",
+            "ref: HEAD\n",
+            "ref:\nHEAD\n",
+            "ref:\n",
+            "ref: refsX/heads/main\n",
+            "ref:\u{b}refs/heads/main\n",
+            "ref:\u{c}refs/heads/main\n",
+            " ref: refs/heads/main\n",
+            "refs/heads/main\n",
+            "REF: refs/heads/main\n",
+            &"a".repeat(39),
+            &format!("{}\n", "a".repeat(20)),
+        ] {
+            assert!(!head_reference(rejected), "{rejected:?} is not a repository marker");
+        }
     }
 
     #[test]
