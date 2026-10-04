@@ -25,16 +25,18 @@ pub enum SettingsSection {
     Workspace,
     Hotkeys,
     Claude,
+    Quota,
 }
 
 impl SettingsSection {
-    const ALL: [SettingsSection; 6] = [
+    const ALL: [SettingsSection; 7] = [
         SettingsSection::Appearance,
         SettingsSection::Terminal,
         SettingsSection::Profiles,
         SettingsSection::Workspace,
         SettingsSection::Hotkeys,
         SettingsSection::Claude,
+        SettingsSection::Quota,
     ];
 
     fn title(self) -> &'static str {
@@ -45,6 +47,7 @@ impl SettingsSection {
             SettingsSection::Workspace => strings::SETTINGS_WORKSPACE,
             SettingsSection::Hotkeys => strings::SETTINGS_HOTKEYS,
             SettingsSection::Claude => strings::SETTINGS_CLAUDE,
+            SettingsSection::Quota => strings::SETTINGS_QUOTA,
         }
     }
 }
@@ -56,6 +59,9 @@ pub struct SettingsState {
     pub draft: ProfileConfig,
     model_catalog: ModelCatalog,
     model_filter: String,
+    /// Provider whose key is being typed, and the text (masked on screen).
+    quota_key: Option<(crate::quota::ProviderId, String)>,
+    quota_key_error: Option<&'static str>,
 }
 
 impl Default for SettingsState {
@@ -67,6 +73,8 @@ impl Default for SettingsState {
             draft: draft_profile(),
             model_catalog: ModelCatalog::default(),
             model_filter: String::new(),
+            quota_key: None,
+            quota_key_error: None,
         }
     }
 }
@@ -109,6 +117,7 @@ pub struct SettingsContext<'a> {
     pub profiles: Vec<(String, String)>,
     pub fonts: &'a [String],
     pub claude_line: &'a crate::claude_setup::LineState,
+    pub quota: Option<&'a crate::quota::Snapshot>,
 }
 
 pub struct SettingsOutcome {
@@ -117,6 +126,7 @@ pub struct SettingsOutcome {
     pub refresh_fonts: bool,
     pub install_claude: bool,
     pub restore_claude: bool,
+    pub quota_refresh: bool,
 }
 
 fn draft_profile() -> ProfileConfig {
@@ -131,7 +141,14 @@ fn draft_profile() -> ProfileConfig {
 }
 
 pub fn show(ui: &mut egui::Ui, rect: Rect, cx: &mut SettingsContext, state: &mut SettingsState) -> SettingsOutcome {
-    let mut outcome = SettingsOutcome { changed: false, open_config: false, refresh_fonts: false, install_claude: false, restore_claude: false };
+    let mut outcome = SettingsOutcome {
+        changed: false,
+        open_config: false,
+        refresh_fonts: false,
+        install_claude: false,
+        restore_claude: false,
+        quota_refresh: false,
+    };
     ui.painter_at(rect).rect_filled(rect, 0.0, theme::colors().chrome_bg);
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink2(Vec2::new(18.0, 12.0))).id_salt("settings-page"), |ui| {
         ui.label(RichText::new(strings::TAB_SETTINGS).color(theme::colors().text).font(theme::title_font(15.0)));
@@ -176,6 +193,7 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, cx: &mut SettingsContext, state: &mut
                     SettingsSection::Workspace => section_git(ui, cx, state, &mut outcome),
                     SettingsSection::Hotkeys => section_hotkeys(ui, cx, &mut outcome),
                     SettingsSection::Claude => section_claude(ui, cx, &mut outcome),
+                    SettingsSection::Quota => section_quota(ui, cx, state, &mut outcome),
                 }
             });
         });
@@ -574,6 +592,154 @@ fn section_claude(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut Set
         outcome.restore_claude = true;
     }
     ui.add_space(12.0);
+}
+
+fn section_quota(
+    ui: &mut egui::Ui,
+    cx: &mut SettingsContext,
+    state: &mut SettingsState,
+    outcome: &mut SettingsOutcome,
+) {
+    use crate::quota::{creds::Source, ProviderId};
+    theme::section(ui, strings::SETTINGS_QUOTA);
+    let enabled = cx.config.quota.enabled;
+    if theme::choice(ui, strings::SETTINGS_QUOTA_ENABLED, enabled).clicked() {
+        cx.config.quota.enabled = !enabled;
+        outcome.changed = true;
+    }
+    if !cx.config.quota.enabled {
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(strings::SETTINGS_QUOTA_INTERVAL).color(theme::colors().dim).font(theme::font(12.0)));
+        if ui.add(theme::ghost_button(strings::SETTINGS_QUOTA_REFRESH)).clicked() {
+            outcome.quota_refresh = true;
+        }
+    });
+    ui.add_space(6.0);
+    let anvil_key = Source::AnvilKey.label();
+    for id in ProviderId::ALL {
+        let snapshot = cx.quota.and_then(|s| s.get(id));
+        let found = snapshot.is_some();
+        let pref = cx.config.quota.provider_enabled(id.key());
+        let on = pref.unwrap_or(found);
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(found || pref.is_some(), |ui| {
+                if theme::choice(ui, id.label(), on).clicked() {
+                    // Off is remembered; switching back on returns to automatic.
+                    cx.config.quota.set_provider_enabled(id.key(), if on { Some(false) } else { None });
+                    outcome.changed = true;
+                }
+            });
+            let (source, color) = match snapshot {
+                Some(s) => (format!("{} {}", strings::QUOTA_LOGIN, s.source), theme::colors().dim),
+                None => (strings::SETTINGS_QUOTA_NO_LOGIN.to_owned(), theme::colors().faint),
+            };
+            ui.label(RichText::new(source).color(color).font(theme::font(12.0)));
+            if !id.is_subscription() {
+                let has_own = snapshot.is_some_and(|s| s.source == anvil_key);
+                let label = if has_own { strings::SETTINGS_QUOTA_CHANGE_KEY } else { strings::SETTINGS_QUOTA_SET_KEY };
+                if ui.add(theme::ghost_button(label)).clicked() {
+                    state.quota_key = Some((id, String::new()));
+                    state.quota_key_error = None;
+                }
+            }
+        });
+        if let Some(s) = snapshot.filter(|_| on) {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(22.0);
+                if s.windows.is_empty() {
+                    let hint = RichText::new(strings::SETTINGS_QUOTA_WINDOWS_LATER);
+                    ui.label(hint.color(theme::colors().faint).font(theme::font(11.5)));
+                }
+                for window in &s.windows {
+                    let visible = cx.config.quota.window_visible(id.key(), &window.key);
+                    if theme::choice(ui, &window.label, visible).clicked() {
+                        cx.config.quota.set_window_visible(id.key(), &window.key, !visible);
+                        outcome.changed = true;
+                    }
+                }
+            });
+        }
+        if state.quota_key.as_ref().is_some_and(|(editing, _)| *editing == id) {
+            quota_key_editor(ui, id, state, outcome);
+        }
+    }
+}
+
+enum KeyAction {
+    Save,
+    Delete,
+    Cancel,
+}
+
+/// The masked key field under a provider. The key goes straight to the
+/// Credential Manager; config.json never sees it.
+fn quota_key_editor(
+    ui: &mut egui::Ui,
+    id: crate::quota::ProviderId,
+    state: &mut SettingsState,
+    outcome: &mut SettingsOutcome,
+) {
+    use crate::quota::credman;
+    let mut action = None;
+    if let Some((_, text)) = state.quota_key.as_mut() {
+        ui.horizontal(|ui| {
+            ui.add_space(22.0);
+            let field =
+                egui::TextEdit::singleline(text).password(true).desired_width(260.0).font(theme::field_font(12.5));
+            let response = ui.add(field);
+            let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui.add(theme::accent_button(strings::SETTINGS_SAVE)).clicked() || enter {
+                action = Some(KeyAction::Save);
+            }
+            if ui.add(theme::ghost_button(strings::SETTINGS_QUOTA_DELETE_KEY)).clicked() {
+                action = Some(KeyAction::Delete);
+            }
+            if ui.add(theme::ghost_button(strings::SETTINGS_CANCEL)).clicked() {
+                action = Some(KeyAction::Cancel);
+            }
+        });
+    }
+    if let Some(error) = state.quota_key_error {
+        ui.horizontal(|ui| {
+            ui.add_space(22.0);
+            ui.label(RichText::new(error).color(theme::colors().status_yellow).font(theme::font(11.5)));
+        });
+    }
+    let target = credman::target(id);
+    match action {
+        Some(KeyAction::Save) => {
+            let typed = state.quota_key.as_ref().map(|(_, text)| text.as_str()).unwrap_or("");
+            match credman::clean_key(typed) {
+                None => state.quota_key_error = Some(strings::SETTINGS_QUOTA_KEY_INVALID),
+                Some(key) => match credman::write(&target, &key) {
+                    Ok(()) => {
+                        state.quota_key = None;
+                        state.quota_key_error = None;
+                        outcome.quota_refresh = true;
+                    }
+                    Err(code) => {
+                        log::warn!("quota: CredWriteW failed with {code}");
+                        state.quota_key_error = Some(strings::SETTINGS_QUOTA_KEY_FAILED);
+                    }
+                },
+            }
+        }
+        Some(KeyAction::Delete) => {
+            if let Err(code) = credman::delete(&target) {
+                log::warn!("quota: CredDeleteW failed with {code}");
+            }
+            state.quota_key = None;
+            state.quota_key_error = None;
+            outcome.quota_refresh = true;
+        }
+        Some(KeyAction::Cancel) => {
+            state.quota_key = None;
+            state.quota_key_error = None;
+        }
+        None => {}
+    }
 }
 
 /// Inline editor for one custom profile.

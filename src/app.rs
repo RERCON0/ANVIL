@@ -540,6 +540,7 @@ impl AnvilApp {
 
     fn show_settings(&mut self, ui: &mut egui::Ui, rect: Rect) {
         self.refresh_claude_line();
+        let quota_snapshot = self.quota.as_ref().map(|q| q.snapshot());
         let rows = self.keymap.describe();
         // Edit a copy: apply_config must compare the new values against the
         // configuration that is actually in effect, or nothing would ever
@@ -553,6 +554,7 @@ impl AnvilApp {
                 profiles: self.profiles.iter().map(|p| (p.id.clone(), p.name.clone())).collect(),
                 fonts: &self.font_families,
                 claude_line: &claude_line,
+                quota: quota_snapshot.as_ref(),
             };
             crate::settings_ui::show(ui, rect, &mut context, &mut self.settings)
         };
@@ -582,6 +584,11 @@ impl AnvilApp {
         }
         if outcome.restore_claude {
             self.disable_claude();
+        }
+        if outcome.quota_refresh {
+            if let Some(quota) = &self.quota {
+                quota.refresh();
+            }
         }
     }
 
