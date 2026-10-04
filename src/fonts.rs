@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use egui::{FontData, FontDefinitions, FontFamily, FontId};
 
-const CASCADIA: &[u8] = include_bytes!("../fonts/CascadiaMono-Light.ttf");
+pub(crate) const CASCADIA: &[u8] = include_bytes!("../fonts/CascadiaMono-Light.ttf");
 /// Seti UI file icons (MIT, see fonts/seti-LICENSE.txt).
 const SETI: &[u8] = include_bytes!("../fonts/seti.ttf");
 
@@ -45,6 +45,24 @@ pub fn match_family(entries: &[(String, String)], family: &str, fonts_dir: &Path
         slot.get_or_insert(path);
     }
     files
+}
+
+/// Where the data of one terminal face came from.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FaceSource {
+    File(PathBuf),
+    /// The Cascadia Mono shipped inside the exe.
+    Bundled,
+}
+
+/// The four terminal faces as `install` gave them to epaint, so the hinted
+/// glyphs are drawn from exactly the faces the cell metrics are measured on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TermFaces {
+    pub regular: FaceSource,
+    pub bold: FaceSource,
+    pub italic: FaceSource,
+    pub bold_italic: FaceSource,
 }
 
 pub fn fonts_dir() -> PathBuf {
@@ -156,21 +174,24 @@ pub fn install(ctx: &egui::Context, family: &str, entries: &[(String, String)], 
     let dir = fonts_dir();
     let mut report = FontReport::default();
     let mut defs = FontDefinitions::default();
-    let load = |path: &Option<PathBuf>| path.as_ref().and_then(|p| std::fs::read(p).ok());
+    let load = |path: &Option<PathBuf>| {
+        path.as_ref().and_then(|p| std::fs::read(p).ok().map(|bytes| (bytes, FaceSource::File(p.clone()))))
+    };
 
     let files = match_family(entries, family, &dir);
-    let regular = match load(&files.regular) {
-        Some(bytes) => bytes,
-        None => {
-            report.missing.push(format!("{family} (regular): using Cascadia Mono"));
-            CASCADIA.to_vec()
-        }
-    };
-    let face = |bytes: Option<Vec<u8>>, regular: &[u8]| FontData::from_owned(bytes.unwrap_or_else(|| regular.to_vec()));
-    defs.font_data.insert("term-regular".into(), FontData::from_owned(regular.clone()));
-    defs.font_data.insert("term-bold".into(), face(load(&files.bold), &regular));
-    defs.font_data.insert("term-italic".into(), face(load(&files.italic), &regular));
-    defs.font_data.insert("term-bold-italic".into(), face(load(&files.bold_italic), &regular));
+    let (regular, regular_source) = load(&files.regular).unwrap_or_else(|| {
+        report.missing.push(format!("{family} (regular): using Cascadia Mono"));
+        (CASCADIA.to_vec(), FaceSource::Bundled)
+    });
+    let face = |path: &Option<PathBuf>| load(path).unwrap_or_else(|| (regular.clone(), regular_source.clone()));
+    let (bold, bold_source) = face(&files.bold);
+    let (italic, italic_source) = face(&files.italic);
+    let (bold_italic, bold_italic_source) = face(&files.bold_italic);
+    let faces = TermFaces { regular: regular_source, bold: bold_source, italic: italic_source, bold_italic: bold_italic_source };
+    defs.font_data.insert("term-regular".into(), FontData::from_owned(regular));
+    defs.font_data.insert("term-bold".into(), FontData::from_owned(bold));
+    defs.font_data.insert("term-italic".into(), FontData::from_owned(italic));
+    defs.font_data.insert("term-bold-italic".into(), FontData::from_owned(bold_italic));
     defs.font_data.insert("term-cascadia".into(), FontData::from_static(CASCADIA));
 
     let mut extra: Vec<String> = Vec::new();
@@ -225,6 +246,7 @@ pub fn install(ctx: &egui::Context, family: &str, entries: &[(String, String)], 
     defs.font_data.insert("seti".into(), FontData::from_static(SETI));
     defs.families.insert(FontFamily::Name("icons".into()), vec!["seti".to_owned()]);
     ctx.set_fonts(defs);
+    crate::term::glyphs::install(ctx, faces);
     report
 }
 

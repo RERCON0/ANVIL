@@ -63,10 +63,12 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [target.'cfg(windows)'.dependencies]
-# Generated COM interfaces and progress-sink implementation for fail-closed recycling.
+# Generated COM interfaces and progress-sink implementation for fail-closed
+# recycling; DirectWrite rasterizes the terminal's hinted glyphs.
 windows = { version = "0.58", features = [
     "implement",
     "Win32_Foundation",
+    "Win32_Graphics_DirectWrite",
     "Win32_System_Com",
     "Win32_UI_Shell",
 ] }

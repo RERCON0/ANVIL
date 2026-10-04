@@ -12,6 +12,7 @@ use egui::text::LayoutJob;
 use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, TextFormat, Vec2};
 
 use crate::fonts::TermFonts;
+use crate::term::glyphs::{self, Face};
 use crate::term::style::{bg_spans, cell_style, text_runs, Palette, RenderCell, Underline};
 
 pub const SELECTION: Color32 = Color32::from_rgba_premultiplied(77, 77, 77, 77);
@@ -29,6 +30,10 @@ pub struct CellMetrics {
     /// typographic ascent, which for faces whose line box is taller (Consolas)
     /// leaves every row of text hanging under the top edge of its background.
     pub offset_y: f32,
+    /// From the top of the cell to the baseline of its text, in whole physical
+    /// pixels: where epaint puts the baseline, moved down by `offset_y`. The
+    /// hinted glyphs sit on it, so they land where epaint's would.
+    pub baseline: f32,
 }
 
 pub fn snap_to_pixels(points: f32, pixels_per_point: f32) -> f32 {
@@ -37,13 +42,15 @@ pub fn snap_to_pixels(points: f32, pixels_per_point: f32) -> f32 {
 
 pub fn cell_metrics(ctx: &egui::Context, fonts: &TermFonts) -> CellMetrics {
     let ppp = ctx.pixels_per_point();
-    let (advance, row, line) = ctx.fonts(|f| {
+    let (advance, row, line, ascent) = ctx.fonts(|f| {
         // The full block is what a terminal cell means: programs tile regions
         // with it, so the face draws it exactly as tall as its line box. The
         // heavy vertical is no reference — Cascadia draws it a third taller on
         // purpose, so borders overlap — and epaint exposes no font table.
         let line = f.layout_no_wrap("\u{2588}".to_owned(), fonts.primary.clone(), Color32::WHITE);
-        (f.glyph_width(&fonts.regular, 'M'), f.row_height(&fonts.regular), line.mesh_bounds)
+        // epaint's baseline, already snapped to a physical pixel.
+        let ascent = line.rows.first().and_then(|r| r.glyphs.first()).map_or(0.0, |g| g.pos.y);
+        (f.glyph_width(&fonts.regular, 'M'), f.row_height(&fonts.regular), line.mesh_bounds, ascent)
     });
     // epaint pads every glyph in its atlas by one physical pixel per side.
     let ink_top = line.min.y + 1.0 / ppp;
@@ -53,7 +60,7 @@ pub fn cell_metrics(ctx: &egui::Context, fonts: &TermFonts) -> CellMetrics {
     let aligned = line.is_finite() && (line.height() - row).abs() <= row * 0.15;
     let round = |points: f32| (points * ppp).round() / ppp;
     let offset_y = if aligned { round(-ink_top) } else { 0.0 };
-    CellMetrics { width: snap_to_pixels(advance, ppp), height: snap_to_pixels(row, ppp), offset_y }
+    CellMetrics { width: snap_to_pixels(advance, ppp), height: snap_to_pixels(row, ppp), offset_y, baseline: offset_y + ascent }
 }
 
 /// Longest OSC 8 target treated as a link. Real URLs are far shorter; a
@@ -339,6 +346,12 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
     }
     painter.add(fills.into_shape());
     let mut blocks = CellFills::new(ppp);
+    // Grid text is drawn hinted from the DirectWrite atlas, epaint's glyphs
+    // only stand in for what the atlas cannot hold.
+    let hinted = glyphs::shared(painter.ctx());
+    let mut hinted = hinted.as_deref().and_then(|glyphs| glyphs.lock().ok());
+    let mut hinted_mesh = egui::Mesh::default();
+    let pixel = |points: f32| (points * ppp).round() as i32;
 
     let advance = |bold: bool, italic: bool| painter.ctx().fonts(|f| f.glyph_width(opt.fonts.for_style(bold, italic), 'M'));
     let mut primary_ink_center = None;
@@ -370,16 +383,36 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
                         pos.x = span.center().x - ink.center().x;
                         let cell = &row[run.col];
                         if !cell.in_primary_font && !cell.wide && cell.combining.is_none() {
+                            // Measured from the cell's top on the capitals as
+                            // they are drawn: hinted when the atlas has them.
                             let center = *primary_ink_center.get_or_insert_with(|| {
-                                painter.layout_no_wrap("M".to_owned(), opt.fonts.primary.clone(), s.fg).mesh_bounds.center().y
+                                let primary = &opt.fonts.primary;
+                                let hinted_m = hinted.as_mut().and_then(|h| h.run(painter.ctx(), Face::Regular, primary.size * ppp, "M"));
+                                match hinted_m.as_deref() {
+                                    Some([(_, m)]) => opt.metrics.baseline + (m.offset[1] as f32 + m.size[1] as f32 / 2.0) / ppp,
+                                    _ => dy + painter.layout_no_wrap("M".to_owned(), primary.clone(), s.fg).mesh_bounds.center().y,
+                                }
                             });
-                            pos.y = span.min.y + dy + center - ink.center().y;
+                            pos.y = span.min.y + center - ink.center().y;
                         }
                         if pos.y + ink.min.y < span.min.y || pos.y + ink.max.y > span.max.y {
                             pos.y = span.center().y - ink.center().y;
                         }
                     }
                     painter.with_clip_rect(span).galley(pos, galley, s.fg);
+                }
+            } else if let Some(run_glyphs) =
+                hinted.as_mut().and_then(|h| h.run(painter.ctx(), Face::for_style(s.bold, s.italic), font.size * ppp, &run.text))
+            {
+                let baseline = pixel(span.min.y + opt.metrics.baseline);
+                for (i, glyph) in run_glyphs {
+                    let pen = pixel(cell_rect(r, run.col + i, 1).min.x);
+                    glyphs::add_quad(&mut hinted_mesh, glyph, [pen, baseline], ppp, s.fg);
+                }
+                if s.strike {
+                    // Where epaint strikes text through: the middle of its row.
+                    let y = span.min.y + dy + ch / 2.0;
+                    blocks.rect(Rect::from_x_y_ranges(span.x_range(), y - 0.5..=y + 0.5), s.fg);
                 }
             } else {
                 let format = TextFormat {
@@ -394,6 +427,10 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
             }
             paint_underline(painter, span, s.underline, s.fg);
         }
+    }
+    if let Some(texture) = hinted.as_ref().and_then(|h| h.texture_id()).filter(|_| !hinted_mesh.is_empty()) {
+        hinted_mesh.texture_id = texture;
+        painter.add(egui::Shape::mesh(hinted_mesh));
     }
     painter.add(blocks.into_shape());
 
@@ -410,8 +447,22 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
                 painter.rect_filled(rect, 0.0, color);
                 if c.ch != ' ' {
                     let font = opt.fonts.regular.clone();
-                    let galley = painter.layout_no_wrap(c.ch.to_string(), font, frame.default_bg);
-                    painter.galley(cell.min + Vec2::new(0.0, dy), galley, frame.default_bg);
+                    let text = c.ch.to_string();
+                    let cursor_glyphs = hinted.as_mut().and_then(|h| h.run(painter.ctx(), Face::Regular, font.size * ppp, &text));
+                    match (cursor_glyphs, hinted.as_ref().and_then(|h| h.texture_id())) {
+                        (Some(cursor_glyphs), Some(texture)) => {
+                            let mut mesh = egui::Mesh::with_texture(texture);
+                            let pen = [pixel(cell.min.x), pixel(cell.min.y + opt.metrics.baseline)];
+                            for (_, glyph) in cursor_glyphs {
+                                glyphs::add_quad(&mut mesh, glyph, pen, ppp, frame.default_bg);
+                            }
+                            painter.add(egui::Shape::mesh(mesh));
+                        }
+                        _ => {
+                            let galley = painter.layout_no_wrap(text, font, frame.default_bg);
+                            painter.galley(cell.min + Vec2::new(0.0, dy), galley, frame.default_bg);
+                        }
+                    }
                 }
             }
             CursorShape::Beam => {
@@ -513,11 +564,14 @@ mod tests {
         let mut inks = Vec::new();
         for primitive in ctx.tessellate(output.shapes, ppp) {
             let egui::epaint::Primitive::Mesh(mesh) = &primitive.primitive else { continue };
+            // Hinted glyphs come from their own atlas, epaint's from the font
+            // texture, where only glyphs sample anything but the white texel.
+            let atlas = mesh.texture_id != egui::TextureId::default();
             let mut i = 0;
             while i + 5 < mesh.indices.len() {
                 let verts: Vec<&egui::epaint::Vertex> = (0..6).map(|k| &mesh.vertices[mesh.indices[i + k] as usize]).collect();
-                let uv = verts[0].uv;
-                let glyph = (uv.x - egui::epaint::WHITE_UV.x).abs() > 1e-6 || (uv.y - egui::epaint::WHITE_UV.y).abs() > 1e-6;
+                let white = |uv: Pos2| (uv - egui::epaint::WHITE_UV).length() < 1e-6;
+                let glyph = atlas || verts.iter().any(|v| !white(v.uv));
                 if glyph {
                     let y0 = verts.iter().map(|v| v.pos.y).fold(f32::INFINITY, f32::min);
                     let y1 = verts.iter().map(|v| v.pos.y).fold(f32::NEG_INFINITY, f32::max);
@@ -661,6 +715,10 @@ mod tests {
             .iter()
             .find_map(|clipped| match &clipped.shape {
                 egui::Shape::Text(text) => Some((text.visual_bounding_rect(), clipped.clip_rect)),
+                // A hinted glyph from the terminal's atlas.
+                egui::Shape::Mesh(mesh) if mesh.texture_id != egui::TextureId::default() => {
+                    Some((mesh.calc_bounds(), clipped.clip_rect))
+                }
                 _ => None,
             })
             .expect("the glyph is painted");
@@ -688,6 +746,77 @@ mod tests {
         let (text, _, _) = paint_fallback_glyph('M');
         assert!((arrow.center().y - text.center().y).abs() <= 0.5, "permission arrow {arrow:?} sits below primary text {text:?}");
         assert!(clip.contains_rect(arrow.shrink(0.25)), "aligned arrow {arrow:?} is clipped by {clip:?}");
+    }
+
+    /// epaint rasterizes without the font's hinting, so a stem between two
+    /// pixels came out as two grey columns beside letters whose stems hit the
+    /// grid: one row of Consolas looked bold in places and crisp in others.
+    /// Grid text and the character under the cursor have to come from the
+    /// hinted atlas, every texel on exactly one physical pixel: a fractional
+    /// offset or any scaling would resample the hinted glyph.
+    #[test]
+    fn grid_text_is_drawn_hinted_texel_for_pixel() {
+        let ppp = 1.25;
+        let ctx = egui::Context::default();
+        ctx.set_pixels_per_point(ppp);
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        let _ = ctx.run(Default::default(), |_| {});
+        let fonts = TermFonts::new(15.0);
+        let metrics = cell_metrics(&ctx, &fonts);
+        let style = |bold: bool| crate::term::style::CellStyle {
+            fg: Color32::WHITE,
+            bg: Color32::BLACK,
+            bold,
+            italic: false,
+            underline: Underline::None,
+            strike: false,
+        };
+        let cell = |ch: char, bold: bool| RenderCell {
+            ch,
+            combining: None,
+            style: style(bold),
+            wide: false,
+            spacer: false,
+            in_primary_font: true,
+            hyperlink: None,
+        };
+        let text = "/backend-build mn Привет";
+        let mut row: Vec<RenderCell> = text.chars().map(|ch| cell(ch, false)).collect();
+        row.extend("bold".chars().map(|ch| cell(ch, true)));
+        let inked = row.iter().filter(|c| c.ch != ' ').count();
+        let columns = row.len();
+        let cursor = Some(CursorDraw { row: 0, col: 1, shape: CursorShape::Block, ch: 'b', wide: false });
+        let frame = Frame { rows: vec![row], columns, lines: 1, cursor, selection: Vec::new(), display_offset: 0, history_size: 0, default_bg: Color32::BLACK };
+        let output = ctx.run(Default::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            let palette = Palette::hardcore();
+            let opt = PaintOptions { metrics, fonts: &fonts, palette: &palette, focused: true, cursor_on: true, highlights: &[] };
+            paint(&painter, Pos2::new(10.3, 7.7), &frame, &opt);
+        });
+        let atlas = glyphs::shared(&ctx).expect("DirectWrite loads Consolas").lock().unwrap().texture_id().expect("glyphs were stored");
+        let mut quads = 0;
+        for primitive in ctx.tessellate(output.shapes, ppp) {
+            let egui::epaint::Primitive::Mesh(mesh) = &primitive.primitive else { continue };
+            for quad in mesh.indices.chunks_exact(6) {
+                let verts: Vec<&egui::epaint::Vertex> = quad.iter().map(|&i| &mesh.vertices[i as usize]).collect();
+                let white = verts.iter().all(|v| (v.uv - egui::epaint::WHITE_UV).length() < 1e-6);
+                if mesh.texture_id == egui::TextureId::default() && white {
+                    continue; // a fill
+                }
+                assert_eq!(mesh.texture_id, atlas, "a glyph drawn from epaint's unhinted font texture");
+                quads += 1;
+                let lo = |f: fn(&egui::epaint::Vertex) -> f32| verts.iter().map(|v| f(v)).fold(f32::INFINITY, f32::min);
+                let hi = |f: fn(&egui::epaint::Vertex) -> f32| verts.iter().map(|v| f(v)).fold(f32::NEG_INFINITY, f32::max);
+                for v in [lo(|v| v.pos.x), hi(|v| v.pos.x), lo(|v| v.pos.y), hi(|v| v.pos.y)] {
+                    let px = v * ppp;
+                    assert!((px - px.round()).abs() < 1e-3, "glyph edge off the pixel grid: {v} pt = {px} px");
+                }
+                let pixels = ((hi(|v| v.pos.x) - lo(|v| v.pos.x)) * ppp, (hi(|v| v.pos.y) - lo(|v| v.pos.y)) * ppp);
+                let texels = ((hi(|v| v.uv.x) - lo(|v| v.uv.x)) * glyphs::ATLAS as f32, (hi(|v| v.uv.y) - lo(|v| v.uv.y)) * glyphs::ATLAS as f32);
+                assert!((pixels.0 - texels.0).abs() < 1e-2 && (pixels.1 - texels.1).abs() < 1e-2, "{texels:?} texels stretched over {pixels:?} px");
+            }
+        }
+        assert_eq!(quads, inked + 1, "every character, and the one under the cursor, is a hinted glyph");
     }
 
     /// OSC 8 targets come from any program's output; a multi-megabyte URI on
