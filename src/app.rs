@@ -24,7 +24,7 @@ use crate::fonts;
 use crate::hotkeys::{Action, Keymap};
 use crate::host::route::KeyFocus;
 use crate::host::WindowCommand;
-use crate::layout::split_tree::{Dir, PaneId, SplitTree};
+use crate::layout::split_tree::{Anchor, Dir, PaneId, SplitTree};
 use crate::profiles::{self, Profile};
 use crate::session::{self, PaneState, SessionState, TabState, WindowState};
 use crate::strings;
@@ -1441,6 +1441,33 @@ impl AnvilApp {
         let mut tab = Tab::new(tree, entries, focused);
         tab.custom_title = state.custom_title.clone();
         tab.color = state.color;
+        // Hidden panes come back hidden: their shell, cwd and workspace state
+        // are saved like any other pane's, and discarding them on restart
+        // silently loses the pane the user collapsed to get out of the way.
+        for saved in &state.collapsed {
+            let id = self.alloc_pane_id();
+            let profile = self
+                .profiles
+                .iter()
+                .find(|p| p.id == saved.pane.profile_id)
+                .cloned()
+                .or_else(|| {
+                    saved.pane.profile_id.strip_prefix("wsl-").filter(|d| !d.is_empty()).map(profiles::wsl_profile)
+                })
+                .unwrap_or_else(|| self.default_profile());
+            let cwd = session::usable_cwd(saved.pane.cwd.as_deref());
+            let mut entry = self.spawn_entry(id, &profile, cwd);
+            entry.workspace.open = saved.pane.workspace_open;
+            if let Some(width) = saved.pane.workspace_width {
+                entry.workspace.width = crate::workspace::clamp_width(width);
+            }
+            if let Some(name) = &saved.pane.workspace_tab {
+                entry.workspace.tab = crate::workspace::PanelTab::parse(name);
+            }
+            let neighbor = order.get(saved.neighbor).copied().unwrap_or(focused);
+            tab.collapsed.push((id, Anchor { neighbor, dir: saved.dir, after: saved.after }));
+            tab.panes.insert(id, entry);
+        }
         Some(tab)
     }
 
@@ -1457,11 +1484,23 @@ impl AnvilApp {
                 .unwrap_or(PaneState { profile_id: String::new(), cwd: None, workspace_open: false, workspace_width: None, workspace_tab: None })
         };
         let focused = tab.tree.panes().iter().position(|id| *id == tab.focused).unwrap_or(0);
+        let order = tab.tree.panes();
+        let collapsed = tab
+            .collapsed
+            .iter()
+            .map(|(id, anchor)| session::CollapsedPane {
+                pane: describe(*id),
+                neighbor: order.iter().position(|pane| *pane == anchor.neighbor).unwrap_or(focused),
+                dir: anchor.dir,
+                after: anchor.after,
+            })
+            .collect();
         TabState {
             layout: crate::session::SavedNode::from_node(tab.tree.root(), &describe),
             focused,
             custom_title: tab.custom_title.clone(),
             color: tab.color,
+            collapsed,
         }
     }
 

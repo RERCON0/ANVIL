@@ -38,6 +38,20 @@ pub struct TabState {
     /// The tab's colour mark; absent in sessions saved before it existed.
     #[serde(default)]
     pub color: Option<crate::theme::TabColor>,
+    /// Panes hidden by PaneCollapse, with the place they were removed from.
+    /// `neighbor` is an index into the visible layout's reading order, which
+    /// is stable across a save and a restore.
+    #[serde(default)]
+    pub collapsed: Vec<CollapsedPane>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollapsedPane {
+    pub pane: PaneState,
+    pub neighbor: usize,
+    pub dir: Dir,
+    pub after: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -157,6 +171,7 @@ mod tests {
                 focused: 0,
                 custom_title: None,
                 color: None,
+                collapsed: Vec::new(),
             }],
         };
         let extra = session.for_extra_window();
@@ -184,6 +199,7 @@ mod tests {
                     focused: 0,
                     custom_title: None,
                     color: Some(crate::theme::TabColor::Green),
+                    collapsed: Vec::new(),
                 },
                 TabState {
                     layout: SavedNode::Split {
@@ -196,6 +212,12 @@ mod tests {
                     focused: 1,
                     custom_title: Some("сервер".into()),
                     color: None,
+                    collapsed: vec![CollapsedPane {
+                        pane: pane("wsl-debian", Some("C:\\src")),
+                        neighbor: 0,
+                        dir: Dir::Row,
+                        after: true,
+                    }],
                 },
             ],
         }
