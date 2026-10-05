@@ -118,3 +118,100 @@ pub fn show(ui: &mut egui::Ui, area: Rect, block: &QuotaBlock) -> Option<QuotaAc
     }
     action
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::QuotaConfig;
+    use crate::quota::model::{ProviderId, ProviderSnapshot, ProviderState, Snapshot, Window};
+    use crate::quota::view::HEADER_HEIGHT;
+
+    const NOW: i64 = 1_791_210_000;
+
+    fn rows() -> Vec<Row> {
+        let provider = |id, state, pct| ProviderSnapshot {
+            id,
+            plan: Some("Max".into()),
+            source: "Claude Code".into(),
+            state,
+            windows: vec![Window::new("5h", "5ч", pct, Some(NOW + 3_600))],
+            fetched_at: Some(NOW - 60),
+            checked_at: NOW,
+        };
+        let snapshot = Snapshot {
+            version: Snapshot::VERSION,
+            providers: vec![
+                provider(ProviderId::Claude, ProviderState::Ok, 42.0),
+                provider(ProviderId::Kimi, ProviderState::RateLimited { retry_at: NOW + 300 }, 91.0),
+            ],
+        };
+        view::rows(&snapshot, &QuotaConfig::default(), NOW)
+    }
+
+    fn painted(ctx: &egui::Context, area: Rect, block: &QuotaBlock) -> Option<QuotaAction> {
+        let mut seen = None;
+        let _ = ctx.run_ui(egui::RawInput { screen_rect: Some(area), ..Default::default() }, |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
+                seen = show(ui, area, block);
+            });
+        });
+        seen
+    }
+
+    /// Column widths are the owner's narrowest, and the column grows shorter
+    /// as tabs pile up: the block must paint (or cleanly hide) at every size
+    /// rather than panic or spill over Settings.
+    #[test]
+    fn it_paints_at_every_column_height_in_both_states() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), true);
+        let _ = ctx.run_ui(Default::default(), |_| {});
+        let rows = rows();
+        for collapsed in [false, true] {
+            for height in [0.0_f32, 1.0, 10.0, HEADER_HEIGHT, 40.0, 120.0, 600.0] {
+                let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(theme::TABBAR_WIDTH, height));
+                let block = QuotaBlock { rows: &rows, collapsed };
+                let _ = painted(&ctx, area, &block);
+            }
+        }
+    }
+
+    /// The header does two jobs: anywhere it collapses, its right edge asks for
+    /// a cycle. The glyph zone is 16 px wide, 40 px from the right border.
+    #[test]
+    fn the_header_collapses_wherever_clicked_and_refreshes_at_the_right_edge() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), true);
+        let _ = ctx.run_ui(Default::default(), |_| {});
+        let rows = rows();
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(theme::TABBAR_WIDTH, 600.0));
+        let height = view::expanded_height(&rows);
+        for (x, expected) in [(40.0, QuotaAction::ToggleCollapsed), (160.0, QuotaAction::Refresh)] {
+            let pos = Pos2::new(x, area.max.y - height + HEADER_HEIGHT / 2.0);
+            let block = QuotaBlock { rows: &rows, collapsed: false };
+            let click = |pressed| {
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                }]
+            };
+            // egui answers `clicked()` only after a press frame and a release
+            // frame, with a move before them.
+            let _ = painted(&ctx, area, &block);
+            let mut seen = None;
+            for events in [vec![egui::Event::PointerMoved(pos)], click(true), click(false)] {
+                let _ = ctx.run_ui(
+                    egui::RawInput { screen_rect: Some(area), events, ..Default::default() },
+                    |ui| {
+                        ui.scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
+                            seen = show(ui, area, &block);
+                        });
+                    },
+                );
+            }
+            assert_eq!(seen, Some(expected), "x = {x}");
+        }
+    }
+}
