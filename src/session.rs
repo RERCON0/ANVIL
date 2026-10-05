@@ -55,7 +55,7 @@ pub struct PaneState {
     pub workspace_open: bool,
     #[serde(default)]
     pub workspace_width: Option<f32>,
-    /// Active workspace tab: "changes", "commits" or "files".
+    /// Active workspace tab: "changes" or "files".
     #[serde(default)]
     pub workspace_tab: Option<String>,
 }

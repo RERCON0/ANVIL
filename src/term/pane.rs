@@ -249,10 +249,6 @@ impl Pane {
         }
     }
 
-    pub fn grid_size(&self) -> (u16, u16) {
-        (self.size.num_cols, self.size.num_lines)
-    }
-
     /// Resizes the terminal and the ConPTY when the cell grid changes.
     pub fn resize(&mut self, columns: u16, lines: u16, cell_width: u16, cell_height: u16) {
         let size = WindowSize {
