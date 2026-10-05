@@ -106,7 +106,7 @@ pub fn parse(body: &[u8], now: i64, region: Region) -> Result<Fetched, FetchErro
     if windows.is_empty() {
         return Err(FetchError::Format("no usable windows".into()));
     }
-    Ok(Fetched { plan: None, windows })
+    Ok(Fetched::windows(None, windows))
 }
 
 #[cfg(test)]

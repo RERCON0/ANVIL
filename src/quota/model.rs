@@ -24,11 +24,33 @@ pub enum ProviderId {
     MiniMax,
     #[serde(rename = "minimax-cn")]
     MiniMaxCn,
+    #[serde(rename = "opencode-go")]
+    OpencodeGo,
+    #[serde(rename = "synthetic")]
+    Synthetic,
+    #[serde(rename = "ollama-cloud")]
+    OllamaCloud,
+    #[serde(rename = "chutes")]
+    Chutes,
+    #[serde(rename = "commandcode")]
+    CommandCode,
+    #[serde(rename = "umans")]
+    Umans,
+    #[serde(rename = "deepseek")]
+    DeepSeek,
+    #[serde(rename = "openrouter")]
+    OpenRouter,
+    #[serde(rename = "kilo")]
+    Kilo,
+    #[serde(rename = "opencode-zen")]
+    OpencodeZen,
+    #[serde(rename = "charm-hyper")]
+    CharmHyper,
 }
 
 impl ProviderId {
-    /// Display and settings order.
-    pub const ALL: [ProviderId; 8] = [
+    /// Display and settings order: subscriptions, coding plans, balances.
+    pub const ALL: [ProviderId; 19] = [
         ProviderId::Claude,
         ProviderId::ChatGpt,
         ProviderId::Zai,
@@ -37,6 +59,17 @@ impl ProviderId {
         ProviderId::KimiAi,
         ProviderId::MiniMax,
         ProviderId::MiniMaxCn,
+        ProviderId::OpencodeGo,
+        ProviderId::Synthetic,
+        ProviderId::OllamaCloud,
+        ProviderId::Chutes,
+        ProviderId::CommandCode,
+        ProviderId::Umans,
+        ProviderId::DeepSeek,
+        ProviderId::OpenRouter,
+        ProviderId::Kilo,
+        ProviderId::OpencodeZen,
+        ProviderId::CharmHyper,
     ];
 
     /// Stable key used in config.json and the credential target name.
@@ -50,6 +83,17 @@ impl ProviderId {
             ProviderId::KimiAi => "kimi-ai",
             ProviderId::MiniMax => "minimax",
             ProviderId::MiniMaxCn => "minimax-cn",
+            ProviderId::OpencodeGo => "opencode-go",
+            ProviderId::Synthetic => "synthetic",
+            ProviderId::OllamaCloud => "ollama-cloud",
+            ProviderId::Chutes => "chutes",
+            ProviderId::CommandCode => "commandcode",
+            ProviderId::Umans => "umans",
+            ProviderId::DeepSeek => "deepseek",
+            ProviderId::OpenRouter => "openrouter",
+            ProviderId::Kilo => "kilo",
+            ProviderId::OpencodeZen => "opencode-zen",
+            ProviderId::CharmHyper => "charm-hyper",
         }
     }
 
@@ -64,13 +108,30 @@ impl ProviderId {
             ProviderId::KimiAi => "Kimi (kimi.ai)",
             ProviderId::MiniMax => "MiniMax",
             ProviderId::MiniMaxCn => "MiniMax CN",
+            ProviderId::OpencodeGo => "OpenCode Go",
+            ProviderId::Synthetic => "Synthetic",
+            ProviderId::OllamaCloud => "Ollama Cloud",
+            ProviderId::Chutes => "Chutes",
+            ProviderId::CommandCode => "Command Code",
+            ProviderId::Umans => "Umans",
+            ProviderId::DeepSeek => "DeepSeek",
+            ProviderId::OpenRouter => "OpenRouter",
+            ProviderId::Kilo => "Kilo",
+            ProviderId::OpencodeZen => "OpenCode Zen",
+            ProviderId::CharmHyper => "Charm Hyper",
         }
     }
 
     /// Subscriptions are reached through a CLI's OAuth login only: an API key
-    /// has no subscription quota, so ANVIL offers no key field for them.
+    /// has no subscription quota.
     pub fn is_subscription(self) -> bool {
         matches!(self, ProviderId::Claude | ProviderId::ChatGpt)
+    }
+
+    /// Whether the settings page offers a key field. Subscriptions and
+    /// OpenCode Zen (its billing needs the OpenCode Console login) do not.
+    pub fn accepts_own_key(self) -> bool {
+        !self.is_subscription() && self != ProviderId::OpencodeZen
     }
 }
 
@@ -124,6 +185,97 @@ pub fn duration_window(secs: i64) -> Option<(String, String)> {
     (minutes > 0).then(|| (format!("{minutes}m"), format!("{minutes}{}", strings::QUOTA_UNIT_MINUTE)))
 }
 
+/// What an amount is counted in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Unit {
+    Usd,
+    Cny,
+    Credits,
+}
+
+/// Whether an amount is what is left or what has been spent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BalanceKind {
+    Remaining,
+    Spent,
+}
+
+/// Money or credits: a prepaid balance, a credit allowance, or spend.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Balance {
+    /// Stable key the visibility setting is stored under: `balance`,
+    /// `balance:usd`, `credits`, `spend`, `pass`.
+    pub key: String,
+    /// Settings and hover label: «баланс», «кредиты», «траты», «Kilo Pass».
+    pub label: String,
+    pub amount: f64,
+    pub unit: Unit,
+    pub kind: BalanceKind,
+    /// The allowance `amount` belongs to, when the provider reports one.
+    pub limit: Option<f64>,
+    pub resets_at: Option<i64>,
+    /// Extra facts for the hover text, already worded.
+    pub detail: Option<String>,
+}
+
+impl Balance {
+    pub fn new(
+        key: impl Into<String>,
+        label: impl Into<String>,
+        amount: f64,
+        unit: Unit,
+        kind: BalanceKind,
+    ) -> Balance {
+        let amount = if amount.is_finite() { amount } else { 0.0 };
+        Balance { key: key.into(), label: label.into(), amount, unit, kind, limit: None, resets_at: None, detail: None }
+    }
+
+    pub fn with_limit(mut self, limit: Option<f64>) -> Balance {
+        self.limit = limit.filter(|l| l.is_finite() && *l > 0.0);
+        self
+    }
+
+    pub fn resetting(mut self, resets_at: Option<i64>) -> Balance {
+        self.resets_at = resets_at;
+        self
+    }
+
+    pub fn with_detail(mut self, detail: Option<String>) -> Balance {
+        self.detail = detail.filter(|d| !d.is_empty());
+        self
+    }
+
+    /// Share of the limit already spent; None without a limit.
+    pub fn used_pct(&self) -> Option<f64> {
+        let limit = self.limit?;
+        let spent = match self.kind {
+            BalanceKind::Spent => self.amount,
+            BalanceKind::Remaining => limit - self.amount,
+        };
+        Some(clamp_pct(spent / limit * 100.0))
+    }
+
+    /// A prepaid balance at or below zero.
+    pub fn exhausted(&self) -> bool {
+        self.kind == BalanceKind::Remaining && self.amount <= 0.0
+    }
+}
+
+/// `$12.40`, `-$3.00`, `¥12.40`, `120 кр.`, `4.5 кр.`.
+pub fn format_amount(amount: f64, unit: Unit) -> String {
+    let sign = if amount < 0.0 { "-" } else { "" };
+    let abs = amount.abs();
+    match unit {
+        Unit::Usd => format!("{sign}${abs:.2}"),
+        Unit::Cny => format!("{sign}¥{abs:.2}"),
+        Unit::Credits if abs >= 10.0 => format!("{sign}{} {}", abs.round() as i64, strings::QUOTA_CREDITS_SHORT),
+        Unit::Credits => format!("{sign}{abs:.1} {}", strings::QUOTA_CREDITS_SHORT),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ProviderState {
@@ -158,6 +310,9 @@ pub struct ProviderSnapshot {
     pub state: ProviderState,
     /// The last successfully fetched windows; kept through later failures.
     pub windows: Vec<Window>,
+    /// The last successfully fetched balances (absent in older caches).
+    #[serde(default)]
+    pub balances: Vec<Balance>,
     pub fetched_at: Option<i64>,
     pub checked_at: i64,
 }
@@ -192,6 +347,13 @@ impl Snapshot {
 pub struct Fetched {
     pub plan: Option<String>,
     pub windows: Vec<Window>,
+    pub balances: Vec<Balance>,
+}
+
+impl Fetched {
+    pub fn windows(plan: Option<String>, windows: Vec<Window>) -> Fetched {
+        Fetched { plan, windows, balances: Vec::new() }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -252,6 +414,31 @@ mod tests {
     }
 
     #[test]
+    fn balances_know_their_share_and_format_their_amounts() {
+        let pass = Balance::new("pass", "Kilo Pass", 4.2, Unit::Usd, BalanceKind::Remaining).with_limit(Some(20.0));
+        assert!((pass.used_pct().unwrap() - 79.0).abs() < 1e-9);
+        let spend = Balance::new("spend", "траты", 3.1, Unit::Usd, BalanceKind::Spent).with_limit(Some(10.0));
+        assert!((spend.used_pct().unwrap() - 31.0).abs() < 1e-9);
+        let open = Balance::new("spend", "траты", 3.1, Unit::Usd, BalanceKind::Spent).with_limit(Some(0.0));
+        assert_eq!(open.used_pct(), None, "a zero limit is no limit");
+        assert!(Balance::new("balance", "баланс", 0.0, Unit::Cny, BalanceKind::Remaining).exhausted());
+        assert!(!Balance::new("spend", "траты", 0.0, Unit::Usd, BalanceKind::Spent).exhausted());
+        assert_eq!(format_amount(12.4, Unit::Usd), "$12.40");
+        assert_eq!(format_amount(-3.0, Unit::Usd), "-$3.00");
+        assert_eq!(format_amount(12.4, Unit::Cny), "¥12.40");
+        assert_eq!(format_amount(120.4, Unit::Credits), "120 кр.");
+        assert_eq!(format_amount(4.54, Unit::Credits), "4.5 кр.");
+    }
+
+    #[test]
+    fn older_caches_without_balances_still_load() {
+        let old = r#"{"id": "claude", "plan": null, "source": "Claude Code", "state": {"kind": "ok"},
+                      "windows": [], "fetchedAt": 1, "checkedAt": 1}"#;
+        let snapshot: ProviderSnapshot = serde_json::from_str(old).unwrap();
+        assert!(snapshot.balances.is_empty());
+    }
+
+    #[test]
     fn percentages_are_clamped() {
         assert_eq!(Window::new("5h", "5ч", 140.0, None).used_pct, 100.0);
         assert_eq!(Window::new("5h", "5ч", -3.0, None).used_pct, 0.0);
@@ -303,6 +490,7 @@ mod tests {
                 source: "ключ ANVIL".into(),
                 state: ProviderState::RateLimited { retry_at: 5 },
                 windows: vec![Window::new("5h", "5ч", 17.0, Some(1_791_210_000))],
+                balances: vec![Balance::new("balance", "баланс", 12.4, Unit::Cny, BalanceKind::Remaining)],
                 fetched_at: Some(1),
                 checked_at: 2,
             }],

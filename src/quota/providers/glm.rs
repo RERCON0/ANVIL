@@ -56,7 +56,7 @@ pub fn parse(body: &[u8], envelope: Envelope) -> Result<Fetched, FetchError> {
     if windows.is_empty() {
         return Err(FetchError::Format("no known limits".into()));
     }
-    Ok(Fetched { plan: None, windows })
+    Ok(Fetched::windows(None, windows))
 }
 
 #[cfg(test)]

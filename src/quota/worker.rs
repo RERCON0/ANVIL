@@ -91,6 +91,7 @@ impl Engine {
                 source,
                 state,
                 windows: old.map(|o| o.windows.clone()).unwrap_or_default(),
+                balances: old.map(|o| o.balances.clone()).unwrap_or_default(),
                 fetched_at: old.and_then(|o| o.fetched_at),
                 checked_at: now,
             };
@@ -124,6 +125,7 @@ impl Engine {
                                     source,
                                     state: ProviderState::Ok,
                                     windows: fetched.windows,
+                                    balances: fetched.balances,
                                     fetched_at: Some(now),
                                     checked_at: now,
                                 }
@@ -157,7 +159,7 @@ impl Engine {
 fn own_keys() -> HashMap<ProviderId, String> {
     ProviderId::ALL
         .into_iter()
-        .filter(|id| !id.is_subscription())
+        .filter(|id| id.accepts_own_key())
         .filter_map(|id| credman::read(&credman::target(id)).map(|key| (id, key)))
         .collect()
 }
@@ -240,6 +242,8 @@ mod tests {
             source: Source::AnvilKey,
             plan: None,
             account: None,
+            org: None,
+            server: None,
             expires_at: None,
             marker,
         })
@@ -250,7 +254,7 @@ mod tests {
     }
 
     fn ok() -> Result<Fetched, FetchError> {
-        Ok(Fetched { plan: Some("Pro".into()), windows: vec![Window::new("5h", "5ч", 10.0, None)] })
+        Ok(Fetched::windows(Some("Pro".into()), vec![Window::new("5h", "5ч", 10.0, None)]))
     }
 
     #[test]

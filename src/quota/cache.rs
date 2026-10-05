@@ -105,6 +105,7 @@ mod tests {
                 source: "Claude Code".into(),
                 state: ProviderState::Ok,
                 windows: Vec::new(),
+                balances: Vec::new(),
                 fetched_at: Some(1),
                 checked_at: 1,
             }],

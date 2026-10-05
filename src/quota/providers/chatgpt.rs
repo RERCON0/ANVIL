@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use super::{clean, json, number};
 use crate::quota::http::Endpoint;
-use crate::quota::model::{duration_window, FetchError, Fetched, Window};
+use crate::quota::model::{duration_window, Balance, BalanceKind, FetchError, Fetched, Unit, Window};
 use crate::quota::time::epoch_from_json;
 use crate::strings;
 
@@ -41,7 +41,22 @@ pub fn parse(body: &[u8], now: i64) -> Result<Fetched, FetchError> {
     if windows.is_empty() {
         return Err(FetchError::Format("no rate_limit windows".into()));
     }
-    Ok(Fetched { plan: value.get("plan_type").and_then(Value::as_str).and_then(plan_label), windows })
+    let plan = value.get("plan_type").and_then(Value::as_str).and_then(plan_label);
+    Ok(Fetched { plan, windows, balances: credits(&value).into_iter().collect() })
+}
+
+/// Codex credits that fund use beyond the plan windows; nothing when the
+/// account has none or they are unlimited.
+fn credits(value: &Value) -> Option<Balance> {
+    let credits = value.get("credits")?;
+    if credits.get("unlimited") == Some(&Value::Bool(true)) {
+        return None;
+    }
+    let amount = number(credits.get("balance"))?;
+    if credits.get("has_credits") == Some(&Value::Bool(false)) && amount <= 0.0 {
+        return None;
+    }
+    Some(Balance::new("credits", strings::QUOTA_CREDITS, amount, Unit::Credits, BalanceKind::Remaining))
 }
 
 /// `plan_type` (or the `chatgpt_plan_type` claim) for display.
@@ -90,6 +105,22 @@ mod tests {
         let fetched = parse(body, 0).unwrap();
         assert_eq!(fetched.windows, vec![Window::new("month", "мес", 7.0, None)]);
         assert!(matches!(parse(br#"{"rate_limit": {}}"#, 0), Err(FetchError::Format(_))));
+    }
+
+    #[test]
+    fn credits_ride_along_when_the_account_has_them() {
+        let windows = r#""rate_limit": {"primary_window": {"used_percent": 1, "limit_window_seconds": 18000}}"#;
+        let with = format!(r#"{{{windows}, "credits": {{"has_credits": true, "balance": "120.5"}}}}"#);
+        let balances = parse(with.as_bytes(), 0).unwrap().balances;
+        assert_eq!((balances[0].key.as_str(), balances[0].amount, balances[0].unit), ("credits", 120.5, Unit::Credits));
+        for none in [
+            r#""credits": {"has_credits": false, "balance": "0"}"#,
+            r#""credits": {"unlimited": true, "balance": "5"}"#,
+            r#""credits": null"#,
+        ] {
+            let body = format!("{{{windows}, {none}}}");
+            assert!(parse(body.as_bytes(), 0).unwrap().balances.is_empty(), "{none}");
+        }
     }
 
     #[test]

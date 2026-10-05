@@ -65,8 +65,6 @@ pub enum TabbarAction {
     NewTab,
     Profiles,
     Settings,
-    QuotaToggle,
-    QuotaRefresh,
 }
 
 pub fn show(
@@ -76,7 +74,6 @@ pub fn show(
     tabs: &[TabInfo],
     settings_open: bool,
     badge_fields: &ClaudeBadgeFields,
-    quota: Option<&crate::chrome::quota_block::QuotaBlock>,
 ) -> Vec<TabbarAction> {
     let mut actions = Vec::new();
     let painter = ui.painter_at(rect);
@@ -239,21 +236,6 @@ pub fn show(
 
     let settings_rect =
         Rect::from_min_size(Pos2::new(rect.min.x + 8.0, rect.max.y - 30.0), Vec2::new(rect.width() - 16.0, 24.0));
-
-    // Tabs and their buttons get the space first; the quota block takes what is
-    // left above Settings and collapses or hides itself when that is too little.
-    if let Some(block) = quota {
-        let bottom = Pos2::new(rect.max.x, settings_rect.min.y - 4.0);
-        let area = Rect::from_min_max(Pos2::new(rect.min.x, y + 40.0), bottom);
-        if area.height() > 0.0 {
-            use crate::chrome::quota_block::{show as show_quota, QuotaAction};
-            match show_quota(ui, area, block) {
-                Some(QuotaAction::ToggleCollapsed) => actions.push(TabbarAction::QuotaToggle),
-                Some(QuotaAction::Refresh) => actions.push(TabbarAction::QuotaRefresh),
-                None => {}
-            }
-        }
-    }
     let settings = ui.interact(settings_rect, ui.id().with("tab-settings"), Sense::click());
     if settings_open {
         painter.rect_filled(settings_rect, 0.0, theme::colors().tab_active_bg);

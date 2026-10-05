@@ -197,7 +197,6 @@ impl Default for ClaudeStatusConfig {
 #[serde(default, rename_all = "camelCase")]
 pub struct QuotaConfig {
     pub enabled: bool,
-    pub collapsed: bool,
     /// By provider key (`claude`, `zai`…): only what the user changed.
     pub providers: BTreeMap<String, QuotaProviderPrefs>,
 }
@@ -508,7 +507,7 @@ mod tests {
         assert_eq!(c.claude_status.line_fields, ClaudeLineFields::default());
         assert!(c.claude_status.line_fields.branch && c.claude_status.line_fields.five_hour);
         assert!(c.claude_status.badge_fields.any());
-        assert!(!c.quota.enabled && !c.quota.collapsed && c.quota.providers.is_empty());
+        assert!(!c.quota.enabled && c.quota.providers.is_empty());
         assert_eq!(c.to_minimal_json(), serde_json::json!({"version": 1}));
     }
 
@@ -571,6 +570,26 @@ mod tests {
             serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap()).unwrap(),
             serde_json::json!({"version": 1, "colorScheme": crate::strings::SCHEME_LIGHT})
         );
+    }
+
+    /// A stage-one config carried `quota.collapsed`, which the bottom line no
+    /// longer has: loading must not call the file broken, and the next save
+    /// drops the key.
+    #[test]
+    fn a_stage_one_quota_config_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"quota":{"enabled":true,"collapsed":true,"providers":{"kimi":{"enabled":false}}}}"#,
+        )
+        .unwrap();
+        let loaded = Config::load(&path);
+        assert!(loaded.notice.is_none(), "an unknown old key is not corruption");
+        assert!(loaded.config.quota.enabled);
+        assert_eq!(loaded.config.quota.provider_enabled("kimi"), Some(false));
+        loaded.config.save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("collapsed"));
     }
 
     #[test]

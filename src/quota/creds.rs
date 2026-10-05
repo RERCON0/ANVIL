@@ -74,6 +74,10 @@ pub struct Credential {
     pub plan: Option<String>,
     /// ChatGPT account id for the request header; never stored or shown.
     pub account: Option<String>,
+    /// OpenCode Console organisation (`x-org-id`); never stored or shown.
+    pub org: Option<String>,
+    /// OpenCode Console server the login belongs to, as the login says.
+    pub server: Option<String>,
     pub expires_at: Option<i64>,
     /// Changes whenever the login does; kept in memory only.
     pub marker: u64,
@@ -111,6 +115,15 @@ const VARS: &[&str] = &[
     "MINIMAX_CODING_PLAN_API_KEY",
     "MINIMAX_API_KEY",
     "MINIMAX_CHINA_CODING_PLAN_API_KEY",
+    "OPENCODE_API_KEY",
+    "SYNTHETIC_API_KEY",
+    "OLLAMA_API_KEY",
+    "CHUTES_API_KEY",
+    "COMMAND_CODE_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "OPENROUTER_API_KEY",
+    "KILO_API_KEY",
+    "CHARM_HYPER_API_KEY",
 ];
 
 /// Everything discovery depends on, so tests can point it at temp folders.
@@ -221,6 +234,8 @@ fn credential(secret: String, source: Source) -> Credential {
         source,
         plan: None,
         account: None,
+        org: None,
+        server: None,
         expires_at: None,
     }
 }
@@ -248,6 +263,8 @@ fn from_entry(entry: &Value, source: Source, accept: Accept) -> Option<Credentia
             let mut found = credential(text(entry.get("access"))?, source);
             found.expires_at = entry.get("expires").and_then(epoch_from_json);
             found.account = text(entry.get("accountId"));
+            found.org = text(entry.get("orgID"));
+            found.server = text(entry.get("server"));
             Some(found)
         }
         _ => None,
@@ -345,6 +362,7 @@ fn claude_settings(env: &CredEnv, hosts: &[&str]) -> Option<Credential> {
     Some(credential(key, Source::ClaudeSettings))
 }
 
+#[derive(Clone, Copy)]
 struct KeySpec {
     env: &'static [&'static str],
     hosts: &'static [&'static str],
@@ -390,7 +408,45 @@ fn key_spec(id: ProviderId) -> KeySpec {
             omp: &[],
             opencode: &["minimax-china-coding-plan", "minimax-cn-coding-plan", "minimax-cn", "minimax-china"],
         },
-        ProviderId::Claude | ProviderId::ChatGpt => KeySpec { env: &[], hosts: &[], omp: &[], opencode: &[] },
+        ProviderId::OpencodeGo => KeySpec {
+            env: &["OPENCODE_API_KEY"],
+            hosts: &[],
+            omp: &["opencode-go"],
+            opencode: &["opencode-go", "opencode"],
+        },
+        ProviderId::Synthetic => KeySpec {
+            env: &["SYNTHETIC_API_KEY"],
+            hosts: &["api.synthetic.new"],
+            omp: &["synthetic"],
+            opencode: &["synthetic"],
+        },
+        ProviderId::OllamaCloud => {
+            KeySpec { env: &["OLLAMA_API_KEY"], hosts: &[], omp: &["ollama-cloud"], opencode: &["ollama-cloud"] }
+        }
+        ProviderId::Chutes => KeySpec { env: &["CHUTES_API_KEY"], hosts: &[], omp: &[], opencode: &["chutes"] },
+        ProviderId::CommandCode => {
+            KeySpec { env: &["COMMAND_CODE_API_KEY"], hosts: &[], omp: &["commandcode"], opencode: &["commandcode"] }
+        }
+        ProviderId::Umans => KeySpec { env: &[], hosts: &["api.code.umans.ai"], omp: &["umans"], opencode: &["umans"] },
+        ProviderId::DeepSeek => KeySpec {
+            env: &["DEEPSEEK_API_KEY"],
+            hosts: &["api.deepseek.com"],
+            omp: &["deepseek"],
+            opencode: &["deepseek"],
+        },
+        ProviderId::OpenRouter => KeySpec {
+            env: &["OPENROUTER_API_KEY"],
+            hosts: &["openrouter.ai"],
+            omp: &["openrouter"],
+            opencode: &["openrouter"],
+        },
+        ProviderId::Kilo => KeySpec { env: &["KILO_API_KEY"], hosts: &[], omp: &["kilo"], opencode: &["kilo"] },
+        ProviderId::CharmHyper => {
+            KeySpec { env: &["CHARM_HYPER_API_KEY"], hosts: &[], omp: &["charm-hyper"], opencode: &["charm-hyper"] }
+        }
+        ProviderId::Claude | ProviderId::ChatGpt | ProviderId::OpencodeZen => {
+            KeySpec { env: &[], hosts: &[], omp: &[], opencode: &[] }
+        }
     }
 }
 
@@ -405,6 +461,12 @@ fn candidates(id: ProviderId, env: &CredEnv) -> Vec<Box<dyn Fn() -> Option<Crede
             Box::new(move || opencode2(env, &["anthropic"], oauth_only)),
             Box::new(move || opencode1(env, &["anthropic"], oauth_only)),
         ],
+        // Zen's billing answers the OpenCode Console login only; OMP's
+        // `opencode-zen` entry is a model-gateway key and cannot read it.
+        ProviderId::OpencodeZen => vec![
+            Box::new(move || opencode2(env, &["opencode"], oauth_only)),
+            Box::new(move || opencode1(env, &["opencode"], oauth_only)),
+        ],
         ProviderId::ChatGpt => vec![
             Box::new(move || codex_cli(env)),
             Box::new(move || omp(env, &["openai-codex"], oauth_only)),
@@ -413,8 +475,10 @@ fn candidates(id: ProviderId, env: &CredEnv) -> Vec<Box<dyn Fn() -> Option<Crede
         ],
         _ => {
             let spec = key_spec(id);
-            // Kimi Code's OMP login is OAuth; the other plans use keys only.
-            let accept = Accept { key: true, oauth: id == ProviderId::Kimi };
+            // Kimi Code's OMP login is OAuth; OpenRouter and Kilo log in through
+            // a browser flow whose result may be stored either way.
+            let oauth = matches!(id, ProviderId::Kimi | ProviderId::OpenRouter | ProviderId::Kilo);
+            let accept = Accept { key: true, oauth };
             vec![
                 Box::new(move || env.own_keys.get(&id).cloned().map(|key| credential(key, Source::AnvilKey))),
                 Box::new(move || {
@@ -581,6 +645,50 @@ mod tests {
         );
         assert!(matches!(detect(ProviderId::Claude, &e), Detection::Missing), "a disabled OMP row is not a login");
         assert_eq!(found(detect(ProviderId::Zhipu, &e)).secret.expose(), "zp-key", "active rows first");
+    }
+
+    #[test]
+    fn zen_uses_the_console_login_and_go_a_key() {
+        let home = tempfile::tempdir().unwrap();
+        write(
+            &home.path().join(".local/share/opencode/auth.json"),
+            &format!(
+                r#"{{"opencode": {{"type": "oauth", "access": "console-token", "refresh": "r", "expires": {},
+                "orgID": "org-7", "server": "https://opencode.ai/console"}},
+              "opencode-go": {{"type": "api", "key": "go-key"}}}}"#,
+                (NOW + 600) * 1000
+            ),
+        );
+        let zen = found(detect(ProviderId::OpencodeZen, &env(home.path())));
+        assert_eq!(
+            (zen.secret.expose(), zen.org.as_deref(), zen.server.as_deref()),
+            ("console-token", Some("org-7"), Some("https://opencode.ai/console"))
+        );
+        let go = found(detect(ProviderId::OpencodeGo, &env(home.path())));
+        assert_eq!(go.secret.expose(), "go-key");
+        assert!(!ProviderId::OpencodeZen.accepts_own_key() && ProviderId::OpencodeGo.accepts_own_key());
+    }
+
+    #[test]
+    fn new_key_providers_read_their_variables() {
+        let home = tempfile::tempdir().unwrap();
+        let mut e = env(home.path());
+        for (id, var) in [
+            (ProviderId::DeepSeek, "DEEPSEEK_API_KEY"),
+            (ProviderId::OpenRouter, "OPENROUTER_API_KEY"),
+            (ProviderId::Kilo, "KILO_API_KEY"),
+            (ProviderId::Synthetic, "SYNTHETIC_API_KEY"),
+            (ProviderId::OllamaCloud, "OLLAMA_API_KEY"),
+            (ProviderId::Chutes, "CHUTES_API_KEY"),
+            (ProviderId::CommandCode, "COMMAND_CODE_API_KEY"),
+            (ProviderId::CharmHyper, "CHARM_HYPER_API_KEY"),
+            (ProviderId::OpencodeGo, "OPENCODE_API_KEY"),
+        ] {
+            e.vars.insert(var.into(), format!("{var}-value"));
+            let c = found(detect(id, &e));
+            assert_eq!((c.secret.expose(), c.source), (format!("{var}-value").as_str(), Source::Env(var)), "{id:?}");
+        }
+        assert!(VARS.contains(&"COMMAND_CODE_API_KEY"), "every variable read is listed for from_process");
     }
 
     #[test]

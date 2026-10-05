@@ -47,7 +47,7 @@ pub fn parse(body: &[u8]) -> Result<Fetched, FetchError> {
             let label = format!("{name}·7{}", strings::QUOTA_UNIT_DAY);
             windows.push(Window::new(key, label, used, limit.get("resets_at").and_then(epoch_from_json)));
         }
-        return Ok(Fetched { plan: None, windows });
+        return Ok(Fetched::windows(None, windows));
     }
     Err(FetchError::Format("no five_hour/seven_day windows".into()))
 }

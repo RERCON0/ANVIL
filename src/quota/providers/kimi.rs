@@ -62,7 +62,7 @@ pub fn parse(body: &[u8], now: i64) -> Result<Fetched, FetchError> {
     if windows.is_empty() {
         return Err(FetchError::Format("no usage windows".into()));
     }
-    Ok(Fetched { plan: None, windows })
+    Ok(Fetched::windows(None, windows))
 }
 
 #[cfg(test)]

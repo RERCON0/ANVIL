@@ -141,7 +141,6 @@ pub const SETTINGS_QUOTA_DELETE_KEY: &str = "Удалить ключ";
 pub const SETTINGS_QUOTA_KEY_FAILED: &str = "Не удалось сохранить ключ в Диспетчере учётных данных Windows";
 pub const SETTINGS_QUOTA_KEY_INVALID: &str = "Ключ пуст, слишком длинный или содержит переводы строк";
 pub const SETTINGS_QUOTA_WINDOWS_LATER: &str = "окна появятся после первого ответа";
-pub const QUOTA_TITLE: &str = "КВОТЫ";
 pub const QUOTA_REFRESH_HINT: &str = "Обновить квоты";
 pub const QUOTA_LOGIN: &str = "вход:";
 pub const QUOTA_SOURCE_CLAUDE_CODE: &str = "Claude Code";
@@ -163,6 +162,23 @@ pub const QUOTA_RESET_IN: &str = "сброс через";
 pub const QUOTA_DATA_AT: &str = "данные от";
 pub const QUOTA_UPDATE_FAILED: &str = "не удалось обновить:";
 pub const QUOTA_RETRY_AT: &str = "повтор в";
+
+// Quotas: balances and the bottom line.
+pub const QUOTA_CREDITS: &str = "кредиты";
+pub const QUOTA_CREDITS_SHORT: &str = "кр.";
+pub const QUOTA_BALANCE: &str = "баланс";
+pub const QUOTA_SPEND: &str = "траты";
+pub const QUOTA_SESSION: &str = "сессия";
+pub const QUOTA_KILO_PASS: &str = "Kilo Pass";
+pub const QUOTA_TOPPED_UP: &str = "пополнено";
+pub const QUOTA_GRANTED: &str = "подарено";
+pub const QUOTA_CREDIT_LIMIT: &str = "кредитный лимит";
+pub const QUOTA_NO_SUBSCRIPTION: &str = "нет подписки";
+pub const QUOTA_ZEN_OTHER_SERVER: &str = "вход OpenCode относится к другому серверу консоли";
+pub const QUOTA_PROVIDER_SAID: &str = "ответ провайдера:";
+pub const QUOTA_RATE_LIMITED: &str = "лимит запросов, повтор в";
+pub const QUOTA_MORE: &str = "ещё";
+pub const SETTINGS_QUOTA_OWN_KEY: &str = "Свой ключ…";
 
 // Explicit consent for global Claude settings and executable paste.
 pub const CLAUDE_INSTALL_QUESTION: &str = "Установить или обновить строку статуса Claude Code?";

@@ -57,6 +57,8 @@ pub enum HttpError {
     Redirect(u16),
     /// Plain HTTP outside tests.
     Insecure,
+    /// A query string with characters that could change the address.
+    BadQuery,
     /// A WinHTTP call failed with this `GetLastError` code.
     Os(u32),
 }
@@ -68,14 +70,25 @@ impl std::fmt::Display for HttpError {
             HttpError::TooLarge => f.write_str("response too large"),
             HttpError::Redirect(code) => write!(f, "unexpected redirect {code}"),
             HttpError::Insecure => f.write_str("plain HTTP refused"),
+            HttpError::BadQuery => f.write_str("invalid query string"),
             HttpError::Os(code) => write!(f, "WinHTTP error {code}"),
         }
     }
 }
 
 /// The transport a provider fetch goes through; tests substitute a fake.
+/// `query` is appended to the endpoint's fixed path after `?`; it must pass
+/// [`valid_query`], so it can never change the host or the path.
 pub trait Http {
-    fn get(&self, endpoint: &Endpoint, headers: &[(&str, &str)]) -> Result<Response, HttpError>;
+    fn get(&self, endpoint: &Endpoint, query: Option<&str>, headers: &[(&str, &str)]) -> Result<Response, HttpError>;
+}
+
+/// Characters of a percent-encoded query only: no `/`, `?`, `#`, `@`, `:`,
+/// spaces or controls, and a bounded length.
+pub fn valid_query(query: &str) -> bool {
+    !query.is_empty()
+        && query.len() <= 512
+        && query.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.~=&%".contains(&b))
 }
 
 struct Handle(*mut c_void);
@@ -167,15 +180,20 @@ impl WinHttp {
 }
 
 impl Http for WinHttp {
-    fn get(&self, endpoint: &Endpoint, headers: &[(&str, &str)]) -> Result<Response, HttpError> {
+    fn get(&self, endpoint: &Endpoint, query: Option<&str>, headers: &[(&str, &str)]) -> Result<Response, HttpError> {
         if !endpoint.secure && !cfg!(test) {
             return Err(HttpError::Insecure);
         }
+        let target = match query {
+            Some(query) if !valid_query(query) => return Err(HttpError::BadQuery),
+            Some(query) => format!("{}?{query}", endpoint.path),
+            None => endpoint.path.to_owned(),
+        };
         let host = wide(endpoint.host);
         // SAFETY: valid session handle and NUL-terminated host string.
         let connect = Handle::new(unsafe { WinHttpConnect(self.session.0, host.as_ptr(), endpoint.port, 0) })?;
         let verb = wide("GET");
-        let path = wide(endpoint.path);
+        let path = wide(&target);
         let flags = if endpoint.secure { WINHTTP_FLAG_SECURE } else { 0 };
         // SAFETY: valid connect handle; null version/referrer/accept-types are
         // the documented defaults.
@@ -308,8 +326,9 @@ mod tests {
     fn sends_headers_and_reads_the_body() {
         let (port, request) = serve(reply("200 OK", "", b"{\"ok\":true}"), Duration::ZERO);
         let http = WinHttp::for_tests(5_000);
-        let response =
-            http.get(&Endpoint::loopback(port, "/quota"), &[("Authorization", "Bearer t0k"), ("X-Test", "1")]).unwrap();
+        let response = http
+            .get(&Endpoint::loopback(port, "/quota"), None, &[("Authorization", "Bearer t0k"), ("X-Test", "1")])
+            .unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, b"{\"ok\":true}");
         assert_eq!(response.retry_after, None);
@@ -324,7 +343,8 @@ mod tests {
     fn redirects_are_not_followed() {
         let (port, _request) =
             serve(reply("302 Found", "Location: http://127.0.0.1:9/elsewhere\r\n", b""), Duration::ZERO);
-        let result = WinHttp::for_tests(5_000).get(&Endpoint::loopback(port, "/"), &[("Authorization", "Bearer t")]);
+        let result =
+            WinHttp::for_tests(5_000).get(&Endpoint::loopback(port, "/"), None, &[("Authorization", "Bearer t")]);
         assert_eq!(result, Err(HttpError::Redirect(302)));
     }
 
@@ -332,15 +352,35 @@ mod tests {
     fn oversized_bodies_are_refused() {
         let big = vec![b'x'; BODY_LIMIT + 1];
         let (port, _request) = serve(reply("200 OK", "", &big), Duration::ZERO);
-        assert_eq!(WinHttp::for_tests(5_000).get(&Endpoint::loopback(port, "/"), &[]), Err(HttpError::TooLarge));
+        assert_eq!(WinHttp::for_tests(5_000).get(&Endpoint::loopback(port, "/"), None, &[]), Err(HttpError::TooLarge));
     }
 
     #[test]
     fn retry_after_is_reported() {
         let (port, _request) =
             serve(reply("429 Too Many Requests", "Retry-After: 120\r\n", b"slow down"), Duration::ZERO);
-        let response = WinHttp::for_tests(5_000).get(&Endpoint::loopback(port, "/"), &[]).unwrap();
+        let response = WinHttp::for_tests(5_000).get(&Endpoint::loopback(port, "/"), None, &[]).unwrap();
         assert_eq!((response.status, response.retry_after.as_deref()), (429, Some("120")));
+    }
+
+    #[test]
+    fn a_query_is_appended_to_the_fixed_path() {
+        let (port, request) = serve(reply("200 OK", "", b"{}"), Duration::ZERO);
+        let response =
+            WinHttp::for_tests(5_000).get(&Endpoint::loopback(port, "/credits"), Some("orgId=a%2Fb&x=1"), &[]).unwrap();
+        assert_eq!(response.status, 200);
+        let request = request.recv().unwrap();
+        assert!(request.starts_with("GET /credits?orgId=a%2Fb&x=1 HTTP/1.1\r\n"), "{request}");
+    }
+
+    #[test]
+    fn queries_that_could_change_the_address_are_refused() {
+        for bad in ["", "a/b", "x=1#frag", "@evil", "a?b", "a b", "x=\r\n", "host:80", &"a".repeat(513)] {
+            assert!(!valid_query(bad), "{bad:?}");
+            let result = WinHttp::for_tests(1_000).get(&Endpoint::loopback(1, "/"), Some(bad), &[]);
+            assert_eq!(result, Err(HttpError::BadQuery), "{bad:?}");
+        }
+        assert!(valid_query("batch=1&input=%7B%220%22%3Anull%7D"));
     }
 
     /// WinHTTP checks its timers in steps of about four seconds, so the limit
@@ -349,7 +389,7 @@ mod tests {
     fn a_silent_server_times_out() {
         let (port, _request) = serve(reply("200 OK", "", b"late"), Duration::from_secs(8));
         let started = std::time::Instant::now();
-        assert_eq!(WinHttp::for_tests(1_000).get(&Endpoint::loopback(port, "/"), &[]), Err(HttpError::Timeout));
+        assert_eq!(WinHttp::for_tests(1_000).get(&Endpoint::loopback(port, "/"), None, &[]), Err(HttpError::Timeout));
         assert!(started.elapsed() < Duration::from_secs(7), "{:?}", started.elapsed());
     }
 }
