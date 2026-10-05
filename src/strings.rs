@@ -59,6 +59,10 @@ pub const SETTINGS_FONT: &str = "Шрифт";
 pub const SETTINGS_FONT_SIZE: &str = "Размер";
 pub const SETTINGS_FONT_REFRESH: &str = "Обновить список шрифтов";
 pub const SETTINGS_SCHEME: &str = "Цветовая схема";
+/// The two built-in colour schemes, by how the window reads: the owner's dark
+/// design and the light one.
+pub const SCHEME_DARK: &str = "Тёмная";
+pub const SCHEME_LIGHT: &str = "Светлая";
 pub const SETTINGS_SCROLLBACK: &str = "История (строк)";
 pub const SETTINGS_CURSOR: &str = "Курсор";
 pub const CURSOR_BLOCK: &str = "Блок";
