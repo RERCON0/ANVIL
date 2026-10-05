@@ -12,7 +12,7 @@ use crate::term::style::{ensure_contrast, Palette, MIN_CONTRAST};
 // ---- colours ----------------------------------------------------------------
 
 /// Colours of the window chrome and the controls. They follow the terminal's
-/// colour scheme, as Tabby's interface does: `HARDCORE` is the owner's design
+/// colour scheme, as Tabby's interface does: `DARK` is the owner's design
 /// (chrome and tabs from the Helm screenshot, control surfaces shared with
 /// SNATCH/BEAT/STRIKE), and any other scheme gets the same design laid on its
 /// own background and foreground, so a light scheme gets a light window.
@@ -45,7 +45,7 @@ pub struct Colors {
     pub divider: Color32,
     pub divider_hover: Color32,
     pub accent: Color32,
-    /// Claude status thresholds (the owner's Hardcore scheme).
+    /// Claude status thresholds (the owner's Dark scheme).
     pub status_green: Color32,
     pub status_yellow: Color32,
     pub status_red: Color32,
@@ -64,7 +64,7 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
 }
 
 impl Colors {
-    pub const HARDCORE: Colors = Colors {
+    pub const DARK: Colors = Colors {
         light: false,
         chrome_bg: rgb(0x0a, 0x0a, 0x0a),
         border: rgb(0x13, 0x13, 0x13),
@@ -100,16 +100,16 @@ impl Colors {
     };
 
     /// The design laid on `scheme`. Each neutral keeps its place on the line
-    /// from Hardcore's background (0) to its foreground (1) — the chrome a
+    /// from Dark's background (0) to its foreground (1) — the chrome a
     /// step beyond the background, labels most of the way to the text — now
     /// drawn from this scheme's background to its foreground, and the control
-    /// surfaces keep their cool tint. Hardcore itself maps onto the design
+    /// surfaces keep their cool tint. Dark itself maps onto the design
     /// unchanged. On a light scheme the hues are deepened until they read
     /// against the window, and the diff bands become pale washes of the
     /// scheme's own green and red; dark schemes keep the owner's hues.
     pub fn for_scheme(scheme: &Palette) -> Colors {
-        let design = Colors::HARDCORE;
-        let reference = Palette::hardcore();
+        let design = Colors::DARK;
+        let reference = Palette::dark();
         let light = scheme.is_light();
         let (bg, fg) = (scheme.background, scheme.foreground);
         let from = reference.background.r() as f32;
@@ -174,7 +174,7 @@ impl Colors {
     }
 }
 
-static COLORS: RwLock<Colors> = RwLock::new(Colors::HARDCORE);
+static COLORS: RwLock<Colors> = RwLock::new(Colors::DARK);
 
 /// The colours of the current scheme. One window per process, one scheme.
 pub fn colors() -> Colors {
@@ -410,25 +410,25 @@ mod tests {
     use crate::term::style::contrast_ratio;
 
     /// The chrome follows the scheme, but the owner's dark design is the
-    /// scheme it was drawn for: Hardcore must come out exactly as designed.
+    /// scheme it was drawn for: the dark one must come out exactly as designed.
     #[test]
-    fn hardcore_keeps_the_design() {
-        assert_eq!(Colors::for_scheme(&Palette::hardcore()), Colors::HARDCORE);
+    fn dark_keeps_the_design() {
+        assert_eq!(Colors::for_scheme(&Palette::dark()), Colors::DARK);
     }
 
-    /// 3024 Day left the window black around a white terminal. A light scheme
-    /// gets a light window whose labels, accent and status colours read
-    /// against it as well as the dark design's do against black.
+    /// A light scheme used to leave the window black around a white terminal.
+    /// A light one now gets a light window whose labels, accent and status
+    /// colours read against it as well as the dark design's do against black.
     #[test]
     fn light_schemes_get_a_light_window() {
-        let scheme = Palette::day_3024();
+        let scheme = Palette::light();
         let c = Colors::for_scheme(&scheme);
         assert!(c.light);
         let surfaces = [("chrome", c.chrome_bg), ("tab", c.tab_active_bg), ("lift", c.lift), ("field", c.field)];
         for (name, surface) in surfaces {
             assert!(contrast_ratio(surface, Color32::WHITE) < 1.2, "{name} {surface:?} is not light");
         }
-        let dark = Colors::HARDCORE;
+        let dark = Colors::DARK;
         let readable = |fg: Color32, bg: Color32, design_fg: Color32, design_bg: Color32| {
             contrast_ratio(fg, bg) >= contrast_ratio(design_fg, design_bg).min(MIN_CONTRAST) - 0.05
         };

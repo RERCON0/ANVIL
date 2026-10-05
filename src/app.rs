@@ -1872,12 +1872,9 @@ fn cursor_style(cursor: &CursorConfig) -> CursorStyle {
 }
 
 pub fn scheme_palette(config: &Config) -> Palette {
-    use crate::config::{LEGACY_SCHEME_DARK, LEGACY_SCHEME_LIGHT};
     match config.color_scheme.as_str() {
-        // A config written before the rename still names the same palettes;
-        // `Config::sanitized` normally rewrites it, but never block on that.
-        strings::SCHEME_LIGHT | LEGACY_SCHEME_LIGHT => Palette::day_3024(),
-        strings::SCHEME_DARK | LEGACY_SCHEME_DARK => Palette::hardcore(),
+        strings::SCHEME_LIGHT => Palette::light(),
+        strings::SCHEME_DARK => Palette::dark(),
         name => config
             .custom_color_schemes
             .iter()
@@ -1886,7 +1883,7 @@ pub fn scheme_palette(config: &Config) -> Palette {
                 let colors: Vec<&str> = scheme.colors.iter().map(String::as_str).collect();
                 Palette::from_hex(&scheme.foreground, &scheme.background, &scheme.cursor, &colors).ok()
             })
-            .unwrap_or_else(Palette::hardcore),
+            .unwrap_or_else(Palette::dark),
     }
 }
 

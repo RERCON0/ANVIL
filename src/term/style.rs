@@ -37,7 +37,7 @@ impl Palette {
     }
 
     /// Owner's dark scheme from Helm.
-    pub fn hardcore() -> Palette {
+    pub fn dark() -> Palette {
         Palette::from_hex(
             "#a0a0a0",
             "#121212",
@@ -51,7 +51,7 @@ impl Palette {
     }
 
     /// Owner's light scheme from Helm.
-    pub fn day_3024() -> Palette {
+    pub fn light() -> Palette {
         Palette::from_hex(
             "#4a4543",
             "#f7f7f7",
@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn xterm_256_palette() {
-        let p = Palette::hardcore();
+        let p = Palette::dark();
         assert_eq!(p.indexed(1), parse_hex("#f92672").unwrap());
         assert_eq!(p.indexed(16), Color32::from_rgb(0, 0, 0));
         assert_eq!(p.indexed(21), Color32::from_rgb(0, 0, 255));
@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn named_indexed_spec_and_overrides() {
-        let p = Palette::hardcore();
+        let p = Palette::dark();
         let mut colors = Colors::default();
         assert_eq!(resolve(Color::Named(NamedColor::Red), &colors, &p, false), p.ansi[1]);
         assert_eq!(resolve(Color::Named(NamedColor::Red), &colors, &p, true), p.ansi[9]);
@@ -426,7 +426,7 @@ mod tests {
 
     #[test]
     fn inverse_hidden_dim() {
-        let p = Palette::hardcore();
+        let p = Palette::dark();
         let c = Colors::default();
         let fg = Color::Named(NamedColor::Foreground);
         let bg = Color::Named(NamedColor::Background);
@@ -440,15 +440,15 @@ mod tests {
         assert_eq!((s.underline, s.strike), (Underline::Curly, true));
     }
 
-    /// 3024 Day's yellow and light cyan vanished into its white background,
-    /// Hardcore's colour 0 into its black one. Every colour reaches 4:1
+    /// The light scheme's yellow and light cyan vanished into its white
+    /// background, the dark scheme's colour 0 into its black one. Every colour reaches 4:1
     /// against its cell and dim text 2:1; colours that already read are left
     /// exactly as they are, and box drawing keeps its colour.
     #[test]
     fn every_scheme_keeps_text_legible() {
         let c = Colors::default();
         let bg = Color::Named(NamedColor::Background);
-        let (day, dark) = (Palette::day_3024(), Palette::hardcore());
+        let (day, dark) = (Palette::light(), Palette::dark());
         assert!(day.is_light() && !dark.is_light());
         assert!(contrast_ratio(day.ansi[3], day.background) < 2.0, "the yellow this is about");
         assert!(contrast_ratio(dark.ansi[0], dark.background) < 1.2, "the black this is about");

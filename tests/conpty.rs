@@ -25,7 +25,7 @@ fn spawn(program: &str, args: &[&str]) -> Pane {
         scrollback: 1000,
         word_separators: " ".into(),
         allow_osc52: false,
-        palette: Palette::hardcore(),
+        palette: Palette::dark(),
         cursor_style: alacritty_terminal::vte::ansi::CursorStyle::default(),
     };
     Pane::spawn(opts, Arc::new(|| {})).expect("spawn")

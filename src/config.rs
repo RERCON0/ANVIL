@@ -102,21 +102,6 @@ pub enum Bell {
 /// Largest scrollback the settings page offers (lines per pane).
 pub const MAX_SCROLLBACK: usize = 1_000_000;
 
-/// What the built-in schemes were called before they were named by how the
-/// window reads. A config written back then still loads, and `sanitized`
-/// rewrites it to the current names.
-pub const LEGACY_SCHEME_DARK: &str = "Hardcore";
-pub const LEGACY_SCHEME_LIGHT: &str = "3024 Day";
-
-/// The current name of a built-in scheme, or the name itself for a custom one.
-fn scheme_name(name: &str) -> String {
-    match name {
-        LEGACY_SCHEME_DARK => crate::strings::SCHEME_DARK.to_owned(),
-        LEGACY_SCHEME_LIGHT => crate::strings::SCHEME_LIGHT.to_owned(),
-        custom => custom.to_owned(),
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct TerminalConfig {
@@ -375,9 +360,6 @@ impl Config {
             Config::default().font.size
         };
         self.terminal.scrollback = self.terminal.scrollback.min(MAX_SCROLLBACK);
-        // A scheme stored under its former name still selects the same palette,
-        // but the settings page must show a name that is in its list.
-        self.color_scheme = scheme_name(&self.color_scheme);
         self
     }
 
@@ -552,32 +534,27 @@ mod tests {
         assert_eq!(Config::load(&path).config, c);
     }
 
-    /// The built-in schemes are named by how the window reads now. A config
-    /// written under their former names must still load, must land on the same
-    /// palette, and must be rewritten to the names the list offers.
+    /// Each built-in scheme name must be in the list the settings page offers
+    /// and must select the palette it is named after.
     #[test]
-    fn legacy_scheme_names_load_as_the_current_ones() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        for (stored, current, light) in [
-            (LEGACY_SCHEME_DARK, crate::strings::SCHEME_DARK, false),
-            (LEGACY_SCHEME_LIGHT, crate::strings::SCHEME_LIGHT, true),
-            (crate::strings::SCHEME_DARK, crate::strings::SCHEME_DARK, false),
-            (crate::strings::SCHEME_LIGHT, crate::strings::SCHEME_LIGHT, true),
-        ] {
-            std::fs::write(&path, format!(r#"{{"version":1,"colorScheme":"{stored}"}}"#)).unwrap();
+    fn the_built_in_scheme_names_select_their_own_palette() {
+        for (name, light) in [(crate::strings::SCHEME_DARK, false), (crate::strings::SCHEME_LIGHT, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.json");
+            std::fs::write(&path, format!(r#"{{"version":1,"colorScheme":"{name}"}}"#)).unwrap();
             let loaded = Config::load(&path).config;
-            assert_eq!(loaded.color_scheme, current, "stored {stored}");
-            assert_eq!(crate::app::scheme_palette(&loaded).is_light(), light, "stored {stored}");
-            assert_eq!(
-                crate::app::scheme_names(&Config::default()),
-                vec![crate::strings::SCHEME_DARK.to_owned(), crate::strings::SCHEME_LIGHT.to_owned()]
-            );
+            assert_eq!(loaded.color_scheme, name);
+            assert_eq!(crate::app::scheme_palette(&loaded).is_light(), light, "{name}");
+            assert!(crate::app::scheme_names(&Config::default()).contains(&name.to_owned()), "{name} is not offered");
         }
+        assert_eq!(
+            crate::app::scheme_names(&Config::default()),
+            vec![crate::strings::SCHEME_DARK.to_owned(), crate::strings::SCHEME_LIGHT.to_owned()]
+        );
     }
 
-    /// Renaming must not make existing files grow: a config that never chose a
-    /// scheme still saves as `{"version": 1}`.
+    /// A config that never chose a scheme must stay minimal: the dark scheme is
+    /// the default, so it needs no key at all.
     #[test]
     fn the_default_scheme_stays_unwritten() {
         let dir = tempfile::tempdir().unwrap();
@@ -588,30 +565,12 @@ mod tests {
             serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap()).unwrap(),
             serde_json::json!({"version": 1})
         );
-    }
-
-    /// A config on disk named with a former scheme name still shows the current
-    /// name in the settings list, keeps its palette, and is rewritten with the
-    /// new name as soon as anything else is saved.
-    #[test]
-    fn a_file_on_disk_named_the_old_way_shows_the_new_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.json");
-        std::fs::write(&path, r#"{"version":1,"colorScheme":"3024 Day"}"#).unwrap();
-        let mut c = Config::load(&path).config;
-        assert_eq!(c.color_scheme, crate::strings::SCHEME_LIGHT);
-        assert!(crate::app::scheme_palette(&c).is_light(), "the palette did not change with the name");
-        let names = crate::app::scheme_names(&c);
-        assert!(names.contains(&c.color_scheme), "the shown scheme must be in the list: {names:?}");
-        assert!(!names.contains(&"3024 Day".to_owned()), "the old name is gone from the list");
-        c.color_scheme = crate::strings::SCHEME_DARK.to_string();
-        c.save(&path).unwrap();
-        let written: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(written, serde_json::json!({"version": 1}), "the dark scheme is the default, so it needs no key");
-        c.color_scheme = crate::strings::SCHEME_LIGHT.to_string();
-        c.save(&path).unwrap();
-        let written: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(written, serde_json::json!({"version": 1, "colorScheme": crate::strings::SCHEME_LIGHT}));
+        let light = Config { color_scheme: crate::strings::SCHEME_LIGHT.to_owned(), ..Config::default() };
+        light.save(&path).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&std::fs::read_to_string(&path).unwrap()).unwrap(),
+            serde_json::json!({"version": 1, "colorScheme": crate::strings::SCHEME_LIGHT})
+        );
     }
 
     #[test]

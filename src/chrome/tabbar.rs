@@ -322,7 +322,7 @@ fn badge_parts(record: &StatusRecord, fields: &ClaudeBadgeFields) -> Vec<(String
 }
 
 /// The Claude badge line: `Opus 5 · ▓▓▓▓░░░░░░ 37% · 5h 17 · 7d 64` with the
-/// percentage colours of the Hardcore scheme, limited to the chosen pieces.
+/// percentage colours of the dark scheme, limited to the chosen pieces.
 fn paint_claude_line(painter: &egui::Painter, row: Rect, record: &StatusRecord, fields: &ClaudeBadgeFields) {
     let mut x = row.min.x + 36.0;
     let y = row.min.y + theme::TAB_ROW_HEIGHT + theme::CLAUDE_ROW_HEIGHT / 2.0;

@@ -663,7 +663,7 @@ mod tests {
         let origin = Pos2::new(4.0, 4.0);
         let output = ctx.run_ui(Default::default(), |ui| {
             let painter = ui.ctx().layer_painter(egui::LayerId::background());
-            let palette = Palette::hardcore();
+            let palette = Palette::dark();
             let opt = PaintOptions { metrics, fonts: &fonts, palette: &palette, focused: true, cursor_on: true, highlights: &[] };
             paint(&painter, origin, &frame, &opt);
         });
@@ -743,7 +743,7 @@ mod tests {
         };
         let output = ctx.run_ui(Default::default(), |ui| {
             let painter = ui.ctx().layer_painter(egui::LayerId::background());
-            let palette = Palette::hardcore();
+            let palette = Palette::dark();
             let opt = PaintOptions { metrics, fonts: &fonts, palette: &palette, focused: true, cursor_on: true, highlights: &[] };
             paint(&painter, Pos2::new(10.3, 7.7), &frame, &opt);
         });
@@ -812,7 +812,7 @@ mod tests {
                 history_size: 0,
                 default_bg: Color32::BLACK,
             };
-            let palette = Palette::hardcore();
+            let palette = Palette::dark();
             let opt = PaintOptions { metrics: cell, fonts: &fonts, palette: &palette, focused: true, cursor_on: true, highlights: &[] };
             paint(&painter, Pos2::ZERO, &frame, &opt);
         });
@@ -895,7 +895,7 @@ mod tests {
         let frame = Frame { rows: vec![row], columns, lines: 1, cursor, selection: Vec::new(), display_offset: 0, history_size: 0, default_bg: Color32::BLACK };
         let output = ctx.run_ui(Default::default(), |ui| {
             let painter = ui.ctx().layer_painter(egui::LayerId::background());
-            let palette = Palette::hardcore();
+            let palette = Palette::dark();
             let opt = PaintOptions { metrics, fonts: &fonts, palette: &palette, focused: true, cursor_on: true, highlights: &[] };
             paint(&painter, Pos2::new(10.3, 7.7), &frame, &opt);
         });
