@@ -214,7 +214,7 @@ pub fn pieces(segment: &Segment, detail: Detail, reset_icon: bool) -> Vec<Piece>
         out.push(piece(if index == 0 { " ".to_owned() } else { " · ".to_owned() }, Style::Separator));
         out.push(piece(item.text.clone(), Style::Value { pct: item.pct, exhausted: item.exhausted }));
         if let (Detail::Full, Some(hint)) = (detail, &item.reset_hint) {
-            out.push(piece(if reset_icon { format!(" ↺{hint}") } else { format!(" {hint}") }, Style::Hint));
+            out.push(piece(if reset_icon { format!(" ↺ {hint}") } else { format!(" {hint}") }, Style::Hint));
         }
     }
     out
@@ -341,7 +341,7 @@ mod tests {
             lines,
             vec![
                 "Claude ⚠ 5ч 17%",
-                "ChatGPT 5ч 42% · 7д 75% ↺2ч5м · 120 кр.",
+                "ChatGPT 5ч 42% · 7д 75% ↺ 2ч5м · 120 кр.",
                 "Z.ai —",
                 "DeepSeek ¥0.00",
                 "OpenRouter траты $3.10/$10",

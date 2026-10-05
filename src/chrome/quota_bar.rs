@@ -208,6 +208,38 @@ mod tests {
         }
     }
 
+    /// The painted text must stop short of the refresh zone at every width: a
+    /// run that reaches it looks glued to the glyph, and the fold arithmetic in
+    /// `view::layout` budgets in separators the painter never draws.
+    #[test]
+    fn no_run_reaches_the_refresh_zone() {
+        let ctx = context();
+        let segments = segments();
+        let font = FontId::proportional(FONT_SIZE);
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(2000.0, HEIGHT));
+        let _ = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
+            let painter = ui.painter_at(rect);
+            let measure = |text: &str| painter.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE).size().x;
+            for width in 200..2000 {
+                let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(width as f32, HEIGHT));
+                let budget = rect.width() - REFRESH_WIDTH - 2.0 * PAD;
+                let layout = view::layout(&segments, budget, GAP, true, measure);
+                // Walk the paint loop of `show`: every shown segment plus its
+                // trailing gap, then the fold when there is one.
+                let mut x = PAD;
+                for segment in segments.iter().take(layout.shown) {
+                    x += view::pieces(segment, layout.detail, true).iter().map(|p| measure(&p.text)).sum::<f32>() + GAP;
+                }
+                let drawn = match layout.hidden {
+                    0 => x - GAP, // the gap after the last segment is not painted
+                    hidden => x + measure(&view::more_text(hidden)),
+                };
+                let limit = rect.width() - REFRESH_WIDTH - PAD;
+                assert!(drawn <= limit, "width {width}: text ends at {drawn:.1}, limit {limit:.1}");
+            }
+        });
+    }
+
     /// Review Focus 4: an empty prepaid balance stays red even in a dimmed segment.
     #[test]
     fn exhausted_balances_stay_red() {

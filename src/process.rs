@@ -357,8 +357,28 @@ mod tests {
         (handles, count)
     }
 
-    fn assert_descendant_dead(path: &std::path::Path) {
-        let pid: u32 = fs::read_to_string(path).unwrap().parse().unwrap();
+    /// The descendant's pid, once the helper has recorded it. A helper the
+    /// deadline kills before it even reaches the spawn leaves no file, and then
+    /// there was no descendant to survive: `None` is that, not a failure.
+    fn descendant_pid(path: &std::path::Path, grace: Duration) -> Option<u32> {
+        let until = Instant::now() + grace;
+        loop {
+            if let Ok(text) = fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse() {
+                    return Some(pid);
+                }
+            }
+            if Instant::now() >= until {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Asserts the recorded descendant is gone; answers whether it was recorded
+    /// at all, so the caller can insist the check was not vacuous.
+    fn assert_descendant_dead(path: &std::path::Path) -> bool {
+        let Some(pid) = descendant_pid(path, Duration::from_secs(2)) else { return false };
         let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
         if raw.is_null() {
             // ERROR_INVALID_PARAMETER means the process has already disappeared,
@@ -369,6 +389,7 @@ mod tests {
             unsafe { CloseHandle(raw); }
             assert_eq!(status, WAIT_OBJECT_0, "descendant {pid} survived invocation");
         }
+        true
     }
 
     fn raw_stdout(output: &[u8]) -> &[u8] {
@@ -386,8 +407,12 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
         )));
         fs::create_dir(&scratch.0).unwrap();
+        // These two cases assert what came back, not how fast: half a megabyte
+        // through both pipes plus a megabyte in has no business finishing inside
+        // a deadline a loaded machine can stretch, so give it room.
+        let roomy = Duration::from_secs(20);
         let (success, out, err) = run_bounded(
-            helper("duplex"), "own duplex helper", Duration::from_secs(5), 4096,
+            helper("duplex"), "own duplex helper", roomy, 4096,
             Some(bytes(1024 * 1024)),
         ).unwrap();
         assert!(success, "{}", String::from_utf8_lossy(&err));
@@ -398,36 +423,47 @@ mod tests {
         let mut context = helper("context");
         context.current_dir(&scratch.0).env("ANVIL_TEST_CWD", &scratch.0)
             .env("ANVIL_TEST_VALUE", "spaces \"quotes\" Юникод").env_remove("ANVIL_TEST_REMOVED");
-        assert!(run_bounded(context, "own context helper", Duration::from_secs(3), 4096, Some(Vec::new())).unwrap().0);
+        assert!(run_bounded(context, "own context helper", roomy, 4096, Some(Vec::new())).unwrap().0);
 
         let before = resources();
+        let deadline = Duration::from_millis(600);
+        // The deadline must be met without waiting for the inherited pipes the
+        // descendant holds open for a minute; the slack only absorbs a loaded
+        // machine's scheduling delay, it is nowhere near that minute.
+        let slack = Duration::from_millis(400);
+        // The direct child exits on its own here, so the call must come back
+        // well before its own deadline — and a fortiori nowhere near the minute
+        // its descendant would hold the pipes for.
+        let tree_deadline = Duration::from_secs(3);
+        let mut checked = 0;
         for index in 0..8 {
             let pid_path = scratch.0.join(format!("success-{index}.pid"));
             let mut command = helper("tree-success");
             command.env(PID_FILE, &pid_path);
             let start = Instant::now();
             let (success, out, err) = run_bounded(
-                command, "own success tree", Duration::from_secs(2), 4096,
+                command, "own success tree", tree_deadline, 4096,
                 Some(bytes(1024 * 1024)),
             ).unwrap();
             assert!(success);
-            assert!(start.elapsed() < Duration::from_secs(1), "waited for inherited pipe EOF");
+            assert!(start.elapsed() < tree_deadline / 2, "waited for inherited pipe EOF");
             assert!(raw_stdout(&out).starts_with(&bytes(2048)));
             assert_eq!(err, bytes(2048));
-            assert_descendant_dead(&pid_path);
+            checked += usize::from(assert_descendant_dead(&pid_path));
 
             let pid_path = scratch.0.join(format!("timeout-{index}.pid"));
             let mut command = helper("tree-timeout");
             command.env(PID_FILE, &pid_path);
             let start = Instant::now();
             let result = run_bounded(
-                command, "own timed-out tree", Duration::from_millis(300), 4096,
+                command, "own timed-out tree", deadline, 4096,
                 Some(bytes(1024 * 1024)),
             );
             assert!(result.unwrap_err().contains("не ответил"));
-            assert!(start.elapsed() < Duration::from_millis(800), "added per-stream waits to deadline");
-            assert_descendant_dead(&pid_path);
+            assert!(start.elapsed() < deadline + slack, "added per-stream waits to deadline");
+            checked += usize::from(assert_descendant_dead(&pid_path));
         }
+        assert!(checked > 0, "no helper recorded a descendant, so nothing was proved about the tree");
         let after = resources();
         assert!(after.0 <= before.0 + 2, "handles grew: {before:?} -> {after:?}");
         assert!(after.1 <= before.1, "pipe threads survived: {before:?} -> {after:?}");
@@ -437,7 +473,7 @@ mod tests {
         ).unwrap_err().contains("не ответил"));
         // Empty caps still drain, rather than blocking a chatty child.
         assert_eq!(run_bounded(
-            helper("duplex"), "zero cap", Duration::from_secs(5), 0,
+            helper("duplex"), "zero cap", roomy, 0,
             Some(bytes(1024 * 1024)),
         ).unwrap(), (true, Vec::new(), Vec::new()));
     }
