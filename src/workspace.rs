@@ -42,6 +42,7 @@ pub enum Request {
     /// `side`: Some(true) the index, Some(false) the worktree, None the
     /// index when it has changes for the file, else the worktree.
     Diff { path: String, side: Option<bool> },
+    CheckDiff { stamp: DiffStamp },
     Stage { paths: Vec<String>, staged: bool },
     Commit { message: String },
     AiMessage { command: Option<String> },
@@ -77,6 +78,7 @@ pub enum Response {
     TrustRequired { identity: Option<git::RepositoryIdentity>, error: Option<String> },
     Trusted(git::RepositoryIdentity),
     Diff { path: String, files: Vec<FileDiff>, text: String, staged: bool, side: Option<bool> },
+    DiffChecked(DiffStamp),
     Refreshed,
     Committed(String),
     AiMessage(Result<String, String>),
@@ -439,7 +441,8 @@ impl Workspace {
                     self.pending_identity = None;
                     self.changes_dirty |= self.status.changes != status.changes;
                     self.status = status;
-                    self.selected.retain(|path| self.status.changes.iter().any(|change| &change.path == path));
+                    let paths: HashSet<_> = self.status.changes.iter().map(|change| &change.path).collect();
+                    self.selected.retain(|path| paths.contains(path));
                     if let Some(path) = self.diff_path.clone() {
                         if !self.status.changes.iter().any(|change| change.path == path) {
                             self.diff_path = None;
@@ -449,11 +452,8 @@ impl Workspace {
                             self.diff_wrapped = WrappedRows::default();
                             self.diff_stamp = None;
                         } else {
-                            let stamp = DiffStamp::read(self.root.as_deref(), &path, self.diff_side, &self.status);
-                            if self.diff_stamp.as_ref() != Some(&stamp) {
-                                self.diff_stamp = Some(stamp);
-                                self.send(Request::Diff { path, side: self.diff_side });
-                            }
+                            let stamp = DiffStamp::for_view(self.root.as_deref(), &path, self.diff_side, &self.status);
+                            self.send(Request::CheckDiff { stamp });
                         }
                     }
                     if commit_state_changed && self.root.is_some() {
@@ -461,6 +461,17 @@ impl Workspace {
                     }
                     if inventory_changed || (self.tab == PanelTab::Files && !self.files_loaded) {
                         self.send(Request::Files);
+                    }
+                }
+                Response::DiffChecked(stamp) => {
+                    let current = stamp.root == self.root
+                        && self.diff_path.as_deref() == Some(&stamp.path)
+                        && stamp.side == self.diff_side
+                        && stamp.head == self.status.head_oid
+                        && stamp.change.as_ref() == self.status.changes.iter().find(|c| c.path == stamp.path);
+                    if current && self.diff_stamp.as_ref() != Some(&stamp) {
+                        self.send(Request::Diff { path: stamp.path.clone(), side: stamp.side });
+                        self.diff_stamp = Some(stamp);
                     }
                 }
                 Response::Diff { path, files, text, staged, side } => {
@@ -565,7 +576,9 @@ impl Workspace {
 
     /// Draws the panel; returns actions the app must handle.
     pub fn show(&mut self, ui: &mut egui::Ui, rect: Rect, pane: crate::layout::split_tree::PaneId, ai_command: Option<&str>) -> Vec<WorkspaceAction> {
-        self.ai_command = ai_command.map(str::to_owned);
+        if self.ai_command.as_deref() != ai_command {
+            self.ai_command = ai_command.map(str::to_owned);
+        }
         let mut actions = Vec::new();
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, theme::colors().lift);
@@ -578,8 +591,7 @@ impl Workspace {
             // Reserve the scroll-bar strip instead of letting it float over the
             // rows: file names and hashes were running underneath it.
             ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
-            // Two modes only: the changes view keeps commits in the same
-            // column (one scroll), the file browser is separate.
+            // Two modes only: changes with a separate history viewport, or files.
             ui.horizontal(|ui| {
                 for (tab, label) in [
                     (PanelTab::Files, strings::WORKSPACE_TAB_FILES.to_owned()),
@@ -772,10 +784,7 @@ impl Workspace {
             ui.label(RichText::new(strings::WORKSPACE_NO_COMMITS).color(theme::colors().faint).font(theme::font(11.5)));
             return;
         }
-        ScrollArea::vertical()
-            .id_salt("workspace-commits")
-            .auto_shrink([false, false])
-            .show(ui, |ui| self.commit_rows(ui));
+        self.commit_rows(ui);
     }
 
     /// The commit list as fixed-height rows, so it can be virtualized: the
@@ -786,11 +795,18 @@ impl Workspace {
         let rows = commit_rows_of(&self.log);
         let width = ui.available_width();
         let mut opened: Option<String> = None;
-        let scroll = ScrollArea::vertical().id_salt("workspace-commits-rows").auto_shrink([false, false]);
+        // A single viewport fills the remaining column. Nesting two default
+        // ScrollAreas imposed a 400pt ceiling and left tall windows unused.
+        let scroll = ScrollArea::vertical()
+            .id_salt("workspace-commits-rows")
+            .max_height(ui.available_height().max(0.0))
+            .auto_shrink([false, false]);
+        // show_rows computes its virtual row stride before calling the closure.
+        // Set spacing here so off-screen offsets match the actual graph rows.
+        ui.spacing_mut().item_spacing.y = 0.0;
         scroll.show_rows(ui, ROW_HEIGHT, rows.len(), |ui, visible| {
             // Rows sit edge to edge: each draws its lane segments only inside
             // its own rect, so any item spacing is a gap in every lane.
-            ui.spacing_mut().item_spacing.y = 0.0;
             for row in rows[visible].iter() {
                 match row {
                     // A header occupies a normal row: virtualization needs one
@@ -1140,7 +1156,7 @@ impl Workspace {
                                     self.diff_wrapped = WrappedRows::default();
                                     self.diff_side = None;
                                     self.busy = true;
-                                    self.diff_stamp = Some(DiffStamp::read(self.root.as_deref(), &path, None, &self.status));
+                                    self.diff_stamp = None;
                                     self.send(Request::Diff { path, side: None });
                                 }
                             }
@@ -1171,7 +1187,6 @@ impl Workspace {
                     self.diff_wrapped = WrappedRows::default();
                     self.diff_stamp = None;
                     self.diff_side = Some(!self.diff_from_index);
-                    self.diff_stamp = Some(DiffStamp::read(self.root.as_deref(), &path, self.diff_side, &self.status));
                     self.busy = true;
                     self.send(Request::Diff { path: path.clone(), side: self.diff_side });
                 }
@@ -1718,21 +1733,47 @@ fn text_rows(text: &str, patch: bool) -> Vec<TextRow> {
     }).collect()
 }
 
-fn count_text_lines(bytes: &[u8]) -> u64 {
-    bytes.iter().filter(|byte| **byte == b'\n').count() as u64
-        + u64::from(bytes.last().is_some_and(|last| *last != b'\n'))
+fn count_text_lines(reader: impl std::io::Read, cap: u64) -> std::io::Result<Option<u64>> {
+    use std::io::Read;
+    let mut reader = reader.take(cap.saturating_add(1));
+    let mut buffer = [0_u8; 8192];
+    let mut bytes = 0_u64;
+    let mut lines = 0_u64;
+    let mut last = None;
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(Some(lines + u64::from(last.is_some_and(|byte| byte != b'\n'))));
+        }
+        bytes += count as u64;
+        if bytes > cap || buffer[..count].contains(&0) {
+            return Ok(None);
+        }
+        lines += buffer[..count].iter().filter(|byte| **byte == b'\n').count() as u64;
+        last = Some(buffer[count - 1]);
+    }
 }
 
 #[cfg(test)]
 #[test]
 fn text_line_counts_include_an_unterminated_final_line() {
     for (text, expected) in [("", 0), ("one", 1), ("one\n", 1), ("one\nlast", 2), ("\n\n", 2)] {
-        assert_eq!(count_text_lines(text.as_bytes()), expected);
+        assert_eq!(count_text_lines(text.as_bytes(), MAX_COUNTED_FILE).unwrap(), Some(expected));
     }
 }
 
+#[cfg(test)]
+#[test]
+fn streaming_line_count_rejects_late_nul_and_files_that_grow_past_the_cap() {
+    let mut binary = vec![b'x'; 9000];
+    binary.push(0);
+    assert_eq!(count_text_lines(binary.as_slice(), MAX_COUNTED_FILE).unwrap(), None);
+    assert_eq!(count_text_lines(&b"one\nlast"[..], 8).unwrap(), Some(2));
+    assert_eq!(count_text_lines(&b"one\nlast!"[..], 8).unwrap(), None);
+}
+
 #[derive(Debug, PartialEq, Eq)]
-struct DiffStamp {
+pub struct DiffStamp {
     root: Option<PathBuf>,
     path: String,
     side: Option<bool>,
@@ -1743,17 +1784,28 @@ struct DiffStamp {
 }
 
 impl DiffStamp {
-    fn read(root: Option<&Path>, path: &str, side: Option<bool>, status: &Status) -> Self {
-        let stat = |full: Result<PathBuf, String>| {
-            full.ok().and_then(|full| std::fs::metadata(full).ok()).map(|meta| (meta.len(), meta.modified().ok()))
-        };
+    fn for_view(root: Option<&Path>, path: &str, side: Option<bool>, status: &Status) -> Self {
         Self {
             root: root.map(Path::to_owned), path: path.to_owned(), side,
             head: status.head_oid.clone(),
             change: status.changes.iter().find(|change| change.path == path).cloned(),
-            index: root.and_then(|root| stat(git::metadata_path(root, "index"))),
-            file: root.and_then(|root| stat(git::resolve_path(root, path))),
+            index: None,
+            file: None,
         }
+    }
+
+    #[cfg(test)]
+    fn read(root: Option<&Path>, path: &str, side: Option<bool>, status: &Status) -> Self {
+        Self::for_view(root, path, side, status).with_metadata()
+    }
+
+    fn with_metadata(mut self) -> Self {
+        let stat = |full: Result<PathBuf, String>| {
+            full.ok().and_then(|full| std::fs::metadata(full).ok()).map(|meta| (meta.len(), meta.modified().ok()))
+        };
+        self.index = self.root.as_deref().and_then(|root| stat(git::metadata_path(root, "index")));
+        self.file = self.root.as_deref().and_then(|root| stat(git::resolve_path(root, &self.path)));
+        self
     }
 }
 
@@ -2366,6 +2418,13 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                     }
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
                 },
+                Request::CheckDiff { stamp } => {
+                    if stamp.root != root {
+                        send(Response::Error(strings::WORKSPACE_REPO_CHANGED.to_owned()));
+                    } else {
+                        send(Response::DiffChecked(stamp.with_metadata()));
+                    }
+                }
                 Request::Stage { paths, staged } => match &root {
                     Some(root) => match git::stage(root, &paths, staged) {
                         Ok(()) => send(Response::Refreshed),
@@ -2440,21 +2499,20 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                         Ok(files) => {
                             let mut lines = 0u64;
                             let mut counted = 0usize;
+                            let resolver = git::PathResolver::new(root);
                             for path in &files {
-                                let Ok(full) = git::resolve_path(root, path) else { continue };
+                                let Ok(resolver) = &resolver else { break };
+                                let Ok(full) = resolver.resolve(path) else { continue };
                                 let Ok(meta) = std::fs::metadata(&full) else { continue };
                                 // Huge and binary files would only slow the walk down.
                                 if !meta.is_file() || meta.len() > MAX_COUNTED_FILE {
                                     continue;
                                 }
-                                let Ok(bytes) = crate::fsutil::read_limited(&full, MAX_COUNTED_FILE as usize) else {
-                                    continue;
-                                };
-                                if bytes.iter().take(8192).any(|byte| *byte == 0) {
-                                    continue;
+                                let Ok(file) = std::fs::File::open(full) else { continue };
+                                if let Ok(Some(count)) = count_text_lines(file, MAX_COUNTED_FILE) {
+                                    lines += count;
+                                    counted += 1;
                                 }
-                                lines += count_text_lines(&bytes);
-                                counted += 1;
                             }
                             send(Response::LineCount { files: counted, lines });
                         }
@@ -2547,6 +2605,10 @@ fn write_path(root: &Path, path: &str, folder: bool) -> Result<(), String> {
 }
 
 fn rename_path(root: &Path, from: &str, to: &str) -> Result<(), String> {
+    rename_path_checked(root, from, to, || {})
+}
+
+fn rename_path_checked(root: &Path, from: &str, to: &str, before_move: impl FnOnce()) -> Result<(), String> {
     let from = git::resolve_path(root, from)?;
     let to = git::resolve_path(root, to)?;
     if !from.exists() {
@@ -2560,6 +2622,21 @@ fn rename_path(root: &Path, from: &str, to: &str) -> Result<(), String> {
             return Err(strings::WORKSPACE_FILE_EXISTS.to_owned());
         }
     }
+    before_move();
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+        let source: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+        let target: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+        // No REPLACE_EXISTING: a target created after the check wins atomically.
+        // SAFETY: both buffers contain complete NUL-terminated local paths.
+        if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), 0) } == 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
     std::fs::rename(&from, &to).map_err(|e| e.to_string())
 }
 
@@ -2678,9 +2755,15 @@ mod tests {
         };
         response_tx.send(Response::Status(status.clone(), workspace.root.clone())).unwrap();
         workspace.absorb();
+        let stamp = DiffStamp::read(workspace.root.as_deref(), "f.txt", None, &status);
+        response_tx.send(Response::DiffChecked(stamp)).unwrap();
+        workspace.absorb();
         assert!(!request_rx.try_iter().any(|(_, request)| matches!(request, Request::Diff { .. })));
         std::fs::write(dir.path().join("f.txt"), "new content, same status letters\n").unwrap();
         response_tx.send(Response::Status(status.clone(), workspace.root.clone())).unwrap();
+        workspace.absorb();
+        let stamp = DiffStamp::read(workspace.root.as_deref(), "f.txt", None, &status);
+        response_tx.send(Response::DiffChecked(stamp)).unwrap();
         workspace.absorb();
         assert!(request_rx.try_iter().any(|(_, request)| matches!(request, Request::Diff { .. })));
         response_tx.send(Response::Diff { path: "f.txt".to_owned(), files: Vec::new(), text: "@@ -1 +1 @@\n-old\n+new".to_owned(), staged: false, side: None }).unwrap();
@@ -2689,9 +2772,15 @@ mod tests {
         assert!(git(dir.path(), &["add", "--", "f.txt"]));
         response_tx.send(Response::Status(status.clone(), workspace.root.clone())).unwrap();
         workspace.absorb();
+        let stamp = DiffStamp::read(workspace.root.as_deref(), "f.txt", None, &status);
+        response_tx.send(Response::DiffChecked(stamp)).unwrap();
+        workspace.absorb();
         assert!(request_rx.try_iter().any(|(_, request)| matches!(request, Request::Diff { .. })), "an externally changed index invalidates the open diff");
         response_tx.send(Response::Applied).unwrap();
-        response_tx.send(Response::Status(status, workspace.root.clone())).unwrap();
+        response_tx.send(Response::Status(status.clone(), workspace.root.clone())).unwrap();
+        workspace.absorb();
+        let stamp = DiffStamp::read(workspace.root.as_deref(), "f.txt", None, &status);
+        response_tx.send(Response::DiffChecked(stamp)).unwrap();
         workspace.absorb();
         assert!(request_rx.try_iter().any(|(_, request)| matches!(request, Request::Diff { .. })), "explicit staging invalidates even unchanged metadata");
         workspace.diff_side = Some(true);
@@ -3046,6 +3135,74 @@ mod tests {
     /// `[ КОММИТЫ ]` header, so the repo row and the commit box never scroll
     /// away with it.
     #[test]
+    fn history_fills_tall_panels_and_virtual_rows_stay_aligned_after_scrolling() {
+        let commits: Vec<_> = (0..300).map(|i| commit(&format!("{i:010}"), git::Section::History)).collect();
+        let mut workspace = Workspace {
+            status: Status { branch: "main".into(), ..Default::default() },
+            graph: graph::compute(&commits),
+            log: CommitLog { commits, ..Default::default() },
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Test", &[], false);
+        for height in [900.0, 1400.0] {
+            let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, height));
+            for step in 0..20 {
+                let pointer = Pos2::new(300.0, height - 100.0);
+                let events = if step == 2 {
+                    vec![
+                        egui::Event::PointerMoved(pointer),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: Vec2::new(0.0, -440.0),
+                            phase: egui::TouchPhase::Move,
+                            modifiers: Default::default(),
+                        },
+                    ]
+                } else {
+                    Vec::new()
+                };
+                let input = egui::RawInput {
+                    screen_rect: Some(rect),
+                    time: Some(height as f64 + step as f64 * 0.1),
+                    events,
+                    ..Default::default()
+                };
+                let output = ctx.run_ui(input, |ui| {
+                    egui::CentralPanel::default().show_inside(ui, |ui| {
+                        workspace.show(ui, rect, 1, None);
+                    });
+                });
+                if step < 3 {
+                    continue;
+                }
+                let rows: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text)
+                            if text.galley.text().starts_with("commit ")
+                                && shape.clip_rect.min.x >= 10.0
+                                && shape.clip_rect.max.x <= rect.max.x - 10.0 =>
+                        {
+                            Some((text.visual_bounding_rect(), shape.clip_rect))
+                        }
+                        _ => None,
+                    })
+                    .filter(|(text, clip)| text.intersects(*clip))
+                    .collect();
+                assert!(!rows.is_empty());
+                let bottom = rows.last().unwrap();
+                assert!(bottom.1.max.y > height - 30.0, "history clipped early: {bottom:?}");
+                assert!(bottom.0.max.y > height - 40.0, "unused bottom of {height}pt panel: {bottom:?}");
+                for pair in rows.windows(2) {
+                    assert!((pair[1].0.min.y - pair[0].0.min.y - 22.0).abs() < 0.1);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn scrolling_the_history_keeps_the_header_in_place() {
         let commits: Vec<git::Commit> = (0..200).map(|i| commit(&format!("{i:010}"), git::Section::History)).collect();
         let mut workspace = Workspace {
@@ -3154,6 +3311,19 @@ mod tests {
 
     /// std::fs::rename replaces an existing target on Windows: renaming onto
     /// another file used to destroy it. A case-only rename is still allowed.
+    #[test]
+    #[cfg(windows)]
+    fn renaming_does_not_replace_a_target_created_after_the_last_check() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("source.txt"), "source").unwrap();
+        let result = rename_path_checked(dir.path(), "source.txt", "target.txt", || {
+            std::fs::write(dir.path().join("target.txt"), "concurrent target").unwrap();
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(dir.path().join("source.txt")).unwrap(), "source");
+        assert_eq!(std::fs::read_to_string(dir.path().join("target.txt")).unwrap(), "concurrent target");
+    }
+
     #[test]
     fn renaming_never_overwrites_another_file() {
         let dir = tempfile::tempdir().unwrap();

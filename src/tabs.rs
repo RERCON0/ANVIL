@@ -151,7 +151,7 @@ impl Tab {
         if self.panes.len() <= 1 {
             return true;
         }
-        if self.tree.panes() == [id] && !self.collapsed.is_empty() {
+        if self.tree.pane_count() == 1 && self.tree.contains(id) && !self.collapsed.is_empty() {
             let (restored, anchor) = self.collapsed.remove(0);
             self.tree.restore(restored, anchor, id);
         }
@@ -177,11 +177,11 @@ impl Tab {
     }
 
     /// The title shown in the tab list: custom, else the focused pane's.
-    pub fn title(&self) -> String {
+    pub fn title(&self) -> &str {
         if let Some(title) = &self.custom_title {
-            return title.clone();
+            return title;
         }
-        self.panes.get(&self.focused).map(|p| p.title_text().to_owned()).unwrap_or_default()
+        self.panes.get(&self.focused).map(|p| p.title_text()).unwrap_or_default()
     }
 
     pub fn pane(&self, id: PaneId) -> Option<&PaneEntry> {
@@ -297,11 +297,6 @@ impl Tab {
                     };
                     self.terminal_rects.push((*id, terminal_rect));
                     let output = entry.view.show(ui, terminal_rect, pane, &input);
-                    // The pane that is not focused is dimmed so the eye lands on
-                    // the one being typed into.
-                    if focused != *id {
-                        ui.painter().rect_filled(terminal_rect, 0.0, theme::colors().pane_dim);
-                    }
                     if focused == *id {
                         self.ime_area = output.cursor_rect;
                     }
@@ -385,6 +380,11 @@ impl Tab {
                         actions.push(TabAction::ClosePane(*id));
                     }
                 }
+            }
+            // Terminal and its Git panel are one focus surface. Paint once,
+            // after both, so neither project looks active in an unfocused pane.
+            if focused != *id {
+                ui.painter().rect_filled(*pane_rect, 0.0, theme::colors().pane_dim);
             }
         }
 
@@ -478,6 +478,45 @@ mod tests {
         let mut tree = SplitTree::new(1);
         assert!(tree.insert(1, 2, Dir::Row, true));
         Tab::new(tree, HashMap::from([(1, entry()), (2, entry())]), 1)
+    }
+
+    #[test]
+    fn changing_focus_dims_the_whole_other_pane_including_its_workspace_area() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Test", &[], false);
+        let mut tab = two_panes();
+        let palette = Palette::dark();
+        let env = FrameEnv {
+            palette: &palette,
+            active: true,
+            cursor_blink: false,
+            right_click: RightClick::Menu,
+            paste_on_middle: false,
+            copy_on_select: false,
+            min_pane_width: 80.0,
+            min_pane_height: 60.0,
+            fallbacks_loaded: true,
+            ai_command: None,
+            window_edge: false,
+        };
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 600.0));
+        let panes = tab.tree.layout(tree_rect(rect), theme::DIVIDER_WIDTH);
+        for focus in [1, 2, 1] {
+            tab.set_focus(focus);
+            let output = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
+                tab.show(ui, rect, &env);
+            });
+            let dimmed: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(shape) if shape.fill == theme::colors().pane_dim => Some(shape.rect),
+                    _ => None,
+                })
+                .collect();
+            let expected = egui_rect(panes.iter().find(|(id, _)| *id != focus).unwrap().1);
+            assert_eq!(dimmed, [expected], "the terminal and right-hand workspace share one overlay");
+        }
     }
 
     #[test]

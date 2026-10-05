@@ -190,6 +190,15 @@ pub fn uninstall(settings: &str, ours: &str, previous: Option<&Value>) -> Result
 /// Windows does not offer a filesystem compare-and-swap, so another program's
 /// atomic rename after that check remains an unavoidable race.
 pub fn write_confirmed(path: &Path, expected: Option<&str>, replacement: &str) -> std::io::Result<()> {
+    write_confirmed_checked(path, expected, replacement, || {})
+}
+
+fn write_confirmed_checked(
+    path: &Path,
+    expected: Option<&str>,
+    replacement: &str,
+    before_recheck: impl FnOnce(),
+) -> std::io::Result<()> {
     use std::io::{Read, Write};
     let Some(expected) = expected else {
         return create_confirmed(path, replacement.as_bytes());
@@ -214,19 +223,32 @@ pub fn write_confirmed(path: &Path, expected: Option<&str>, replacement: &str) -
     let mut backup = path.as_os_str().to_os_string();
     backup.push(".anvil-backup");
     let owned = previous_status_line(&current);
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(PathBuf::from(backup)) {
-        Ok(mut backup) => {
+    let backup_path = PathBuf::from(backup);
+    let mut backup = match std::fs::OpenOptions::new().write(true).create_new(true).open(&backup_path) {
+        Ok(backup) => Some(backup),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+        Err(e) => return Err(e),
+    };
+    let result = (|| {
+        if let Some(backup) = &mut backup {
             backup.write_all(owned.as_bytes())?;
             backup.sync_all()?;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e),
+        before_recheck();
+        // Detect an editor replacing the pathname while we held the old snapshot.
+        if std::fs::read_to_string(path)? != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "Claude settings changed after confirmation",
+            ));
+        }
+        crate::fsutil::atomic_write(path, replacement.as_bytes())
+    })();
+    if result.is_err() && backup.is_some() {
+        drop(backup);
+        let _ = std::fs::remove_file(backup_path);
     }
-    // Detect an editor replacing the pathname while we held the old snapshot.
-    if std::fs::read_to_string(path)? != expected {
-        return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "Claude settings changed after confirmation"));
-    }
-    crate::fsutil::atomic_write(path, replacement.as_bytes())
+    result
 }
 
 /// Missing-file consent publishes a complete synced file without overwriting
@@ -278,6 +300,28 @@ mod tests {
   "statusLine": {"type": "command", "command": "node \"C:/Tools/cc/statusline.mjs\""},
   "model": "opus"
 }"#;
+
+    #[test]
+    fn failed_second_check_cleans_only_the_backup_this_attempt_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let backup = dir.path().join("settings.json.anvil-backup");
+        for existing in [false, true] {
+            std::fs::write(&path, OWNER).unwrap();
+            if existing {
+                std::fs::write(&backup, "previous backup").unwrap();
+            }
+            let result = write_confirmed_checked(&path, Some(OWNER), "{}", || {
+                crate::fsutil::atomic_write(&path, b"{\"changed\":true}").unwrap();
+            });
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            assert_eq!(backup.exists(), existing);
+            if existing {
+                assert_eq!(std::fs::read_to_string(&backup).unwrap(), "previous backup");
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"changed\":true}");
+        }
+    }
 
     #[test]
     fn command_and_paths() {

@@ -19,7 +19,9 @@ use crate::strings;
 use crate::term::links;
 use crate::term::mouse::{self, ClickCounter, MouseAction, MouseButton, MouseModes};
 use crate::term::pane::Pane;
-use crate::term::render::{cell_metrics, paint, snapshot, CellMetrics, GlyphCache, Highlight, PaintOptions};
+use crate::term::render::{
+    cell_metrics, paint, snapshot_reusing, CellMetrics, Frame, GlyphCache, Highlight, PaintOptions,
+};
 use crate::term::search::{search_pattern, RegexCache};
 use crate::term::style::Palette;
 use crate::theme;
@@ -90,6 +92,7 @@ pub struct TerminalView {
     /// Where inside the scrollbar thumb the drag was grabbed: dragging keeps
     /// the grab point under the pointer instead of jumping to it.
     scroll_grab: Option<f32>,
+    frame: Option<Frame>,
 }
 
 pub struct ViewInput<'a> {
@@ -133,6 +136,7 @@ impl TerminalView {
             last_rows: Vec::new(),
             ctrl_tail: false,
             scroll_grab: None,
+            frame: None,
             last_reported_cell: None,
             last_motion_cell: None,
             hover_cell: None,
@@ -204,8 +208,11 @@ impl TerminalView {
             }
         };
 
-        // Links: Ctrl+hover underlines and Ctrl+click opens (previous frame's text).
-        let hovered_link = if ctrl && hovered {
+        let modes = mouse_modes(pane.term.lock().mode());
+        let app_mouse = modes.any() && !shift;
+        // Mouse-tracking applications own Ctrl+click too. Shift overrides
+        // tracking, so Ctrl+Shift+click remains available to open a link.
+        let hovered_link = if ctrl && hovered && !app_mouse {
             pointer.and_then(|pos| {
                 let (col, row) = clamp_cell(pos);
                 self.link_at(row, col)
@@ -220,8 +227,6 @@ impl TerminalView {
             let _ = response.clone().on_hover_text_at_pointer(url.as_str());
         }
 
-        let modes = mouse_modes(pane.term.lock().mode());
-        let app_mouse = modes.any() && !shift;
         let primary_pressed = hovered && !input.window_edge && ui.input(|i| i.pointer.primary_pressed());
         let primary_released = ui.input(|i| i.pointer.primary_released());
         let dragging = response.dragged();
@@ -411,8 +416,15 @@ impl TerminalView {
             }
 
             let primary = fonts.primary.clone();
-            let frame =
-                ctx.fonts_mut(|f| snapshot(&term, input.palette, &mut self.glyphs, &mut |c| f.has_glyph(&primary, c)));
+            let frame = ctx.fonts_mut(|f| {
+                snapshot_reusing(
+                    &term,
+                    input.palette,
+                    &mut self.glyphs,
+                    &mut |c| f.has_glyph(&primary, c),
+                    self.frame.take(),
+                )
+            });
             (highlights, frame)
         };
         let painter = ui.painter_at(rect);
@@ -592,6 +604,7 @@ impl TerminalView {
                 .rows
                 .iter()
                 .any(|row| row.iter().any(|cell| !cell.in_primary_font && !cell.spacer && cell.ch != ' '));
+        self.frame = Some(frame);
         ViewOutput { pressed: response.is_pointer_button_down_on(), cursor_rect, commands, needs_fallbacks }
     }
 

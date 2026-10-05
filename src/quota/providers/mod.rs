@@ -193,12 +193,15 @@ fn clean(text: &str, max: usize) -> String {
 /// Percent-encodes everything but the unreserved characters, so a value a
 /// provider returned can only ever become one query parameter.
 fn encode_query_value(value: &str) -> String {
-    let mut out = String::new();
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
             out.push(byte as char);
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            out.push('%');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 15) as usize] as char);
         }
     }
     out

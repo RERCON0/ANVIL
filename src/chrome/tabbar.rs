@@ -1,7 +1,7 @@
 //! Vertical tab list on the left: numbers, titles, the Claude badge, activity
 //! dots, drag & drop, rename in place and the buttons under the list.
 
-use egui::{Align2, Color32, FontId, Pos2, Rect, ScrollArea, Sense, Vec2};
+use egui::{Align2, Color32, FontId, Pos2, Rect, ScrollArea, Sense, Stroke, Vec2};
 
 use crate::claude_status::{clamp_pct, js_round, StatusRecord};
 use crate::strings;
@@ -74,11 +74,11 @@ pub struct RenameEdit {
     pub focus: bool,
 }
 
-pub struct TabInfo {
-    pub title: String,
+pub struct TabInfo<'a> {
+    pub title: std::borrow::Cow<'a, str>,
     pub active: bool,
     pub activity: bool,
-    pub claude: Option<StatusRecord>,
+    pub claude: Option<&'a StatusRecord>,
     /// The tab's colour mark, painted as a bar on the row's leading edge.
     pub color: Option<theme::TabColor>,
 }
@@ -112,8 +112,11 @@ pub fn show(
 
     // More tabs than fit must stay reachable: the list scrolls, so a tab past
     // the fold can be clicked, renamed, dragged and closed like any other.
-    let list = Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.max.y - 30.0));
     let content_height: f32 = tabs.iter().map(row_height).sum();
+    // Reserve separate rows for the action buttons and bottom settings link.
+    // A short list ends at its last tab, not at the bottom of the sidebar.
+    let list_height = content_height.min((rect.height() - 70.0).max(0.0));
+    let list = Rect::from_min_size(rect.min, Vec2::new(rect.width(), list_height));
     let mut target = None;
     // The title bar only paints; it does not advance the parent's cursor.
     ui.scope_builder(egui::UiBuilder::new().max_rect(list), |ui| {
@@ -121,7 +124,7 @@ pub fn show(
         ScrollArea::vertical().id_salt("tabbar-tabs").auto_shrink([false, false]).max_height(list.height()).show(
             ui,
             |ui| {
-                ui.set_height(content_height.max(list.height()));
+                ui.set_height(content_height);
                 let painter = ui.painter().clone();
                 let pointer = ui.input(|i| i.pointer.interact_pos()).filter(|pos| list.contains(*pos));
                 for (index, tab) in tabs.iter().enumerate() {
@@ -138,7 +141,7 @@ pub fn show(
             },
         );
     });
-    // The buttons sit below the list, not below its scrolled content.
+    // Buttons follow the visible list; scrolling never hides them.
     let y = list.max.y;
 
     // Drag & drop reordering.
@@ -179,13 +182,15 @@ pub fn show(
         painter.rect_filled(settings_rect, 0.0, theme::colors().tab_active_bg);
     }
     let settings_color = if settings_open || settings.hovered() { theme::colors().icon_hover } else { theme::colors().icon };
-    painter.text(
-        Pos2::new(settings_rect.min.x + 10.0, settings_rect.center().y),
-        Align2::LEFT_CENTER,
-        format!("› {}", strings::TAB_SETTINGS),
-        theme::font(12.5),
-        settings_color,
-    );
+    let label = painter.layout_no_wrap(strings::TAB_SETTINGS.to_owned(), theme::font(12.5), settings_color);
+    let label_pos = Pos2::new(settings_rect.min.x + 24.0, settings_rect.center().y - label.size().y / 2.0);
+    // Align to the visible letters, not the font's ascent/descent box: the
+    // chevron glyph's optical center was lower than the Cyrillic label.
+    let center = Pos2::new(settings_rect.min.x + 12.0, label_pos.y + label.mesh_bounds.center().y);
+    let stroke = Stroke::new(1.0, settings_color);
+    painter.line_segment([center + Vec2::new(-1.5, -3.0), center + Vec2::new(1.5, 0.0)], stroke);
+    painter.line_segment([center + Vec2::new(1.5, 0.0), center + Vec2::new(-1.5, 3.0)], stroke);
+    painter.galley(label_pos, label, settings_color);
     if settings.clicked() {
         actions.push(TabbarAction::Settings);
     }
@@ -242,7 +247,7 @@ fn tab_row(
                 actions.push(TabbarAction::Rename(index, rename.text.trim().to_owned()));
             }
             if escape {
-                actions.push(TabbarAction::Rename(index, tab.title.clone()));
+                actions.push(TabbarAction::Rename(index, tab.title.to_string()));
             }
         });
         if !actions.is_empty() {
@@ -294,7 +299,7 @@ fn tab_row(
         actions.push(TabbarAction::Close(index));
     }
     if response.double_clicked() {
-        state.rename = Some(RenameEdit { tab: index, text: tab.title.clone(), focus: true });
+        state.rename = Some(RenameEdit { tab: index, text: tab.title.to_string(), focus: true });
     } else if response.drag_started() {
         state.drag_from = Some(index);
     } else if response.clicked() && state.drag_from.is_none() {
@@ -307,7 +312,7 @@ fn tab_row(
     }
     response.context_menu(|ui| {
         if ui.button(strings::TAB_RENAME).clicked() {
-            state.rename = Some(RenameEdit { tab: index, text: tab.title.clone(), focus: true });
+            state.rename = Some(RenameEdit { tab: index, text: tab.title.to_string(), focus: true });
             ui.close_kind(egui::UiKind::Menu);
         }
         if ui.button(strings::TAB_DUPLICATE).clicked() {
@@ -399,7 +404,8 @@ pub(crate) fn elide(painter: &egui::Painter, text: &str, font: FontId, max_width
             high = mid;
         }
     }
-    let cut = chars.get(low).map_or(text.len(), |(offset, _)| *offset);
+    // `low` is the first prefix that does NOT fit, not the last fitting one.
+    let cut = chars.get(low.saturating_sub(1)).map_or(0, |(offset, _)| *offset);
     format!("{}…", &text[..cut])
 }
 
@@ -468,12 +474,35 @@ mod tests {
     }
 
     #[test]
+    fn elision_fits_and_egui_reuses_unchanged_layouts() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Test", &[], false);
+        let mut previous = None;
+        for _ in 0..3 {
+            let _ = ctx.run_ui(Default::default(), |ui| {
+                let painter = ui.painter();
+                let font = theme::font(12.5);
+                let layout = painter.layout_no_wrap("cached".into(), font.clone(), Color32::WHITE);
+                if let Some(old) = &previous {
+                    assert!(std::sync::Arc::ptr_eq(old, &layout), "egui already caches identical layout jobs");
+                }
+                previous = Some(layout);
+                for width in [25.0, 40.0, 80.0] {
+                    let text = elide(painter, "длинное название вкладки", font.clone(), width);
+                    let measured = painter.layout_no_wrap(text, font.clone(), Color32::WHITE).size().x;
+                    assert!(measured <= width, "elision overflows: {measured} > {width}");
+                }
+            });
+        }
+    }
+
+    #[test]
     fn rows_start_below_the_title_and_drop_targets_follow_actual_scrolled_rects() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Test", &[], false);
         let tabs: Vec<_> = (0..6)
             .map(|index| TabInfo {
-                title: format!("tab {index}"),
+                title: format!("tab {index}").into(),
                 active: false,
                 activity: false,
                 claude: None,
@@ -528,6 +557,78 @@ mod tests {
         };
         let (_, actions) = list_frame(&ctx, &mut state, &tabs, rect, vec![release]);
         assert!(actions.contains(&TabbarAction::Move(0, target)), "wrong drop target: {actions:?}");
+    }
+
+    #[test]
+    fn settings_chevron_is_centered_on_the_visible_label_at_each_scale() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Test", &[], false);
+        let rect = Rect::from_min_size(Pos2::new(0.0, 30.0), Vec2::new(195.0, 400.0));
+        let mut state = TabbarState::default();
+        for scale in [1.0, 1.25, 1.5] {
+            ctx.set_pixels_per_point(scale);
+            let (output, _) = list_frame(&ctx, &mut state, &[], rect, Vec::new());
+            let label = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == strings::TAB_SETTINGS => {
+                        Some(text.visual_bounding_rect())
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let arrows: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::LineSegment { points, .. }
+                        if points[0].x < label.min.x && points[1].x < label.min.x =>
+                    {
+                        Some(points)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(arrows.len(), 2);
+            let center_y = (arrows[0][0].y + arrows[1][1].y) / 2.0;
+            assert!((center_y - label.center().y).abs() < 0.1);
+        }
+    }
+
+    #[test]
+    fn action_buttons_follow_short_lists_and_stay_above_settings_when_scrolled() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Test", &[], false);
+        let rect = Rect::from_min_size(Pos2::new(0.0, 30.0), Vec2::new(195.0, 400.0));
+        for count in [1, 20] {
+            let tabs: Vec<_> = (0..count)
+                .map(|_| TabInfo { title: "tab".into(), active: false, activity: false, claude: None, color: None })
+                .collect();
+            let mut state = TabbarState::default();
+            let (output, _) = list_frame(&ctx, &mut state, &tabs, rect, Vec::new());
+            let plus = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "+" => Some(text.visual_bounding_rect()),
+                    _ => None,
+                })
+                .unwrap();
+            let expected = rect.min.y + (count as f32 * row_height(&tabs[0])).min(rect.height() - 70.0);
+            assert!((plus.center().y - (expected + 20.0)).abs() < 1.0);
+            assert!(plus.max.y < rect.max.y - 30.0, "buttons overlap settings: {plus:?}");
+            let pos = Pos2::new(rect.min.x + 22.0, expected + 20.0);
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            let _ = list_frame(&ctx, &mut state, &tabs, rect, vec![egui::Event::PointerMoved(pos), button(true)]);
+            let (_, actions) = list_frame(&ctx, &mut state, &tabs, rect, vec![button(false)]);
+            assert!(actions.contains(&TabbarAction::NewTab), "plus is not clickable: {actions:?}");
+        }
     }
 
     #[test]
@@ -587,8 +688,9 @@ mod tests {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), true);
         let _ = ctx.run_ui(Default::default(), |_| {});
-        let blank = || TabInfo { title: String::new(), active: false, activity: false, claude: None, color: None };
-        let many: Vec<TabInfo> = (0..12).map(|index| TabInfo { title: format!("tab {index}"), ..blank() }).collect();
+        let blank = || TabInfo { title: "".into(), active: false, activity: false, claude: None, color: None };
+        let many: Vec<TabInfo> =
+            (0..12).map(|index| TabInfo { title: format!("tab {index}").into(), ..blank() }).collect();
         let mut state = TabbarState::default();
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(180.0, 120.0));
         let mut actions = Vec::new();
@@ -612,7 +714,7 @@ mod tests {
         let _ = ctx.run_ui(Default::default(), |_| {});
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(180.0, 120.0));
         let bars = |color: Option<theme::TabColor>| {
-            let tab = TabInfo { title: "t".to_owned(), active: false, activity: false, claude: None, color };
+            let tab = TabInfo { title: "t".into(), active: false, activity: false, claude: None, color };
             let mut state = TabbarState::default();
             let mut actions = Vec::new();
             let output = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {

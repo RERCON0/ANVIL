@@ -36,7 +36,9 @@ def generate(config, prompt, model_override=None):
         entry = split_entry(item, "=")
         if entry is not None:
             provider, key = entry
-            os.environ[provider.upper() + "_API_KEY"] = key
+            provider = provider.upper()
+            if provider.isascii() and provider.isidentifier():
+                os.environ[provider + "_API_KEY"] = key
     for item in as_list(config.get("alias", [])):
         entry = split_entry(item, ":")
         if entry is not None:

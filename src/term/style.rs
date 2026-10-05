@@ -365,7 +365,13 @@ pub fn text_runs_into(row: &[RenderCell], out: &mut Vec<TextRun>) {
 
 /// Spans of cells whose background differs from the default: (col, len, colour).
 pub fn bg_spans(row: &[RenderCell], default_bg: Color32) -> Vec<(usize, usize, Color32)> {
-    let mut spans: Vec<(usize, usize, Color32)> = Vec::new();
+    let mut spans = Vec::new();
+    bg_spans_into(row, default_bg, &mut spans);
+    spans
+}
+
+pub fn bg_spans_into(row: &[RenderCell], default_bg: Color32, spans: &mut Vec<(usize, usize, Color32)>) {
+    spans.clear();
     for (col, cell) in row.iter().enumerate() {
         let bg = cell.style.bg;
         if bg == default_bg {
@@ -376,7 +382,6 @@ pub fn bg_spans(row: &[RenderCell], default_bg: Color32) -> Vec<(usize, usize, C
             _ => spans.push((col, 1, bg)),
         }
     }
-    spans
 }
 
 #[cfg(test)]

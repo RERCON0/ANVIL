@@ -13,7 +13,7 @@ use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, TextFormat, Vec2};
 
 use crate::fonts::TermFonts;
 use crate::term::glyphs::{self, Face};
-use crate::term::style::{bg_spans, cell_style, Palette, RenderCell, Underline};
+use crate::term::style::{bg_spans_into, cell_style, Palette, RenderCell, Underline};
 
 pub const SELECTION: Color32 = Color32::from_rgba_premultiplied(77, 77, 77, 77);
 pub const MATCH: Color32 = Color32::from_rgba_premultiplied(89, 53, 11, 89);
@@ -264,6 +264,7 @@ pub struct CursorDraw {
 }
 
 /// Everything `paint` needs, detached from the terminal.
+#[derive(Default)]
 pub struct Frame {
     pub rows: Vec<Vec<RenderCell>>,
     pub columns: usize,
@@ -282,13 +283,28 @@ pub fn snapshot<L: EventListener>(
     glyphs: &mut GlyphCache,
     has_glyph: &mut dyn FnMut(char) -> bool,
 ) -> Frame {
+    snapshot_reusing(term, palette, glyphs, has_glyph, None)
+}
+
+pub fn snapshot_reusing<L: EventListener>(
+    term: &Term<L>,
+    palette: &Palette,
+    glyphs: &mut GlyphCache,
+    has_glyph: &mut dyn FnMut(char) -> bool,
+    previous: Option<Frame>,
+) -> Frame {
     let lines = term.screen_lines();
     let columns = term.columns();
     let history_size = term.grid().history_size();
     let content = term.renderable_content();
     let offset = content.display_offset as i32;
     let colors = content.colors;
-    let mut rows: Vec<Vec<RenderCell>> = (0..lines).map(|_| Vec::with_capacity(columns)).collect();
+    let mut previous = previous.unwrap_or_default();
+    let mut rows = std::mem::take(&mut previous.rows);
+    rows.resize_with(lines, || Vec::with_capacity(columns));
+    for row in &mut rows {
+        row.clear();
+    }
     for indexed in content.display_iter {
         let row = indexed.point.line.0 + offset;
         if row < 0 || row as usize >= lines {
@@ -317,7 +333,8 @@ pub fn snapshot<L: EventListener>(
         });
     }
 
-    let mut selection = Vec::new();
+    let mut selection = std::mem::take(&mut previous.selection);
+    selection.clear();
     if let Some(range) = content.selection {
         let first = (range.start.line.0 + offset).max(0);
         let last = (range.end.line.0 + offset).min(lines as i32 - 1);
@@ -393,8 +410,10 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
     };
 
     let mut fills = CellFills::new(ppp);
+    let mut spans = Vec::new();
     for (r, row) in frame.rows.iter().enumerate() {
-        for (col, len, color) in bg_spans(row, frame.default_bg) {
+        bg_spans_into(row, frame.default_bg, &mut spans);
+        for &(col, len, color) in &spans {
             fills.rect(cell_rect(r, col, len), color);
         }
     }
@@ -593,6 +612,26 @@ fn paint_underline(painter: &Painter, span: Rect, kind: Underline, color: Color3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_reuses_row_storage_without_retaining_old_cells() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::Config;
+        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+        let size = crate::term::pane::GridSize { columns: 200, lines: 50 };
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let palette = Palette::dark();
+        let mut glyphs = GlyphCache::default();
+        let first = snapshot(&term, &palette, &mut glyphs, &mut |_| true);
+        let pointers: Vec<_> = first.rows.iter().map(|row| row.as_ptr()).collect();
+        let mut parser = Processor::<StdSyncHandler>::new();
+        parser.advance(&mut term, b"changed");
+        let second = snapshot_reusing(&term, &palette, &mut glyphs, &mut |_| true, Some(first));
+        assert_eq!(pointers, second.rows.iter().map(|row| row.as_ptr()).collect::<Vec<_>>());
+        assert_eq!(second.rows[0][0].ch, 'c');
+        assert_eq!(second.rows.len(), 50);
+        assert_eq!(second.rows[49].len(), 200);
+    }
 
     #[test]
     fn snapping_to_physical_pixels() {

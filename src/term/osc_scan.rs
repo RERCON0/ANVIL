@@ -38,6 +38,9 @@ impl OscGuard {
         self.offset += n;
         if self.offset == self.ready.len() {
             self.ready.clear();
+            if self.ready.capacity() > 8192 {
+                self.ready = Vec::new();
+            }
             self.offset = 0;
         }
         n
@@ -66,11 +69,14 @@ impl OscGuard {
                         self.ready.extend_from_slice(&self.osc);
                         self.ready.push(b);
                         self.osc.clear();
+                        if self.osc.capacity() > 8192 {
+                            self.osc = Vec::new();
+                        }
                         self.state = if b == 0x1b { GuardState::Escape } else { GuardState::Ground };
                     } else if self.osc.len() < MAX_OSC_BYTES {
                         self.osc.push(b);
                     } else {
-                        self.osc.clear();
+                        self.osc = Vec::new();
                         // Only the initial ESC was forwarded. CAN resets that
                         // escape without dispatching any partial OSC to VTE.
                         self.ready.push(0x18);

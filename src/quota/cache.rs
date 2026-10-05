@@ -18,11 +18,17 @@ pub struct Paths {
     pub snapshot: PathBuf,
     pub lock: PathBuf,
     pub refresh: PathBuf,
+    pub schedule: PathBuf,
 }
 
 impl Paths {
     pub fn in_dir(dir: &Path) -> Paths {
-        Paths { snapshot: dir.join("quota.json"), lock: dir.join("quota.lock"), refresh: dir.join("quota.refresh") }
+        Paths {
+            snapshot: dir.join("quota.json"),
+            lock: dir.join("quota.lock"),
+            refresh: dir.join("quota.refresh"),
+            schedule: dir.join("quota-schedule.json"),
+        }
     }
 
     /// `%LOCALAPPDATA%\anvil`, the parent of the per-process `run` folders.

@@ -113,8 +113,8 @@ impl SettingsState {
 
 pub struct SettingsContext<'a> {
     pub config: &'a mut Config,
-    pub keymap_rows: Vec<(String, Vec<String>)>,
-    pub profiles: Vec<(String, String)>,
+    pub keymap_rows: &'a [(String, Vec<String>)],
+    pub profiles: &'a [crate::profiles::Profile],
     pub fonts: &'a [String],
     pub claude_line: &'a crate::claude_setup::LineState,
     pub quota: Option<&'a crate::quota::Snapshot>,
@@ -359,9 +359,9 @@ fn section_profiles(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Set
         .width(260.0)
         .selected_text(RichText::new(cx.config.default_profile.clone()).font(theme::field_font(13.0)))
         .show_ui(ui, |ui| {
-            for (id, name) in &cx.profiles {
-                if ui.selectable_label(*id == cx.config.default_profile, name).clicked() {
-                    cx.config.default_profile = id.clone();
+            for profile in cx.profiles {
+                if ui.selectable_label(profile.id == cx.config.default_profile, &profile.name).clicked() {
+                    cx.config.default_profile = profile.id.clone();
                     outcome.changed = true;
                 }
             }
@@ -494,7 +494,7 @@ fn section_hotkeys(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut Se
     theme::section(ui, strings::SETTINGS_HOTKEYS);
     ui.label(RichText::new(strings::SETTINGS_HOTKEYS_HINT).color(theme::colors().faint).font(theme::font(11.5)));
     ui.add_space(2.0);
-    for (action, chords) in &cx.keymap_rows {
+    for (action, chords) in cx.keymap_rows {
         ui.horizontal(|ui| {
             ui.label(RichText::new(action).color(theme::colors().dim).font(theme::font(12.0)));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

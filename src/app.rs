@@ -353,7 +353,7 @@ impl AnvilApp {
                 if footer > 0.0 {
                     let line = Rect::from_min_max(Pos2::new(full.min.x, body.max.y), full.max);
                     let segments = self.current_quota_segments();
-                    if crate::chrome::quota_bar::show(ui, line, &segments).is_some() {
+                    if crate::chrome::quota_bar::show(ui, line, segments).is_some() {
                         refresh_quota = true;
                     }
                 }
@@ -365,11 +365,11 @@ impl AnvilApp {
                 let show_badge = badge.badge && badge.badge_fields.any();
                 let infos: Vec<TabInfo> = (0..self.tabs.len())
                     .map(|i| TabInfo {
-                        title: self.tabs[i].title(),
+                        title: self.tabs[i].title().into(),
                         active: i == self.active && !self.settings_open,
                         activity: self.tabs[i].has_activity && i != self.active,
                         // Hidden badge: no extra row height either.
-                        claude: show_badge.then(|| self.tabs[i].claude_status().cloned()).flatten(),
+                        claude: show_badge.then(|| self.tabs[i].claude_status()).flatten(),
                         color: self.tabs[i].color,
                     })
                     .collect();
@@ -561,8 +561,8 @@ impl AnvilApp {
         ));
     }
 
-    fn current_quota_segments(&mut self) -> Vec<crate::quota::view::Segment> {
-        let Some(handle) = &self.quota else { return Vec::new() };
+    fn current_quota_segments(&mut self) -> &[crate::quota::view::Segment] {
+        let Some(handle) = &self.quota else { return &[] };
         let now = crate::quota::time::now_unix();
         let version = handle.version();
         let cache = &mut self.quota_segments;
@@ -572,7 +572,7 @@ impl AnvilApp {
             cache.minute = now / 60;
             cache.config = self.config.quota.clone();
         }
-        cache.segments.clone()
+        &cache.segments
     }
 
     /// Re-reads Claude Code's user settings when they changed (one stat per
@@ -601,7 +601,7 @@ impl AnvilApp {
             let mut context = crate::settings_ui::SettingsContext {
                 config: &mut next,
                 keymap_rows: rows,
-                profiles: self.profiles.iter().map(|p| (p.id.clone(), p.name.clone())).collect(),
+                profiles: &self.profiles,
                 fonts: &self.font_families,
                 claude_line: &claude_line,
                 quota: quota_snapshot.as_ref(),
@@ -864,7 +864,7 @@ impl AnvilApp {
             Action::ReopenTab => self.reopen_tab(),
             Action::RenameTab => {
                 let title = self.tabs.get(self.active).map(Tab::title).unwrap_or_default();
-                self.tabbar.rename = Some(tabbar::RenameEdit { tab: self.active, text: title, focus: true });
+                self.tabbar.rename = Some(tabbar::RenameEdit { tab: self.active, text: title.to_owned(), focus: true });
             }
             Action::NextTab => self.cycle_tab(1),
             Action::PreviousTab => self.cycle_tab(-1),
@@ -991,7 +991,7 @@ impl AnvilApp {
             tab.panes.clear();
         }
         if let Some(dir) = self.run_dir.take() {
-            let _ = std::fs::remove_dir_all(dir);
+            remove_owned_status_dir(&dir);
         }
     }
 
@@ -2097,26 +2097,106 @@ fn run_base() -> PathBuf {
 /// ANVIL processes that are gone.
 fn prepare_status_dir() -> (PathBuf, Option<PathBuf>) {
     let base = run_base();
-    let mine = base.join(std::process::id().to_string());
-    if std::fs::create_dir_all(&mine).is_err() {
-        return (mine, None);
+    if std::fs::create_dir_all(&base).is_err() {
+        return (status_dir(), None);
     }
-    let alive: Vec<u32> = crate::procs::snapshot().into_iter().map(|p| p.pid).collect();
-    if let Ok(entries) = std::fs::read_dir(&base) {
+    let prefix = format!("anvil-{}-", std::process::id());
+    let Ok(directory) = tempfile::Builder::new().prefix(&prefix).tempdir_in(&base) else {
+        return (status_dir(), None);
+    };
+    let mine = directory.keep();
+    let _ = std::fs::write(mine.join(".anvil-owner"), b"ANVIL status v1\n");
+    std::thread::spawn(move || {
+        let alive = crate::procs::snapshot().into_iter().map(|p| p.pid).collect();
+        remove_stale_status_dirs(&base, &alive);
+    });
+    (mine.clone(), Some(mine))
+}
+
+fn remove_stale_status_dirs(base: &Path, alive: &std::collections::HashSet<u32>) {
+    if let Ok(entries) = std::fs::read_dir(base) {
         for entry in entries.flatten() {
-            let Some(pid) = entry.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
-            if pid != std::process::id() && !alive.contains(&pid) {
-                let _ = std::fs::remove_dir_all(entry.path());
+            let name = entry.file_name();
+            let pid = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("anvil-"))
+                .and_then(|name| name.split_once('-'))
+                .and_then(|(pid, _)| pid.parse::<u32>().ok());
+            if pid.is_some_and(|pid| !alive.contains(&pid)) {
+                remove_owned_status_dir(&entry.path());
             }
         }
     }
-    let run_dir = mine.clone();
-    (mine, Some(run_dir))
+}
+
+/// Never recursively delete a directory based on its name/PID. A private run
+/// marker and exclusively ordinary numeric JSON files are required; unexpected
+/// contents (including reparse points) leave the whole directory untouched.
+fn remove_owned_status_dir(dir: &Path) {
+    let ordinary = |path: &Path| {
+        std::fs::symlink_metadata(path).is_ok_and(|meta| {
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                !meta.file_type().is_symlink() && meta.file_attributes() & 0x400 == 0
+            }
+            #[cfg(not(windows))]
+            {
+                !meta.file_type().is_symlink()
+            }
+        })
+    };
+    let marker = dir.join(".anvil-owner");
+    if !ordinary(dir)
+        || !ordinary(&marker)
+        || crate::fsutil::read_limited(&marker, 32).ok().as_deref() != Some(b"ANVIL status v1\n")
+    {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut files = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else { return };
+        let name = entry.file_name();
+        let ours = name == ".anvil-owner"
+            || name
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+                .is_some_and(|stem| !stem.is_empty() && stem.bytes().all(|byte| byte.is_ascii_digit()));
+        if !ours || !ordinary(&entry.path()) || !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            return;
+        }
+        files.push(entry.path());
+    }
+    for file in files {
+        if std::fs::remove_file(file).is_err() {
+            return;
+        }
+    }
+    let _ = std::fs::remove_dir(dir); // A concurrent/unknown child is never traversed.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_run_cleanup_preserves_foreign_and_unexpected_contents() {
+        let base = tempfile::tempdir().unwrap();
+        for name in ["123", "anvil-123-owned", "anvil-123-foreign", "anvil-456-live"] {
+            std::fs::create_dir(base.path().join(name)).unwrap();
+        }
+        for name in ["anvil-123-owned", "anvil-123-foreign", "anvil-456-live"] {
+            std::fs::write(base.path().join(name).join(".anvil-owner"), b"ANVIL status v1\n").unwrap();
+        }
+        std::fs::write(base.path().join("anvil-123-owned/1.json"), b"{}").unwrap();
+        std::fs::create_dir(base.path().join("anvil-123-foreign/foreign-directory")).unwrap();
+        remove_stale_status_dirs(base.path(), &std::collections::HashSet::from([456]));
+        assert!(!base.path().join("anvil-123-owned").exists());
+        assert!(base.path().join("123").exists());
+        assert!(base.path().join("anvil-123-foreign/foreign-directory").exists());
+        assert!(base.path().join("anvil-456-live").exists());
+    }
 
     #[test]
     fn disabling_claude_from_settings_restores_the_saved_status_line() {

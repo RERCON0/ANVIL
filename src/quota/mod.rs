@@ -33,9 +33,7 @@ pub(crate) struct Shared {
     /// (the file cannot be read right now) skips the cycle.
     prefs: Box<dyn Fn() -> Option<Prefs> + Send + Sync>,
     repaint: Box<dyn Fn() + Send + Sync>,
-    /// Seconds a manual refresh still has to wait, published by the worker that
-    /// holds the leadership. The gap keeps a held-down button from hammering
-    /// the providers, but a click inside it has to be reported, not swallowed.
+    /// Unix deadline of the shared manual-refresh gap, observed by every window.
     manual_wait: AtomicU64,
 }
 
@@ -76,7 +74,7 @@ impl QuotaHandle {
             snapshot: Mutex::new(cache::read(&paths.snapshot).unwrap_or_default()),
             prefs: Box::new(prefs),
             repaint: Box::new(repaint),
-            manual_wait: AtomicU64::new(0),
+            manual_wait: AtomicU64::new(worker::manual_deadline(&paths.schedule).max(0) as u64),
         });
         let thread_shared = Arc::clone(&shared);
         let thread_paths = paths.clone();
@@ -112,7 +110,7 @@ impl QuotaHandle {
     }
 
     fn manual_wait(&self) -> i64 {
-        self.shared.manual_wait.load(Ordering::Relaxed) as i64
+        (self.shared.manual_wait.load(Ordering::Relaxed) as i64 - time::now_unix()).max(0)
     }
 }
 

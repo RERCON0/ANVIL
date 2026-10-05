@@ -94,11 +94,23 @@ impl SplitTree {
     }
 
     pub fn contains(&self, id: PaneId) -> bool {
-        self.panes().contains(&id)
+        fn contains(node: &Node, id: PaneId) -> bool {
+            match node {
+                Node::Leaf(pane) => *pane == id,
+                Node::Split { children, .. } => children.iter().any(|(_, child)| contains(child, id)),
+            }
+        }
+        contains(&self.root, id)
     }
 
     pub fn pane_count(&self) -> usize {
-        self.panes().len()
+        fn count(node: &Node) -> usize {
+            match node {
+                Node::Leaf(_) => 1,
+                Node::Split { children, .. } => children.iter().map(|(_, child)| count(child)).sum(),
+            }
+        }
+        count(&self.root)
     }
 
     /// Puts `new` next to `target` along `dir`, after it (right/below) or before.

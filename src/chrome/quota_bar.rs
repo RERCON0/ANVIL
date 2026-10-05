@@ -37,11 +37,17 @@ fn color(style: Style, dim: bool) -> Color32 {
 fn job(pieces: &[Piece], dim: bool, font: &FontId) -> LayoutJob {
     let mut job = LayoutJob::default();
     for piece in pieces {
-        job.append(
-            &piece.text,
-            0.0,
-            TextFormat { font_id: font.clone(), color: color(piece.style, dim), ..Default::default() },
-        );
+        let format = TextFormat { font_id: font.clone(), color: color(piece.style, dim), ..Default::default() };
+        if let Some((before, after)) = piece.text.split_once('↺') {
+            job.append(before, 0.0, format.clone());
+            let mut icon = format.clone();
+            icon.font_id.size *= 0.82;
+            icon.valign = egui::Align::Center;
+            job.append("↺", 0.0, icon);
+            job.append(after, 0.0, format);
+        } else {
+            job.append(&piece.text, 0.0, format);
+        }
     }
     job
 }
@@ -170,6 +176,19 @@ mod tests {
 
     /// From a collapsed sliver to a wide monitor, with and without data: the
     /// line paints (folding as it must) and never panics.
+    #[test]
+    fn reset_icons_are_smaller_without_shrinking_the_surrounding_text() {
+        let font = FontId::proportional(FONT_SIZE);
+        let pieces = [Piece { text: " ↺ 2д4ч".into(), style: Style::Hint }];
+        let layout = job(&pieces, false, &font);
+        assert_eq!(layout.text, " ↺ 2д4ч");
+        let icon = layout.sections.iter().find(|section| &layout.text[section.byte_range.clone()] == "↺").unwrap();
+        assert!(icon.format.font_id.size < FONT_SIZE);
+        for section in layout.sections.iter().filter(|section| section.byte_range != icon.byte_range) {
+            assert_eq!(section.format.font_id.size, FONT_SIZE);
+        }
+    }
+
     #[test]
     fn it_paints_at_every_width() {
         let ctx = context();

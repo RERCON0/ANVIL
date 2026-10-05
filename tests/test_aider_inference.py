@@ -37,7 +37,10 @@ class AiderProjectionTests(unittest.TestCase):
         modules = {"aider.models": models, "aider.onboarding": onboarding, "aider.reasoning_tags": reasoning}
         output = io.StringIO()
         config = {
-            "api-key": ["fake-secret-without-separator", None, " = value", "provider = fake-valid-key"],
+            "api-key": [
+                "fake-secret-without-separator", None, " = value", "provider = fake-valid-key",
+                "invalid name=fake-key", "bad\x00name=fake-key", "кириллица=fake-key",
+            ],
             "alias": ["malformed", {}, " : value", "fast: provider/model:version"],
         }
         with patch.dict(sys.modules, modules), patch.dict(os.environ):

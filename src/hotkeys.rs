@@ -175,15 +175,58 @@ impl Action {
     }
 
     pub fn id(&self) -> String {
-        match self {
-            Action::Tab(n) => format!("tab-{n}"),
-            Action::Profile(p) => format!("profile:{p}"),
-            other => SIMPLE_ACTIONS
-                .iter()
-                .find(|(_, a)| a == other)
-                .map(|(name, _)| (*name).to_owned())
-                .expect("every simple action is in SIMPLE_ACTIONS"),
-        }
+        // Exhaustive: adding an action must also name it, at compile time.
+        let name = match self {
+            Action::Tab(n) => return format!("tab-{n}"),
+            Action::Profile(p) => return format!("profile:{p}"),
+            Action::NewTab => "new-tab",
+            Action::NewWindow => "new-window",
+            Action::CloseTab => "close-tab",
+            Action::ReopenTab => "reopen-tab",
+            Action::RenameTab => "rename-tab",
+            Action::NextTab => "next-tab",
+            Action::PreviousTab => "previous-tab",
+            Action::MoveTabLeft => "move-tab-left",
+            Action::MoveTabRight => "move-tab-right",
+            Action::SplitRight => "split-right",
+            Action::SplitBottom => "split-bottom",
+            Action::PaneNavLeft => "pane-nav-left",
+            Action::PaneNavRight => "pane-nav-right",
+            Action::PaneNavUp => "pane-nav-up",
+            Action::PaneNavDown => "pane-nav-down",
+            Action::PaneNavPrevious => "pane-nav-previous",
+            Action::PaneNavNext => "pane-nav-next",
+            Action::PaneMaximize => "pane-maximize",
+            Action::ClosePane => "close-pane",
+            Action::PaneCollapse => "pane-collapse",
+            Action::PaneRestore => "pane-restore",
+            Action::ProfileSelector => "profile-selector",
+            Action::Settings => "settings",
+            Action::ToggleFullscreen => "toggle-fullscreen",
+            Action::ToggleFrameStats => "toggle-frame-stats",
+            Action::CtrlC => "ctrl-c",
+            Action::Copy => "copy",
+            Action::Paste => "paste",
+            Action::SelectAll => "select-all",
+            Action::Clear => "clear",
+            Action::ZoomIn => "zoom-in",
+            Action::ZoomOut => "zoom-out",
+            Action::ResetZoom => "reset-zoom",
+            Action::PreviousWord => "previous-word",
+            Action::NextWord => "next-word",
+            Action::DeletePreviousWord => "delete-previous-word",
+            Action::DeleteNextWord => "delete-next-word",
+            Action::DeleteLine => "delete-line",
+            Action::Search => "search",
+            Action::ToggleWorkspace => "toggle-workspace",
+            Action::ScrollToTop => "scroll-to-top",
+            Action::ScrollToBottom => "scroll-to-bottom",
+            Action::ScrollPageUp => "scroll-page-up",
+            Action::ScrollPageDown => "scroll-page-down",
+            Action::ScrollUp => "scroll-up",
+            Action::ScrollDown => "scroll-down",
+        };
+        name.to_owned()
     }
 
     /// Actions that act on the focused terminal pane. They only fire while the
@@ -371,6 +414,7 @@ fn parse_key(name: &str) -> Option<KeyName> {
 
 pub struct Keymap {
     bindings: Vec<(Chord, Action)>,
+    rows: Vec<(String, Vec<String>)>,
 }
 
 impl Keymap {
@@ -405,7 +449,16 @@ impl Keymap {
                 bindings.push((parse_chord(chord).expect("default chords parse"), action.clone()));
             }
         }
-        (Keymap { bindings }, problems)
+        for (index, (chord, action)) in bindings.iter().enumerate() {
+            if let Some((_, winner)) = bindings[..index].iter().find(|(other, _)| other == chord) {
+                if winner != action {
+                    problems.push(format!("hotkey {}: {} wins over {}", format_chord(chord), winner.id(), action.id()));
+                }
+            }
+        }
+        let mut keymap = Keymap { bindings, rows: Vec::new() };
+        keymap.rows = keymap.describe_rows();
+        (keymap, problems)
     }
 
     pub fn lookup(&self, chord: &Chord) -> Option<&Action> {
@@ -415,7 +468,11 @@ impl Keymap {
     /// All (action id, chord strings) pairs for the settings page, in table order.
     /// An action the user unbound appears with an empty list rather than
     /// vanishing: a row that disappears looks like a feature that was removed.
-    pub fn describe(&self) -> Vec<(String, Vec<String>)> {
+    pub fn describe(&self) -> &[(String, Vec<String>)] {
+        &self.rows
+    }
+
+    fn describe_rows(&self) -> Vec<(String, Vec<String>)> {
         let mut out: Vec<(String, Vec<String>)> =
             SIMPLE_ACTIONS.iter().map(|(_, action)| (action.id(), Vec::new())).collect();
         for (chord, action) in &self.bindings {
@@ -477,6 +534,17 @@ mod tests {
     const CTRL_SHIFT: Mods = Mods { ctrl: true, alt: false, shift: true, meta: false };
     const CTRL_ALT: Mods = Mods { ctrl: true, alt: true, shift: false, meta: false };
     const ALT: Mods = Mods { ctrl: false, alt: true, shift: false, meta: false };
+
+    #[test]
+    fn conflicts_are_reported_without_changing_override_priority() {
+        let overrides =
+            BTreeMap::from([("new-tab".into(), vec!["Ctrl-X".into()]), ("close-tab".into(), vec!["Ctrl-X".into()])]);
+        let (keymap, problems) = Keymap::with_overrides(&overrides);
+        assert_eq!(keymap.lookup(&parse_chord("Ctrl-X").unwrap()), Some(&Action::CloseTab));
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("close-tab wins over new-tab"));
+        assert_eq!(keymap.describe().as_ptr(), keymap.describe().as_ptr(), "descriptions are cached");
+    }
 
     #[test]
     fn parses_every_default_chord() {

@@ -186,6 +186,29 @@ const NUL: char = '\0';
 /// and control characters, then canonicalizes the deepest existing ancestor to
 /// catch symlinks and junctions pointing outside the repository.
 pub fn resolve_path(root: &Path, path: &str) -> Result<PathBuf, String> {
+    PathResolver::new(root)?.resolve(path)
+}
+
+/// One canonical root per bounded worker operation. Each child still passes
+/// the local/reparse checks; this is not a cache across filesystem mutations.
+pub(crate) struct PathResolver<'a> {
+    root: &'a Path,
+    canonical_root: PathBuf,
+}
+
+impl<'a> PathResolver<'a> {
+    pub(crate) fn new(root: &'a Path) -> Result<Self, String> {
+        local_path(root)?;
+        let canonical_root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+        Ok(Self { root, canonical_root })
+    }
+
+    pub(crate) fn resolve(&self, path: &str) -> Result<PathBuf, String> {
+        resolve_inside(self.root, &self.canonical_root, path)
+    }
+}
+
+fn resolve_inside(root: &Path, canonical_root: &Path, path: &str) -> Result<PathBuf, String> {
     let inside = crate::strings::WORKSPACE_PATH_INSIDE_REPO;
     local_path(root)?;
     let clean = path.replace('\\', "/");
@@ -214,7 +237,6 @@ pub fn resolve_path(root: &Path, path: &str) -> Result<PathBuf, String> {
         return Err(inside.to_owned());
     }
     local_path(&full)?;
-    let canonical_root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
     let mut probe = full.clone();
     loop {
         match std::fs::canonicalize(&probe) {
@@ -223,7 +245,7 @@ pub fn resolve_path(root: &Path, path: &str) -> Result<PathBuf, String> {
                 // file at the top level); the target itself may not be the
                 // root (a junction pointing back at it).
                 let is_root = canonical == canonical_root && probe == full;
-                if is_root || !canonical.starts_with(&canonical_root) {
+                if is_root || !canonical.starts_with(canonical_root) {
                     return Err(inside.to_owned());
                 }
                 return Ok(full);

@@ -26,7 +26,6 @@ mod windows {
     use std::os::windows::process::CommandExt;
     use std::process::{Child, Stdio};
     use std::ptr::{null, null_mut};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
     use windows_sys::Win32::Foundation::{
         ERROR_BROKEN_PIPE, ERROR_NO_DATA, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
@@ -118,10 +117,20 @@ mod windows {
     }
 
     fn stdin_pipe() -> io::Result<(File, File)> {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let name: Vec<u16> = format!(
-            "\\\\.\\pipe\\anvil-stdin-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed),
-        ).encode_utf16().chain(Some(0)).collect();
+        use windows_sys::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
+        let mut nonce = [0_u8; 16];
+        // SAFETY: the system RNG writes exactly the size of this writable buffer.
+        let status = unsafe {
+            BCryptGenRandom(null_mut(), nonce.as_mut_ptr(), nonce.len() as u32, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+        };
+        if status < 0 {
+            return Err(io::Error::other("cannot generate stdin pipe name"));
+        }
+        let name: Vec<u16> =
+            format!("\\\\.\\pipe\\anvil-stdin-{}-{:032x}", std::process::id(), u128::from_le_bytes(nonce),)
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
         let writer = owned(unsafe {
             CreateNamedPipeW(
                 name.as_ptr(), PIPE_ACCESS_OUTBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,

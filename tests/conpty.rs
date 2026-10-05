@@ -121,6 +121,58 @@ fn mouse_mode_resets_reach_the_terminal() {
 }
 
 #[test]
+fn ctrl_click_on_a_link_reaches_a_mouse_tracking_app_instead_of_opening_the_browser() {
+    use anvil::config::RightClick;
+    use anvil::term::view::{TerminalView, ViewInput};
+    use egui::{Event, PointerButton, Pos2, Rect, Vec2};
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("mouse.bin");
+    let mut pane = probe(&["mouse-input", out.to_str().unwrap()]);
+    assert!(wait_until(Duration::from_secs(10), || screen_text(&pane).contains("READY")));
+    let ctx = egui::Context::default();
+    anvil::fonts::install(&ctx, "Test", &[], false);
+    let mut view = TerminalView::new(14.0);
+    let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 400.0));
+    let palette = Palette::dark();
+    let modifiers = egui::Modifiers { ctrl: true, ..Default::default() };
+    let input = ViewInput {
+        palette: &palette,
+        focused: true,
+        cursor_blink: false,
+        right_click: RightClick::Menu,
+        paste_on_middle: false,
+        copy_on_select: false,
+        fallbacks_loaded: true,
+        window_edge: false,
+    };
+    let mut frame = |events| {
+        ctx.run_ui(egui::RawInput { screen_rect: Some(rect), events, modifiers, ..Default::default() }, |ui| {
+            view.show(ui, rect, &mut pane, &input);
+        })
+    };
+    let _ = frame(Vec::new());
+    // The link is in the first terminal cell. This lies well inside that cell
+    // with both the bundled and system fonts at 14pt.
+    let pos = Pos2::new(anvil::theme::PANE_PADDING + 2.0, anvil::theme::PANE_PADDING + 2.0);
+    let _ = frame(vec![Event::PointerMoved(pos)]);
+    let _ = frame(Vec::new()); // Hit testing and previous-frame link data are ready.
+    for pressed in [true, false] {
+        let output = frame(vec![Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers }]);
+        assert!(!output
+            .platform_output
+            .commands
+            .iter()
+            .any(|command| matches!(command, egui::OutputCommand::OpenUrl(_))));
+    }
+    pane.write(b"q".to_vec());
+    wait_exit(&pane);
+    let bytes = std::fs::read(out).unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("\x1b[<16;1;1M"), "Ctrl+press lost: {text:?}");
+    assert!(text.contains("\x1b[<16;1;1m"), "Ctrl+release lost: {text:?}");
+}
+
+#[test]
 fn answers_device_attributes_and_cursor_position() {
     let out = out_file("queries.bin");
     let pane = probe(&["queries", out.to_str().unwrap()]);

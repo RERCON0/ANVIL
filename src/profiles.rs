@@ -79,17 +79,8 @@ pub fn parse_wsl_list(bytes: &[u8]) -> Vec<String> {
 fn run_bounded(command: &mut std::process::Command, timeout: std::time::Duration) -> Option<std::process::Output> {
     use std::io::{Read, Seek};
     use std::process::Stdio;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let path = std::env::temp_dir().join(format!("anvil-wsl-{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
-    struct Cleanup(PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    let mut output = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path).ok()?;
-    let cleanup = Cleanup(path.clone());
+    // Anonymous, delete-on-close output has no predictable filename to squat.
+    let mut output = tempfile::tempfile().ok()?;
     command.stdout(Stdio::from(output.try_clone().ok()?)).stderr(Stdio::null());
     let mut child = command.spawn().ok()?;
     let deadline = std::time::Instant::now() + timeout;
@@ -111,7 +102,6 @@ fn run_bounded(command: &mut std::process::Command, timeout: std::time::Duration
     let mut stdout = Vec::new();
     output.by_ref().take(1024 * 1024).read_to_end(&mut stdout).ok()?;
     drop(output);
-    drop(cleanup);
     Some(std::process::Output { status, stdout, stderr: Vec::new() })
 }
 

@@ -25,8 +25,22 @@ pub(super) fn words(spec: &str) -> Result<Vec<String>, String> {
     let mut started = false;
     let mut chars = spec.chars().peekable();
     while let Some(ch) = chars.next() {
-        if ch == '\\' && quote == Some('"') && chars.peek() == Some(&'"') {
-            word.push(chars.next().unwrap());
+        if ch == '\\' && quote == Some('"') {
+            let mut count = 1;
+            while chars.peek() == Some(&'\\') {
+                count += 1;
+                chars.next();
+            }
+            if chars.peek() == Some(&'"') {
+                word.extend(std::iter::repeat_n('\\', count / 2));
+                if count % 2 != 0 {
+                    chars.next();
+                    word.push('"');
+                }
+            } else {
+                word.extend(std::iter::repeat_n('\\', count));
+            }
+            started = true;
         } else if matches!(ch, '\'' | '"') && (quote.is_none() || quote == Some(ch)) {
             quote = if quote.is_some() { None } else { Some(ch) };
             started = true;
@@ -200,7 +214,23 @@ fn wrapper_hides_agent(arg: &str) -> bool {
         return true;
     }
     // `cmd /c claude ...`, `sh -c "gemini -p ..."` and similar shell text.
-    path.split_whitespace().next().is_some_and(|first| classify_backend(first) != Backend::Custom)
+    // cmd accepts /c and /k without a separating space; words() has already
+    // removed surrounding quotes from the user's command specification.
+    let path = path.strip_prefix("/c").or_else(|| path.strip_prefix("/k")).unwrap_or(&path);
+    path.split_whitespace()
+        .next()
+        .is_some_and(|first| classify_backend(first.trim_matches(['\'', '"'])) != Backend::Custom)
+}
+
+#[cfg(test)]
+#[test]
+fn command_words_count_backslashes_before_quotes() {
+    assert_eq!(words(r#""C:\Tools\App\\" --model "a\\\"b""#).unwrap(), [r"C:\Tools\App\", r#"--model"#, r#"a\"b"#]);
+    assert_eq!(words(r#""C:\Program Files\agent.exe" """#).unwrap(), [r"C:\Program Files\agent.exe", ""]);
+    assert!(words(r#""unterminated\""#).is_err());
+    assert!(wrapper_hides_agent("/cclaude"));
+    assert!(wrapper_hides_agent("/k\"codex\""));
+    assert!(!wrapper_hides_agent("/cecho test"));
 }
 
 /// Environment values Claude Code reads: credentials and provider routing.

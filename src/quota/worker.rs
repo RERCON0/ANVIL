@@ -26,7 +26,7 @@ const LEAD_RETRY: i64 = 30;
 /// the next cycle comes this soon instead of a full interval later.
 pub const QUICK_RETRY: i64 = 60;
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Memory {
     /// 429s in a row.
     failures: u32,
@@ -38,7 +38,7 @@ struct Memory {
 /// `Some(true)`/`Some(false)`: switched on/off by the user; `None`: automatic.
 pub type Prefs = HashMap<ProviderId, Option<bool>>;
 
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct Engine {
     memory: HashMap<ProviderId, Memory>,
     last_cycle: Option<i64>,
@@ -49,7 +49,53 @@ pub struct Engine {
     retry_at: Option<i64>,
     /// The snapshot built so far, so a panic part-way through a cycle still
     /// leaves the providers that answered on screen.
+    #[serde(skip)]
     partial: Option<Snapshot>,
+}
+
+impl Engine {
+    fn read(path: &std::path::Path) -> Option<Self> {
+        let bytes = crate::fsutil::read_limited(path, 64 * 1024).ok()?;
+        let mut engine: Self = serde_json::from_slice(&bytes).ok()?;
+        // Hand-edited metadata and a backwards clock jump must not overflow
+        // deadline arithmetic or disable polling indefinitely.
+        let now = now_unix();
+        engine.last_cycle = engine.last_cycle.map(|at| at.clamp(0, now));
+        engine.last_manual = engine.last_manual.map(|at| at.clamp(0, now));
+        engine.retry_at = engine.retry_at.map(|at| at.clamp(0, now + QUICK_RETRY));
+        for memory in engine.memory.values_mut() {
+            memory.paused_until = memory.paused_until.clamp(0, now + super::model::MAX_PAUSE);
+        }
+        Some(engine)
+    }
+
+    fn save(&self, path: &std::path::Path) {
+        let result = serde_json::to_vec(self)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| crate::fsutil::atomic_write(path, &bytes));
+        if let Err(error) = result {
+            log::warn!("quota: cannot save schedule: {error}");
+        }
+    }
+
+    fn begin_cycle(&mut self, now: i64) {
+        self.last_cycle = Some(now);
+        self.retry_at = None;
+        if self.manual_pending {
+            self.manual_pending = false;
+            self.last_manual = Some(now);
+        }
+    }
+
+    fn manual_deadline(&self) -> i64 {
+        self.last_manual.map_or(0, |at| at.saturating_add(MANUAL_GAP))
+    }
+}
+
+/// Scheduling metadata contains only timestamps, counters and token-change
+/// fingerprints, never credentials. Observers need it even before a fetch ends.
+pub(super) fn manual_deadline(path: &std::path::Path) -> i64 {
+    Engine::read(path).map_or(0, |engine| engine.manual_deadline())
 }
 
 impl Engine {
@@ -57,6 +103,7 @@ impl Engine {
     /// The gap exists so a held-down button cannot hammer the providers, but a
     /// click that is going to be deferred has to say so instead of looking like
     /// a button that did nothing.
+    #[cfg(test)]
     pub fn manual_wait(&self, now: i64) -> i64 {
         match self.last_manual {
             Some(at) => (MANUAL_GAP - (now - at)).max(0),
@@ -89,13 +136,7 @@ impl Engine {
         detect: impl Fn(ProviderId) -> Detection,
         fetch: impl Fn(ProviderId, &Credential) -> Result<Fetched, FetchError>,
     ) -> Snapshot {
-        self.last_cycle = Some(now);
-        self.retry_at = None;
-        // Any cycle serves a pending request, and the gap counts from here.
-        if self.manual_pending {
-            self.manual_pending = false;
-            self.last_manual = Some(now);
-        }
+        self.begin_cycle(now);
         self.partial = Some(Snapshot::default());
         for id in ProviderId::ALL {
             let entry = self.cycle_one(id, now, prefs, previous, &detect, &fetch);
@@ -260,17 +301,27 @@ pub(super) fn run(shared: Arc<Shared>, paths: Paths, user_agent: String) {
         if leader.is_none() && last_lead_try.is_none_or(|at| now - at >= LEAD_RETRY) {
             last_lead_try = Some(now);
             leader = cache::try_lead(&paths.lock);
+            if leader.is_some() {
+                engine = Engine::read(&paths.schedule).unwrap_or_default();
+            }
         }
         let refresh_mtime = cache::mtime(&paths.refresh);
         let manual = refresh_mtime != seen_refresh;
         seen_refresh = refresh_mtime;
         if leader.is_some() {
             let age = shared.snapshot().checked_at().map(|at| now - at);
-            if engine.due(now, age, manual) {
+            let due = engine.due(now, age, manual);
+            if manual {
+                engine.save(&paths.schedule); // Keep a deferred request across leadership changes.
+            }
+            if due {
                 if http.is_none() {
                     http = WinHttp::new(&user_agent).map_err(|e| log::warn!("quota: WinHTTP: {e}")).ok();
                 }
                 if let (Some(http), Some(prefs)) = (&http, shared.prefs()) {
+                    engine.begin_cycle(now);
+                    engine.save(&paths.schedule); // Publish the gap before any blocking HTTP call.
+                    shared.manual_wait.store(engine.manual_deadline().max(0) as u64, Ordering::Relaxed);
                     let previous = shared.snapshot();
                     let env = CredEnv::from_process(now, sqlite.clone(), own_keys());
                     let cycle = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -303,12 +354,12 @@ pub(super) fn run(shared: Arc<Shared>, paths: Paths, user_agent: String) {
                             }
                         }
                     }
+                    engine.save(&paths.schedule);
                 }
             }
         }
-        // Publish every tick, not only on a cycle: otherwise "30 seconds"
-        // stays on screen for the entire five-minute polling interval.
-        shared.manual_wait.store(engine.manual_wait(now_unix()).max(0) as u64, Ordering::Relaxed);
+        let deadline = if leader.is_some() { engine.manual_deadline() } else { manual_deadline(&paths.schedule) };
+        shared.manual_wait.store(deadline.max(0) as u64, Ordering::Relaxed);
         std::thread::sleep(Duration::from_secs(1));
     }
 }
@@ -332,6 +383,56 @@ mod tests {
             expires_at: None,
             marker,
         })
+    }
+
+    #[test]
+    fn corrupt_schedule_timestamps_cannot_overflow_or_postpone_cycles_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("schedule.json");
+        let engine = Engine {
+            last_cycle: Some(i64::MIN),
+            last_manual: Some(i64::MAX),
+            retry_at: Some(i64::MAX),
+            memory: HashMap::from([(ProviderId::Zai, Memory { paused_until: i64::MAX, ..Default::default() })]),
+            ..Default::default()
+        };
+        engine.save(&path);
+        let mut loaded = Engine::read(&path).unwrap();
+        let now = now_unix();
+        assert!(loaded.due(now, None, false));
+        assert!(loaded.manual_deadline() <= now + MANUAL_GAP);
+        assert!(loaded.memory[&ProviderId::Zai].paused_until <= now + crate::quota::model::MAX_PAUSE);
+    }
+
+    #[test]
+    fn scheduling_survives_restart_and_observers_see_the_same_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        let mut engine = Engine::default();
+        assert!(engine.due(1000, None, true));
+        let first =
+            engine.cycle(1000, &Prefs::new(), &Snapshot::default(), only(ProviderId::Zai, || login(1)), |_, _| {
+                Err(FetchError::Status { code: 401, retry_after: None })
+            });
+        engine.save(&paths.schedule);
+        assert_eq!(manual_deadline(&paths.schedule), 1030, "another window reads the leader's gap");
+        let mut restarted = Engine::read(&paths.schedule).unwrap();
+        assert_eq!(restarted.manual_wait(1010), 20);
+        restarted.cycle(1300, &Prefs::new(), &first, only(ProviderId::Zai, || login(1)), |_, _| {
+            panic!("refused login was retried after restart");
+        });
+        let changed = restarted.cycle(1301, &Prefs::new(), &first, only(ProviderId::Zai, || login(2)), |_, _| ok());
+        assert_eq!(changed.get(ProviderId::Zai).unwrap().state, ProviderState::Ok);
+        let limited = restarted.cycle(1400, &Prefs::new(), &changed, only(ProviderId::Zai, || login(2)), |_, _| {
+            Err(FetchError::Status { code: 429, retry_after: None })
+        });
+        restarted.save(&paths.schedule);
+        let mut restarted = Engine::read(&paths.schedule).unwrap();
+        let twice = restarted.cycle(1460, &Prefs::new(), &limited, only(ProviderId::Zai, || login(2)), |_, _| {
+            Err(FetchError::Status { code: 429, retry_after: None })
+        });
+        assert_eq!(twice.get(ProviderId::Zai).unwrap().state, ProviderState::RateLimited { retry_at: 1580 });
+        assert!(!std::fs::read_to_string(&paths.schedule).unwrap().contains("secret"));
     }
 
     fn only(id: ProviderId, detection: impl Fn() -> Detection) -> impl Fn(ProviderId) -> Detection {

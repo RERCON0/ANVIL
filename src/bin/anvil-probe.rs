@@ -80,6 +80,13 @@ fn main() {
             std::thread::sleep(Duration::from_millis(700));
             out("\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l");
         }
+        "mouse-input" => {
+            raw_vt_stdin();
+            out("\x1b[?9001h\x1b[?1000h\x1b[?1006h");
+            out("\x1b]8;;https://example.invalid/\x07LINK\x1b]8;;\x07\r\nREADY\r\n");
+            let got = record(b'q', Duration::from_secs(10));
+            std::fs::write(path.unwrap(), got).unwrap();
+        }
         "queries" => {
             raw_vt_stdin();
             out("\x1b[c\x1b[6n");
