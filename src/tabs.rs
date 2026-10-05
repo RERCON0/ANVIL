@@ -47,12 +47,6 @@ impl PaneEntry {
             PaneContent::Error(_) => None,
         }
     }
-    pub fn live_mut(&mut self) -> Option<&mut Pane> {
-        match &mut self.content {
-            PaneContent::Live(pane) => Some(pane),
-            PaneContent::Error(_) => None,
-        }
-    }
     pub fn title_text(&self) -> &str {
         if self.title.is_empty() {
             &self.profile_name
@@ -188,10 +182,6 @@ impl Tab {
         self.panes.get(&id)
     }
 
-    pub fn pane_mut(&mut self, id: PaneId) -> Option<&mut PaneEntry> {
-        self.panes.get_mut(&id)
-    }
-
     pub fn focused_entry(&self) -> Option<&PaneEntry> {
         self.panes.get(&self.focused)
     }
@@ -284,7 +274,9 @@ impl Tab {
             };
             match &mut entry.content {
                 PaneContent::Live(pane) => {
-                    let cwd = pane.current_dir();
+                    // Only the open panel needs the directory, so the shell's cwd query and
+                    // its PathBuf are not paid for a closed panel every frame.
+                    let cwd = entry.workspace.open.then(|| pane.current_dir());
                     let (terminal_rect, panel_rect) = if entry.workspace.open {
                         let width = crate::workspace::clamp_width(entry.workspace.width)
                             .min((pane_rect.width() - 140.0).max(crate::workspace::MIN_WIDTH));
@@ -338,7 +330,7 @@ impl Tab {
                         }
                     }
                     if let Some(panel_rect) = panel_rect {
-                        let cwd = cwd.clone().or_else(|| entry.start_cwd.clone());
+                        let cwd = cwd.clone().flatten().or_else(|| entry.start_cwd.clone());
                         if let Some(cwd) = cwd {
                             entry.workspace.poll(cwd);
                             if entry.workspace.absorb() {

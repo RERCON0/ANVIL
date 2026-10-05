@@ -369,16 +369,18 @@ pub fn stepper_f32(ui: &mut egui::Ui, value: &mut f32, min: f32, max: f32, step:
     let mut changed = false;
     ui.horizontal(|ui| {
         if ui.add_sized([22.0, 22.0], ghost_button("−")).clicked() {
-            *value = (*value - step).max(min);
-            changed = true;
+            let next = (*value - step).max(min);
+            changed = next != *value;
+            *value = next;
         }
         ui.add_sized(
             [52.0, 22.0],
             egui::Label::new(RichText::new(format!("{value:.0}")).color(colors().text).font(field_font(13.0))),
         );
         if ui.add_sized([22.0, 22.0], ghost_button("+")).clicked() {
-            *value = (*value + step).min(max);
-            changed = true;
+            let next = (*value + step).min(max);
+            changed = next != *value;
+            *value = next;
         }
     });
     changed
@@ -389,16 +391,20 @@ pub fn stepper(ui: &mut egui::Ui, value: &mut usize, min: usize, max: usize, ste
     let mut changed = false;
     ui.horizontal(|ui| {
         if ui.add_sized([22.0, 22.0], ghost_button("−")).clicked() {
-            *value = value.saturating_sub(step).max(min);
-            changed = true;
+            // At the bound the click changes nothing, and reporting a change
+            // would rewrite config.json and sweep apply_config for no reason.
+            let next = value.saturating_sub(step).max(min);
+            changed = next != *value;
+            *value = next;
         }
         ui.add_sized(
             [64.0, 22.0],
             egui::Label::new(RichText::new(value.to_string()).color(colors().text).font(field_font(13.0))),
         );
         if ui.add_sized([22.0, 22.0], ghost_button("+")).clicked() {
-            *value = (*value + step).min(max);
-            changed = true;
+            let next = (*value + step).min(max);
+            changed = next != *value;
+            *value = next;
         }
     });
     changed

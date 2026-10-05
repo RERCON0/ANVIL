@@ -125,6 +125,9 @@ pub struct AnvilApp {
     repaint: Option<Arc<dyn Fn() + Send + Sync>>,
     inherited_prompt_command: Option<String>,
     proc_snapshot: Vec<crate::procs::ProcInfo>,
+    /// A process enumeration in flight. The Toolhelp snapshot blocks for
+    /// milliseconds, which does not belong on the frame path.
+    proc_results: Option<std::sync::mpsc::Receiver<Vec<crate::procs::ProcInfo>>>,
     last_status_poll: Instant,
     last_proc_poll: Instant,
     last_tab_area: Rect,
@@ -193,6 +196,7 @@ impl AnvilApp {
             repaint: None,
             inherited_prompt_command: std::env::var("PROMPT_COMMAND").ok(),
             proc_snapshot: Vec::new(),
+            proc_results: None,
             last_status_poll: Instant::now(),
             last_proc_poll: Instant::now(),
             last_tab_area: Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0)),
@@ -286,6 +290,7 @@ impl AnvilApp {
         let ctx = ui.ctx().clone();
         let started = Instant::now();
         let mut commands = Vec::new();
+        let mut refresh_quota = false;
         self.check_config(&ctx);
         self.absorb_wsl_profiles();
         self.poll_panes(&ctx);
@@ -311,9 +316,7 @@ impl AnvilApp {
                     let line = Rect::from_min_max(Pos2::new(full.min.x, body.max.y), full.max);
                     let segments = self.current_quota_segments();
                     if crate::chrome::quota_bar::show(ui, line, &segments).is_some() {
-                        if let Some(quota) = &self.quota {
-                            quota.refresh();
-                        }
+                        refresh_quota = true;
                     }
                 }
                 let tabbar_rect = Rect::from_min_size(body.min, Vec2::new(theme::TABBAR_WIDTH, body.height()));
@@ -366,6 +369,9 @@ impl AnvilApp {
                 FontId::monospace(11.0),
                 theme::colors().accent,
             );
+        }
+        if refresh_quota {
+            self.request_quota_refresh();
         }
         // The config watcher and the Claude status poll are periodic: keep a
         // 1 Hz tick alive so they run even when nothing else asks for a frame.
@@ -547,12 +553,15 @@ impl AnvilApp {
         self.refresh_claude_line();
         let quota_snapshot = self.quota.as_ref().map(|q| q.snapshot());
         let rows = self.keymap.describe();
-        // Edit a copy: apply_config must compare the new values against the
-        // configuration that is actually in effect, or nothing would ever
-        // re-install fonts, switch the palette or rebuild the profile list.
-        let mut next = self.config.clone();
+        // The page edits the live config in place: it used to clone the whole config
+        // every frame only to hand out mutable access to one, and apply_config
+        // compares against the config actually in effect, so a clone would have
+        // to be kept anyway. It is taken out for the duration of the call and
+        // put back below, with apply_config taking it over when the page
+        // reports a change.
+        let mut next = std::mem::take(&mut self.config);
+        let claude_line = self.claude_line.1.clone();
         let outcome = {
-            let claude_line = self.claude_line.1.clone();
             let mut context = crate::settings_ui::SettingsContext {
                 config: &mut next,
                 keymap_rows: rows,
@@ -572,8 +581,10 @@ impl AnvilApp {
             crate::settings_ui::open_path(&path);
         }
         if outcome.changed {
-            self.apply_config(ui.ctx().clone(), next, true);
+            let applied = std::mem::take(&mut next);
+            self.apply_config(ui.ctx().clone(), applied, true);
         }
+        self.config = next;
         if outcome.refresh_fonts {
             self.font_entries = fonts::registry_font_entries();
             self.font_families = font_families(&self.font_entries);
@@ -591,9 +602,17 @@ impl AnvilApp {
             self.disable_claude();
         }
         if outcome.quota_refresh {
-            if let Some(quota) = &self.quota {
-                quota.refresh();
-            }
+            self.request_quota_refresh();
+        }
+    }
+
+    /// Asks for a quota cycle, saying so when the anti-hammer gap defers it:
+    /// otherwise a click inside the gap looks exactly like a dead button.
+    fn request_quota_refresh(&mut self) {
+        let Some(quota) = &self.quota else { return };
+        let wait = quota.refresh();
+        if wait > 0 {
+            self.toast(strings::QUOTA_REFRESH_DEFERRED.replace("{0}", &wait.to_string()));
         }
     }
 
@@ -838,6 +857,7 @@ impl AnvilApp {
             Action::ProfileSelector => self.open_picker(ctx),
             Action::Settings => self.settings_open = true,
             Action::ToggleFullscreen => commands.push(WindowCommand::ToggleFullscreen),
+            Action::ToggleFrameStats => self.toggle_debug_overlay(),
             Action::CtrlC => {
                 if let Some(id) = self.focused_id() {
                     if self.selection_text(id).is_some() {
@@ -1517,6 +1537,20 @@ impl AnvilApp {
         }
     }
 
+    /// Adopts a finished process enumeration. The snapshot is empty when the
+    /// enumeration failed, which is what the previous blocking call also did.
+    fn absorb_proc_snapshot(&mut self) {
+        let Some(rx) = &self.proc_results else { return };
+        match rx.try_recv() {
+            Ok(found) => {
+                self.proc_snapshot = found;
+                self.proc_results = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.proc_results = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
     fn build_profiles(&self) -> Vec<Profile> {
         let mut profiles = self.builtin_profiles.clone();
         if let Some(distro) = self.config.default_profile.strip_prefix("wsl-").filter(|distro| !distro.is_empty()) {
@@ -1701,10 +1735,25 @@ impl AnvilApp {
             return;
         }
         self.last_status_poll = Instant::now();
-        let polled_processes = self.last_proc_poll.elapsed() >= Duration::from_secs(3);
+        // A finished enumeration is adopted first, so the pane walk below reads
+        // the snapshot the `polled_processes` branch then annotates.
+        let adopted = matches!(self.proc_results.as_ref().map(std::sync::mpsc::Receiver::try_recv), Some(Ok(_)));
+        if adopted {
+            self.absorb_proc_snapshot();
+        }
+        let polled_processes = adopted || self.last_proc_poll.elapsed() >= Duration::from_secs(3);
         if polled_processes {
-            self.last_proc_poll = Instant::now();
-            self.proc_snapshot = crate::procs::snapshot();
+            if !adopted {
+                self.last_proc_poll = Instant::now();
+                // One enumeration at a time: a slow Win32 call must not stack up.
+                if self.proc_results.is_none() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    self.proc_results = Some(rx);
+                    std::thread::spawn(move || {
+                        let _ = tx.send(crate::procs::snapshot());
+                    });
+                }
+            }
             self.ai_commands.clear();
             for tab in &mut self.tabs {
                 for (id, entry) in &mut tab.panes {
@@ -1877,7 +1926,16 @@ pub fn scheme_palette(config: &Config) -> Palette {
             .find(|scheme| scheme.name == name)
             .and_then(|scheme| {
                 let colors: Vec<&str> = scheme.colors.iter().map(String::as_str).collect();
-                Palette::from_hex(&scheme.foreground, &scheme.background, &scheme.cursor, &colors).ok()
+                // A malformed scheme still has to be visible as broken: the
+                // settings combo keeps showing it as selected, so a silent
+                // fallback to dark would look like the setting did not apply.
+                match Palette::from_hex(&scheme.foreground, &scheme.background, &scheme.cursor, &colors) {
+                    Ok(palette) => Some(palette),
+                    Err(e) => {
+                        log::warn!("colour scheme `{name}` is malformed, drawing dark: {e}");
+                        None
+                    }
+                }
             })
             .unwrap_or_else(Palette::dark),
     }

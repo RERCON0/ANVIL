@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use egui::{Align, Align2, Layout, Rect, RichText, ScrollArea, Sense, Stroke, Vec2};
+use egui::{Align, Align2, Layout, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, Vec2};
 
 use crate::git::{self, Change, CommitLog, FileDiff, Status};
 use crate::graph;
@@ -90,6 +90,32 @@ pub enum Response {
     Fetched(String),
     Pushed(String),
     Error(String),
+}
+
+/// A row of the commit list: either a section header or a commit by index.
+/// Flattened so the list can be virtualized by index.
+enum CommitRow {
+    Header { label: &'static str },
+    Commit { index: usize },
+}
+
+/// Section headers and their commits, in display order.
+fn commit_rows_of(log: &CommitLog) -> Vec<CommitRow> {
+    let mut rows = Vec::with_capacity(log.commits.len() * 2);
+    let mut section = None;
+    for (index, commit) in log.commits.iter().enumerate() {
+        if section != Some(commit.section) {
+            section = Some(commit.section);
+            let label = match commit.section {
+                git::Section::Outgoing => strings::WORKSPACE_SECTION_OUTGOING,
+                git::Section::Incoming => strings::WORKSPACE_SECTION_INCOMING,
+                git::Section::History => strings::WORKSPACE_SECTION_HISTORY,
+            };
+            rows.push(CommitRow::Header { label });
+        }
+        rows.push(CommitRow::Commit { index });
+    }
+    rows
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -724,32 +750,50 @@ impl Workspace {
             .show(ui, |ui| self.commit_rows(ui));
     }
 
+    /// The commit list as fixed-height rows, so it can be virtualized: the
+    /// whole log used to lay out every commit on every frame.
     fn commit_rows(&mut self, ui: &mut egui::Ui) {
-        let mut current_section = None;
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         const ROW_HEIGHT: f32 = 22.0;
-        // Rows sit edge to edge: each draws its lane segments only inside its
-        // own rect, so any item spacing between rows is a gap in every lane.
-        // The section labels keep the spacing they had around them.
-        let gap = ui.spacing().item_spacing.y;
-        ui.spacing_mut().item_spacing.y = 0.0;
-        // Read in place (the log is not cloned every frame); a click is
-        // handled after the loop.
+        let rows = commit_rows_of(&self.log);
+        let width = ui.available_width();
         let mut opened: Option<String> = None;
-        for (index, commit) in self.log.commits.iter().enumerate() {
-            if current_section != Some(commit.section) {
-                current_section = Some(commit.section);
-                let label = match commit.section {
-                    git::Section::Outgoing => strings::WORKSPACE_SECTION_OUTGOING,
-                    git::Section::Incoming => strings::WORKSPACE_SECTION_INCOMING,
-                    git::Section::History => strings::WORKSPACE_SECTION_HISTORY,
-                };
-                ui.add_space(if index > 0 { gap + 4.0 } else { 4.0 });
-                ui.label(RichText::new(label).color(theme::colors().faint).font(theme::font(10.5)));
-                ui.add_space(gap);
+        let scroll = ScrollArea::vertical().id_salt("workspace-commits-rows").auto_shrink([false, false]);
+        scroll.show_rows(ui, ROW_HEIGHT, rows.len(), |ui, visible| {
+            // Rows sit edge to edge: each draws its lane segments only inside
+            // its own rect, so any item spacing is a gap in every lane.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for row in rows[visible].iter() {
+                match row {
+                    // A header occupies a normal row: virtualization needs one
+                    // height for every line, and the label fits in it.
+                    CommitRow::Header { label, .. } => {
+                        let width = ui.available_width();
+                        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, ROW_HEIGHT), Sense::hover());
+                        ui.painter_at(rect).text(
+                            Pos2::new(rect.min.x, rect.center().y),
+                            Align2::LEFT_CENTER,
+                            *label,
+                            theme::font(10.5),
+                            theme::colors().faint,
+                        );
+                    }
+                    CommitRow::Commit { index } => self.commit_row(ui, *index, now, width, &mut opened),
+                }
             }
+        });
+        if let Some(hash) = opened {
+            self.busy = true;
+            self.send(Request::CommitDetail { hash });
+        }
+    }
+
+    /// One commit's row: its lane graph, badges, time, hash and subject.
+    fn commit_row(&mut self, ui: &mut egui::Ui, index: usize, now: i64, width: f32, opened: &mut Option<String>) {
+        const ROW_HEIGHT: f32 = 22.0;
+        let commit = &self.log.commits[index];
+        {
             let row = self.graph.get(index).cloned().unwrap_or(graph::Row { lane: 0, lane_count: 1, segments: Vec::new() });
-            let width = ui.available_width();
             let (rect, response) = ui.allocate_exact_size(Vec2::new(width, ROW_HEIGHT), Sense::click());
             let painter = ui.painter_at(rect);
             if response.hovered() {
@@ -854,12 +898,8 @@ impl Workspace {
                 let _ = response.clone().on_hover_text(tooltip);
             }
             if response.clicked() {
-                opened = Some(commit.hash.clone());
+                *opened = Some(commit.hash.clone());
             }
-        }
-        if let Some(hash) = opened {
-            self.busy = true;
-            self.send(Request::CommitDetail { hash });
         }
     }
 
@@ -2063,24 +2103,15 @@ fn is_format_control(ch: char) -> bool {
     matches!(ch, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
 }
 
-/// Truncates text to `max_width` with an ellipsis.
+/// Truncates text to `max_width` with an ellipsis. The single implementation
+/// lives in `chrome::tabbar`: this panel and the tab bar must not hold two
+/// copies that can drift into showing different text.
+///
+/// The cut point is found by binary search over char boundaries, so the cost is
+/// a handful of layouts rather than one per character. Width grows monotonically
+/// with the prefix, which is what makes the search valid.
 fn elide(painter: &egui::Painter, text: &str, font: egui::FontId, max_width: f32) -> String {
-    let measure = |value: &str| painter.layout_no_wrap(value.to_owned(), font.clone(), egui::Color32::WHITE).size().x;
-    if measure(text) <= max_width {
-        return text.to_owned();
-    }
-    let mut out = String::new();
-    for ch in text.chars() {
-        let mut candidate = out.clone();
-        candidate.push(ch);
-        candidate.push('…');
-        if measure(&candidate) > max_width {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push('…');
-    out
+    crate::chrome::tabbar::elide(painter, text, font, max_width)
 }
 
 /// Elides the *front* of a path so the folder closest to the file stays
@@ -2090,15 +2121,23 @@ fn elide_front(painter: &egui::Painter, text: &str, font: egui::FontId, max_widt
     if measure(text) <= max_width {
         return text.to_owned();
     }
-    let mut tail = String::new();
-    for ch in text.chars().rev() {
-        tail.insert(0, ch);
-        if measure(&format!("…{tail}")) > max_width {
-            tail.remove(0);
-            break;
+    let chars: Vec<char> = text.chars().collect();
+    let fits = |count: usize| {
+        let kept: String = chars[chars.len() - count..].iter().collect();
+        measure(&format!("…{kept}")) <= max_width
+    };
+    let mut low = 0;
+    let mut high = chars.len();
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if fits(mid) {
+            low = mid + 1;
+        } else {
+            high = mid;
         }
     }
-    format!("…{tail}")
+    let kept: String = chars[chars.len() - low..].iter().collect();
+    format!("…{kept}")
 }
 
 /// VS Code's ref colours: local branch (charts.blue), remote (charts.purple).
@@ -2494,6 +2533,51 @@ pub fn clamp_width(width: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The commit list is virtualized by row index, so the flattened rows must
+    /// carry every commit in order under a header per section run.
+    #[test]
+    fn commit_rows_carry_each_commit_under_one_header_per_section() {
+        let commit = |section, hash: &str| git::Commit {
+            hash: hash.to_owned(),
+            short: hash[..4].to_owned(),
+            parents: Vec::new(),
+            author: "a".to_owned(),
+            subject: hash.to_owned(),
+            refs: Vec::new(),
+            time: 0,
+            section,
+        };
+        let log = CommitLog {
+            commits: vec![
+                commit(git::Section::Outgoing, "aaaa111"),
+                commit(git::Section::Outgoing, "bbbb222"),
+                commit(git::Section::Incoming, "cccc333"),
+                commit(git::Section::History, "dddd444"),
+                commit(git::Section::History, "eeee555"),
+                commit(git::Section::History, "ffff666"),
+            ],
+            ..Default::default()
+        };
+        let rows = commit_rows_of(&log);
+        let indexes: Vec<usize> = rows
+            .iter()
+            .filter_map(|row| match row {
+                CommitRow::Commit { index } => Some(*index),
+                CommitRow::Header { .. } => None,
+            })
+            .collect();
+        assert_eq!(indexes, [0, 1, 2, 3, 4, 5], "every commit must appear exactly once, in order");
+        let headers: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| match row {
+                CommitRow::Header { label } => Some(*label),
+                CommitRow::Commit { .. } => None,
+            })
+            .collect();
+        assert_eq!(headers.len(), 3, "one header per section run, not one per commit");
+        assert!(commit_rows_of(&CommitLog::default()).is_empty());
+    }
 
     #[test]
     fn row_ranges_preserve_unicode_crlf_numbers_and_last_line() {

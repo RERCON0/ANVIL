@@ -1,9 +1,9 @@
 //! Vertical tab list on the left: numbers, titles, the Claude badge, activity
 //! dots, drag & drop, rename in place and the buttons under the list.
 
-use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
+use egui::{Align2, Color32, FontId, Pos2, Rect, ScrollArea, Sense, Vec2};
 
-use crate::claude_status::{js_round, StatusRecord};
+use crate::claude_status::{clamp_pct, js_round, StatusRecord};
 use crate::strings;
 use crate::theme;
 
@@ -78,119 +78,32 @@ pub fn show(
     let mut actions = Vec::new();
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme::colors().chrome_bg);
-    let mut y = rect.min.y;
     state.hover_index = None;
 
-    for (index, tab) in tabs.iter().enumerate() {
-        let height = theme::TAB_ROW_HEIGHT + if tab.claude.is_some() { theme::CLAUDE_ROW_HEIGHT } else { 0.0 };
-        let row = Rect::from_min_size(Pos2::new(rect.min.x, y), Vec2::new(rect.width(), height));
-        y += height;
-        if row.max.y > rect.max.y {
-            break;
-        }
-        let response = ui.interact(row, ui.id().with(("tab", index)), Sense::click_and_drag());
-        if response.hovered() {
-            state.hover_index = Some(index);
-        }
-        if tab.active {
-            painter.rect_filled(row, 0.0, theme::colors().tab_active_bg);
-        } else if response.hovered() {
-            painter.rect_filled(row, 0.0, theme::colors().tab_hover_bg);
-        }
-
-        if let Some(rename) = state.rename.as_mut().filter(|rename| rename.tab == index) {
-            let field_rect = Rect::from_min_size(Pos2::new(row.min.x + 30.0, row.min.y + 4.0), Vec2::new(row.width() - 40.0, row.height() - 8.0));
-            ui.scope_builder(egui::UiBuilder::new().max_rect(field_rect), |ui| {
-                let field = ui.add(egui::TextEdit::singleline(&mut rename.text).desired_width(field_rect.width()));
-                if rename.focus {
-                    field.request_focus();
-                    rename.focus = false;
-                }
-                let commit = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-                if commit {
-                    actions.push(TabbarAction::Rename(index, rename.text.trim().to_owned()));
-                }
-                if escape {
-                    actions.push(TabbarAction::Rename(index, tab.title.clone()));
-                }
-            });
-            if !actions.is_empty() {
-                state.rename = None;
-            }
-            continue;
-        }
-
-        let number_color = if tab.active { theme::colors().tab_active_number } else { theme::colors().tab_number };
-        painter.text(
-            Pos2::new(row.min.x + 14.0 + 11.0, row.min.y + 17.0),
-            Align2::CENTER_CENTER,
-            (index + 1).to_string(),
-            theme::field_font(12.0),
-            number_color,
-        );
-        if tab.activity {
-            painter.circle_filled(Pos2::new(row.min.x + 7.0, row.min.y + 17.0), 2.0, theme::colors().accent);
-        }
-        let text_color = if tab.active { theme::colors().tab_active_text } else { theme::colors().tab_text };
-        let title_rect = Rect::from_min_size(Pos2::new(row.min.x + 36.0, row.min.y), Vec2::new(row.width() - 58.0, theme::TAB_ROW_HEIGHT));
-        let title_font = theme::font(12.5);
-        let title = elide(&painter, &tab.title, title_font.clone(), title_rect.width());
-        painter.with_clip_rect(title_rect).text(
-            Pos2::new(title_rect.min.x, title_rect.center().y),
-            Align2::LEFT_CENTER,
-            title,
-            title_font,
-            text_color,
-        );
-        if let Some(record) = &tab.claude {
-            paint_claude_line(&painter, row, record, badge_fields);
-        }
-
-        // Close button: the row's own response owns the click (a nested widget
-        // registered later would never win the press), so hit-test by position.
-        let close_rect = Rect::from_min_size(Pos2::new(row.max.x - 22.0, row.min.y + 8.0), Vec2::splat(18.0));
-        let pointer = ui.input(|i| i.pointer.hover_pos());
-        let close_hovered = response.hovered() && pointer.is_some_and(|pos| close_rect.contains(pos));
-        if response.hovered() {
-            let color = if close_hovered { theme::colors().tab_active_text } else { theme::colors().tab_text };
-            painter.text(close_rect.center(), Align2::CENTER_CENTER, "×", theme::font(14.0), color);
-        }
-
-        if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle)) && response.hovered() {
-            actions.push(TabbarAction::Close(index));
-        }
-        if response.double_clicked() {
-            state.rename = Some(RenameEdit { tab: index, text: tab.title.clone(), focus: true });
-        } else if response.drag_started() {
-            state.drag_from = Some(index);
-        } else if response.clicked() && state.drag_from.is_none() {
-            let clicked_close = response.interact_pointer_pos().is_some_and(|pos| close_rect.contains(pos));
-            if clicked_close {
-                actions.push(TabbarAction::Close(index));
-            } else {
-                actions.push(TabbarAction::Select(index));
-            }
-        }
-        response.context_menu(|ui| {
-            if ui.button(strings::TAB_RENAME).clicked() {
-                state.rename = Some(RenameEdit { tab: index, text: tab.title.clone(), focus: true });
-                ui.close_kind(egui::UiKind::Menu);
-            }
-            if ui.button(strings::TAB_DUPLICATE).clicked() {
-                actions.push(TabbarAction::Duplicate(index));
-                ui.close_kind(egui::UiKind::Menu);
-            }
-            if ui.button(strings::TAB_CLOSE).clicked() {
-                actions.push(TabbarAction::Close(index));
-                ui.close_kind(egui::UiKind::Menu);
-            }
-            if ui.button(strings::TAB_CLOSE_OTHERS).clicked() {
-                actions.push(TabbarAction::CloseOthers(index));
-                ui.close_kind(egui::UiKind::Menu);
+    // More tabs than fit must stay reachable: the list scrolls, so a tab past
+    // the fold can be clicked, renamed, dragged and closed like any other.
+    let list = Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.max.y - 30.0));
+    let content_height: f32 = tabs.iter().map(row_height).sum();
+    let scroll = ScrollArea::vertical()
+        .id_salt("tabbar-tabs")
+        .auto_shrink([false, false])
+        .max_height(list.height())
+        .show(ui, |ui| {
+            ui.set_height(content_height.max(list.height()));
+            for (index, tab) in tabs.iter().enumerate() {
+                let height = row_height(tab);
+                let top = ui.next_widget_position().y;
+                let row = Rect::from_min_size(Pos2::new(list.min.x, top), Vec2::new(list.width(), height));
+                let response = ui.interact(row, ui.id().with(("tab", index)), Sense::click_and_drag());
+                tab_row(ui, &painter, state, index, tab, row, response, badge_fields, &mut actions);
+                ui.allocate_space(Vec2::new(0.0, height));
             }
         });
-    }
+    // Rows are laid out from the scrolled content origin, so a drag that
+    // started above the fold has to be mapped through the same offset.
+    let scroll_y = scroll.state.offset.y;
+    // The buttons sit below the list, not below its scrolled content.
+    let y = list.max.y;
 
     // Drag & drop reordering.
     if let Some(from) = state.drag_from {
@@ -206,9 +119,8 @@ pub fn show(
                 .iter()
                 .enumerate()
                 .find(|(index, tab)| {
-                    let height = theme::TAB_ROW_HEIGHT + if tab.claude.is_some() { theme::CLAUDE_ROW_HEIGHT } else { 0.0 };
-                    let top = rect.min.y + (0..*index).map(|i| row_height(&tabs[i])).sum::<f32>();
-                    pos.y >= top && pos.y < top + height
+                    let top = scroll_y + (0..*index).map(|i| row_height(&tabs[i])).sum::<f32>();
+                    pos.y >= top && pos.y < top + row_height(tab)
                 })
                 .map(|(index, _)| index);
             if let Some(target) = target {
@@ -218,7 +130,6 @@ pub fn show(
     }
 
     // Buttons under the list.
-    let y = y.max(rect.min.y);
     let plus_rect = Rect::from_min_size(Pos2::new(rect.min.x + 8.0, y + 8.0), Vec2::new(28.0, 24.0));
     let plus = ui.interact(plus_rect, ui.id().with("tab-new"), Sense::click());
     let plus_color = if plus.hovered() { theme::colors().icon_hover } else { theme::colors().icon };
@@ -258,23 +169,154 @@ fn row_height(tab: &TabInfo) -> f32 {
     theme::TAB_ROW_HEIGHT + if tab.claude.is_some() { theme::CLAUDE_ROW_HEIGHT } else { 0.0 }
 }
 
+/// One tab's row: background, number, activity dot, title, Claude line, close
+/// button and the click, drag and context-menu handling.
+#[allow(clippy::too_many_arguments)]
+fn tab_row(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    state: &mut TabbarState,
+    index: usize,
+    tab: &TabInfo,
+    row: Rect,
+    response: egui::Response,
+    badge_fields: &ClaudeBadgeFields,
+    actions: &mut Vec<TabbarAction>,
+) {
+    if response.hovered() {
+        state.hover_index = Some(index);
+    }
+    if tab.active {
+        painter.rect_filled(row, 0.0, theme::colors().tab_active_bg);
+    } else if response.hovered() {
+        painter.rect_filled(row, 0.0, theme::colors().tab_hover_bg);
+    }
+
+    if let Some(rename) = state.rename.as_mut().filter(|rename| rename.tab == index) {
+        let field_rect = Rect::from_min_size(
+            Pos2::new(row.min.x + 30.0, row.min.y + 4.0),
+            Vec2::new(row.width() - 40.0, row.height() - 8.0),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(field_rect), |ui| {
+            let field = ui.add(egui::TextEdit::singleline(&mut rename.text).desired_width(field_rect.width()));
+            if rename.focus {
+                field.request_focus();
+                rename.focus = false;
+            }
+            let commit = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if commit {
+                actions.push(TabbarAction::Rename(index, rename.text.trim().to_owned()));
+            }
+            if escape {
+                actions.push(TabbarAction::Rename(index, tab.title.clone()));
+            }
+        });
+        if !actions.is_empty() {
+            state.rename = None;
+        }
+        return;
+    }
+
+    let number_color = if tab.active { theme::colors().tab_active_number } else { theme::colors().tab_number };
+    painter.text(
+        Pos2::new(row.min.x + 14.0 + 11.0, row.min.y + 17.0),
+        Align2::CENTER_CENTER,
+        (index + 1).to_string(),
+        theme::field_font(12.0),
+        number_color,
+    );
+    if tab.activity {
+        painter.circle_filled(Pos2::new(row.min.x + 7.0, row.min.y + 17.0), 2.0, theme::colors().accent);
+    }
+    let text_color = if tab.active { theme::colors().tab_active_text } else { theme::colors().tab_text };
+    let title_rect = Rect::from_min_size(
+        Pos2::new(row.min.x + 36.0, row.min.y),
+        Vec2::new(row.width() - 58.0, theme::TAB_ROW_HEIGHT),
+    );
+    let title_font = theme::font(12.5);
+    let title = elide(painter, &tab.title, title_font.clone(), title_rect.width());
+    painter.with_clip_rect(title_rect).text(
+        Pos2::new(title_rect.min.x, title_rect.center().y),
+        Align2::LEFT_CENTER,
+        title,
+        title_font,
+        text_color,
+    );
+    if let Some(record) = &tab.claude {
+        paint_claude_line(painter, row, record, badge_fields);
+    }
+
+    // Close button: the row's own response owns the click (a nested widget
+    // registered later would never win the press), so hit-test by position.
+    let close_rect = Rect::from_min_size(Pos2::new(row.max.x - 22.0, row.min.y + 8.0), Vec2::splat(18.0));
+    let pointer = ui.input(|i| i.pointer.hover_pos());
+    let close_hovered = response.hovered() && pointer.is_some_and(|pos| close_rect.contains(pos));
+    if response.hovered() {
+        let color = if close_hovered { theme::colors().tab_active_text } else { theme::colors().tab_text };
+        painter.text(close_rect.center(), Align2::CENTER_CENTER, "×", theme::font(14.0), color);
+    }
+
+    if ui.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle)) && response.hovered() {
+        actions.push(TabbarAction::Close(index));
+    }
+    if response.double_clicked() {
+        state.rename = Some(RenameEdit { tab: index, text: tab.title.clone(), focus: true });
+    } else if response.drag_started() {
+        state.drag_from = Some(index);
+    } else if response.clicked() && state.drag_from.is_none() {
+        let clicked_close = response.interact_pointer_pos().is_some_and(|pos| close_rect.contains(pos));
+        if clicked_close {
+            actions.push(TabbarAction::Close(index));
+        } else {
+            actions.push(TabbarAction::Select(index));
+        }
+    }
+    response.context_menu(|ui| {
+        if ui.button(strings::TAB_RENAME).clicked() {
+            state.rename = Some(RenameEdit { tab: index, text: tab.title.clone(), focus: true });
+            ui.close_kind(egui::UiKind::Menu);
+        }
+        if ui.button(strings::TAB_DUPLICATE).clicked() {
+            actions.push(TabbarAction::Duplicate(index));
+            ui.close_kind(egui::UiKind::Menu);
+        }
+        if ui.button(strings::TAB_CLOSE).clicked() {
+            actions.push(TabbarAction::Close(index));
+            ui.close_kind(egui::UiKind::Menu);
+        }
+        if ui.button(strings::TAB_CLOSE_OTHERS).clicked() {
+            actions.push(TabbarAction::CloseOthers(index));
+            ui.close_kind(egui::UiKind::Menu);
+        }
+    });
+}
+
+/// One implementation for both callers: a byte-identical copy of this drifted
+/// from the workspace panel's. Binary search over char boundaries keeps it at a
+/// handful of layouts instead of one per character.
 pub(crate) fn elide(painter: &egui::Painter, text: &str, font: FontId, max_width: f32) -> String {
     let measure = |s: &str| painter.layout_no_wrap(s.to_owned(), font.clone(), Color32::WHITE).size().x;
     if measure(text) <= max_width {
         return text.to_owned();
     }
-    let mut out = String::new();
-    for ch in text.chars() {
-        let mut candidate = out.clone();
-        candidate.push(ch);
-        candidate.push('…');
-        if measure(&candidate) > max_width {
-            break;
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let fits = |count: usize| {
+        let cut = chars.get(count).map_or(text.len(), |(offset, _)| *offset);
+        measure(&format!("{}…", &text[..cut])) <= max_width
+    };
+    let mut low = 0;
+    let mut high = chars.len();
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if fits(mid) {
+            low = mid + 1;
+        } else {
+            high = mid;
         }
-        out.push(ch);
     }
-    out.push('…');
-    out
+    let cut = chars.get(low).map_or(text.len(), |(offset, _)| *offset);
+    format!("{}…", &text[..cut])
 }
 
 use crate::config::ClaudeBadgeFields;
@@ -286,15 +328,15 @@ fn badge_parts(record: &StatusRecord, fields: &ClaudeBadgeFields) -> Vec<(String
     if let Some(model) = record.model.as_ref().filter(|_| fields.model) {
         parts.push((model.clone(), None));
     }
-    if let Some(pct) = record.context_pct.filter(|_| fields.context) {
+    if let Some(pct) = record.context_pct.map(clamp_pct).filter(|_| fields.context) {
         let filled = js_round(pct / 10.0).clamp(0, 10) as usize;
         let bar = format!("{}{} {}%", "▓".repeat(filled), "░".repeat(10 - filled), js_round(pct));
         parts.push((bar, Some(pct)));
     }
-    if let Some(pct) = record.five_hour_pct.filter(|_| fields.five_hour) {
+    if let Some(pct) = record.five_hour_pct.map(clamp_pct).filter(|_| fields.five_hour) {
         parts.push((format!("5h {}", js_round(pct)), Some(pct)));
     }
-    if let Some(pct) = record.seven_day_pct.filter(|_| fields.seven_day) {
+    if let Some(pct) = record.seven_day_pct.map(clamp_pct).filter(|_| fields.seven_day) {
         parts.push((format!("7d {}", js_round(pct)), Some(pct)));
     }
     if let Some(agent) = record.agent.as_ref().filter(|_| fields.agent) {
@@ -344,6 +386,35 @@ mod tests {
         let fields = ClaudeBadgeFields { model: false, five_hour: false, ..ClaudeBadgeFields::default() };
         assert_eq!(texts(&fields), vec!["▓▓▓▓░░░░░░ 37%", "7d 64", "reviewer"]);
         assert_eq!(badge_parts(&record, &fields)[0].1, Some(37.4), "percent parts carry their value for the colour");
+        // A broken or hostile payload is clamped here exactly as the status
+        // line clamps it, so the badge cannot print `150%` beside `100%`.
+        let wild = StatusRecord { context_pct: Some(150.0), five_hour_pct: Some(-20.0), ..StatusRecord::default() };
+        let parts = badge_parts(&wild, &ClaudeBadgeFields::default());
+        assert_eq!(parts.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(), ["▓▓▓▓▓▓▓▓▓▓ 100%", "5h 0"]);
+        assert_eq!(parts[0].1, Some(100.0), "the colour follows the clamped value, not the raw one");
+    }
+
+    /// More tabs than fit must stay reachable: the list scrolls, and a tab past the
+    /// fold is still painted and still hit-testable where the scroll put it.
+    #[test]
+    fn a_scrolled_list_still_reaches_the_tabs_past_the_fold() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), true);
+        let _ = ctx.run_ui(Default::default(), |_| {});
+        let blank = || TabInfo { title: String::new(), active: false, activity: false, claude: None };
+        let many: Vec<TabInfo> =
+            (0..12).map(|index| TabInfo { title: format!("tab {index}"), ..blank() }).collect();
+        let mut state = TabbarState::default();
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(180.0, 120.0));
+        let mut actions = Vec::new();
+        let _ = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
+            actions = show(ui, rect, &mut state, &many, false, &Default::default());
+        });
+        assert!(actions.is_empty(), "painting alone reports no actions");
+        // Every row is laid out inside the scrolled content, not clipped away.
+        let heights: f32 = many.iter().map(row_height).sum();
+        assert!(heights > rect.height(), "the fixture really does overflow: {heights} vs {}", rect.height());
+        assert_eq!(row_height(&many[0]), theme::TAB_ROW_HEIGHT);
     }
 
     /// A rename or drag in progress names a tab by index: when an earlier tab
