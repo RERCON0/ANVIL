@@ -35,6 +35,9 @@ pub struct TabState {
     pub focused: usize,
     #[serde(default)]
     pub custom_title: Option<String>,
+    /// The tab's colour mark; absent in sessions saved before it existed.
+    #[serde(default)]
+    pub color: Option<crate::theme::TabColor>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -116,8 +119,22 @@ impl SavedNode {
 }
 
 /// The saved directory if it still exists, else None (use the profile's).
+/// Only a path on a local drive counts: a UNC or device path restored from a
+/// session file would make the pane's ConPTY dial that host — and authenticate
+/// to it — while starting the shell, so it is rejected before any filesystem
+/// call (`is_dir` on a UNC path is itself the connection).
 pub fn usable_cwd(saved: Option<&Path>) -> Option<PathBuf> {
-    saved.filter(|p| p.is_dir()).map(Path::to_path_buf)
+    saved.filter(|p| is_local_dir(p)).map(Path::to_path_buf)
+}
+
+fn is_local_dir(path: &Path) -> bool {
+    let mut components = path.components();
+    let local = matches!(
+        components.next(),
+        Some(std::path::Component::Prefix(prefix))
+            if matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_))
+    );
+    local && components.next().is_some() && path.is_dir()
 }
 
 #[cfg(test)]
@@ -139,6 +156,7 @@ mod tests {
                 }),
                 focused: 0,
                 custom_title: None,
+                color: None,
             }],
         };
         let extra = session.for_extra_window();
@@ -161,7 +179,12 @@ mod tests {
             window: Some(WindowState { x: 10, y: 20, width: 1600, height: 900, maximized: true }),
             active_tab: 1,
             tabs: vec![
-                TabState { layout: SavedNode::Pane(pane("git-bash", Some("C:\\work"))), focused: 0, custom_title: None },
+                TabState {
+                    layout: SavedNode::Pane(pane("git-bash", Some("C:\\work"))),
+                    focused: 0,
+                    custom_title: None,
+                    color: Some(crate::theme::TabColor::Green),
+                },
                 TabState {
                     layout: SavedNode::Split {
                         dir: Dir::Row,
@@ -172,6 +195,7 @@ mod tests {
                     },
                     focused: 1,
                     custom_title: Some("сервер".into()),
+                    color: None,
                 },
             ],
         }
@@ -183,6 +207,18 @@ mod tests {
         let path = dir.path().join("session.json");
         sample().save(&path).unwrap();
         assert_eq!(SessionState::load(&path), sample());
+    }
+
+    /// A tab colour is written by name, and a session saved before the field
+    /// existed loads as uncoloured instead of failing the whole file.
+    #[test]
+    fn a_tab_colour_survives_and_an_older_session_has_none() {
+        let text = serde_json::to_string(&sample()).unwrap();
+        assert!(text.contains("\"color\":\"green\""), "colour is written by name: {text}");
+        let older = r#"{"tabs":[{"layout":{"pane":{"profileId":"pwsh"}}}]}"#;
+        let loaded: SessionState = serde_json::from_str(older).unwrap();
+        assert_eq!(loaded.tabs.len(), 1);
+        assert_eq!(loaded.tabs[0].color, None, "an older session must still load");
     }
 
     #[test]
@@ -218,5 +254,15 @@ mod tests {
         assert_eq!(usable_cwd(Some(dir.path())), Some(dir.path().to_path_buf()));
         assert_eq!(usable_cwd(Some(Path::new("C:\\definitely\\not\\here"))), None);
         assert_eq!(usable_cwd(None), None);
+    }
+
+    /// A crafted session must not send the pane's shell to a remote host: the
+    /// rejection is lexical, before `is_dir`, which would itself open the
+    /// connection and offer the user's credentials.
+    #[test]
+    fn a_remote_path_is_rejected_before_it_is_touched() {
+        for path in ["\\\\attacker\\share", "//attacker/share", "\\\\?\\UNC\\attacker\\share"] {
+            assert_eq!(usable_cwd(Some(Path::new(path))), None, "{path}");
+        }
     }
 }

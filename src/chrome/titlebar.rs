@@ -14,7 +14,7 @@ enum Button {
     Close,
 }
 
-pub fn title_bar(ui: &mut egui::Ui, rect: Rect, maximized: bool, commands: &mut Vec<WindowCommand>) {
+pub fn title_bar(ui: &mut egui::Ui, rect: Rect, maximized: bool, window_edge: bool, commands: &mut Vec<WindowCommand>) {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme::colors().chrome_bg);
     let buttons_width = theme::WINDOW_BUTTON_WIDTH * 3.0;
@@ -22,7 +22,8 @@ pub fn title_bar(ui: &mut egui::Ui, rect: Rect, maximized: bool, commands: &mut 
     let drag = ui.interact(drag_rect, ui.id().with("titlebar-drag"), Sense::click_and_drag());
     if drag.double_clicked() {
         commands.push(WindowCommand::ToggleMaximize);
-    } else if drag.drag_started_by(egui::PointerButton::Primary) {
+    } else if !window_edge && drag.drag_started_by(egui::PointerButton::Primary) {
+        // A press on the window border belongs to the resize, not to a drag.
         commands.push(WindowCommand::Drag);
     }
     painter.text(

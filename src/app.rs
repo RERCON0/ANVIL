@@ -84,6 +84,25 @@ struct QuotaSegments {
 /// Command-line flag of a window opened with Ctrl+Shift+N.
 pub const NEW_WINDOW_ARG: &str = "--new-window";
 
+/// Takes the value a finished worker sent, if one is waiting, and clears the
+/// slot. The slot is finished either way (a disconnected worker sends nothing
+/// more), and `try_recv` *consumes*: asking whether a value is ready without
+/// taking it loses it, so this is the only place the channel is read.
+fn take_ready<T>(slot: &mut Option<std::sync::mpsc::Receiver<T>>) -> Option<T> {
+    let rx = slot.as_ref()?;
+    match rx.try_recv() {
+        Ok(value) => {
+            *slot = None;
+            Some(value)
+        }
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            *slot = None;
+            None
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+    }
+}
+
 pub struct AnvilApp {
     config: Config,
     config_mtime: Option<SystemTime>,
@@ -296,7 +315,10 @@ impl AnvilApp {
         self.poll_panes(&ctx);
         self.poll_statuses();
         self.expire_toasts();
-        resize_borders(&ctx, maximized, &mut commands);
+        // On a border the press belongs to the window resize, not to the pane
+        // under it: the flag is threaded down so a drag there does not also
+        // start a text selection.
+        let window_edge = resize_borders(&ctx, maximized, &mut commands);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(theme::colors().chrome_bg))
@@ -306,7 +328,7 @@ impl AnvilApp {
                 }
                 let full = ui.max_rect();
                 let title = Rect::from_min_size(full.min, Vec2::new(full.width(), theme::TITLEBAR_HEIGHT));
-                title_bar(ui, title, maximized, &mut commands);
+                title_bar(ui, title, maximized, window_edge, &mut commands);
                 // The quota line takes the bottom of the window while quotas are on;
                 // tabs and panes get the rest, so nothing is ever drawn under it.
                 let footer = if self.quota.is_some() { crate::chrome::quota_bar::HEIGHT } else { 0.0 };
@@ -332,6 +354,7 @@ impl AnvilApp {
                         activity: self.tabs[i].has_activity && i != self.active,
                         // Hidden badge: no extra row height either.
                         claude: show_badge.then(|| self.tabs[i].claude_status().cloned()).flatten(),
+                        color: self.tabs[i].color,
                     })
                     .collect();
                 let badge_fields = self.config.claude_status.badge_fields;
@@ -345,7 +368,7 @@ impl AnvilApp {
                     self.ime_area = None;
                     self.show_settings(ui, area);
                 } else {
-                    self.show_active_tab(ui, area, &ctx);
+                    self.show_active_tab(ui, area, &ctx, window_edge);
                 }
             });
 
@@ -459,7 +482,7 @@ impl AnvilApp {
         }
     }
 
-    fn show_active_tab(&mut self, ui: &mut egui::Ui, rect: Rect, ctx: &egui::Context) {
+    fn show_active_tab(&mut self, ui: &mut egui::Ui, rect: Rect, ctx: &egui::Context, window_edge: bool) {
         self.last_tab_area = rect;
         let cursor = &self.config.terminal.cursor;
         let metrics = self.tabs.get(self.active).and_then(|t| t.focused_entry()).and_then(|e| e.view.metrics);
@@ -475,6 +498,7 @@ impl AnvilApp {
             min_pane_height: cell_h * 3.0,
             fallbacks_loaded: self.fallbacks_loaded,
             ai_command: self.ai_command(),
+            window_edge,
         };
         let actions = match self.tabs.get_mut(self.active) {
             Some(tab) => tab.show(ui, rect, &env),
@@ -633,6 +657,12 @@ impl AnvilApp {
                     tab.custom_title = (!title.is_empty()).then_some(title);
                 }
             }
+            tabbar::TabbarAction::SetColor(index, color) => {
+                if let Some(tab) = self.tabs.get_mut(index) {
+                    tab.color = color;
+                    self.mark_session_dirty();
+                }
+            }
             tabbar::TabbarAction::Move(from, to) => self.move_tab(from, to),
             tabbar::TabbarAction::NewTab => {
                 let profile = self.default_profile();
@@ -672,18 +702,26 @@ impl AnvilApp {
     }
 
     /// Installs the system fallback fonts the first time a glyph needs them.
-    /// They cost ~100 MB of working set, so panes start without them.
+    /// They cost ~100 MB of working set, so panes start without them. Reading
+    /// and parsing them takes long enough to drop frames, so it happens on a
+    /// worker: the glyphs appear one repaint later instead of freezing the
+    /// window the first time a CJK or emoji character arrives.
     fn load_fallbacks(&mut self, ctx: &egui::Context) {
         if self.fallbacks_loaded {
             return;
         }
         self.fallbacks_loaded = true;
-        let report = fonts::install(ctx, &self.config.font.family, &self.font_entries, true);
-        for missing in &report.missing {
-            log::info!("font not found: {missing}");
-        }
-        log::info!("system fallback fonts installed");
-        ctx.request_repaint();
+        let ctx = ctx.clone();
+        let family = self.config.font.family.clone();
+        let entries = self.font_entries.clone();
+        std::thread::spawn(move || {
+            let report = fonts::install(&ctx, &family, &entries, true);
+            for missing in &report.missing {
+                log::info!("font not found: {missing}");
+            }
+            log::info!("system fallback fonts installed");
+            ctx.request_repaint();
+        });
     }
 
     fn apply_pane_command(&mut self, id: PaneId, command: PaneCommand, ctx: &egui::Context) {
@@ -742,6 +780,13 @@ impl AnvilApp {
 
     pub fn send_text(&mut self, text: &str) {
         if self.ui.dialog.is_some() { return; }
+        // The same guard as a key press: text goes nowhere once the process is
+        // gone, and typing is what dismisses the exit message.
+        if self.tabs.get(self.active).is_some_and(Tab::focused_exited) {
+            let id = self.tabs[self.active].focused;
+            self.close_pane(id);
+            return;
+        }
         if let Some(pane) = self.focused_pane() {
             pane.term.lock().scroll_display(Scroll::Bottom);
             pane.write(text.as_bytes().to_vec());
@@ -1015,7 +1060,10 @@ impl AnvilApp {
         let Some(entry) = tab.pane(target) else { return };
         let profile_id = entry.profile_id.clone();
         let cwd = entry.cwd();
-        let Some(profile) = self.profiles.iter().find(|p| p.id == profile_id).cloned() else { return };
+        // A profile removed from the config after this pane started must not
+        // make the split silently do nothing: fall back as restore does.
+        let profile =
+            self.profiles.iter().find(|p| p.id == profile_id).cloned().unwrap_or_else(|| self.default_profile());
         let id = self.alloc_pane_id();
         let entry = self.spawn_entry(id, &profile, cwd);
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
@@ -1392,6 +1440,7 @@ impl AnvilApp {
         let focused = order.get(state.focused).copied().unwrap_or(order[0]);
         let mut tab = Tab::new(tree, entries, focused);
         tab.custom_title = state.custom_title.clone();
+        tab.color = state.color;
         Some(tab)
     }
 
@@ -1412,6 +1461,7 @@ impl AnvilApp {
             layout: crate::session::SavedNode::from_node(tab.tree.root(), &describe),
             focused,
             custom_title: tab.custom_title.clone(),
+            color: tab.color,
         }
     }
 
@@ -1537,17 +1587,17 @@ impl AnvilApp {
         }
     }
 
-    /// Adopts a finished process enumeration. The snapshot is empty when the
-    /// enumeration failed, which is what the previous blocking call also did.
-    fn absorb_proc_snapshot(&mut self) {
-        let Some(rx) = &self.proc_results else { return };
-        match rx.try_recv() {
-            Ok(found) => {
+    /// Adopts a finished process enumeration and answers whether one was
+    /// waiting. The snapshot is empty when the enumeration failed, which is
+    /// what the previous blocking call also did.
+    #[must_use]
+    fn absorb_proc_snapshot(&mut self) -> bool {
+        match take_ready(&mut self.proc_results) {
+            Some(found) => {
                 self.proc_snapshot = found;
-                self.proc_results = None;
+                true
             }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.proc_results = None,
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            None => false,
         }
     }
 
@@ -1737,10 +1787,7 @@ impl AnvilApp {
         self.last_status_poll = Instant::now();
         // A finished enumeration is adopted first, so the pane walk below reads
         // the snapshot the `polled_processes` branch then annotates.
-        let adopted = matches!(self.proc_results.as_ref().map(std::sync::mpsc::Receiver::try_recv), Some(Ok(_)));
-        if adopted {
-            self.absorb_proc_snapshot();
-        }
+        let adopted = self.absorb_proc_snapshot();
         let polled_processes = adopted || self.last_proc_poll.elapsed() >= Duration::from_secs(3);
         if polled_processes {
             if !adopted {
@@ -2008,4 +2055,36 @@ fn prepare_status_dir() -> (PathBuf, Option<PathBuf>) {
     }
     let run_dir = mine.clone();
     (mine, Some(run_dir))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A finished enumeration is taken exactly once. The old code asked the
+    /// channel whether a value was ready and then tried to read it: `try_recv`
+    /// consumes, so the second read found nothing and every pane kept the
+    /// empty startup snapshot, which in turn made the poll delete the status
+    /// file of a running agent.
+    #[test]
+    fn a_finished_enumeration_is_consumed_exactly_once() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut slot = Some(rx);
+        assert_eq!(take_ready(&mut slot), None, "nothing sent yet");
+        tx.send(vec![1u64, 2]).unwrap();
+        assert_eq!(take_ready(&mut slot), Some(vec![1u64, 2]));
+        assert_eq!(take_ready(&mut slot), None, "the value must not be read twice");
+        assert!(slot.is_none(), "a sent value finishes the slot");
+    }
+
+    /// A worker that panicked leaves nothing to read: the slot empties instead
+    /// of claiming a value forever.
+    #[test]
+    fn a_disconnected_worker_clears_the_slot() {
+        let (tx, rx) = std::sync::mpsc::channel::<u64>();
+        let mut slot = Some(rx);
+        drop(tx);
+        assert_eq!(take_ready(&mut slot), None);
+        assert!(slot.is_none(), "nothing more can arrive: the slot is finished");
+    }
 }

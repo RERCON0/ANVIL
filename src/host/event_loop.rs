@@ -184,6 +184,13 @@ impl ApplicationHandler<UserEvent> for Host {
                 let ctx = self.egui.as_ref().expect("egui").egui_ctx.clone();
                 let focus = self.app.key_focus(&ctx);
                 let binding = keys::chord(key, self.modifiers).and_then(|c| self.app.keymap().lookup(&c).cloned());
+                // A held key repeats: one action per press, except the ones
+                // that are meant to run while held (scrolling). Otherwise
+                // holding Ctrl+Shift+T opens a tab per repeat.
+                let repeat = key.repeat && binding.as_ref().is_some_and(|action| !action.repeats_on_hold());
+                if repeat {
+                    return;
+                }
                 match route_key_press(binding.as_ref(), focus) {
                     KeyRoute::AppAction | KeyRoute::TerminalAction => {
                         let action = binding.expect("routed actions have a binding");

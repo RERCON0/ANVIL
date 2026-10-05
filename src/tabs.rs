@@ -72,6 +72,9 @@ pub struct FrameEnv<'a> {
     pub fallbacks_loaded: bool,
     /// CLI for the AI commit message (config or auto-detected), if any.
     pub ai_command: Option<String>,
+    /// The pointer is on a window resize border: the press belongs to the
+    /// window, so panes must not start a selection under it.
+    pub window_edge: bool,
 }
 
 /// Actions a tab asks the application to perform.
@@ -98,6 +101,8 @@ pub struct Tab {
     /// Collapsed panes with the place they were removed from.
     pub collapsed: Vec<(PaneId, Anchor)>,
     pub custom_title: Option<String>,
+    /// The tab's colour from the context menu; None: no mark.
+    pub color: Option<theme::TabColor>,
     pub has_activity: bool,
     /// Cursor rectangle of the focused pane, for the IME candidate window.
     pub ime_area: Option<Rect>,
@@ -119,6 +124,7 @@ impl Tab {
             maximized: None,
             collapsed: Vec::new(),
             custom_title: None,
+            color: None,
             has_activity: false,
             ime_area: None,
             terminal_rects: Vec::new(),
@@ -271,6 +277,7 @@ impl Tab {
                 paste_on_middle: env.paste_on_middle,
                 copy_on_select: env.copy_on_select,
                 fallbacks_loaded: env.fallbacks_loaded,
+                window_edge: env.window_edge,
             };
             match &mut entry.content {
                 PaneContent::Live(pane) => {

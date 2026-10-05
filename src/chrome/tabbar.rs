@@ -53,6 +53,8 @@ pub struct TabInfo {
     pub active: bool,
     pub activity: bool,
     pub claude: Option<StatusRecord>,
+    /// The tab's colour mark, painted as a bar on the row's leading edge.
+    pub color: Option<theme::TabColor>,
 }
 
 pub enum TabbarAction {
@@ -61,6 +63,7 @@ pub enum TabbarAction {
     Duplicate(usize),
     CloseOthers(usize),
     Rename(usize, String),
+    SetColor(usize, Option<theme::TabColor>),
     Move(usize, usize),
     NewTab,
     Profiles,
@@ -191,6 +194,12 @@ fn tab_row(
     } else if response.hovered() {
         painter.rect_filled(row, 0.0, theme::colors().tab_hover_bg);
     }
+    if let Some(color) = tab.color {
+        // The reference marks a tab with a 3px bar along its edge; in this
+        // vertical list the nearest edge to the content is the left one, and
+        // the bar sits above the row's background so it reads on every state.
+        painter.rect_filled(Rect::from_min_max(row.min, Pos2::new(row.min.x + 3.0, row.max.y)), 0.0, color.color());
+    }
 
     if let Some(rename) = state.rename.as_mut().filter(|rename| rename.tab == index) {
         let field_rect = Rect::from_min_size(
@@ -281,6 +290,31 @@ fn tab_row(
             actions.push(TabbarAction::Duplicate(index));
             ui.close_kind(egui::UiKind::Menu);
         }
+        // The current colour rides on the submenu label, as in the reference:
+        // the menu answers "which colour is this" without opening it.
+        let mut submenu = egui::text::LayoutJob::default();
+        submenu.append(
+            strings::TAB_COLOR,
+            0.0,
+            egui::TextFormat { font_id: theme::field_font(13.0), color: theme::colors().text, ..Default::default() },
+        );
+        submenu.append(
+            &format!("  {}", tab.color.map_or(strings::TAB_COLOR_NONE, theme::TabColor::label)),
+            0.0,
+            egui::TextFormat { font_id: theme::field_font(11.5), color: theme::colors().faint, ..Default::default() },
+        );
+        ui.menu_button(submenu, |ui| {
+            if color_item(ui, tab.color.is_none(), None) {
+                actions.push(TabbarAction::SetColor(index, None));
+                ui.close();
+            }
+            for color in theme::TabColor::ALL {
+                if color_item(ui, tab.color == Some(color), Some(color)) {
+                    actions.push(TabbarAction::SetColor(index, Some(color)));
+                    ui.close();
+                }
+            }
+        });
         if ui.button(strings::TAB_CLOSE).clicked() {
             actions.push(TabbarAction::Close(index));
             ui.close_kind(egui::UiKind::Menu);
@@ -290,6 +324,32 @@ fn tab_row(
             ui.close_kind(egui::UiKind::Menu);
         }
     });
+}
+
+/// One row of the colour submenu: the chosen colour is marked by the radio,
+/// and every row carries the colour itself as a swatch. A list of colour
+/// names would describe the choices without showing any of them.
+fn color_item(ui: &mut egui::Ui, selected: bool, color: Option<theme::TabColor>) -> bool {
+    let mut job = egui::text::LayoutJob::default();
+    match color {
+        Some(color) => job.append(
+            "■   ",
+            0.0,
+            egui::TextFormat { font_id: theme::field_font(12.0), color: color.color(), ..Default::default() },
+        ),
+        // "No colour" wears the same swatch shape, hollow, so the names align.
+        None => job.append(
+            "□   ",
+            0.0,
+            egui::TextFormat { font_id: theme::field_font(12.0), color: theme::colors().faint, ..Default::default() },
+        ),
+    }
+    job.append(
+        color.map_or(strings::TAB_COLOR_NONE, theme::TabColor::label),
+        0.0,
+        egui::TextFormat { font_id: theme::field_font(13.0), color: theme::colors().text, ..Default::default() },
+    );
+    ui.radio(selected, job).clicked()
 }
 
 /// One implementation for both callers: a byte-identical copy of this drifted
@@ -401,9 +461,8 @@ mod tests {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), true);
         let _ = ctx.run_ui(Default::default(), |_| {});
-        let blank = || TabInfo { title: String::new(), active: false, activity: false, claude: None };
-        let many: Vec<TabInfo> =
-            (0..12).map(|index| TabInfo { title: format!("tab {index}"), ..blank() }).collect();
+        let blank = || TabInfo { title: String::new(), active: false, activity: false, claude: None, color: None };
+        let many: Vec<TabInfo> = (0..12).map(|index| TabInfo { title: format!("tab {index}"), ..blank() }).collect();
         let mut state = TabbarState::default();
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(180.0, 120.0));
         let mut actions = Vec::new();
@@ -415,6 +474,38 @@ mod tests {
         let heights: f32 = many.iter().map(row_height).sum();
         assert!(heights > rect.height(), "the fixture really does overflow: {heights} vs {}", rect.height());
         assert_eq!(row_height(&many[0]), theme::TAB_ROW_HEIGHT);
+    }
+
+    /// A coloured tab is marked with a bar in that colour on its leading edge,
+    /// and an uncoloured one paints no bar at all. The colour is the whole
+    /// point of the menu, so it has to reach the row.
+    #[test]
+    fn a_coloured_tab_paints_a_bar_in_that_colour() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), true);
+        let _ = ctx.run_ui(Default::default(), |_| {});
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(180.0, 120.0));
+        let bars = |color: Option<theme::TabColor>| {
+            let tab = TabInfo { title: "t".to_owned(), active: false, activity: false, claude: None, color };
+            let mut state = TabbarState::default();
+            let mut actions = Vec::new();
+            let output = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
+                actions = show(ui, rect, &mut state, std::slice::from_ref(&tab), false, &Default::default());
+            });
+            assert!(actions.is_empty());
+            output
+                .shapes
+                .iter()
+                .filter(|clipped| match &clipped.shape {
+                    egui::Shape::Rect(shape) => {
+                        shape.rect.width() == 3.0 && color.is_some_and(|color| shape.fill == color.color())
+                    }
+                    _ => false,
+                })
+                .count()
+        };
+        assert_eq!(bars(Some(theme::TabColor::Red)), 1, "one bar in the colour");
+        assert_eq!(bars(None), 0, "no colour, no bar");
     }
 
     /// A rename or drag in progress names a tab by index: when an earlier tab

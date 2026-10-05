@@ -214,6 +214,28 @@ impl Action {
                 | Action::ScrollDown
         )
     }
+
+    /// Whether holding the key should keep running the action. Continuous
+    /// operations the user holds (scrolling, zooming, moving and deleting by
+    /// word, an interrupting Ctrl+C) repeat; anything that opens, closes or
+    /// pastes must happen once per press, or a held key repeats it.
+    pub fn repeats_on_hold(&self) -> bool {
+        matches!(
+            self,
+            Action::ScrollUp
+                | Action::ScrollDown
+                | Action::ScrollPageUp
+                | Action::ScrollPageDown
+                | Action::ZoomIn
+                | Action::ZoomOut
+                | Action::PreviousWord
+                | Action::NextWord
+                | Action::DeletePreviousWord
+                | Action::DeleteNextWord
+                | Action::DeleteLine
+                | Action::CtrlC
+        )
+    }
 }
 
 /// Default bindings: the owner's Helm configuration.

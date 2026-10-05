@@ -14,7 +14,11 @@ pub fn payload(jwt: &str) -> Option<serde_json::Value> {
             b'0'..=b'9' => byte - b'0' + 52,
             b'-' => 62,
             b'_' => 63,
-            _ => continue,
+            // Padding ends the segment; anything else is not base64url and
+            // must not be skipped, or junk would decode into a payload the
+            // token never carried.
+            b'=' => break,
+            _ => return None,
         };
         value = value << 6 | u32::from(digit);
         bits += 6;

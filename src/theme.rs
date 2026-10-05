@@ -6,6 +6,7 @@
 use std::sync::RwLock;
 
 use egui::{Align, Button, Color32, FontId, Layout, Response, RichText, Sense, Stroke, Vec2};
+use serde::{Deserialize, Serialize};
 
 use crate::term::style::{ensure_contrast, Palette, MIN_CONTRAST};
 
@@ -190,6 +191,49 @@ pub fn threshold_color(pct: f64) -> Color32 {
         colors().status_yellow
     } else {
         colors().status_green
+    }
+}
+
+/// The tab colours of the reference menu (Tabby's palette), stored by name in
+/// the session so a saved colour survives a scheme change and a hand-edited
+/// `session.json` stays readable. The values are the reference's: they are
+/// chosen to read as a bar on either scheme, so they do not follow it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TabColor {
+    Blue,
+    Green,
+    Orange,
+    Purple,
+    Red,
+    Yellow,
+}
+
+impl TabColor {
+    pub const ALL: [TabColor; 6] =
+        [TabColor::Blue, TabColor::Green, TabColor::Orange, TabColor::Purple, TabColor::Red, TabColor::Yellow];
+
+    pub fn color(self) -> Color32 {
+        match self {
+            TabColor::Blue => Color32::from_rgb(0x02, 0x75, 0xd8),
+            TabColor::Green => Color32::from_rgb(0x5c, 0xb8, 0x5c),
+            TabColor::Orange => Color32::from_rgb(0xf0, 0xad, 0x4e),
+            TabColor::Purple => Color32::from_rgb(0x61, 0x3d, 0x7c),
+            TabColor::Red => Color32::from_rgb(0xd9, 0x53, 0x4f),
+            TabColor::Yellow => Color32::from_rgb(0xff, 0xd5, 0x00),
+        }
+    }
+
+    /// Label of the colour in the tab's menu.
+    pub fn label(self) -> &'static str {
+        match self {
+            TabColor::Blue => crate::strings::TAB_COLOR_BLUE,
+            TabColor::Green => crate::strings::TAB_COLOR_GREEN,
+            TabColor::Orange => crate::strings::TAB_COLOR_ORANGE,
+            TabColor::Purple => crate::strings::TAB_COLOR_PURPLE,
+            TabColor::Red => crate::strings::TAB_COLOR_RED,
+            TabColor::Yellow => crate::strings::TAB_COLOR_YELLOW,
+        }
     }
 }
 

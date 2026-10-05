@@ -85,6 +85,9 @@ pub struct TerminalView {
     /// Ctrl was held on the previous frame. The hover probe reads the previous
     /// frame's text, so the text must survive one frame past the release.
     ctrl_tail: bool,
+    /// Where inside the scrollbar thumb the drag was grabbed: dragging keeps
+    /// the grab point under the pointer instead of jumping to it.
+    scroll_grab: Option<f32>,
 }
 
 pub struct ViewInput<'a> {
@@ -96,6 +99,9 @@ pub struct ViewInput<'a> {
     pub copy_on_select: bool,
     /// System fallback fonts are already installed.
     pub fallbacks_loaded: bool,
+    /// The pointer is on a window resize border: the press belongs to the
+    /// window, not to a text selection.
+    pub window_edge: bool,
 }
 
 pub struct ViewOutput {
@@ -124,6 +130,7 @@ impl TerminalView {
             selecting: false,
             last_rows: Vec::new(),
             ctrl_tail: false,
+            scroll_grab: None,
             last_reported_cell: None,
             hover_cell: None,
             press_reported: false,
@@ -198,7 +205,7 @@ impl TerminalView {
 
         let modes = mouse_modes(pane.term.lock().mode());
         let app_mouse = modes.any() && !shift;
-        let primary_pressed = hovered && ui.input(|i| i.pointer.primary_pressed());
+        let primary_pressed = hovered && !input.window_edge && ui.input(|i| i.pointer.primary_pressed());
         let primary_released = ui.input(|i| i.pointer.primary_released());
         let dragging = response.dragged();
 
@@ -412,14 +419,17 @@ impl TerminalView {
                     if cell.spacer {
                         continue;
                     }
+                    // Base character, then its combining marks, as the painter
+                    // and the clipboard build them: a URL with a mark inside
+                    // must be found and opened in the order it is written.
+                    text.push(cell.ch);
+                    cols.push(i);
                     if let Some(extra) = cell.combining.as_deref() {
                         text.push_str(extra);
                         for _ in 0..extra.chars().count() {
                             cols.push(i);
                         }
                     }
-                    text.push(cell.ch);
-                    cols.push(i);
                 }
             }
             // OSC 8 targets per row, so Ctrl+click works on hyperlinked labels too.
@@ -459,7 +469,7 @@ impl TerminalView {
             let track = Rect::from_min_max(Pos2::new(rect.max.x - 6.0, rect.min.y), rect.max);
             let response = ui.interact(track, ui.id().with(("scrollbar", pane.id)), Sense::click_and_drag());
             let active = frame.display_offset > 0 || response.hovered() || response.dragged();
-            if active {
+            let thumb = if active {
                 let visible = frame.lines as f32 / (frame.lines + frame.history_size) as f32;
                 let top = 1.0 - (frame.display_offset + frame.lines) as f32 / (frame.lines + frame.history_size) as f32;
                 let thumb = Rect::from_min_size(
@@ -467,11 +477,23 @@ impl TerminalView {
                     Vec2::new(track.width(), (visible * track.height()).max(12.0)),
                 );
                 painter.rect_filled(thumb, 0.0, theme::colors().divider_hover);
+                Some(thumb)
+            } else {
+                None
+            };
+            // The grab point is kept: `fraction` addresses the thumb's top, so
+            // without this the view jumps to put the thumb under the pointer.
+            if response.drag_started() {
+                self.scroll_grab = response.interact_pointer_pos().map(|pos| {
+                    let thumb = thumb.unwrap_or(track);
+                    (pos.y - thumb.min.y).clamp(0.0, thumb.height())
+                });
             }
             if response.dragged() {
                 if let Some(pos) = response.interact_pointer_pos() {
+                    let grab = self.scroll_grab.unwrap_or(0.0);
                     let total = (frame.lines + frame.history_size) as f32;
-                    let fraction = ((pos.y - track.min.y) / track.height()).clamp(0.0, 1.0);
+                    let fraction = ((pos.y - grab - track.min.y) / track.height()).clamp(0.0, 1.0);
                     let target = ((1.0 - fraction) * total - frame.lines as f32).round().max(0.0) as i32;
                     let delta = target - frame.display_offset as i32;
                     if delta != 0 {

@@ -277,8 +277,15 @@ impl Workspace {
             self.tx = Some(tx);
             self.rx = Some(rx);
         }
+        // One repository read at a time. A directory change while one runs is
+        // not queued as another request: `last_cwd` is left alone, so the next
+        // idle poll picks the new directory up. A shell that cd's through a
+        // script would otherwise queue one `git status` per step.
+        if self.busy || self.ai_generating {
+            return;
+        }
         let cwd_changed = self.last_cwd.as_ref() != Some(&cwd);
-        if !cwd_changed && (self.busy || self.ai_generating || self.last_poll.elapsed() < POLL_INTERVAL) {
+        if !cwd_changed && self.last_poll.elapsed() < POLL_INTERVAL {
             return;
         }
         self.last_poll = Instant::now();
@@ -365,10 +372,31 @@ impl Workspace {
     pub fn absorb(&mut self) -> bool {
         let mut repaint = false;
         let mut responses = Vec::new();
+        let mut lost = false;
         if let Some(rx) = &self.rx {
-            while let Ok(response) = rx.try_recv() {
-                responses.push(response);
+            loop {
+                match rx.try_recv() {
+                    Ok(response) => responses.push(response),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    // The worker only drops its receiver by panicking: the
+                    // panel would otherwise stay `busy` with no one to answer.
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        lost = true;
+                        break;
+                    }
+                }
             }
+        }
+        if lost {
+            self.tx = None;
+            self.rx = None;
+            self.busy = false;
+            self.ai_generating = false;
+            self.trust_approval_pending = false;
+            if self.notice.is_none() {
+                self.notice = Some((strings::WORKSPACE_WORKER_LOST.to_owned(), true));
+            }
+            return true;
         }
         for response in responses {
             repaint = true;
