@@ -636,26 +636,49 @@ fn section_quota(
                 None => (strings::SETTINGS_QUOTA_NO_LOGIN.to_owned(), theme::colors().faint),
             };
             ui.label(RichText::new(source).color(color).font(theme::font(12.0)));
-            if !id.is_subscription() {
-                let has_own = snapshot.is_some_and(|s| s.source == anvil_key);
-                let label = if has_own { strings::SETTINGS_QUOTA_CHANGE_KEY } else { strings::SETTINGS_QUOTA_SET_KEY };
+            if id.accepts_own_key() {
+                let label = match snapshot {
+                    Some(s) if s.source == anvil_key => strings::SETTINGS_QUOTA_CHANGE_KEY,
+                    Some(_) => strings::SETTINGS_QUOTA_OWN_KEY,
+                    None => strings::SETTINGS_QUOTA_SET_KEY,
+                };
                 if ui.add(theme::ghost_button(label)).clicked() {
                     state.quota_key = Some((id, String::new()));
                     state.quota_key_error = None;
                 }
+            } else if id == ProviderId::OpencodeZen && !found {
+                let hint = RichText::new(strings::SETTINGS_QUOTA_ZEN_LOGIN);
+                ui.label(hint.color(theme::colors().faint).font(theme::font(11.5)));
             }
         });
         if let Some(s) = snapshot.filter(|_| on) {
+            if let Some(note) = crate::quota::view::state_note(&s.state, crate::quota::time::now_unix()) {
+                ui.horizontal(|ui| {
+                    ui.add_space(22.0);
+                    ui.label(RichText::new(note).color(theme::colors().status_yellow).font(theme::font(11.5)));
+                });
+            }
+            // Windows by their label, balances with their value ("баланс (¥12.40)"):
+            // a provider may report one balance per currency.
+            let balance = |b: &crate::quota::model::Balance| {
+                (b.key.clone(), format!("{} ({})", b.label, crate::quota::view::balance_text(b)))
+            };
+            let items: Vec<(String, String)> = s
+                .windows
+                .iter()
+                .map(|w| (w.key.clone(), w.label.clone()))
+                .chain(s.balances.iter().map(balance))
+                .collect();
             ui.horizontal_wrapped(|ui| {
                 ui.add_space(22.0);
-                if s.windows.is_empty() {
+                if items.is_empty() && s.state == crate::quota::model::ProviderState::Idle {
                     let hint = RichText::new(strings::SETTINGS_QUOTA_WINDOWS_LATER);
                     ui.label(hint.color(theme::colors().faint).font(theme::font(11.5)));
                 }
-                for window in &s.windows {
-                    let visible = cx.config.quota.window_visible(id.key(), &window.key);
-                    if theme::choice(ui, &window.label, visible).clicked() {
-                        cx.config.quota.set_window_visible(id.key(), &window.key, !visible);
+                for (key, label) in &items {
+                    let visible = cx.config.quota.window_visible(id.key(), key);
+                    if theme::choice(ui, label, visible).clicked() {
+                        cx.config.quota.set_window_visible(id.key(), key, !visible);
                         outcome.changed = true;
                     }
                 }

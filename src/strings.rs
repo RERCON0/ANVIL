@@ -181,6 +181,7 @@ pub const QUOTA_PROVIDER_SAID: &str = "ответ провайдера:";
 pub const QUOTA_RATE_LIMITED: &str = "лимит запросов, повтор в";
 pub const QUOTA_MORE: &str = "ещё";
 pub const SETTINGS_QUOTA_OWN_KEY: &str = "Свой ключ…";
+pub const SETTINGS_QUOTA_ZEN_LOGIN: &str = "войдите в OpenCode: opencode auth login";
 
 // Explicit consent for global Claude settings and executable paste.
 pub const CLAUDE_INSTALL_QUESTION: &str = "Установить или обновить строку статуса Claude Code?";
