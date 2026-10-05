@@ -82,6 +82,9 @@ pub struct TerminalView {
     press_reported: bool,
     /// OSC 8 links of the last painted rows: (row, first column, end column, uri).
     last_links: Vec<(usize, usize, usize, String)>,
+    /// Ctrl was held on the previous frame. The hover probe reads the previous
+    /// frame's text, so the text must survive one frame past the release.
+    ctrl_tail: bool,
 }
 
 pub struct ViewInput<'a> {
@@ -120,6 +123,7 @@ impl TerminalView {
             menu_open: false,
             selecting: false,
             last_rows: Vec::new(),
+            ctrl_tail: false,
             last_reported_cell: None,
             hover_cell: None,
             press_reported: false,
@@ -396,32 +400,37 @@ impl TerminalView {
             let primary = fonts.primary.clone();
             ctx.fonts_mut(|f| snapshot(&term, input.palette, &mut self.glyphs, &mut |c| f.has_glyph(&primary, c)))
         };
-        self.last_rows.resize_with(frame.rows.len(), || (String::new(), Vec::new()));
-        for (row, (text, cols)) in frame.rows.iter().zip(&mut self.last_rows) {
-            text.clear();
-            cols.clear();
-            for (i, cell) in row.iter().enumerate() {
-                if cell.spacer {
-                    continue;
-                }
-                if let Some(extra) = cell.combining.as_deref() {
-                    text.push_str(extra);
-                    for _ in 0..extra.chars().count() {
-                        cols.push(i);
+        // Link detection reads the previous frame's text, so it must also be
+        // built on the frame Ctrl is released. Neither is consulted otherwise.
+        if ctrl || self.ctrl_tail {
+            self.ctrl_tail = ctrl;
+            self.last_rows.resize_with(frame.rows.len(), || (String::new(), Vec::new()));
+            for (row, (text, cols)) in frame.rows.iter().zip(&mut self.last_rows) {
+                text.clear();
+                cols.clear();
+                for (i, cell) in row.iter().enumerate() {
+                    if cell.spacer {
+                        continue;
                     }
+                    if let Some(extra) = cell.combining.as_deref() {
+                        text.push_str(extra);
+                        for _ in 0..extra.chars().count() {
+                            cols.push(i);
+                        }
+                    }
+                    text.push(cell.ch);
+                    cols.push(i);
                 }
-                text.push(cell.ch);
-                cols.push(i);
             }
+            // OSC 8 targets per row, so Ctrl+click works on hyperlinked labels too.
+            self.last_links = link_runs(&frame.rows);
         }
-        // OSC 8 targets per row, so Ctrl+click works on hyperlinked labels too.
-        self.last_links = link_runs(&frame.rows);
 
         let cursor_on = if (input.cursor_blink || self.app_blink) && input.focused {
             let elapsed = self.blink_epoch.elapsed().as_millis();
             let left = BLINK_MS - elapsed % BLINK_MS;
             ctx.request_repaint_after(Duration::from_millis(left as u64));
-            (elapsed / BLINK_MS) % 2 == 0
+            (elapsed / BLINK_MS).is_multiple_of(2)
         } else {
             true
         };
@@ -716,6 +725,11 @@ fn viewport_to_point(display_offset: usize, point: Point<usize>) -> Point {
     alacritty_terminal::term::viewport_to_point(display_offset, point)
 }
 
+/// Matches the search bar may highlight across the whole visible screen in one
+/// frame. The scan runs on every frame while the bar is open, so this has to
+/// bound the work, not the per-row work.
+pub const MAX_VISIBLE_MATCHES: usize = 400;
+
 /// Visible-screen matches of `regex`, per row, as (row, start column, end column).
 fn collect_matches<L: EventListener>(
     term: &Term<L>,
@@ -724,6 +738,10 @@ fn collect_matches<L: EventListener>(
     columns: usize,
     display_offset: usize,
 ) -> Vec<(usize, usize, usize)> {
+    // The budget is for the whole visible screen, not per row: a row's own limit
+    // multiplied by the row count turns a broad regex into tens of thousands of
+    // searches on every frame.
+    let mut budget = MAX_VISIBLE_MATCHES;
     let mut out = Vec::new();
     if columns == 0 {
         return out;
@@ -733,9 +751,8 @@ fn collect_matches<L: EventListener>(
         let start = Point::new(Line(line), Column(0));
         let end = Point::new(Line(line), Column(columns - 1));
         let mut origin = start;
-        let mut guard = 0;
-        while guard < 200 {
-            guard += 1;
+        while budget > 0 {
+            budget -= 1;
             let Some(found) = term.regex_search_right(regex, origin, end) else { break };
             let (first, last) = (*found.start(), *found.end());
             if first.line != last.line || last.column.0 >= columns {

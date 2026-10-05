@@ -137,19 +137,39 @@ impl TermGlyphs {
     /// None when any of them has to be drawn by epaint instead (the face has
     /// no such glyph, or the atlas is full for this pass).
     pub fn run(&mut self, ctx: &Context, face: Face, em: f32, text: &str) -> Option<Vec<(usize, Glyph)>> {
-        let mut out = Vec::with_capacity(text.len());
+        let mut out = Vec::new();
+        self.run_into(ctx, face, em, text, &mut out)?;
+        Some(out)
+    }
+
+    /// The same glyphs, appended to a buffer the caller keeps: this runs once
+    /// per text run per row per frame, so the per-run Vec was real churn.
+    pub fn run_into(
+        &mut self,
+        ctx: &Context,
+        face: Face,
+        em: f32,
+        text: &str,
+        out: &mut Vec<(usize, Glyph)>,
+    ) -> Option<()> {
+        out.clear();
+        // Read once for the whole run: `cumulative_pass_nr` takes two egui read
+        // locks, so calling it per character cost 15% of the paint.
+        let pass = ctx.cumulative_pass_nr();
         for (i, ch) in text.chars().enumerate() {
-            match self.slot(ctx, face, ch, em)? {
+            match self.slot(ctx, pass, face, ch, em)? {
                 Slot::Ink(glyph) => out.push((i, glyph)),
                 Slot::Blank => {}
                 Slot::Missing => return None,
             }
         }
-        Some(out)
+        Some(())
     }
 
-    fn slot(&mut self, ctx: &Context, face: Face, ch: char, em: f32) -> Option<Slot> {
-        let pass = ctx.cumulative_pass_nr();
+    /// The cache lookup for one glyph, with the frame's pass number already read:
+    /// `cumulative_pass_nr` takes two egui read locks, so the per-character loop
+    /// must not call it per character.
+    fn slot(&mut self, ctx: &Context, pass: u64, face: Face, ch: char, em: f32) -> Option<Slot> {
         if self.full_since.is_some_and(|full| full != pass) {
             self.shelves = Shelves::default();
             self.glyphs.clear();

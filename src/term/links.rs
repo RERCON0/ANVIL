@@ -1,9 +1,8 @@
 //! Which links Ctrl+click may open.
 
-/// Pattern for alacritty's `RegexSearch` over visible lines while Ctrl is held.
-pub const URL_PATTERN: &str = r#"(?:https?://|ftp://|mailto:)[^\s<>"'`]+"#;
-
 /// Only these schemes are ever opened; file paths and anything else are not.
+/// This allowlist is the whole policy: `is_openable` gates both entry paths
+/// (OSC 8 targets and the Ctrl-held scan of visible lines).
 pub fn is_openable(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     ["http://", "https://", "ftp://", "mailto:"].iter().any(|s| lower.starts_with(s) && lower.len() > s.len())

@@ -13,7 +13,7 @@ use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, TextFormat, Vec2};
 
 use crate::fonts::TermFonts;
 use crate::term::glyphs::{self, Face};
-use crate::term::style::{bg_spans, cell_style, text_runs, Palette, RenderCell, Underline};
+use crate::term::style::{bg_spans, cell_style, Palette, RenderCell, Underline};
 
 pub const SELECTION: Color32 = Color32::from_rgba_premultiplied(77, 77, 77, 77);
 pub const MATCH: Color32 = Color32::from_rgba_premultiplied(89, 53, 11, 89);
@@ -70,6 +70,16 @@ pub const MAX_LINK_URI: usize = 2048;
 /// `link` when its target is short enough to act on.
 pub fn usable_link(link: alacritty_terminal::term::cell::Hyperlink) -> Option<alacritty_terminal::term::cell::Hyperlink> {
     (link.uri().len() <= MAX_LINK_URI).then_some(link)
+}
+
+/// Combining marks carried out of one cell. Upstream stores them uncapped, so
+/// without this a single cell holding millions of zero-width marks would clone
+/// and shape them on every frame and keep the capacity for the pane's life.
+pub const MAX_COMBINING: usize = 16;
+
+/// The marks of a cell, truncated to what one cell can usefully show.
+pub fn usable_marks(marks: &[char]) -> String {
+    marks.iter().take(MAX_COMBINING).collect()
 }
 
 const MAX_KNOWN_GLYPHS: usize = 4096;
@@ -294,7 +304,7 @@ pub fn snapshot<L: EventListener>(
             combining: cell
                 .zerowidth()
                 .filter(|marks| !marks.is_empty())
-                .map(|marks| marks.iter().collect::<String>().into_boxed_str()),
+                .map(|marks| usable_marks(marks).into_boxed_str()),
             style: cell_style(cell.c, cell.fg, cell.bg, flags, colors, palette),
             wide: flags.contains(Flags::WIDE_CHAR),
             spacer: flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
@@ -405,8 +415,13 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
 
     let advance = |bold: bool, italic: bool| painter.ctx().fonts_mut(|f| f.glyph_width(opt.fonts.for_style(bold, italic), 'M'));
     let mut primary_ink_center = None;
+    // One buffer for the whole frame: `text_runs` allocated a Vec and a String
+    // per run, for every row, on every frame.
+    let mut runs_buffer: Vec<crate::term::style::TextRun> = Vec::new();
+    let mut glyph_buffer: Vec<(usize, crate::term::glyphs::Glyph)> = Vec::new();
     for (r, row) in frame.rows.iter().enumerate() {
-        for run in text_runs(row) {
+        crate::term::style::text_runs_into(row, &mut runs_buffer);
+        for run in &runs_buffer {
             let s = run.style;
             let font = opt.fonts.for_style(s.bold, s.italic).clone();
             let span = cell_rect(r, run.col, run.cells);
@@ -456,13 +471,18 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
                     }
                     painter.with_clip_rect(span).galley(pos, galley, s.fg);
                 }
-            } else if let Some(run_glyphs) =
-                hinted.as_mut().and_then(|h| h.run(painter.ctx(), Face::for_style(s.bold, s.italic), font.size * ppp, &run.text))
-            {
+            } else if hinted.as_mut().is_some_and(|h| {
+                let face = Face::for_style(s.bold, s.italic);
+                h.run_into(painter.ctx(), face, font.size * ppp, &run.text, &mut glyph_buffer).is_some()
+            }) {
                 let baseline = pixel(span.min.y + opt.metrics.baseline);
-                for (i, glyph) in run_glyphs {
-                    let pen = pixel(cell_rect(r, run.col + i, 1).min.x);
-                    glyphs::add_quad(&mut hinted_mesh, glyph, [pen, baseline], ppp, s.fg);
+                // Only the column is needed, so the cell origin is stepped along
+                // directly instead of snapping a full rect four times per glyph.
+                let origin_x = origin.x;
+                let step = cw;
+                for (i, glyph) in &glyph_buffer {
+                    let pen = pixel(snap(origin_x + (run.col + i) as f32 * step, ppp));
+                    glyphs::add_quad(&mut hinted_mesh, *glyph, [pen, baseline], ppp, s.fg);
                 }
                 if s.strike {
                     // Where epaint strikes text through: the middle of its row.
@@ -829,6 +849,17 @@ mod tests {
             })
             .expect("the glyph is painted");
         (bounds, clip, cell)
+    }
+
+    /// A cell's combining marks are capped before they reach the painter: a
+    /// hostile stream can otherwise park millions of zero-width marks in one
+    /// cell, and every frame would then clone and shape all of them.
+    #[test]
+    fn combining_marks_are_capped() {
+        let many: Vec<char> = std::iter::repeat_n('\u{0301}', MAX_COMBINING * 100).collect();
+        assert_eq!(usable_marks(&many).chars().count(), MAX_COMBINING);
+        assert_eq!(usable_marks(&['\u{0301}', '\u{0308}']), "\u{0301}\u{0308}");
+        assert!(usable_marks(&[]).is_empty());
     }
 
     /// Real fonts: Segoe UI Symbol's ↺, ⏵ and ◯ are wider than a Consolas

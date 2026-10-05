@@ -299,7 +299,16 @@ pub struct TextRun {
 /// characters, fallback glyphs or combining marks; trailing spaces are
 /// dropped and space-only runs are skipped.
 pub fn text_runs(row: &[RenderCell]) -> Vec<TextRun> {
-    let mut runs: Vec<TextRun> = Vec::new();
+    let mut runs = Vec::new();
+    text_runs_into(row, &mut runs);
+    runs
+}
+
+/// The same runs, appended to a buffer the caller keeps. Per row per frame this
+/// was one `Vec` and one `String` allocation per run; reusing both is the
+/// difference between hundreds of allocations and a handful.
+pub fn text_runs_into(row: &[RenderCell], out: &mut Vec<TextRun>) {
+    out.clear();
     let mut current: Option<TextRun> = None;
     let flush = |current: &mut Option<TextRun>, runs: &mut Vec<TextRun>| {
         if let Some(mut run) = current.take() {
@@ -323,13 +332,13 @@ pub fn text_runs(row: &[RenderCell]) -> Vec<TextRun> {
             || crate::term::render::is_block_element(cell.ch)
             || crate::term::render::is_braille(cell.ch);
         if standalone {
-            flush(&mut current, &mut runs);
+            flush(&mut current, out);
             let mut text = cell.ch.to_string();
             if let Some(extra) = &cell.combining {
                 text.push_str(extra);
             }
             if cell.ch != ' ' || cell.combining.is_some() {
-                runs.push(TextRun {
+                out.push(TextRun {
                     col,
                     text,
                     style: cell.style,
@@ -341,7 +350,7 @@ pub fn text_runs(row: &[RenderCell]) -> Vec<TextRun> {
         }
         let continues = matches!(&current, Some(run) if run.style == cell.style && run.col + run.cells == col);
         if !continues {
-            flush(&mut current, &mut runs);
+            flush(&mut current, out);
             if cell.ch == ' ' && cell.style.underline == Underline::None && !cell.style.strike {
                 continue;
             }
@@ -351,8 +360,7 @@ pub fn text_runs(row: &[RenderCell]) -> Vec<TextRun> {
         run.text.push(cell.ch);
         run.cells += 1;
     }
-    flush(&mut current, &mut runs);
-    runs
+    flush(&mut current, out);
 }
 
 /// Spans of cells whose background differs from the default: (col, len, colour).
