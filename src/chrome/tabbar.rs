@@ -243,11 +243,13 @@ pub fn show(
     // Tabs and their buttons get the space first; the quota block takes what is
     // left above Settings and collapses or hides itself when that is too little.
     if let Some(block) = quota {
-        let area = Rect::from_min_max(Pos2::new(rect.min.x, y + 40.0), Pos2::new(rect.max.x, settings_rect.min.y - 4.0));
+        let bottom = Pos2::new(rect.max.x, settings_rect.min.y - 4.0);
+        let area = Rect::from_min_max(Pos2::new(rect.min.x, y + 40.0), bottom);
         if area.height() > 0.0 {
-            match crate::chrome::quota_block::show(ui, area, block) {
-                Some(crate::chrome::quota_block::QuotaAction::ToggleCollapsed) => actions.push(TabbarAction::QuotaToggle),
-                Some(crate::chrome::quota_block::QuotaAction::Refresh) => actions.push(TabbarAction::QuotaRefresh),
+            use crate::chrome::quota_block::{show as show_quota, QuotaAction};
+            match show_quota(ui, area, block) {
+                Some(QuotaAction::ToggleCollapsed) => actions.push(TabbarAction::QuotaToggle),
+                Some(QuotaAction::Refresh) => actions.push(TabbarAction::QuotaRefresh),
                 None => {}
             }
         }
