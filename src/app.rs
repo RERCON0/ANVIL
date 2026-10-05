@@ -72,6 +72,15 @@ pub struct ClosedTab {
     pub state: TabState,
 }
 
+/// The quota line's segments with the inputs they were built from.
+#[derive(Default)]
+struct QuotaSegments {
+    version: u64,
+    minute: i64,
+    config: crate::config::QuotaConfig,
+    segments: Vec<crate::quota::view::Segment>,
+}
+
 /// Command-line flag of a window opened with Ctrl+Shift+N.
 pub const NEW_WINDOW_ARG: &str = "--new-window";
 
@@ -109,6 +118,9 @@ pub struct AnvilApp {
     claude_line: (Option<SystemTime>, crate::claude_setup::LineState),
     /// This window's quota worker; None while quotas are switched off.
     quota: Option<crate::quota::QuotaHandle>,
+    /// Segments of the quota line, rebuilt when the snapshot, the quota
+    /// settings or the minute changes (relative times print to the minute).
+    quota_segments: QuotaSegments,
     run_dir: Option<PathBuf>,
     repaint: Option<Arc<dyn Fn() + Send + Sync>>,
     inherited_prompt_command: Option<String>,
@@ -176,6 +188,7 @@ impl AnvilApp {
             status_dir,
             claude_line: (None, crate::claude_setup::LineState::Missing),
             quota: None,
+            quota_segments: QuotaSegments::default(),
             run_dir: None,
             repaint: None,
             inherited_prompt_command: std::env::var("PROMPT_COMMAND").ok(),
@@ -289,7 +302,20 @@ impl AnvilApp {
                 let full = ui.max_rect();
                 let title = Rect::from_min_size(full.min, Vec2::new(full.width(), theme::TITLEBAR_HEIGHT));
                 title_bar(ui, title, maximized, &mut commands);
-                let body = Rect::from_min_max(Pos2::new(full.min.x, title.max.y), full.max);
+                // The quota line takes the bottom of the window while quotas are on;
+                // tabs and panes get the rest, so nothing is ever drawn under it.
+                let footer = if self.quota.is_some() { crate::chrome::quota_bar::HEIGHT } else { 0.0 };
+                let bottom = Pos2::new(full.max.x, full.max.y - footer);
+                let body = Rect::from_min_max(Pos2::new(full.min.x, title.max.y), bottom);
+                if footer > 0.0 {
+                    let line = Rect::from_min_max(Pos2::new(full.min.x, body.max.y), full.max);
+                    let segments = self.current_quota_segments();
+                    if crate::chrome::quota_bar::show(ui, line, &segments).is_some() {
+                        if let Some(quota) = &self.quota {
+                            quota.refresh();
+                        }
+                    }
+                }
                 let tabbar_rect = Rect::from_min_size(body.min, Vec2::new(theme::TABBAR_WIDTH, body.height()));
                 let area = Rect::from_min_max(Pos2::new(body.min.x + theme::TABBAR_WIDTH, body.min.y), body.max);
                 ui.painter().vline(tabbar_rect.max.x - 0.5, tabbar_rect.y_range(), egui::Stroke::new(1.0, theme::colors().border));
@@ -464,6 +490,7 @@ impl AnvilApp {
     fn sync_quota(&mut self) {
         if !self.config.quota.enabled {
             self.quota = None;
+            self.quota_segments = QuotaSegments::default();
             return;
         }
         if self.quota.is_some() {
@@ -486,6 +513,20 @@ impl AnvilApp {
                 }
             },
         ));
+    }
+
+    fn current_quota_segments(&mut self) -> Vec<crate::quota::view::Segment> {
+        let Some(handle) = &self.quota else { return Vec::new() };
+        let now = crate::quota::time::now_unix();
+        let version = handle.version();
+        let cache = &mut self.quota_segments;
+        if cache.version != version || cache.minute != now / 60 || cache.config != self.config.quota {
+            cache.segments = crate::quota::view::segments(&handle.snapshot(), &self.config.quota, now);
+            cache.version = version;
+            cache.minute = now / 60;
+            cache.config = self.config.quota.clone();
+        }
+        cache.segments.clone()
     }
 
     /// Re-reads Claude Code's user settings when they changed (one stat per
