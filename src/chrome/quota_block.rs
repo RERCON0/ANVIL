@@ -62,13 +62,23 @@ pub fn show(ui: &mut egui::Ui, area: Rect, block: &QuotaBlock) -> Option<QuotaAc
         }
         let down = if ui.fonts_mut(|f| f.has_glyphs(&font, "˅")) { "˅" } else { "v" };
         let chevron = if fit == Fit::Expanded { down } else { "›" };
-        painter.text(Pos2::new(header.max.x - RIGHT, y), Align2::RIGHT_CENTER, chevron, font.clone(), colors.icon_hover);
+        painter.text(
+            Pos2::new(header.max.x - RIGHT, y),
+            Align2::RIGHT_CENTER,
+            chevron,
+            font.clone(),
+            colors.icon_hover,
+        );
     }
     let pointer_on_refresh = response.hover_pos().is_some_and(|p| refresh_rect.contains(p));
     let response = if pointer_on_refresh { response.on_hover_text(strings::QUOTA_REFRESH_HINT) } else { response };
     let action = response.clicked().then(|| {
         let on_refresh = response.interact_pointer_pos().is_some_and(|p| refresh_rect.contains(p));
-        if on_refresh { QuotaAction::Refresh } else { QuotaAction::ToggleCollapsed }
+        if on_refresh {
+            QuotaAction::Refresh
+        } else {
+            QuotaAction::ToggleCollapsed
+        }
     });
 
     if fit != Fit::Expanded {
@@ -106,11 +116,8 @@ pub fn show(ui: &mut egui::Ui, area: Rect, block: &QuotaBlock) -> Option<QuotaAc
             painter.galley(pos, galley, colors.tab_text);
         }
         if let Some(note) = row.note {
-            let note_y = if row.lines.is_empty() {
-                first_y
-            } else {
-                top + (row.lines.len() as f32 + 0.5) * view::LINE_HEIGHT
-            };
+            let note_y =
+                if row.lines.is_empty() { first_y } else { top + (row.lines.len() as f32 + 0.5) * view::LINE_HEIGHT };
             painter.text(Pos2::new(rect.max.x - RIGHT, note_y), Align2::RIGHT_CENTER, note, font.clone(), colors.dim);
         }
         let _ = ui.interact(row_rect, ui.id().with(("quota-row", index)), Sense::hover()).on_hover_text(&row.tooltip);
@@ -202,14 +209,11 @@ mod tests {
             let _ = painted(&ctx, area, &block);
             let mut seen = None;
             for events in [vec![egui::Event::PointerMoved(pos)], click(true), click(false)] {
-                let _ = ctx.run_ui(
-                    egui::RawInput { screen_rect: Some(area), events, ..Default::default() },
-                    |ui| {
-                        ui.scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
-                            seen = show(ui, area, &block);
-                        });
-                    },
-                );
+                let _ = ctx.run_ui(egui::RawInput { screen_rect: Some(area), events, ..Default::default() }, |ui| {
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
+                        seen = show(ui, area, &block);
+                    });
+                });
             }
             assert_eq!(seen, Some(expected), "x = {x}");
         }

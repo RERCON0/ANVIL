@@ -513,10 +513,9 @@ impl AnvilApp {
         let Some(handle) = &self.quota else { return Vec::new() };
         let now = crate::quota::time::now_unix();
         let version = handle.version();
-        let snapshot = handle.snapshot();
         let cache = &mut self.quota_rows;
         if cache.version != version || cache.minute != now / 60 || cache.config != self.config.quota {
-            cache.rows = crate::quota::view::rows(&snapshot, &self.config.quota, now);
+            cache.rows = crate::quota::view::rows(&handle.snapshot(), &self.config.quota, now);
             cache.version = version;
             cache.minute = now / 60;
             cache.config = self.config.quota.clone();

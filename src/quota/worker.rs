@@ -43,6 +43,9 @@ pub struct Engine {
     memory: HashMap<ProviderId, Memory>,
     last_cycle: Option<i64>,
     last_manual: Option<i64>,
+    /// A refresh was asked for and no cycle has served it yet; one asked
+    /// inside the gap waits for it to pass instead of being dropped.
+    manual_pending: bool,
     retry_at: Option<i64>,
 }
 
@@ -51,8 +54,8 @@ impl Engine {
     /// data any window wrote (None: there is none), so a window that becomes
     /// leader does not re-poll what another one fetched a minute ago.
     pub fn due(&mut self, now: i64, snapshot_age: Option<i64>, manual: bool) -> bool {
-        if manual && self.last_manual.is_none_or(|at| now - at >= MANUAL_GAP) {
-            self.last_manual = Some(now);
+        self.manual_pending |= manual;
+        if self.manual_pending && self.last_manual.is_none_or(|at| now - at >= MANUAL_GAP) {
             return true;
         }
         if self.retry_at.is_some_and(|at| now >= at) {
@@ -74,6 +77,11 @@ impl Engine {
     ) -> Snapshot {
         self.last_cycle = Some(now);
         self.retry_at = None;
+        // Any cycle serves a pending request, and the gap counts from here.
+        if self.manual_pending {
+            self.manual_pending = false;
+            self.last_manual = Some(now);
+        }
         let mut next = Snapshot::default();
         for id in ProviderId::ALL {
             let old = previous.get(id);
@@ -274,13 +282,46 @@ mod tests {
         assert!(!engine.due(1_000 + 2 * QUICK_RETRY, None, false), "back to the normal interval");
     }
 
+    fn run(engine: &mut Engine, now: i64) {
+        engine.cycle(now, &Prefs::new(), &Snapshot::default(), |_| Detection::Missing, |_, _| ok());
+    }
+
     #[test]
     fn manual_refreshes_are_rate_limited() {
         let mut engine = Engine::default();
-        engine.cycle(1_000, &Prefs::new(), &Snapshot::default(), |_| Detection::Missing, |_, _| ok());
+        run(&mut engine, 1_000);
         assert!(engine.due(1_010, None, true));
+        run(&mut engine, 1_010);
         assert!(!engine.due(1_020, None, true), "within the manual gap");
         assert!(engine.due(1_010 + MANUAL_GAP, None, true));
+    }
+
+    /// Two keys saved back to back ask for two refreshes: the second must wait
+    /// out the gap and then run, not vanish until the next 5-minute cycle.
+    #[test]
+    fn a_refresh_asked_inside_the_gap_runs_once_the_gap_has_passed() {
+        let mut engine = Engine::default();
+        run(&mut engine, 1_000);
+        assert!(engine.due(1_010, None, true));
+        run(&mut engine, 1_010);
+        assert!(!engine.due(1_020, None, true), "inside the gap: deferred");
+        assert!(!engine.due(1_030, None, false), "still inside the gap");
+        assert!(engine.due(1_010 + MANUAL_GAP, None, false), "the deferred request runs without being asked again");
+        run(&mut engine, 1_010 + MANUAL_GAP);
+        assert!(!engine.due(1_010 + MANUAL_GAP + 1, None, false), "and only once");
+    }
+
+    /// A cycle the worker had to skip (config.json unreadable for a moment)
+    /// keeps the request pending instead of swallowing it.
+    #[test]
+    fn a_manual_request_survives_a_skipped_cycle() {
+        let mut engine = Engine::default();
+        run(&mut engine, 1_000);
+        assert!(engine.due(1_010, None, true));
+        // No cycle ran (prefs could not be read): the next tick still owes one.
+        assert!(engine.due(1_011, None, false));
+        run(&mut engine, 1_011);
+        assert!(!engine.due(1_012, None, false));
     }
 
     #[test]
