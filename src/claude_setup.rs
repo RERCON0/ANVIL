@@ -27,12 +27,40 @@ pub enum Plan {
 /// the confirm/decline path instead of being silently replaced.
 pub fn is_anvil_status_command(command: &str) -> bool {
     let trimmed = command.trim();
-    let first_token = match trimmed.strip_prefix('"') {
-        Some(rest) => rest.split('"').next().unwrap_or(""),
-        None => trimmed.split_whitespace().next().unwrap_or(""),
+    // The helper takes no arguments. Reject an unterminated quote or shell
+    // suffix rather than claiming ownership of a foreign compound command.
+    let first_token = if let Some(quote @ ('"' | '\'')) = trimmed.chars().next() {
+        let Some(end) = trimmed[1..].find(quote).map(|index| index + 1) else { return false };
+        if !trimmed[end + 1..].trim().is_empty() {
+            return false;
+        }
+        &trimmed[1..end]
+    } else {
+        if trimmed.chars().any(|ch| ch.is_whitespace() || "\"';&|<>`$".contains(ch)) {
+            return false;
+        }
+        trimmed
     };
     let file_name = first_token.rsplit(['/', '\\']).next().unwrap_or("").to_ascii_lowercase();
     file_name == "anvil-claude-status.exe" || file_name == "anvil-claude-status"
+}
+
+#[cfg(test)]
+#[test]
+fn command_ownership_requires_a_complete_standalone_helper_command() {
+    for command in [r#""C:\Program Files\ANVIL\anvil-claude-status.exe""#, "'C:/ANVIL/anvil-claude-status.exe'"] {
+        assert!(is_anvil_status_command(command), "{command}");
+    }
+    for command in [
+        "'anvil-claude-status.exe",
+        "\"anvil-claude-status.exe",
+        "echo anvil-claude-status.exe",
+        "'anvil-claude-status.exe' ; foreign",
+        "\"anvil-claude-status.exe\"suffix",
+        "anvil-claude-status.exe && foreign",
+    ] {
+        assert!(!is_anvil_status_command(command), "{command}");
+    }
 }
 
 /// `"C:/.../anvil-claude-status.exe"` with forward slashes and quotes, so it

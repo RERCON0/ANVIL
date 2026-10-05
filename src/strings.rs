@@ -174,6 +174,7 @@ pub const QUOTA_MCP: &str = "MCP";
 pub const QUOTA_REVIEW: &str = "ревью";
 pub const QUOTA_AUTH_EXPIRED: &str = "вход устарел";
 pub const QUOTA_FORMAT_ERROR: &str = "ошибка формата";
+pub const QUOTA_STORE_UNREADABLE: &str = "не удалось прочитать локальный вход, повтор через минуту";
 pub const QUOTA_RESET_IN: &str = "сброс через";
 pub const QUOTA_DATA_AT: &str = "данные от";
 
@@ -264,8 +265,8 @@ pub const WORKSPACE_OPEN_EXTERNAL: &str = "Открыть в системе";
 pub const WORKSPACE_REVEAL: &str = "Показать в проводнике";
 pub const WORKSPACE_FILE_FILTER: &str = "Фильтр файлов";
 pub const WORKSPACE_FILE_TRUNCATED: &str = "… файл показан не полностью";
-pub const WORKSPACE_PUSH_HINT: &str = "Отправить в origin";
-pub const WORKSPACE_FETCH_HINT: &str = "Забрать изменения из origin";
+pub const WORKSPACE_PUSH_HINT: &str = "Отправить в настроенный remote";
+pub const WORKSPACE_FETCH_HINT: &str = "Забрать изменения из настроенного remote";
 
 pub const WORKSPACE_NO_BRANCH: &str = "нет текущей ветки";
 pub const WORKSPACE_NO_AI_COMMAND: &str = "не выбрана AI-команда";

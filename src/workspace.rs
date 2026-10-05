@@ -1718,6 +1718,19 @@ fn text_rows(text: &str, patch: bool) -> Vec<TextRow> {
     }).collect()
 }
 
+fn count_text_lines(bytes: &[u8]) -> u64 {
+    bytes.iter().filter(|byte| **byte == b'\n').count() as u64
+        + u64::from(bytes.last().is_some_and(|last| *last != b'\n'))
+}
+
+#[cfg(test)]
+#[test]
+fn text_line_counts_include_an_unterminated_final_line() {
+    for (text, expected) in [("", 0), ("one", 1), ("one\n", 1), ("one\nlast", 2), ("\n\n", 2)] {
+        assert_eq!(count_text_lines(text.as_bytes()), expected);
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct DiffStamp {
     root: Option<PathBuf>,
@@ -2434,11 +2447,13 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                                 if !meta.is_file() || meta.len() > MAX_COUNTED_FILE {
                                     continue;
                                 }
-                                let Ok(bytes) = std::fs::read(&full) else { continue };
+                                let Ok(bytes) = crate::fsutil::read_limited(&full, MAX_COUNTED_FILE as usize) else {
+                                    continue;
+                                };
                                 if bytes.iter().take(8192).any(|byte| *byte == 0) {
                                     continue;
                                 }
-                                lines += bytes.iter().filter(|byte| **byte == b'\n').count() as u64;
+                                lines += count_text_lines(&bytes);
                                 counted += 1;
                             }
                             send(Response::LineCount { files: counted, lines });

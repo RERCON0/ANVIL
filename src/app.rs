@@ -105,6 +105,7 @@ fn take_ready<T>(slot: &mut Option<std::sync::mpsc::Receiver<T>>) -> Option<T> {
 
 pub struct AnvilApp {
     config: Config,
+    config_path: PathBuf,
     config_mtime: Option<SystemTime>,
     config_checked: Instant,
     keymap: Keymap,
@@ -170,20 +171,37 @@ impl AnvilApp {
         let path = Config::path();
         let crate::config::LoadOutcome { config, notice } = Config::load(&path);
         let config_mtime = file_mtime(&path);
-        let (keymap, problems) = Keymap::with_overrides(&config.hotkeys);
-        let has_problems = !problems.is_empty();
-        let palette = scheme_palette(&config);
-        theme::set_scheme(&palette);
+        // Keep disk discovery out of state construction (also used by tests).
         let status_dir = status_dir();
-        // A window opened with Ctrl+Shift+N: the first window owns the session.
         let extra_window = std::env::args().skip(1).any(|arg| arg == NEW_WINDOW_ARG);
         let mut session = SessionState::load(&SessionState::path());
         if extra_window {
             session = session.for_extra_window();
         }
+        let mut app = Self::from_state(config, path, config_mtime, session, extra_window, status_dir);
+        app.inherited_prompt_command = std::env::var("PROMPT_COMMAND").ok();
+        if let Some(notice) = notice {
+            app.toast(notice);
+        }
+        app
+    }
+
+    fn from_state(
+        config: Config,
+        config_path: PathBuf,
+        config_mtime: Option<SystemTime>,
+        session: SessionState,
+        extra_window: bool,
+        status_dir: PathBuf,
+    ) -> Self {
+        let (keymap, problems) = Keymap::with_overrides(&config.hotkeys);
+        let has_problems = !problems.is_empty();
+        let palette = scheme_palette(&config);
+        theme::set_scheme(&palette);
         let session_window = session.window;
         let mut app = AnvilApp {
             config,
+            config_path,
             config_mtime,
             config_checked: Instant::now(),
             keymap,
@@ -213,7 +231,7 @@ impl AnvilApp {
             quota_segments: QuotaSegments::default(),
             run_dir: None,
             repaint: None,
-            inherited_prompt_command: std::env::var("PROMPT_COMMAND").ok(),
+            inherited_prompt_command: None,
             proc_snapshot: Vec::new(),
             proc_results: None,
             last_status_poll: Instant::now(),
@@ -226,9 +244,6 @@ impl AnvilApp {
             first_frame_logged: false,
             fallbacks_loaded: false,
         };
-        if let Some(notice) = notice {
-            app.toast(notice);
-        }
         for problem in &problems {
             log::warn!("config hotkeys: {problem}");
         }
@@ -238,7 +253,7 @@ impl AnvilApp {
         app
     }
 
-    pub fn window_attributes(&self) -> WindowAttributes {
+    pub fn window_attributes(&self, screens: &[(i32, i32, u32, u32)]) -> WindowAttributes {
         let mut attributes = Window::default_attributes()
             .with_title(strings::APP_TITLE)
             .with_decorations(false)
@@ -246,6 +261,7 @@ impl AnvilApp {
             .with_min_inner_size(winit::dpi::LogicalSize::new(640.0, 400.0))
             .with_window_icon(window_icon());
         if let Some(window) = self.session.window {
+            let window = window.on_screens(screens);
             // Saved straight from `inner_size`/`outer_position` of the
             // *restored* (not maximized) window: physical units.
             attributes = attributes
@@ -527,7 +543,7 @@ impl AnvilApp {
             return;
         }
         let repaint = self.repaint.clone();
-        let config_path = Config::path();
+        let config_path = self.config_path.clone();
         self.quota = Some(crate::quota::QuotaHandle::start(
             crate::quota::Paths::in_dir(&crate::quota::Paths::default_dir()),
             // Read per cycle from the file every window saves to, so a provider
@@ -577,13 +593,9 @@ impl AnvilApp {
         self.refresh_claude_line();
         let quota_snapshot = self.quota.as_ref().map(|q| q.snapshot());
         let rows = self.keymap.describe();
-        // The page edits the live config in place: it used to clone the whole config
-        // every frame only to hand out mutable access to one, and apply_config
-        // compares against the config actually in effect, so a clone would have
-        // to be kept anyway. It is taken out for the duration of the call and
-        // put back below, with apply_config taking it over when the page
-        // reports a change.
-        let mut next = std::mem::take(&mut self.config);
+        // Keep the applied config intact until apply_config compares the two:
+        // a default placeholder loses transition detection and can reach disk.
+        let mut next = self.config.clone();
         let claude_line = self.claude_line.1.clone();
         let outcome = {
             let mut context = crate::settings_ui::SettingsContext {
@@ -596,19 +608,10 @@ impl AnvilApp {
             };
             crate::settings_ui::show(ui, rect, &mut context, &mut self.settings)
         };
+        self.settle_settings(ui.ctx(), next, &outcome);
         if outcome.open_config {
-            let path = Config::path();
-            if let Err(e) = self.config.save(&path) {
-                log::warn!("cannot save {}: {e}", path.display());
-            }
-            self.config_mtime = file_mtime(&path);
-            crate::settings_ui::open_path(&path);
+            crate::settings_ui::open_path(&self.config_path);
         }
-        if outcome.changed {
-            let applied = std::mem::take(&mut next);
-            self.apply_config(ui.ctx().clone(), applied, true);
-        }
-        self.config = next;
         if outcome.refresh_fonts {
             self.font_entries = fonts::registry_font_entries();
             self.font_families = font_families(&self.font_entries);
@@ -627,6 +630,19 @@ impl AnvilApp {
         }
         if outcome.quota_refresh {
             self.request_quota_refresh();
+        }
+    }
+
+    fn settle_settings(&mut self, ctx: &egui::Context, next: Config, outcome: &crate::settings_ui::SettingsOutcome) {
+        if outcome.changed {
+            self.apply_config(ctx.clone(), next, true);
+        }
+        if outcome.open_config {
+            if let Err(e) = self.config.save(&self.config_path) {
+                log::warn!("cannot save {}: {e}", self.config_path.display());
+            } else {
+                self.config_mtime = file_mtime(&self.config_path);
+            }
         }
     }
 
@@ -1362,6 +1378,7 @@ impl AnvilApp {
             let mut tab = tab;
             tab.custom_title = title;
             self.tabs.insert(index + 1, tab);
+            self.tabbar.tab_inserted(index + 1);
             self.active = index + 1;
             self.settings_open = false;
             self.mark_session_dirty();
@@ -1394,6 +1411,7 @@ impl AnvilApp {
         }
         let tab = self.tabs.remove(from);
         self.tabs.insert(to, tab);
+        self.tabbar.tab_moved(from, to);
         if self.active == from {
             self.active = to;
         } else if from < self.active && to >= self.active {
@@ -1531,7 +1549,7 @@ impl AnvilApp {
             self.setup_claude();
         }
         if save {
-            let path = Config::path();
+            let path = self.config_path.clone();
             if let Err(e) = self.config.save(&path) {
                 log::warn!("cannot save {}: {e}", path.display());
             } else {
@@ -1591,7 +1609,7 @@ impl AnvilApp {
             return;
         }
         self.config_checked = Instant::now();
-        let path = Config::path();
+        let path = self.config_path.clone();
         let mtime = file_mtime(&path);
         if mtime == self.config_mtime {
             return;
@@ -1775,7 +1793,7 @@ impl AnvilApp {
         self.config.claude_status.installed_command = Some(ours.to_owned());
         self.config.claude_status.installed_settings_path = Some(path.to_path_buf());
         self.config.claude_status.declined_command = None;
-        let config_path = Config::path();
+        let config_path = self.config_path.clone();
         self.config.save(&config_path)?;
         self.config_mtime = file_mtime(&config_path);
         Ok(())
@@ -1808,7 +1826,7 @@ impl AnvilApp {
                 self.config.claude_status.previous_status_line = None;
                 self.config.claude_status.installed_command = None;
                 self.config.claude_status.installed_settings_path = None;
-                let config_path = Config::path();
+                let config_path = self.config_path.clone();
                 if let Err(e) = self.config.save(&config_path) {
                     log::warn!("cannot save {}: {e}", config_path.display());
                 }
@@ -1969,7 +1987,7 @@ impl AnvilApp {
             dialogs::DialogOutcome::Cancel => {
                 if let DialogState::ClaudeInstall { current, .. } = dialog {
                     self.config.claude_status.declined_command = Some(current);
-                    let path = Config::path();
+                    let path = self.config_path.clone();
                     if let Err(e) = self.config.save(&path) {
                         log::warn!("cannot save {}: {e}", path.display());
                     }
@@ -2099,6 +2117,96 @@ fn prepare_status_dir() -> (PathBuf, Option<PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabling_claude_from_settings_restores_the_saved_status_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let claude_path = dir.path().join("claude-settings.json");
+        let ours = "\"C:/test/anvil-claude-status.exe\"";
+        let previous = serde_json::json!({ "type": "command", "command": "test-previous" });
+        std::fs::write(
+            &claude_path,
+            serde_json::to_vec(&serde_json::json!({
+                "statusLine": { "type": "command", "command": ours }, "unrelated": true,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.quota.enabled = false;
+        config.claude_status.enabled = true;
+        config.claude_status.previous_status_line = Some(previous.clone());
+        config.claude_status.installed_settings_path = Some(claude_path.clone());
+        config.claude_status.installed_command = Some(ours.to_owned());
+        let mut next = config.clone();
+        next.claude_status.enabled = false;
+        let mut app =
+            AnvilApp::from_state(config, path.clone(), None, SessionState::default(), false, dir.path().into());
+        app.settle_settings(
+            &egui::Context::default(),
+            next,
+            &crate::settings_ui::SettingsOutcome {
+                changed: true,
+                open_config: false,
+                refresh_fonts: false,
+                install_claude: false,
+                restore_claude: false,
+                quota_refresh: false,
+            },
+        );
+        let restored: serde_json::Value = serde_json::from_slice(&std::fs::read(&claude_path).unwrap()).unwrap();
+        assert_eq!(restored["statusLine"], previous);
+        assert_eq!(restored["unrelated"], true);
+        assert!(!app.config.claude_status.enabled);
+        assert!(app.config.claude_status.installed_command.is_none());
+        assert_eq!(Config::load(&path).config, app.config, "cleanup performed by apply_config must survive settlement");
+    }
+
+    #[test]
+    fn settings_edits_preserve_live_values_transitions_and_the_file_opened_in_the_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = Config::default();
+        config.quota.enabled = false; // No worker, credentials or network in this fixture.
+        config.font.size = 21.0;
+        config.default_profile = "custom".to_owned();
+        config.profiles.push(crate::config::ProfileConfig {
+            id: "custom".into(),
+            name: "test".into(),
+            command: "test-shell".into(),
+            args: Vec::new(),
+            cwd: None,
+            env: Default::default(),
+        });
+        let mut app =
+            AnvilApp::from_state(config.clone(), path.clone(), None, SessionState::default(), false, dir.path().into());
+        app.profiles = app.build_profiles();
+        let ctx = egui::Context::default();
+        let outcome = crate::settings_ui::SettingsOutcome {
+            changed: false,
+            open_config: true,
+            refresh_fonts: false,
+            install_claude: false,
+            restore_claude: false,
+            quota_refresh: false,
+        };
+        app.settle_settings(&ctx, config.clone(), &outcome);
+        assert_eq!(Config::load(&path).config, config, "opening config must not save a default placeholder");
+        assert_eq!(app.config, config);
+        let mut edited = config;
+        edited.font.size = 24.0;
+        edited.profiles.clear();
+        edited.default_profile = Config::default().default_profile;
+        app.settle_settings(&ctx, edited.clone(), &crate::settings_ui::SettingsOutcome { changed: true, ..outcome });
+        assert_eq!(app.config, edited, "the edit must not be overwritten after apply_config");
+        assert_eq!(Config::load(&path).config, edited);
+        assert!(app.profiles.is_empty(), "compare against the old live profiles, not defaults");
+        let source = include_str!("app.rs");
+        let show = source.split("fn show_settings(").nth(1).unwrap().split("fn settle_settings(").next().unwrap();
+        assert!(show.contains("self.config.clone()"));
+        assert!(!show.contains("mem::take"), "drawing settings must leave the applied config in place");
+    }
 
     /// A finished enumeration is taken exactly once. The old code asked the
     /// channel whether a value was ready and then tried to read it: `try_recv`

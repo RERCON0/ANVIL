@@ -4,6 +4,7 @@
 //! refreshed and refresh tokens are never read into memory. Project-level
 //! configuration from repositories is never consulted.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -86,6 +87,8 @@ pub struct Credential {
 #[derive(Clone, Debug)]
 pub enum Detection {
     Missing,
+    /// An existing store failed to read; retain the previous row and retry.
+    Unreadable,
     Found(Credential),
     /// Only expired logins were found: nothing may be requested with them.
     Expired {
@@ -134,6 +137,7 @@ pub struct CredEnv {
     pub own_keys: HashMap<ProviderId, String>,
     pub sqlite: Option<Arc<Sqlite>>,
     pub now: i64,
+    read_failed: Cell<bool>,
 }
 
 impl CredEnv {
@@ -145,7 +149,7 @@ impl CredEnv {
             })
             .collect();
         let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from);
-        CredEnv { home, vars, own_keys, sqlite, now }
+        CredEnv { home, vars, own_keys, sqlite, now, read_failed: Cell::new(false) }
     }
 
     /// Trimmed on read as well as on capture: a test or a caller that inserts a
@@ -329,7 +333,7 @@ fn omp(env: &CredEnv, providers: &[&str], accept: Accept) -> Option<Credential> 
     let sqlite = env.sqlite.as_deref()?;
     let path = env.omp_agent_db()?;
     for provider in providers {
-        let rows = sqlite.query(&path, SQL, provider, 2).ok()?;
+        let rows = database_rows(env, sqlite, &path, SQL, provider)?;
         for row in rows {
             let Ok(Value::Object(mut data)) = serde_json::from_str::<Value>(&row[1]) else { continue };
             data.insert("type".into(), Value::String(row[0].clone()));
@@ -347,7 +351,7 @@ fn opencode2(env: &CredEnv, ids: &[&str], accept: Accept) -> Option<Credential> 
     let sqlite = env.sqlite.as_deref()?;
     let path = env.opencode_db()?;
     for id in ids {
-        for row in sqlite.query(&path, SQL, id, 2).ok()? {
+        for row in database_rows(env, sqlite, &path, SQL, id)? {
             if let Some(found) =
                 serde_json::from_str(&row[1]).ok().and_then(|v: Value| from_entry(&v, Source::OpenCode, accept))
             {
@@ -361,6 +365,17 @@ fn opencode2(env: &CredEnv, ids: &[&str], accept: Accept) -> Option<Credential> 
 fn opencode1(env: &CredEnv, ids: &[&str], accept: Accept) -> Option<Credential> {
     let value = read_json(&env.data_home()?.join("opencode").join("auth.json"))?;
     ids.iter().find_map(|id| from_entry(value.get(*id)?, Source::OpenCode, accept))
+}
+
+fn database_rows(env: &CredEnv, sqlite: &Sqlite, path: &Path, sql: &str, id: &str) -> Option<Vec<Vec<String>>> {
+    match sqlite.query(path, sql, id, 2) {
+        Ok(rows) => Some(rows),
+        Err(super::sqlite::SqliteError::Missing) => None,
+        Err(_) => {
+            env.read_failed.set(true);
+            None
+        }
+    }
 }
 
 /// Exact host of an `https://` URL, lowercased; anything else is `None`.
@@ -521,6 +536,7 @@ fn candidates(id: ProviderId, env: &CredEnv) -> Vec<Box<dyn Fn() -> Option<Crede
 }
 
 pub fn detect(id: ProviderId, env: &CredEnv) -> Detection {
+    env.read_failed.set(false);
     let mut expired = None;
     for candidate in candidates(id, env) {
         let Some(found) = candidate() else { continue };
@@ -530,7 +546,11 @@ pub fn detect(id: ProviderId, env: &CredEnv) -> Detection {
         }
         return Detection::Found(found);
     }
-    expired.unwrap_or(Detection::Missing)
+    if env.read_failed.get() {
+        Detection::Unreadable
+    } else {
+        expired.unwrap_or(Detection::Missing)
+    }
 }
 
 #[cfg(test)]
@@ -546,6 +566,7 @@ mod tests {
             own_keys: HashMap::new(),
             sqlite: None,
             now: NOW,
+            read_failed: Cell::new(false),
         }
     }
 
@@ -755,5 +776,37 @@ mod tests {
         assert_eq!(e.opencode_db(), None);
         e.vars.insert("OPENCODE_DB".into(), "alt.db".into());
         assert_eq!(e.opencode_db(), Some(PathBuf::from("C:/Users/u/.local/share/opencode/alt.db")));
+    }
+
+    #[test]
+    fn a_busy_store_is_not_a_logout_and_a_valid_fallback_still_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite = Arc::new(Sqlite::load().expect("system SQLite required for this regression"));
+        let mut e = env(dir.path());
+        e.sqlite = Some(sqlite.clone());
+        assert!(matches!(detect(ProviderId::Zai, &e), Detection::Missing));
+        let path = e.omp_agent_db().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        sqlite.exec_for_test(
+            &path,
+            "PRAGMA journal_mode=DELETE;
+            CREATE TABLE auth_credentials (id INTEGER, provider TEXT, credential_type TEXT, data TEXT,
+                disabled_cause TEXT, updated_at INTEGER);
+            INSERT INTO auth_credentials VALUES (1, 'zai', 'api_key', '{\"key\":\"test-key\"}', NULL, 1);",
+        );
+        sqlite.with_exclusive_for_test(&path, || {
+            assert!(matches!(detect(ProviderId::Zai, &e), Detection::Unreadable));
+            write(
+                &dir.path().join(".local/share/opencode/auth.json"),
+                r#"{"zai-coding-plan":{"type":"api","key":"fallback"}}"#,
+            );
+            assert_eq!(found(detect(ProviderId::Zai, &e)).secret.expose(), "fallback");
+        });
+        assert_eq!(found(detect(ProviderId::Zai, &e)).secret.expose(), "test-key");
+        // A schema or corrupt-file error also must not masquerade as Missing.
+        let broken = dir.path().join("broken.db");
+        std::fs::write(&broken, b"not a database").unwrap();
+        e.vars.insert("OPENCODE_DB".into(), broken.to_string_lossy().into_owned());
+        assert!(matches!(detect(ProviderId::OpencodeZen, &e), Detection::Unreadable));
     }
 }

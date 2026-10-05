@@ -121,7 +121,6 @@ enum State {
     Ground,
     Escape,
     Osc,
-    OscEscape,
 }
 
 pub struct OscScanner {
@@ -159,8 +158,16 @@ impl OscScanner {
                             found = Some(dir);
                         }
                     }
-                    0x1b => self.state = State::OscEscape,
-                    0x18 | 0x1a => self.state = State::Ground,
+                    0x1b | 0x18 | 0x1a => {
+                        // VTE dispatches OSC on ESC/CAN/SUB, not only BEL/ST.
+                        if let Some(dir) = self.finish() {
+                            found = Some(dir);
+                        }
+                        if b == 0x1b {
+                            self.state = State::Escape;
+                        }
+                    }
+                    0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1c..=0x1f => {}
                     _ => {
                         if self.payload.len() < MAX_PAYLOAD {
                             self.payload.push(b);
@@ -169,16 +176,6 @@ impl OscScanner {
                         }
                     }
                 },
-                State::OscEscape => {
-                    if b == b'\\' {
-                        if let Some(dir) = self.finish() {
-                            found = Some(dir);
-                        }
-                    } else {
-                        // ESC inside an OSC aborts it and starts a new escape.
-                        self.after_escape(b);
-                    }
-                }
             }
         }
         found
@@ -192,6 +189,7 @@ impl OscScanner {
                 self.overflow = false;
             }
             0x1b => self.state = State::Escape,
+            0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f => {}
             _ => self.state = State::Ground,
         }
     }
@@ -273,6 +271,34 @@ fn percent_decode(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cwd_dispatch_matches_vte_at_every_chunk_boundary() {
+        #[derive(Default)]
+        struct Observer(Option<PathBuf>);
+        impl alacritty_terminal::vte::Perform for Observer {
+            fn osc_dispatch(&mut self, params: &[&[u8]], _: bool) {
+                let joined = params.join(&b';');
+                if let Some(path) = parse_cwd(&joined) {
+                    self.0 = Some(path);
+                }
+            }
+        }
+        for sequence in [
+            &b"\x1b]1337;CurrentDir=C:\\test\x18"[..],
+            b"\x1b]1337;CurrentDir=C:\\test\x1a",
+            b"\x1b]1337;CurrentDir=C:\\test\x1b[31m",
+            b"\x1b]1337;CurrentDir=C:\\te\x00st\x07",
+            b"\x1b\x00]1337;CurrentDir=C:\\test\x07",
+        ] {
+            let mut observer = Observer::default();
+            alacritty_terminal::vte::Parser::new().advance(&mut observer, sequence);
+            assert!(observer.0.is_some(), "fixture must really dispatch a cwd");
+            for cut in 0..=sequence.len() {
+                assert_eq!(scan(&[&sequence[..cut], &sequence[cut..]]), observer.0, "cut at {cut}");
+            }
+        }
+    }
 
     fn scan(chunks: &[&[u8]]) -> Option<PathBuf> {
         let mut s = OscScanner::new();

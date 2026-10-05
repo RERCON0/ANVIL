@@ -1526,12 +1526,13 @@ pub fn status(root: &Path) -> Result<Status, String> {
     let raw = run_git_bytes(root, &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"])?;
     let mut status = parse_status(&raw);
     if status.head_oid.is_some() || status.upstream.is_some() {
-        // Match log's origin/<branch> fallback without making a branch name
+        // Match log's remote/<branch> fallback without making a branch name
         // an option or interpreting it as a revision expression.
         let reference: std::borrow::Cow<'_, str> = if status.upstream.is_some() {
             "@{upstream}^{commit}".into()
         } else {
-            format!("refs/remotes/origin/{}^{{commit}}", status.branch).into()
+            let remote = branch_remote(root, &status.branch, false)?;
+            format!("refs/remotes/{remote}/{}^{{commit}}", status.branch).into()
         };
         status.upstream_oid = run_git(root, &["rev-parse", "--verify", "--quiet", "--end-of-options", &reference])
             .ok()
@@ -1732,8 +1733,12 @@ pub fn upstream(root: &Path) -> Option<String> {
     if branch.is_empty() || branch == "HEAD" {
         return None;
     }
-    run_git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/remotes/origin/{branch}")]).ok()?;
-    Some(format!("origin/{branch}"))
+    let remote = branch_remote(root, branch, false).ok()?;
+    if remote == "." {
+        return None;
+    }
+    run_git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/remotes/{remote}/{branch}")]).ok()?;
+    Some(format!("{remote}/{branch}"))
 }
 
 fn rev_list_set(root: &Path, args: &[&str]) -> std::collections::HashSet<String> {
@@ -1763,15 +1768,16 @@ pub fn log(root: &Path) -> Result<CommitLog, String> {
     };
     let mut args: Vec<String> = vec![
         "log".to_owned(),
-        format!("--max-count={MAX_COMMITS}"),
+        format!("--max-count={}", MAX_COMMITS + 1),
         "--topo-order".to_owned(),
         format!("--pretty=format:{format}"),
     ];
     args.extend(revs.iter().map(|rev| (*rev).to_owned()));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let text = run_git(root, &arg_refs)?;
-    let commits = parse_log(&text, &outgoing, &incoming);
-    let truncated = commits.len() >= MAX_COMMITS;
+    let mut commits = parse_log(&text, &outgoing, &incoming);
+    let truncated = commits.len() > MAX_COMMITS;
+    commits.truncate(MAX_COMMITS);
     Ok(CommitLog { commits, upstream, truncated })
 }
 
@@ -2527,15 +2533,28 @@ pub fn apply_hunks(root: &Path, file: &FileDiff, selection: &[usize], from_index
 
 /// Fetches and prunes the remote of the current branch (git resolves it).
 pub fn fetch(root: &Path) -> Result<String, String> {
-    let remote = run_git(root, &["config", "--get", &format!("branch.{}.remote", current_branch(root)?)])
-        .map(|text| text.trim().to_owned())
-        .unwrap_or_default();
-    let remote = if remote.is_empty() { "origin".to_owned() } else { remote };
-    if remote.starts_with('-') {
-        return Err(crate::strings::WORKSPACE_PATH_INSIDE_REPO.to_owned());
-    }
+    let remote = branch_remote(root, &current_branch(root)?, false)?;
     run_git_timeout(root, &["fetch", "--no-tags", "--quiet", "--prune", "--", &remote], GIT_TIMEOUT_NETWORK)
         .map(|_| strings_fetch_done(&remote))
+}
+
+fn branch_remote(root: &Path, branch: &str, pushing: bool) -> Result<String, String> {
+    let mut keys = Vec::new();
+    if pushing {
+        keys.push(format!("branch.{branch}.pushRemote"));
+        keys.push("remote.pushDefault".to_owned());
+    }
+    keys.push(format!("branch.{branch}.remote"));
+    let remote = keys
+        .iter()
+        .find_map(|key| {
+            run_git(root, &["config", "--get", key]).ok().map(|text| text.trim().to_owned()).filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "origin".to_owned());
+    if remote.starts_with('-') || remote.chars().any(char::is_control) {
+        return Err(crate::strings::WORKSPACE_PATH_INSIDE_REPO.to_owned());
+    }
+    Ok(remote)
 }
 
 fn current_branch(root: &Path) -> Result<String, String> {
@@ -2553,10 +2572,18 @@ fn strings_fetch_done(remote: &str) -> String {
 /// Pushes the current branch, setting the upstream when it has none.
 pub fn push(root: &Path) -> Result<String, String> {
     let branch = current_branch(root)?;
-    if upstream(root).is_none() {
+    if run_git(root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]).is_err() {
+        let remote = branch_remote(root, &branch, true)?;
         run_git_timeout(
             root,
-            &["push", "--porcelain", "--set-upstream", "origin", &format!("refs/heads/{branch}:refs/heads/{branch}")],
+            &[
+                "push",
+                "--porcelain",
+                "--set-upstream",
+                "--",
+                &remote,
+                &format!("refs/heads/{branch}:refs/heads/{branch}"),
+            ],
             GIT_TIMEOUT_NETWORK,
         )?;
     } else {

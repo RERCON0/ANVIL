@@ -29,8 +29,16 @@ fn digits(s: &str, from: usize, to: usize) -> Option<i64> {
 }
 
 fn unix_from_parts(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> Option<i64> {
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    };
     let valid = (1..=12).contains(&month)
-        && (1..=31).contains(&day)
+        && (1..=days).contains(&day)
+        && (0..=9999).contains(&year)
         && (0..=23).contains(&hour)
         && (0..=59).contains(&minute)
         && (0..=60).contains(&second);
@@ -75,12 +83,19 @@ pub fn parse_rfc3339(text: &str) -> Option<i64> {
                 b'-' => -1,
                 _ => return None,
             };
-            let tz = rest[1..].replace(':', "");
+            let raw = &rest[1..];
+            if !matches!(raw.len(), 4 | 5) || (raw.len() == 5 && raw.as_bytes()[2] != b':') {
+                return None;
+            }
+            let tz = raw.replace(':', "");
             if tz.len() != 4 {
                 return None;
             }
             let hours = digits(&tz, 0, 2)?;
             let minutes = digits(&tz, 2, 4)?;
+            if hours > 23 || minutes > 59 {
+                return None;
+            }
             sign * (hours * 3_600 + minutes * 60)
         }
     };
@@ -100,7 +115,7 @@ pub fn parse_http_date(text: &str) -> Option<i64> {
         + 1;
     let year = digits(parts[3], 0, parts[3].len())?;
     let clock = parts[4];
-    if clock.len() != 8 {
+    if clock.len() != 8 || clock.as_bytes()[2] != b':' || clock.as_bytes()[5] != b':' {
         return None;
     }
     unix_from_parts(year, month, day, digits(clock, 0, 2)?, digits(clock, 3, 5)?, digits(clock, 6, 8)?)
@@ -112,7 +127,7 @@ pub fn retry_after_secs(value: &str, now: i64) -> Option<i64> {
     if let Ok(secs) = value.parse::<i64>() {
         return (secs >= 0).then_some(secs);
     }
-    parse_http_date(value).map(|at| (at - now).max(0))
+    parse_http_date(value).map(|at| at.saturating_sub(now).max(0))
 }
 
 /// An instant given as a number (seconds, or milliseconds when above 10^12) or
@@ -184,7 +199,7 @@ pub fn local_parts(unix: i64) -> Option<(u16, u16, u16, u16)> {
 /// `16:40` for an instant within the next 24 hours, `6.10 09:00` otherwise.
 pub fn format_clock(unix: i64, now: i64) -> Option<String> {
     let (day, month, hour, minute) = local_parts(unix)?;
-    Some(if (unix - now).abs() < 86_400 {
+    Some(if unix.abs_diff(now) < 86_400 {
         format!("{hour:02}:{minute:02}")
     } else {
         format!("{day}.{month:02} {hour:02}:{minute:02}")
@@ -194,6 +209,23 @@ pub fn format_clock(unix: i64, now: i64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn impossible_calendar_dates_and_offsets_are_not_normalized() {
+        for bad in [
+            "2026-02-29T00:00:00Z",
+            "2100-02-29T00:00:00Z",
+            "2026-04-31T00:00:00Z",
+            "2026-01-01T00:00:00+24:00",
+            "2026-01-01T00:00:00+00:60",
+            "2026-01-01T00:00:00+0:100",
+        ] {
+            assert_eq!(parse_rfc3339(bad), None, "{bad}");
+        }
+        assert!(parse_rfc3339("2000-02-29T00:00:00Z").is_some());
+        assert_eq!(parse_http_date("Wed, 31 Apr 2026 07:28:00 GMT"), None);
+        assert_eq!(parse_http_date("Wed, 21 Oct 2015 07-28-00 GMT"), None);
+    }
 
     #[test]
     fn rfc3339_forms() {

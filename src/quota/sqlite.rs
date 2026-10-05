@@ -108,8 +108,10 @@ impl Sqlite {
     /// Runs one statement with `?1 = param` on a read-only connection and
     /// returns the first `columns` columns of each row as text (NULL → "").
     pub fn query(&self, path: &Path, sql: &str, param: &str, columns: usize) -> Result<Vec<Vec<String>>, SqliteError> {
-        if !path.is_file() {
-            return Err(SqliteError::Missing);
+        match std::fs::metadata(path) {
+            Ok(meta) if meta.is_file() => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(SqliteError::Missing),
+            _ => return Err(SqliteError::Sqlite(14, "cannot read database file".to_owned())),
         }
         let db = self.open(path, SQLITE_OPEN_READONLY)?;
         let sql = CString::new(sql).map_err(|_| SqliteError::BadPath)?;
@@ -179,6 +181,18 @@ impl Sqlite {
             (self.api.exec)(db.raw, sql.as_ptr(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut())
         };
         assert_eq!(rc, SQLITE_OK, "{:?}", self.error(&db, rc));
+    }
+
+    #[cfg(test)]
+    pub fn with_exclusive_for_test(&self, path: &Path, action: impl FnOnce()) {
+        let db = self.open(path, SQLITE_OPEN_READWRITE).expect("open for test");
+        let sql = CString::new("BEGIN EXCLUSIVE").unwrap();
+        // SAFETY: valid test connection, NUL-terminated SQL, no callback.
+        let rc = unsafe {
+            (self.api.exec)(db.raw, sql.as_ptr(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(rc, SQLITE_OK, "{:?}", self.error(&db, rc));
+        action(); // Dropping the connection rolls back and releases the lock.
     }
 }
 

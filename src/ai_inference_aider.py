@@ -6,6 +6,13 @@ import os
 import sys
 
 
+def split_entry(item, separator):
+    if not isinstance(item, str) or separator not in item:
+        return None
+    name, value = (part.strip() for part in item.split(separator, 1))
+    return (name, value) if name and value else None
+
+
 def generate(config, prompt, model_override=None):
     # No aider.main/Coder: those discover repo config and can execute /commands.
     from aider.models import Model, MODEL_ALIASES
@@ -26,11 +33,15 @@ def generate(config, prompt, model_override=None):
         return value if isinstance(value, list) else [value]
 
     for item in as_list(config.get("api-key", [])):
-        provider, key = str(item).split("=", 1)
-        os.environ[provider.strip().upper() + "_API_KEY"] = key.strip()
+        entry = split_entry(item, "=")
+        if entry is not None:
+            provider, key = entry
+            os.environ[provider.upper() + "_API_KEY"] = key
     for item in as_list(config.get("alias", [])):
-        alias, target = str(item).split(":", 1)
-        MODEL_ALIASES[alias.strip()] = target.strip()
+        entry = split_entry(item, ":")
+        if entry is not None:
+            alias, target = entry
+            MODEL_ALIASES[alias] = target
     if "timeout" in config:
         import aider.models
         aider.models.request_timeout = float(config["timeout"])

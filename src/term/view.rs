@@ -75,6 +75,8 @@ pub struct TerminalView {
     last_rows: Vec<(String, Vec<usize>)>,
     /// Last cell mouse reports were sent for (to avoid repeating motion).
     last_reported_cell: Option<(usize, usize)>,
+    /// Deduplication of no-button motion is separate from press/release state.
+    last_motion_cell: Option<(usize, usize)>,
     /// Cell under the pointer (used for wheel reports).
     hover_cell: Option<(usize, usize)>,
     /// A press report was sent for this pane: only then do we report motion
@@ -132,6 +134,7 @@ impl TerminalView {
             ctrl_tail: false,
             scroll_grab: None,
             last_reported_cell: None,
+            last_motion_cell: None,
             hover_cell: None,
             press_reported: false,
             last_links: Vec::new(),
@@ -151,6 +154,20 @@ impl TerminalView {
     /// can draw must be asked again, or glyphs stay routed for the old face.
     pub fn font_changed(&mut self) {
         self.glyphs = GlyphCache::default();
+    }
+
+    fn hover_motion(&mut self, reporting: bool, buttons_down: bool, mods: Mods, modes: MouseModes) -> Option<Vec<u8>> {
+        if !reporting || self.hover_cell.is_none() {
+            self.last_motion_cell = None;
+            return None;
+        }
+        let (col, row) = self.hover_cell?;
+        if buttons_down || self.last_motion_cell == Some((col, row)) {
+            return None;
+        }
+        let bytes = mouse::encode_report(MouseButton::NoButton, MouseAction::Motion, col, row, mods, modes)?;
+        self.last_motion_cell = Some((col, row));
+        Some(bytes)
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, rect: Rect, pane: &mut Pane, input: &ViewInput) -> ViewOutput {
@@ -299,18 +316,10 @@ impl TerminalView {
         }
 
         self.hover_cell = if hovered { pointer.map(clamp_cell) } else { None };
+        let motion_reporting = app_mouse && mouse::wants_report(MouseAction::Motion, false, modes);
         let any_button_down = ui.input(|i| i.pointer.any_down());
-        if let (true, Some((col, row))) = (app_mouse && hovered && !any_button_down, self.hover_cell) {
-            if mouse::wants_report(MouseAction::Motion, false, modes) && self.last_reported_cell != Some((col, row)) {
-                if let Some(bytes) = mouse::encode_report(MouseButton::NoButton, MouseAction::Motion, col, row, mods, modes) {
-                    pane.write(bytes);
-                }
-            }
-        }
-        if let Some(cell) = self.hover_cell {
-            if self.last_reported_cell != Some(cell) {
-                self.last_reported_cell = Some(cell);
-            }
+        if let Some(bytes) = self.hover_motion(motion_reporting, any_button_down, mods, modes) {
+            pane.write(bytes);
         }
 
         // Middle button pastes.
@@ -378,35 +387,36 @@ impl TerminalView {
         });
 
         // Search highlights for the visible screen.
-        let mut highlights: Vec<Highlight> = Vec::new();
-        if self.search.open && !self.search.query.is_empty() {
-            let pattern = search_pattern(&self.search.query, self.search.regex, self.search.case_sensitive);
-            match self.search.compiled.get(&pattern) {
-                Some(regex) => {
-                    self.search.error = false;
-                    let term = pane.term.lock();
-                    let found = collect_matches(&*term, regex, lines as usize, columns as usize, display_offset);
-                    let current = self.search.current.filter(|c| found.contains(c));
-                    self.search.current = current;
-                    for (row, start, end) in found {
-                        let is_current = self.search.current == Some((row, start, end));
-                        highlights.push((row, start, end, is_current));
+        let (highlights, frame) = {
+            let term = pane.term.lock_unfair();
+            let mut highlights: Vec<Highlight> = Vec::new();
+            if self.search.open && !self.search.query.is_empty() {
+                let pattern = search_pattern(&self.search.query, self.search.regex, self.search.case_sensitive);
+                match self.search.compiled.get(&pattern) {
+                    Some(regex) => {
+                        self.search.error = false;
+                        let found = collect_matches(&*term, regex, lines as usize, columns as usize, display_offset);
+                        let current = self.search.current.filter(|c| found.contains(c));
+                        self.search.current = current;
+                        for (row, start, end) in found {
+                            let is_current = self.search.current == Some((row, start, end));
+                            highlights.push((row, start, end, is_current));
+                        }
+                    }
+                    None => {
+                        self.search.error = true;
+                        self.search.current = None;
                     }
                 }
-                None => {
-                    self.search.error = true;
-                    self.search.current = None;
-                }
             }
-        }
 
+            let primary = fonts.primary.clone();
+            let frame =
+                ctx.fonts_mut(|f| snapshot(&term, input.palette, &mut self.glyphs, &mut |c| f.has_glyph(&primary, c)));
+            (highlights, frame)
+        };
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, input.palette.background);
-        let frame = {
-            let term = pane.term.lock_unfair();
-            let primary = fonts.primary.clone();
-            ctx.fonts_mut(|f| snapshot(&term, input.palette, &mut self.glyphs, &mut |c| f.has_glyph(&primary, c)))
-        };
         // Link detection reads the previous frame's text, so it must also be
         // built on the frame Ctrl is released. Neither is consulted otherwise.
         if ctrl || self.ctrl_tail {
@@ -824,6 +834,23 @@ mod tests {
     use crate::term::style::{CellStyle, RenderCell, Underline};
     use alacritty_terminal::term::cell::Hyperlink;
     use egui::Color32;
+
+    #[test]
+    fn enabling_motion_reports_the_current_cell_without_losing_release_coordinates() {
+        let mut view = TerminalView::new(15.0);
+        let modes = MouseModes { motion: true, sgr: true, ..Default::default() };
+        view.last_reported_cell = Some((3, 4)); // A press to release even if the pointer leaves.
+        view.hover_cell = Some((3, 4));
+        assert!(view.hover_motion(false, false, Mods::default(), modes).is_none());
+        let expected = b"\x1b[<35;4;5M".to_vec();
+        assert_eq!(view.hover_motion(true, false, Mods::default(), modes), Some(expected.clone()));
+        assert!(view.hover_motion(true, false, Mods::default(), modes).is_none());
+        view.hover_cell = None;
+        assert!(view.hover_motion(true, false, Mods::default(), modes).is_none());
+        assert_eq!(view.last_reported_cell, Some((3, 4)), "hover state cannot erase a pending release");
+        view.hover_cell = Some((3, 4));
+        assert_eq!(view.hover_motion(true, false, Mods::default(), modes), Some(expected));
+    }
 
     fn cell(ch: char, hyperlink: Option<Hyperlink>) -> RenderCell {
         let style = CellStyle { fg: Color32::WHITE, bg: Color32::BLACK, bold: false, italic: false, underline: Underline::None, strike: false };

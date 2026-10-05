@@ -98,6 +98,7 @@ pub fn segments(snapshot: &Snapshot, config: &QuotaConfig, now: i64) -> Vec<Segm
             let failed = matches!(
                 provider.state,
                 ProviderState::UpdateFailed { .. }
+                    | ProviderState::StoreUnreadable
                     | ProviderState::RateLimited { .. }
                     | ProviderState::FormatError { .. }
             );
@@ -126,6 +127,7 @@ pub fn state_note(state: &ProviderState, now: i64) -> Option<String> {
         ProviderState::Idle | ProviderState::Ok => None,
         ProviderState::UpdateFailed { reason } => Some(format!("{} {reason}", strings::QUOTA_PROVIDER_SAID)),
         ProviderState::AuthExpired => Some(strings::QUOTA_AUTH_EXPIRED.to_owned()),
+        ProviderState::StoreUnreadable => Some(strings::QUOTA_STORE_UNREADABLE.to_owned()),
         ProviderState::RateLimited { retry_at } => {
             Some(format!("{} {}", strings::QUOTA_RATE_LIMITED, format_clock(*retry_at, now).unwrap_or_default()))
         }

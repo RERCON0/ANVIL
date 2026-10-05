@@ -12,17 +12,13 @@
 //! API keys (the supported path) never expire.
 use std::path::Path;
 
-#[cfg(feature = "codex")]
+#[cfg(any(feature = "codex", test))]
 const OUTPUT_CAP: usize = 64 * 1024;
 const DEFAULT_MODEL: &str = "gpt-6-astra"; // first priority in the bundled catalog
 
 fn read_json(path: &Path) -> Result<Option<serde_json::Value>, String> {
-    match std::fs::metadata(path) {
-        Ok(meta) if meta.len() > 2 * 1024 * 1024 => Err(format!("Codex: {} слишком велик", path.display())),
-        Ok(_) => {
-            let bytes = std::fs::read(path).map_err(|e| format!("Codex: {}: {e}", path.display()))?;
-            serde_json::from_slice(&bytes).map(Some).map_err(|e| format!("Codex: {}: {e}", path.display()))
-        }
+    match crate::fsutil::read_limited(path, 2 * 1024 * 1024) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| format!("Codex: {}: {e}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("Codex: {}: {e}", path.display())),
     }
@@ -69,7 +65,13 @@ fn model(home: &Path, override_model: Option<&str>) -> Result<String, String> {
         return Ok(model.trim().to_owned());
     }
     let path = home.join("config.toml");
-    if let Ok(text) = std::fs::read_to_string(&path) {
+    let bytes = match crate::fsutil::read_limited(&path, 2 * 1024 * 1024) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("Codex: config.toml: {e}")),
+    };
+    if let Some(bytes) = bytes {
+        let text = String::from_utf8(bytes).map_err(|_| "Codex: config.toml: invalid UTF-8".to_owned())?;
         let config: toml::Value = toml::from_str(&text).map_err(|e| format!("Codex: config.toml: {e}"))?;
         if let Some(provider) = config.get("model_provider").and_then(toml::Value::as_str) {
             if provider != "openai" {
@@ -117,15 +119,22 @@ pub(super) fn request(home: &Path, override_model: Option<&str>, prompt: &str) -
 #[cfg(feature = "codex")]
 pub(super) fn generate(home: &Path, override_model: Option<&str>, prompt: &str, timeout: std::time::Duration) -> Result<String, String> {
     let request = request(home, override_model, prompt)?;
-    let client = reqwest::blocking::Client::builder().timeout(timeout).user_agent("codex_cli_rs/0.153.4").build()
+    let client = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("codex_cli_rs/0.153.4")
+        .build()
         .map_err(|e| format!("Codex: {e}"))?;
     let response = send(&client, &request, timeout)?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().unwrap_or_default();
+        use std::io::Read;
+        let mut body = String::new();
+        let _ = response.take(64 * 1024).read_to_string(&mut body);
         let detail = serde_json::from_str::<serde_json::Value>(&body).ok()
             .and_then(|value| value.pointer("/error/message").and_then(serde_json::Value::as_str).map(str::to_owned))
-            .unwrap_or_else(|| body.chars().take(400).collect());
+            .unwrap_or(body);
+        let detail: String = detail.replace(&request.token, "…").chars().take(400).collect();
         return Err(match status.as_u16() {
             // OpenAI rotates refresh tokens on use, so a refresh here would log
             // the user's own Codex CLI out. Ask for a fresh login instead.
@@ -152,28 +161,49 @@ fn send(client: &reqwest::blocking::Client, request: &Request, timeout: std::tim
 
 #[cfg(feature = "codex")]
 fn stream_text(response: reqwest::blocking::Response, timeout: std::time::Duration) -> Result<String, String> {
-    use std::io::BufRead;
+    read_stream(response, timeout)
+}
+
+#[cfg(any(feature = "codex", test))]
+fn read_stream(reader: impl std::io::Read, timeout: std::time::Duration) -> Result<String, String> {
+    use std::io::{BufRead, Read};
+    const LINE_CAP: usize = 256 * 1024;
+    const STREAM_CAP: usize = 8 * 1024 * 1024;
     let deadline = std::time::Instant::now() + timeout;
     let mut text = String::new();
     let mut failure = None;
-    for line in std::io::BufReader::new(response).lines() {
+    let mut reader = std::io::BufReader::new(reader);
+    let mut bytes_read = 0;
+    loop {
         if std::time::Instant::now() > deadline {
             return Err(format!("Codex не ответил за {} с", timeout.as_secs()));
         }
-        let line = line.map_err(|e| if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) {
-            format!("Codex не ответил за {} с", timeout.as_secs())
-        } else {
-            format!("Codex: {e}")
+        let mut line = Vec::new();
+        let count = reader.by_ref().take((LINE_CAP + 1) as u64).read_until(b'\n', &mut line);
+        let count = count.map_err(|e| {
+            if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) {
+                format!("Codex не ответил за {} с", timeout.as_secs())
+            } else {
+                format!("Codex: {e}")
+            }
         })?;
+        if count == 0 {
+            break;
+        }
+        bytes_read += count;
+        if count > LINE_CAP || bytes_read > STREAM_CAP {
+            return Err("Codex: поток ответа слишком велик".to_owned());
+        }
+        let line = std::str::from_utf8(&line).map_err(|_| "Codex: invalid UTF-8".to_owned())?;
         let Some(data) = line.strip_prefix("data:") else { continue };
         let Ok(event) = serde_json::from_str::<serde_json::Value>(data.trim()) else { continue };
         match event.get("type").and_then(serde_json::Value::as_str) {
             Some("response.output_text.delta") => {
                 if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str) {
-                    if text.len() < OUTPUT_CAP {
-                        let room = OUTPUT_CAP - text.len();
-                        text.extend(delta.chars().take(room));
+                    if delta.len() > OUTPUT_CAP - text.len() {
+                        return Err("Codex: сообщение коммита слишком велико".to_owned());
                     }
+                    text.push_str(delta);
                 }
             }
             Some("response.failed") | Some("error") | Some("response.incomplete") => {
@@ -190,5 +220,38 @@ fn stream_text(response: reqwest::blocking::Response, timeout: std::time::Durati
         Some(error) => Err(error),
         None if text.trim().is_empty() => Err("Codex: модель не вернула сообщение коммита".to_owned()),
         None => Ok(text),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(delta: &str) -> String {
+        format!("data: {}\n", serde_json::json!({ "type": "response.output_text.delta", "delta": delta }))
+    }
+
+    #[test]
+    fn streaming_output_obeys_a_byte_budget_and_never_returns_a_cut_message() {
+        let exact = "я".repeat(OUTPUT_CAP / 2);
+        let stream = event(&exact);
+        assert_eq!(read_stream(stream.as_bytes(), std::time::Duration::from_secs(1)).unwrap(), exact);
+        let over = event(&"я".repeat(OUTPUT_CAP / 2 + 1));
+        assert!(read_stream(over.as_bytes(), std::time::Duration::from_secs(1)).is_err());
+        let split = event(&"a".repeat(OUTPUT_CAP - 1)) + &event("я");
+        assert!(read_stream(split.as_bytes(), std::time::Duration::from_secs(1)).is_err());
+        let line = vec![b'x'; 256 * 1024 + 1];
+        assert!(read_stream(&line[..], std::time::Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn local_configuration_is_bounded_and_errors_are_not_silently_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, vec![b' '; 2 * 1024 * 1024 + 1]).unwrap();
+        assert!(model(dir.path(), None).is_err());
+        assert!(read_json(&path).is_err());
+        std::fs::write(&path, b"model = 'test-model'").unwrap();
+        assert_eq!(model(dir.path(), None).unwrap(), "test-model");
     }
 }

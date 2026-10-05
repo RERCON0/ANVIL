@@ -26,6 +26,34 @@ pub struct WindowState {
     pub maximized: bool,
 }
 
+impl WindowState {
+    /// Keep the title bar reachable after a monitor disappears; use i64 to
+    /// handle hand-edited coordinates and dimensions without overflow.
+    pub fn on_screens(mut self, screens: &[(i32, i32, u32, u32)]) -> Self {
+        self.width = self.width.clamp(640, 16384);
+        self.height = self.height.clamp(400, 16384);
+        let reachable = screens.iter().any(|&(x, y, w, h)| {
+            let overlap_x =
+                (self.x as i64 + self.width as i64).min(x as i64 + w as i64) - (self.x as i64).max(x as i64);
+            let overlap_y = (self.y as i64 + 30).min(y as i64 + h as i64) - (self.y as i64).max(y as i64);
+            overlap_x >= 64 && overlap_y >= 16
+        });
+        if !reachable {
+            if let Some(&(x, y, w, h)) = screens.first() {
+                self.width = self.width.min(w.max(640));
+                self.height = self.height.min(h.max(400));
+                let coordinate = |origin: i32, available: u32, size: u32| {
+                    (origin as i64 + (available as i64 - size as i64).max(0) / 2)
+                        .clamp(i32::MIN as i64, i32::MAX as i64) as i32
+                };
+                self.x = coordinate(x, w, self.width);
+                self.y = coordinate(y, h, self.height);
+            }
+        }
+        self
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TabState {
@@ -154,6 +182,20 @@ fn is_local_dir(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removed_monitors_and_extreme_saved_dimensions_keep_the_title_reachable() {
+        let window = WindowState { x: 4000, y: 0, width: 1000, height: 600, maximized: false };
+        let repaired = window.on_screens(&[(0, 0, 1920, 1080)]);
+        assert!(repaired.x >= 0 && repaired.x + repaired.width as i32 <= 1920);
+        assert!(repaired.y >= 0 && repaired.y + repaired.height as i32 <= 1080);
+        let visible = WindowState { x: -1500, ..window };
+        assert_eq!(visible.on_screens(&[(-1920, 0, 1920, 1080)]), visible);
+        let extreme = WindowState { x: i32::MAX, y: i32::MIN, width: u32::MAX, height: u32::MAX, maximized: true };
+        let repaired = extreme.on_screens(&[(0, 0, 1920, 1080)]);
+        assert!(repaired.width <= 1920 && repaired.height <= 1080);
+        assert!(repaired.maximized);
+    }
 
     #[test]
     fn an_extra_window_starts_empty_and_offset() {

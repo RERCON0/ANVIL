@@ -13,7 +13,7 @@ pub fn parse(body: &[u8]) -> Result<Fetched, FetchError> {
     let usage = number(data.get("usage")).filter(|u| *u >= 0.0).ok_or_else(|| FetchError::Format("no usage".into()))?;
     let limit = number(data.get("limit")).filter(|l| *l > 0.0);
     let spent = match (limit, number(data.get("limit_remaining"))) {
-        (Some(limit), Some(remaining)) => limit - remaining,
+        (Some(limit), Some(remaining)) if remaining <= limit => limit - remaining,
         _ => usage,
     };
     let spend = Balance::new("spend", strings::QUOTA_SPEND, spent, Unit::Usd, BalanceKind::Spent).with_limit(limit);
@@ -23,6 +23,13 @@ pub fn parse(body: &[u8]) -> Result<Fetched, FetchError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anomalous_remaining_balance_does_not_become_negative_spend() {
+        let fetched = parse(br#"{"data":{"usage":3,"limit":10,"limit_remaining":12}}"#).unwrap();
+        assert_eq!(fetched.balances[0].amount, 3.0);
+        assert_eq!(fetched.balances[0].used_pct(), Some(30.0));
+    }
 
     #[test]
     fn spend_with_and_without_a_limit() {

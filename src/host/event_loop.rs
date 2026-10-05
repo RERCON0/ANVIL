@@ -135,8 +135,16 @@ impl ApplicationHandler<UserEvent> for Host {
         if self.gl.is_some() {
             return;
         }
+        let screens: Vec<_> = event_loop
+            .available_monitors()
+            .map(|monitor| {
+                let p = monitor.position();
+                let s = monitor.size();
+                (p.x, p.y, s.width, s.height)
+            })
+            .collect();
         // SAFETY: called on the event-loop thread.
-        let gl = unsafe { GlWindow::new(event_loop, self.app.window_attributes()) };
+        let gl = unsafe { GlWindow::new(event_loop, self.app.window_attributes(&screens)) };
         let glow = Arc::new(gl.glow_context());
         let egui = egui_glow::EguiGlow::new(event_loop, glow, None, Some(gl.window.scale_factor() as f32), true);
         let proxy = egui::mutex::Mutex::new(self.proxy.clone());

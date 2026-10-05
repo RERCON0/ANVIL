@@ -251,6 +251,9 @@ impl Balance {
     /// Share of the limit already spent; None without a limit.
     pub fn used_pct(&self) -> Option<f64> {
         let limit = self.limit?;
+        if self.kind == BalanceKind::Remaining && self.amount > limit {
+            return None; // An inconsistent allowance is not a genuine 0% spend.
+        }
         let spent = match self.kind {
             BalanceKind::Spent => self.amount,
             BalanceKind::Remaining => limit - self.amount,
@@ -289,6 +292,8 @@ pub enum ProviderState {
     },
     /// The token expired or was refused; nothing is requested until it changes.
     AuthExpired,
+    /// A local credential store could not be read; not a logout.
+    StoreUnreadable,
     /// 429: paused until `retry_at` (unix seconds).
     RateLimited {
         retry_at: i64,
@@ -354,6 +359,33 @@ impl Fetched {
     pub fn windows(plan: Option<String>, windows: Vec<Window>) -> Fetched {
         Fetched { plan, windows, balances: Vec::new() }
     }
+
+    /// Provider text is untrusted on success too; no echoed key may reach disk.
+    pub fn redacted(mut self, secret: &str) -> Self {
+        if secret.is_empty() {
+            return self;
+        }
+        let blank = |text: &mut String| {
+            if text.contains(secret) {
+                *text = text.replace(secret, "…");
+            }
+        };
+        if let Some(plan) = &mut self.plan {
+            blank(plan);
+        }
+        for window in &mut self.windows {
+            blank(&mut window.key);
+            blank(&mut window.label);
+        }
+        for balance in &mut self.balances {
+            blank(&mut balance.key);
+            blank(&mut balance.label);
+            if let Some(detail) = &mut balance.detail {
+                blank(detail);
+            }
+        }
+        self
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -408,6 +440,13 @@ impl FetchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_allowance_smaller_than_the_balance_does_not_claim_zero_usage() {
+        let balance = Balance::new("test", "test", 12.0, Unit::Usd, BalanceKind::Remaining).with_limit(Some(10.0));
+        assert_eq!(balance.used_pct(), None);
+        assert!(!balance.exhausted());
+    }
 
     /// A provider that echoes the key back must not get it into `quota.json`
     /// or the GUI: 120 characters is enough to hold a key whole.

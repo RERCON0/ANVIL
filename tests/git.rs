@@ -48,6 +48,48 @@ fn repo() -> Option<tempfile::TempDir> {
 }
 
 #[test]
+fn eighty_commits_are_complete_and_the_eighty_first_sets_truncated() {
+    let Some(dir) = repo() else { return };
+    for _ in 1..80 {
+        run(dir.path(), &["commit", "--quiet", "--allow-empty", "-m", "test history"]);
+    }
+    let log = git::log(dir.path()).unwrap();
+    assert_eq!(log.commits.len(), 80);
+    assert!(!log.truncated, "exactly 80 is not truncated");
+    run(dir.path(), &["commit", "--quiet", "--allow-empty", "-m", "one beyond the cap"]);
+    let log = git::log(dir.path()).unwrap();
+    assert_eq!(log.commits.len(), 80);
+    assert!(log.truncated);
+}
+
+#[test]
+fn first_push_and_fetch_use_configured_remotes_not_origin() {
+    let Some(dir) = repo() else { return };
+    let upstream = tempfile::tempdir().unwrap();
+    let publish = tempfile::tempdir().unwrap();
+    run(upstream.path(), &["init", "--quiet", "--bare"]);
+    run(publish.path(), &["init", "--quiet", "--bare"]);
+    let root = dir.path();
+    run(root, &["remote", "add", "team/upstream", upstream.path().to_str().unwrap()]);
+    run(root, &["remote", "add", "publish", publish.path().to_str().unwrap()]);
+    run(root, &["checkout", "--quiet", "-b", "test-tracking"]);
+    run(root, &["config", "branch.test-tracking.remote", "team/upstream"]);
+    // All transport in this test stays inside temporary local repositories.
+    git::push(root).unwrap();
+    assert_eq!(git::upstream(root).as_deref(), Some("team/upstream/test-tracking"));
+    assert!(git::fetch(root).unwrap().contains("team/upstream"));
+    run(root, &["checkout", "--quiet", "-b", "test-default"]);
+    run(root, &["config", "remote.pushDefault", "publish"]);
+    run(root, &["config", "branch.test-default.remote", "team/upstream"]);
+    git::push(root).unwrap();
+    assert_eq!(git::upstream(root).as_deref(), Some("publish/test-default"));
+    run(root, &["checkout", "--quiet", "-b", "test-override"]);
+    run(root, &["config", "branch.test-override.pushRemote", "team/upstream"]);
+    git::push(root).unwrap();
+    assert_eq!(git::upstream(root).as_deref(), Some("team/upstream/test-override"));
+}
+
+#[test]
 fn trust_digest_ignores_routine_keys_and_tracks_program_runners() {
     let Some(dir) = repo() else { return };
     let root = dir.path();

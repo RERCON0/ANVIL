@@ -30,7 +30,15 @@ pub fn match_family(entries: &[(String, String)], family: &str, fonts_dir: &Path
             .trim_end_matches(" (truetype)")
             .trim_end_matches(" (opentype)")
             .trim();
-        let path = if Path::new(file).is_absolute() { PathBuf::from(file) } else { fonts_dir.join(file) };
+        let source = Path::new(file);
+        if !source.is_absolute()
+            && source
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_) | std::path::Component::CurDir))
+        {
+            continue;
+        }
+        let path = if source.is_absolute() { source.to_path_buf() } else { fonts_dir.join(source) };
         let slot = if face == family || face == format!("{family} regular") {
             &mut files.regular
         } else if face == format!("{family} bold") {
@@ -67,6 +75,11 @@ pub struct TermFaces {
 
 pub fn fonts_dir() -> PathBuf {
     std::env::var_os("WINDIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("C:\\Windows")).join("Fonts")
+}
+
+fn read_font(path: &Path) -> std::io::Result<Vec<u8>> {
+    // Large CJK collections are legitimate; arbitrary registry targets are not.
+    crate::fsutil::read_limited(path, 64 * 1024 * 1024)
 }
 
 /// (value name, data) pairs of HKLM and HKCU `...\Windows NT\CurrentVersion\Fonts`.
@@ -175,7 +188,7 @@ pub fn install(ctx: &egui::Context, family: &str, entries: &[(String, String)], 
     let mut report = FontReport::default();
     let mut defs = FontDefinitions::default();
     let load = |path: &Option<PathBuf>| {
-        path.as_ref().and_then(|p| std::fs::read(p).ok().map(|bytes| (bytes, FaceSource::File(p.clone()))))
+        path.as_ref().and_then(|p| read_font(p).ok().map(|bytes| (bytes, FaceSource::File(p.clone()))))
     };
 
     let files = match_family(entries, family, &dir);
@@ -197,7 +210,7 @@ pub fn install(ctx: &egui::Context, family: &str, entries: &[(String, String)], 
     let mut extra: Vec<String> = Vec::new();
     if fallbacks {
         for (name, file) in [("fallback-symbols", "seguisym.ttf"), ("fallback-emoji", "seguiemj.ttf"), ("fallback-cjk", "msyh.ttc")] {
-            match std::fs::read(dir.join(file)) {
+            match read_font(&dir.join(file)) {
                 Ok(bytes) => {
                     defs.font_data.insert(name.into(), FontData::from_owned(bytes).into());
                     extra.push(name.to_owned());
@@ -300,5 +313,13 @@ mod tests {
         assert_eq!(f.regular, Some(PathBuf::from("C:\\Users\\me\\Fonts\\CascadiaMono.ttf")));
         assert_eq!(f.bold, None);
         assert_eq!(match_family(&entries(), "Nope", Path::new("C:\\")), FontFiles::default());
+    }
+
+    #[test]
+    fn relative_registry_paths_cannot_escape_the_fonts_directory() {
+        for file in ["../outside.ttf", "..\\outside.ttf", "C:relative.ttf", "\\rooted.ttf"] {
+            let entries = vec![("Test (TrueType)".to_owned(), file.to_owned())];
+            assert_eq!(match_family(&entries, "Test", Path::new("C:/Windows/Fonts")), FontFiles::default());
+        }
     }
 }

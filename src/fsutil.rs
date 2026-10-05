@@ -1,9 +1,34 @@
 //! File helpers shared by writers and workspace file operations.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Limit the read itself, not just a metadata check that can race a writer.
+pub fn read_limited(path: &Path, cap: usize) -> io::Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take((cap as u64).saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() > cap {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "file exceeds size limit"));
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+#[test]
+fn bounded_reads_accept_the_exact_cap_and_reject_more() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bounded");
+    fs::write(&path, b"1234").unwrap();
+    assert_eq!(read_limited(&path, 4).unwrap(), b"1234");
+    assert!(read_limited(&path, 3).is_err());
+    assert!(read_limited(dir.path(), 4).is_err());
+}
 
 /// Writes `bytes` to `path` via a uniquely named sibling temp file and a
 /// rename, so readers never see a half-written file and two ANVIL processes

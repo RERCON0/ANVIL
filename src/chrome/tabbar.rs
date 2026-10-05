@@ -15,6 +15,32 @@ pub struct TabbarState {
 }
 
 impl TabbarState {
+    fn remap(&mut self, map: impl Fn(usize) -> usize) {
+        if let Some(rename) = &mut self.rename {
+            rename.tab = map(rename.tab);
+        }
+        self.drag_from = self.drag_from.map(&map);
+        self.hover_index = self.hover_index.map(map);
+    }
+
+    pub fn tab_inserted(&mut self, index: usize) {
+        self.remap(|slot| if slot >= index { slot + 1 } else { slot });
+    }
+
+    pub fn tab_moved(&mut self, from: usize, to: usize) {
+        self.remap(|slot| {
+            if slot == from {
+                to
+            } else if from < slot && slot <= to {
+                slot - 1
+            } else if to <= slot && slot < from {
+                slot + 1
+            } else {
+                slot
+            }
+        });
+    }
+
     /// Tab `index` was closed: a rename or drag in progress follows its tab
     /// (indices after it shift down) or ends when its own tab is gone.
     pub fn tab_removed(&mut self, index: usize) {
@@ -57,6 +83,7 @@ pub struct TabInfo {
     pub color: Option<theme::TabColor>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum TabbarAction {
     Select(usize),
     Close(usize),
@@ -87,29 +114,38 @@ pub fn show(
     // the fold can be clicked, renamed, dragged and closed like any other.
     let list = Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.max.y - 30.0));
     let content_height: f32 = tabs.iter().map(row_height).sum();
-    let scroll = ScrollArea::vertical()
-        .id_salt("tabbar-tabs")
-        .auto_shrink([false, false])
-        .max_height(list.height())
-        .show(ui, |ui| {
-            ui.set_height(content_height.max(list.height()));
-            for (index, tab) in tabs.iter().enumerate() {
-                let height = row_height(tab);
-                let top = ui.next_widget_position().y;
-                let row = Rect::from_min_size(Pos2::new(list.min.x, top), Vec2::new(list.width(), height));
-                let response = ui.interact(row, ui.id().with(("tab", index)), Sense::click_and_drag());
-                tab_row(ui, &painter, state, index, tab, row, response, badge_fields, &mut actions);
-                ui.allocate_space(Vec2::new(0.0, height));
-            }
-        });
-    // Rows are laid out from the scrolled content origin, so a drag that
-    // started above the fold has to be mapped through the same offset.
-    let scroll_y = scroll.state.offset.y;
+    let mut target = None;
+    // The title bar only paints; it does not advance the parent's cursor.
+    ui.scope_builder(egui::UiBuilder::new().max_rect(list), |ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ScrollArea::vertical().id_salt("tabbar-tabs").auto_shrink([false, false]).max_height(list.height()).show(
+            ui,
+            |ui| {
+                ui.set_height(content_height.max(list.height()));
+                let painter = ui.painter().clone();
+                let pointer = ui.input(|i| i.pointer.interact_pos()).filter(|pos| list.contains(*pos));
+                for (index, tab) in tabs.iter().enumerate() {
+                    let height = row_height(tab);
+                    let top = ui.next_widget_position().y;
+                    let row = Rect::from_min_size(Pos2::new(list.min.x, top), Vec2::new(list.width(), height));
+                    if pointer.is_some_and(|pos| row.contains(pos)) {
+                        target = Some(index);
+                    }
+                    let response = ui.interact(row, ui.id().with(("tab", index)), Sense::click_and_drag());
+                    tab_row(ui, &painter, state, index, tab, row, response, badge_fields, &mut actions);
+                    ui.allocate_space(Vec2::new(0.0, height));
+                }
+            },
+        );
+    });
     // The buttons sit below the list, not below its scrolled content.
     let y = list.max.y;
 
     // Drag & drop reordering.
     if let Some(from) = state.drag_from {
+        // Use the actual row rects, including their scroll translation, even
+        // on the release frame (hovered() does not identify drop targets).
+        state.hover_index = target;
         if ui.input(|i| i.pointer.any_released()) {
             if let Some(to) = state.hover_index {
                 if from != to {
@@ -117,18 +153,6 @@ pub fn show(
                 }
             }
             state.drag_from = None;
-        } else if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
-            let target = tabs
-                .iter()
-                .enumerate()
-                .find(|(index, tab)| {
-                    let top = scroll_y + (0..*index).map(|i| row_height(&tabs[i])).sum::<f32>();
-                    pos.y >= top && pos.y < top + row_height(tab)
-                })
-                .map(|(index, _)| index);
-            if let Some(target) = target {
-                state.hover_index = Some(target);
-            }
         }
     }
 
@@ -428,6 +452,108 @@ fn paint_claude_line(painter: &egui::Painter, row: Rect, record: &StatusRecord, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn list_frame(
+        ctx: &egui::Context,
+        state: &mut TabbarState,
+        tabs: &[TabInfo],
+        rect: Rect,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, Vec<TabbarAction>) {
+        let mut actions = Vec::new();
+        let output = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), events, ..Default::default() }, |ui| {
+            actions = show(ui, rect, state, tabs, false, &Default::default());
+        });
+        (output, actions)
+    }
+
+    #[test]
+    fn rows_start_below_the_title_and_drop_targets_follow_actual_scrolled_rects() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Test", &[], false);
+        let tabs: Vec<_> = (0..6)
+            .map(|index| TabInfo {
+                title: format!("tab {index}"),
+                active: false,
+                activity: false,
+                claude: None,
+                color: Some(theme::TabColor::ALL[index]),
+            })
+            .collect();
+        let rect = Rect::from_min_size(Pos2::new(0.0, 30.0), Vec2::new(180.0, 200.0));
+        let mut state = TabbarState::default();
+        let (output, _) = list_frame(&ctx, &mut state, &tabs, rect, Vec::new());
+        let bars: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Rect(r) if r.rect.width() == 3.0 => Some(r.rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bars[0].min.y, rect.min.y, "the title bar must not be covered by the first tab");
+        assert_eq!(bars[1].min.y, bars[0].max.y, "no hidden item_spacing between rows");
+        let pointer = Pos2::new(70.0, rect.min.y + 45.0);
+        let scroll = vec![
+            egui::Event::PointerMoved(pointer),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: Vec2::new(0.0, -90.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: Default::default(),
+            },
+        ];
+        let _ = list_frame(&ctx, &mut state, &tabs, rect, scroll);
+        for _ in 0..30 {
+            let _ = list_frame(&ctx, &mut state, &tabs, rect, Vec::new());
+        }
+        let (scrolled, _) = list_frame(&ctx, &mut state, &tabs, rect, Vec::new());
+        let bars: Vec<_> = scrolled
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Rect(r) if r.rect.width() == 3.0 => Some((r.rect, r.fill)),
+                _ => None,
+            })
+            .collect();
+        let (row, color) = bars.iter().find(|(row, _)| row.min.y <= pointer.y && pointer.y < row.max.y).unwrap();
+        let target = theme::TabColor::ALL.iter().position(|c| c.color() == *color).unwrap();
+        assert!(row.min.y < rect.min.y + target as f32 * row_height(&tabs[0]), "the fixture actually scrolled");
+        state.drag_from = Some(0);
+        let release = egui::Event::PointerButton {
+            pos: pointer,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        };
+        let (_, actions) = list_frame(&ctx, &mut state, &tabs, rect, vec![release]);
+        assert!(actions.contains(&TabbarAction::Move(0, target)), "wrong drop target: {actions:?}");
+    }
+
+    #[test]
+    fn insertion_and_reordering_keep_edits_bound_to_the_same_tab() {
+        for from in 0..5 {
+            for to in 0..5 {
+                for slot in 0..5 {
+                    let mut identities: Vec<_> = (0..5).collect();
+                    let moved = identities.remove(from);
+                    identities.insert(to, moved);
+                    let mut state = TabbarState {
+                        rename: Some(RenameEdit { tab: slot, text: "test".into(), focus: false }),
+                        drag_from: Some(slot),
+                        hover_index: Some(slot),
+                    };
+                    state.tab_moved(from, to);
+                    let expected = identities.iter().position(|id| *id == slot).unwrap();
+                    assert_eq!(state.rename.as_ref().unwrap().tab, expected);
+                    assert_eq!(state.drag_from, Some(expected));
+                    state.tab_inserted(0);
+                    assert_eq!(state.rename.as_ref().unwrap().tab, expected + 1);
+                    assert_eq!(state.hover_index, Some(expected + 1));
+                }
+            }
+        }
+    }
 
     #[test]
     fn badge_parts_follow_the_fields() {

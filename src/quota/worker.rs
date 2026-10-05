@@ -96,18 +96,16 @@ impl Engine {
             self.manual_pending = false;
             self.last_manual = Some(now);
         }
-        let mut next = Snapshot::default();
+        self.partial = Some(Snapshot::default());
         for id in ProviderId::ALL {
             let entry = self.cycle_one(id, now, prefs, previous, &detect, &fetch);
             if let Some(entry) = entry {
-                next.providers.push(entry);
+                if let Some(partial) = &mut self.partial {
+                    partial.providers.push(entry);
+                }
             }
-            // Kept so a panic further down still has the providers that did
-            // answer: the worker's own guard publishes this instead of nothing.
-            self.partial = Some(next.clone());
         }
-        self.partial = None;
-        next
+        self.partial.take().unwrap_or_default()
     }
 
     /// The snapshot built so far, if a panic cut the cycle short.
@@ -137,16 +135,37 @@ impl Engine {
                 fetched_at: old.and_then(|o| o.fetched_at),
                 checked_at: now,
             };
-            let memory = self.memory.entry(id).or_default();
+            // The cache already carries Retry-After. A new leader or a restart
+            // must honour it rather than immediately buying another 429.
+            let memory = self.memory.entry(id).or_insert_with(|| Memory {
+                paused_until: old
+                    .and_then(|o| match o.state {
+                        ProviderState::RateLimited { retry_at } => Some(retry_at.min(now + super::model::MAX_PAUSE)),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
+                ..Memory::default()
+            });
+            let enabled = prefs.get(&id).copied().flatten().unwrap_or(true);
             let entry = match detect(id) {
                 Detection::Missing => {
                     *memory = Memory::default();
                     None
                 }
+                Detection::Unreadable => {
+                    if enabled {
+                        self.retry_at = Some(now + QUICK_RETRY);
+                    }
+                    let state = if memory.paused_until > now {
+                        ProviderState::RateLimited { retry_at: memory.paused_until }
+                    } else {
+                        ProviderState::StoreUnreadable
+                    };
+                    Some(keep(state, old.map(|o| o.source.clone()).unwrap_or_default(), None))
+                }
                 Detection::Expired { source, .. } => Some(keep(ProviderState::AuthExpired, source.label(), None)),
                 Detection::Found(credential) => {
                     let source = credential.source.label();
-                    let enabled = prefs.get(&id).copied().flatten().unwrap_or(true);
                     let previous_state = old.map(|o| o.state.clone()).unwrap_or(ProviderState::Idle);
                     if memory.refused.is_some_and(|m| m != credential.marker) {
                         memory.refused = None;
@@ -156,11 +175,17 @@ impl Engine {
                     } else if memory.refused.is_some() {
                         Some(keep(ProviderState::AuthExpired, source, credential.plan))
                     } else if memory.paused_until > now {
-                        Some(keep(previous_state, source, credential.plan))
+                        Some(keep(
+                            ProviderState::RateLimited { retry_at: memory.paused_until },
+                            source,
+                            credential.plan,
+                        ))
                     } else {
                         match fetch(id, &credential) {
                             Ok(fetched) => {
                                 memory.failures = 0;
+                                memory.paused_until = 0;
+                                let fetched = fetched.redacted(credential.secret.expose());
                                 Some(ProviderSnapshot {
                                     id,
                                     plan: fetched.plan.or(credential.plan),
@@ -184,10 +209,10 @@ impl Engine {
                                 match &state {
                                     ProviderState::AuthExpired => memory.refused = Some(credential.marker),
                                     ProviderState::RateLimited { retry_at } => {
-                                        memory.failures += 1;
+                                        memory.failures = memory.failures.saturating_add(1);
                                         memory.paused_until = *retry_at;
                                     }
-                                    _ => {}
+                                    _ => memory.failures = 0,
                                 }
                                 Some(keep(state, source, credential.plan))
                             }
@@ -245,7 +270,6 @@ pub(super) fn run(shared: Arc<Shared>, paths: Paths, user_agent: String) {
                 if http.is_none() {
                     http = WinHttp::new(&user_agent).map_err(|e| log::warn!("quota: WinHTTP: {e}")).ok();
                 }
-                shared.manual_wait.store(engine.manual_wait(now).max(0) as u64, Ordering::Relaxed);
                 if let (Some(http), Some(prefs)) = (&http, shared.prefs()) {
                     let previous = shared.snapshot();
                     let env = CredEnv::from_process(now, sqlite.clone(), own_keys());
@@ -279,10 +303,12 @@ pub(super) fn run(shared: Arc<Shared>, paths: Paths, user_agent: String) {
                             }
                         }
                     }
-                    shared.manual_wait.store(engine.manual_wait(now).max(0) as u64, Ordering::Relaxed);
                 }
             }
         }
+        // Publish every tick, not only on a cycle: otherwise "30 seconds"
+        // stays on screen for the entire five-minute polling interval.
+        shared.manual_wait.store(engine.manual_wait(now_unix()).max(0) as u64, Ordering::Relaxed);
         std::thread::sleep(Duration::from_secs(1));
     }
 }
@@ -476,5 +502,87 @@ mod tests {
         assert_eq!(s.providers.len(), ProviderId::ALL.len());
         assert_eq!(s.get(ProviderId::Zai).unwrap().state, ProviderState::FormatError { reason: "bad".into() });
         assert!(s.providers.iter().filter(|p| p.id != ProviderId::Zai).all(|p| p.state == ProviderState::Ok));
+    }
+
+    #[test]
+    fn successful_responses_cannot_echo_the_key_to_the_cache() {
+        use crate::quota::model::{Balance, BalanceKind, Unit};
+        let mut engine = Engine::default();
+        let secret = "fake-test-secret";
+        let detect = || {
+            let Detection::Found(mut c) = login(1) else { unreachable!() };
+            c.secret = Secret::new(secret);
+            Detection::Found(c)
+        };
+        let fetch = |_: ProviderId, _: &Credential| {
+            let mut balance = Balance::new(secret, secret, 1.0, Unit::Usd, BalanceKind::Remaining);
+            balance.detail = Some(format!("detail {secret}"));
+            Ok(Fetched {
+                plan: Some(secret.into()),
+                windows: vec![Window::new(secret, secret, 1.0, None)],
+                balances: vec![balance],
+            })
+        };
+        let s = engine.cycle(1, &Prefs::new(), &Snapshot::default(), only(ProviderId::Zai, detect), fetch);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quota.json");
+        cache::write(&path, &s).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains(secret));
+        assert_eq!(s.get(ProviderId::Zai).unwrap().state, ProviderState::Ok);
+    }
+
+    #[test]
+    fn store_failures_preserve_data_and_rate_limit_memory() {
+        let mut engine = Engine::default();
+        let first =
+            engine.cycle(1, &Prefs::new(), &Snapshot::default(), only(ProviderId::Zai, || login(1)), |_, _| ok());
+        let second = engine.cycle(2, &Prefs::new(), &first, only(ProviderId::Zai, || Detection::Unreadable), |_, _| {
+            panic!("no credential, no request")
+        });
+        let p = second.get(ProviderId::Zai).unwrap();
+        assert_eq!(
+            (&p.state, p.fetched_at, &p.windows),
+            (&ProviderState::StoreUnreadable, Some(1), &first.providers[0].windows)
+        );
+        assert!(!engine.due(2 + QUICK_RETRY - 1, None, false));
+        assert!(engine.due(2 + QUICK_RETRY, None, false));
+        let limited = engine.cycle(100, &Prefs::new(), &second, only(ProviderId::Zai, || login(1)), |_, _| {
+            Err(FetchError::Status { code: 429, retry_after: Some(120) })
+        });
+        let busy =
+            engine.cycle(110, &Prefs::new(), &limited, only(ProviderId::Zai, || Detection::Unreadable), |_, _| {
+                panic!("no request while busy")
+            });
+        let mut restarted = Engine::default();
+        let paused = restarted.cycle(150, &Prefs::new(), &busy, only(ProviderId::Zai, || login(1)), |_, _| {
+            panic!("restart must honour persisted Retry-After")
+        });
+        assert_eq!(paused.providers[0].state, ProviderState::RateLimited { retry_at: 220 });
+    }
+
+    #[test]
+    fn a_non_429_failure_breaks_the_backoff_streak_and_manual_wait_counts_down() {
+        let mut engine = Engine::default();
+        let limited = |_: ProviderId, _: &Credential| Err(FetchError::Status { code: 429, retry_after: None });
+        let detect = only(ProviderId::Zai, || login(1));
+        let first = engine.cycle(1, &Prefs::new(), &Snapshot::default(), &detect, limited);
+        let second = engine.cycle(100, &Prefs::new(), &first, &detect, |_, _| Err(FetchError::Network("test".into())));
+        let third = engine.cycle(200, &Prefs::new(), &second, &detect, limited);
+        assert_eq!(third.providers[0].state, ProviderState::RateLimited { retry_at: 260 });
+        assert!(engine.due(300, None, true));
+        run(&mut engine, 300);
+        assert_eq!(engine.manual_wait(300), MANUAL_GAP);
+        assert_eq!(engine.manual_wait(320), 10);
+        assert_eq!(engine.manual_wait(340), 0);
+    }
+
+    #[test]
+    fn a_disabled_provider_with_an_unreadable_store_does_not_speed_up_network_polling() {
+        let mut engine = Engine::default();
+        let prefs = Prefs::from([(ProviderId::Zai, Some(false))]);
+        engine.cycle(1, &prefs, &Snapshot::default(), only(ProviderId::Zai, || Detection::Unreadable), |_, _| {
+            panic!("disabled provider cannot be requested")
+        });
+        assert!(!engine.due(1 + QUICK_RETRY, None, false));
     }
 }
