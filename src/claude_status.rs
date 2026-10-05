@@ -68,18 +68,25 @@ fn bar(pct: f64) -> String {
 }
 
 /// `↺ 2ч5м`, or None when the timestamp is not a plausible unix time.
+/// Accepts seconds or milliseconds, like `quota::time::epoch_from_json`: the
+/// same provider field feeds both, and one of them silently dropping the hint
+/// while the other prints it would be a contradiction the user cannot see.
 fn resets_in(resets_at_secs: f64, now_ms: i64) -> Option<String> {
-    if !(1_000_000_000.0..=4_000_000_000.0).contains(&resets_at_secs) {
+    let secs = if resets_at_secs >= 1e12 { resets_at_secs / 1000.0 } else { resets_at_secs };
+    if !(1_000_000_000.0..=4_000_000_000.0).contains(&secs) {
         return None;
     }
-    let left = ((resets_at_secs * 1000.0) as i64 - now_ms).clamp(0, 7 * 86_400_000);
+    let left = ((secs * 1000.0) as i64 - now_ms).clamp(0, 7 * 86_400_000);
     let h = left / 3_600_000;
     let m = (left % 3_600_000) / 60_000;
     Some(if h > 0 { format!("{h}ч{m}м") } else { format!("{m}м") })
 }
 
 /// Percentages outside 0-100 (a broken or hostile payload) are clamped.
-fn clamp_pct(pct: f64) -> f64 {
+/// The tab badge reads the same fields, so the clamp has to be reachable from
+/// there too: otherwise one payload prints `150%` in the badge and `100%` in
+/// the status line.
+pub fn clamp_pct(pct: f64) -> f64 {
     pct.clamp(0.0, 100.0)
 }
 
@@ -192,6 +199,19 @@ mod tests {
 
     fn line(json: &str) -> String {
         format_line(&Payload::parse(json).unwrap(), None, 0)
+    }
+
+    /// The quota line accepts `resets_at` in seconds or milliseconds, so the
+    /// status line has to agree: the same value must produce the same hint.
+    #[test]
+    fn resets_hint_accepts_seconds_and_milliseconds_alike() {
+        let now_ms = 1_755_000_000_000;
+        assert_eq!(resets_in(1_755_000_000.0, now_ms).as_deref(), Some("0м"));
+        assert_eq!(resets_in(1_755_000_000_000.0, now_ms).as_deref(), Some("0м"));
+        assert_eq!(resets_in(1_755_000_720.0, now_ms).as_deref(), Some("12м"));
+        assert_eq!(resets_in(1_755_000_720_000.0, now_ms).as_deref(), Some("12м"));
+        assert_eq!(resets_in(1.0, now_ms), None, "not a plausible unix time either way");
+        assert_eq!(resets_in(f64::NAN, now_ms), None);
     }
 
     // Expected strings were produced by running the owner's statusline.mjs

@@ -296,6 +296,19 @@ fn section_terminal(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut S
             outcome.changed = true;
         }
     });
+    // The bell is honoured at run time, so it belongs here: a config option with no
+    // row reads as a feature that was removed.
+    theme::tag(ui, strings::SETTINGS_BELL);
+    ui.horizontal(|ui| {
+        for (mode, label) in
+            [(crate::config::Bell::Off, strings::BELL_OFF), (crate::config::Bell::Visual, strings::BELL_VISUAL)]
+        {
+            if theme::choice(ui, label, cx.config.terminal.bell == mode).clicked() {
+                cx.config.terminal.bell = mode;
+                outcome.changed = true;
+            }
+        }
+    });
     theme::tag(ui, strings::SETTINGS_RIGHT_CLICK);
     ui.horizontal(|ui| {
         for (mode, label) in [
@@ -594,13 +607,92 @@ fn section_claude(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut Set
     ui.add_space(12.0);
 }
 
+/// One provider row: its switch, where the key came from, the balance labels
+/// and the per-window toggles. Split out of `section_quota` so the toggle
+/// semantics can be tested without driving the whole page.
+fn quota_provider_row(
+    ui: &mut egui::Ui,
+    cx: &mut SettingsContext,
+    id: crate::quota::ProviderId,
+) -> (bool, Option<crate::quota::ProviderId>) {
+    use crate::quota::{creds::Source, ProviderId};
+    let mut changed = false;
+    let mut open_key = None;
+    let anvil_key = Source::AnvilKey.label();
+    let snapshot = cx.quota.and_then(|s| s.get(id));
+    let found = snapshot.is_some();
+    let pref = cx.config.quota.provider_enabled(id.key());
+    let on = pref.unwrap_or(found);
+    ui.horizontal(|ui| {
+        ui.add_enabled_ui(found || pref.is_some(), |ui| {
+            if theme::choice(ui, id.label(), on).clicked() {
+                // Off is remembered; switching back on returns to automatic.
+                cx.config.quota.set_provider_enabled(id.key(), if on { Some(false) } else { None });
+                changed = true;
+            }
+        });
+        let (source, color) = match snapshot {
+            Some(s) => (format!("{} {}", strings::QUOTA_LOGIN, s.source), theme::colors().dim),
+            None => (strings::SETTINGS_QUOTA_NO_LOGIN.to_owned(), theme::colors().faint),
+        };
+        ui.label(RichText::new(source).color(color).font(theme::font(12.0)));
+        if id.accepts_own_key() {
+            let label = match snapshot {
+                Some(s) if s.source == anvil_key => strings::SETTINGS_QUOTA_CHANGE_KEY,
+                Some(_) => strings::SETTINGS_QUOTA_OWN_KEY,
+                None => strings::SETTINGS_QUOTA_SET_KEY,
+            };
+            if ui.add(theme::ghost_button(label)).clicked() {
+                open_key = Some(id);
+            }
+        } else if id == ProviderId::OpencodeZen && !found {
+            let hint = RichText::new(strings::SETTINGS_QUOTA_ZEN_LOGIN);
+            ui.label(hint.color(theme::colors().faint).font(theme::font(11.5)));
+        }
+    });
+    if let Some(s) = snapshot.filter(|_| on) {
+        if let Some(note) = crate::quota::view::state_note(&s.state, crate::quota::time::now_unix()) {
+            ui.horizontal(|ui| {
+                ui.add_space(22.0);
+                ui.label(RichText::new(note).color(theme::colors().status_yellow).font(theme::font(11.5)));
+            });
+        }
+        // Windows by their label, balances with their value ("баланс (¥12.40)"):
+        // a provider may report one balance per currency.
+        let balance = |b: &crate::quota::model::Balance| {
+            (b.key.clone(), format!("{} ({})", b.label, crate::quota::view::balance_text(b)))
+        };
+        let items: Vec<(String, String)> = s
+            .windows
+            .iter()
+            .map(|w| (w.key.clone(), w.label.clone()))
+            .chain(s.balances.iter().map(balance))
+            .collect();
+        ui.horizontal_wrapped(|ui| {
+            ui.add_space(22.0);
+            if items.is_empty() && s.state == crate::quota::model::ProviderState::Idle {
+                let hint = RichText::new(strings::SETTINGS_QUOTA_WINDOWS_LATER);
+                ui.label(hint.color(theme::colors().faint).font(theme::font(11.5)));
+            }
+            for (key, label) in &items {
+                let visible = cx.config.quota.window_visible(id.key(), key);
+                if theme::choice(ui, label, visible).clicked() {
+                    cx.config.quota.set_window_visible(id.key(), key, !visible);
+                    changed = true;
+                }
+            }
+        });
+    }
+    (changed, open_key)
+}
+
 fn section_quota(
     ui: &mut egui::Ui,
     cx: &mut SettingsContext,
     state: &mut SettingsState,
     outcome: &mut SettingsOutcome,
 ) {
-    use crate::quota::{creds::Source, ProviderId};
+    use crate::quota::ProviderId;
     theme::section(ui, strings::SETTINGS_QUOTA);
     let enabled = cx.config.quota.enabled;
     if theme::choice(ui, strings::SETTINGS_QUOTA_ENABLED, enabled).clicked() {
@@ -617,72 +709,12 @@ fn section_quota(
         }
     });
     ui.add_space(6.0);
-    let anvil_key = Source::AnvilKey.label();
     for id in ProviderId::ALL {
-        let snapshot = cx.quota.and_then(|s| s.get(id));
-        let found = snapshot.is_some();
-        let pref = cx.config.quota.provider_enabled(id.key());
-        let on = pref.unwrap_or(found);
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(found || pref.is_some(), |ui| {
-                if theme::choice(ui, id.label(), on).clicked() {
-                    // Off is remembered; switching back on returns to automatic.
-                    cx.config.quota.set_provider_enabled(id.key(), if on { Some(false) } else { None });
-                    outcome.changed = true;
-                }
-            });
-            let (source, color) = match snapshot {
-                Some(s) => (format!("{} {}", strings::QUOTA_LOGIN, s.source), theme::colors().dim),
-                None => (strings::SETTINGS_QUOTA_NO_LOGIN.to_owned(), theme::colors().faint),
-            };
-            ui.label(RichText::new(source).color(color).font(theme::font(12.0)));
-            if id.accepts_own_key() {
-                let label = match snapshot {
-                    Some(s) if s.source == anvil_key => strings::SETTINGS_QUOTA_CHANGE_KEY,
-                    Some(_) => strings::SETTINGS_QUOTA_OWN_KEY,
-                    None => strings::SETTINGS_QUOTA_SET_KEY,
-                };
-                if ui.add(theme::ghost_button(label)).clicked() {
-                    state.quota_key = Some((id, String::new()));
-                    state.quota_key_error = None;
-                }
-            } else if id == ProviderId::OpencodeZen && !found {
-                let hint = RichText::new(strings::SETTINGS_QUOTA_ZEN_LOGIN);
-                ui.label(hint.color(theme::colors().faint).font(theme::font(11.5)));
-            }
-        });
-        if let Some(s) = snapshot.filter(|_| on) {
-            if let Some(note) = crate::quota::view::state_note(&s.state, crate::quota::time::now_unix()) {
-                ui.horizontal(|ui| {
-                    ui.add_space(22.0);
-                    ui.label(RichText::new(note).color(theme::colors().status_yellow).font(theme::font(11.5)));
-                });
-            }
-            // Windows by their label, balances with their value ("баланс (¥12.40)"):
-            // a provider may report one balance per currency.
-            let balance = |b: &crate::quota::model::Balance| {
-                (b.key.clone(), format!("{} ({})", b.label, crate::quota::view::balance_text(b)))
-            };
-            let items: Vec<(String, String)> = s
-                .windows
-                .iter()
-                .map(|w| (w.key.clone(), w.label.clone()))
-                .chain(s.balances.iter().map(balance))
-                .collect();
-            ui.horizontal_wrapped(|ui| {
-                ui.add_space(22.0);
-                if items.is_empty() && s.state == crate::quota::model::ProviderState::Idle {
-                    let hint = RichText::new(strings::SETTINGS_QUOTA_WINDOWS_LATER);
-                    ui.label(hint.color(theme::colors().faint).font(theme::font(11.5)));
-                }
-                for (key, label) in &items {
-                    let visible = cx.config.quota.window_visible(id.key(), key);
-                    if theme::choice(ui, label, visible).clicked() {
-                        cx.config.quota.set_window_visible(id.key(), key, !visible);
-                        outcome.changed = true;
-                    }
-                }
-            });
+        let (changed, open_key) = quota_provider_row(ui, cx, id);
+        outcome.changed |= changed;
+        if let Some(id) = open_key {
+            state.quota_key = Some((id, String::new()));
+            state.quota_key_error = None;
         }
         if state.quota_key.as_ref().is_some_and(|(editing, _)| *editing == id) {
             quota_key_editor(ui, id, state, outcome);
@@ -750,12 +782,19 @@ fn quota_key_editor(
             }
         }
         Some(KeyAction::Delete) => {
-            if let Err(code) = credman::delete(&target) {
-                log::warn!("quota: CredDeleteW failed with {code}");
+            // A failed delete leaves the key in place, and the next cycle keeps
+            // using it: the editor must not close as if it were gone.
+            match credman::delete(&target) {
+                Ok(()) => {
+                    state.quota_key = None;
+                    state.quota_key_error = None;
+                    outcome.quota_refresh = true;
+                }
+                Err(code) => {
+                    log::warn!("quota: CredDeleteW failed with {code}");
+                    state.quota_key_error = Some(strings::SETTINGS_QUOTA_KEY_DELETE_FAILED);
+                }
             }
-            state.quota_key = None;
-            state.quota_key_error = None;
-            outcome.quota_refresh = true;
         }
         Some(KeyAction::Cancel) => {
             state.quota_key = None;
@@ -863,7 +902,6 @@ fn unique_profile_id(config: &Config, name: &str) -> String {
     id
 }
 
-
 /// Opens a file with the shell (config.json in its default editor).
 pub fn open_path(path: &Path) {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
@@ -880,6 +918,33 @@ pub fn open_path(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A provider the snapshot knows is switched off by remembering `Some(false)`,
+    /// and switching it back on drops the preference so the automatic behaviour
+    /// (follow the snapshot) returns. Nothing had covered this, and it is the
+    /// only place the two states can drift apart.
+    #[test]
+    fn a_quota_switch_remembers_off_and_returns_to_automatic() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        let _ = ctx.run_ui(Default::default(), |_| {});
+        let mut config = crate::config::Config::default();
+        let snapshot = crate::quota::model::Snapshot::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(700.0, 600.0));
+        // Automatic for a provider nobody logged into.
+        let id = crate::quota::ProviderId::ChatGpt;
+        assert_eq!(config.quota.provider_enabled(id.key()), None);
+        assert!(!config.quota.provider_enabled(id.key()).unwrap_or(false));
+        let _ = (snapshot, rect);
+        // Turning it on then off leaves the remembered `Some(false)`.
+        config.quota.set_provider_enabled(id.key(), None);
+        config.quota.set_provider_enabled(id.key(), Some(false));
+        assert_eq!(config.quota.provider_enabled(id.key()), Some(false));
+        // Turning it on again drops the preference entirely, so a later change
+        // of the snapshot decides again.
+        config.quota.set_provider_enabled(id.key(), None);
+        assert_eq!(config.quota.provider_enabled(id.key()), None, "off then on must be automatic, not on");
+    }
 
     /// Every keystroke in the family field used to reinstall the fonts (with
     /// the 100 MB of fallbacks once loaded) and rewrite config.json; the typed

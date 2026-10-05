@@ -206,7 +206,11 @@ pub fn pieces(segment: &Segment, detail: Detail, reset_icon: bool) -> Vec<Piece>
         Detail::Hottest => segment
             .items
             .iter()
-            .max_by(|a, b| a.pct.unwrap_or(-1.0).total_cmp(&b.pct.unwrap_or(-1.0)))
+            // `max_by` returns the last of equal values, while the tie-break is
+            // documented as the first. Keeping the incumbent unless the next is
+            // strictly hotter gives that: balance-only providers all share
+            // `None` and still show their first item.
+            .reduce(|best, item| if item.pct.unwrap_or(-1.0) > best.pct.unwrap_or(-1.0) { item } else { best })
             .into_iter()
             .collect(),
     };
@@ -384,6 +388,20 @@ mod tests {
             Layout { detail: Detail::Hottest, shown: 5, hidden: 0 }
         );
         assert_eq!(texts(&segments[1], Detail::Hottest), "ChatGPT 7д 75%");
+        // A balance-only provider has no percentage, so every item ties and the
+        // documented tie-break (the first item) has to win.
+        let balances = [Segment {
+            id: ProviderId::Zai,
+            name: "Z.ai",
+            mark: None,
+            dim: false,
+            tooltip: String::new(),
+            items: vec![
+                Item { text: "первый".to_owned(), pct: None, exhausted: false, reset_hint: None },
+                Item { text: "второй".to_owned(), pct: None, exhausted: false, reset_hint: None },
+            ],
+        }];
+        assert_eq!(texts(&balances[0], Detail::Hottest), "Z.ai первый");
         let tight = layout(&segments, hottest - 1.0, 2.0, true, measure);
         assert_eq!((tight.detail, tight.shown + tight.hidden), (Detail::Hottest, 5));
         assert!(tight.hidden >= 1);

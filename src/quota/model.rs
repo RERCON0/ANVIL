@@ -372,6 +372,24 @@ pub enum FetchError {
 pub const MAX_PAUSE: i64 = 900;
 
 impl FetchError {
+    /// Blanks out the secret inside a provider's own error text. That text is
+    /// written to `quota.json` and drawn in the GUI, so an endpoint that echoes
+    /// the `Authorization` header back would otherwise put the live key on disk.
+    pub fn redacted(self, secret: &str) -> Self {
+        let blank = |reason: String| {
+            if secret.is_empty() || !reason.contains(secret) {
+                return reason;
+            }
+            reason.replace(secret, "…")
+        };
+        match self {
+            FetchError::Network(reason) => FetchError::Network(blank(reason)),
+            FetchError::Rejected(reason) => FetchError::Rejected(blank(reason)),
+            FetchError::Format(reason) => FetchError::Format(blank(reason)),
+            other => other,
+        }
+    }
+
     /// `failures` counts the 429s in a row before this one.
     pub fn into_state(self, now: i64, failures: u32) -> ProviderState {
         match self {
@@ -390,6 +408,29 @@ impl FetchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A provider that echoes the key back must not get it into `quota.json`
+    /// or the GUI: 120 characters is enough to hold a key whole.
+    #[test]
+    fn error_text_cannot_carry_the_secret_to_disk() {
+        let secret = "sk-live-abcdef0123456789";
+        let echoed = FetchError::Rejected(format!("bad token {secret} for org 42"));
+        let ProviderState::UpdateFailed { reason } = echoed.redacted(secret).into_state(0, 0) else {
+            panic!("expected a failure state");
+        };
+        assert!(!reason.contains(secret), "the secret survived: {reason}");
+        assert!(reason.contains('…'), "the message keeps its shape: {reason}");
+        // A reason that never held the secret is untouched, and the status
+        // variants carry no text to redact.
+        assert_eq!(
+            FetchError::Rejected("нет coding plan".into()).redacted(secret).into_state(0, 0),
+            ProviderState::UpdateFailed { reason: "нет coding plan".into() }
+        );
+        assert_eq!(
+            FetchError::Status { code: 503, retry_after: None }.redacted(secret).into_state(0, 0),
+            ProviderState::UpdateFailed { reason: "HTTP 503".into() }
+        );
+    }
 
     #[test]
     fn provider_keys_round_trip_through_serde() {

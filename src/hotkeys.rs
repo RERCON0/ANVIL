@@ -85,6 +85,9 @@ pub enum Action {
     ProfileSelector,
     Settings,
     ToggleFullscreen,
+    /// The frame-time overlay, so frame-path work can be judged in the app
+    /// itself instead of only in an external harness.
+    ToggleFrameStats,
     CtrlC,
     Copy,
     Paste,
@@ -133,6 +136,7 @@ const SIMPLE_ACTIONS: &[(&str, Action)] = &[
     ("profile-selector", Action::ProfileSelector),
     ("settings", Action::Settings),
     ("toggle-fullscreen", Action::ToggleFullscreen),
+    ("toggle-frame-stats", Action::ToggleFrameStats),
     ("ctrl-c", Action::CtrlC),
     ("copy", Action::Copy),
     ("paste", Action::Paste),
@@ -249,6 +253,7 @@ pub const DEFAULT_BINDINGS: &[(&str, &[&str])] = &[
     ("profile-selector", &["Ctrl-Shift-E"]),
     ("settings", &["Ctrl-,"]),
     ("toggle-fullscreen", &["F11", "Alt-Enter"]),
+    ("toggle-frame-stats", &["Ctrl-Shift-F12"]),
     ("ctrl-c", &["Ctrl-C"]),
     ("copy", &["Ctrl-Shift-C"]),
     ("paste", &["Ctrl-Shift-V", "Shift-Insert"]),
@@ -386,8 +391,11 @@ impl Keymap {
     }
 
     /// All (action id, chord strings) pairs for the settings page, in table order.
+    /// An action the user unbound appears with an empty list rather than
+    /// vanishing: a row that disappears looks like a feature that was removed.
     pub fn describe(&self) -> Vec<(String, Vec<String>)> {
-        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        let mut out: Vec<(String, Vec<String>)> =
+            SIMPLE_ACTIONS.iter().map(|(_, action)| (action.id(), Vec::new())).collect();
         for (chord, action) in &self.bindings {
             let id = action.id();
             let text = format_chord(chord);

@@ -33,6 +33,10 @@ pub(crate) struct Shared {
     /// (the file cannot be read right now) skips the cycle.
     prefs: Box<dyn Fn() -> Option<Prefs> + Send + Sync>,
     repaint: Box<dyn Fn() + Send + Sync>,
+    /// Seconds a manual refresh still has to wait, published by the worker that
+    /// holds the leadership. The gap keeps a held-down button from hammering
+    /// the providers, but a click inside it has to be reported, not swallowed.
+    manual_wait: AtomicU64,
 }
 
 impl Shared {
@@ -51,9 +55,10 @@ impl Shared {
     }
 }
 
-/// The running quota worker of this window. Dropping it stops the thread
-/// within about a second (a request in flight finishes first, bounded by the
-/// WinHTTP timeouts); the UI never waits for it.
+/// The running quota worker of this window. Dropping it sets a flag the worker
+/// checks between cycles, so the thread ends after the cycle in flight rather
+/// than within a second — a request against a black-holed network still has to
+/// run out its WinHTTP timeouts. The UI never waits for it.
 pub struct QuotaHandle {
     shared: Arc<Shared>,
     paths: Paths,
@@ -71,6 +76,7 @@ impl QuotaHandle {
             snapshot: Mutex::new(cache::read(&paths.snapshot).unwrap_or_default()),
             prefs: Box::new(prefs),
             repaint: Box::new(repaint),
+            manual_wait: AtomicU64::new(0),
         });
         let thread_shared = Arc::clone(&shared);
         let thread_paths = paths.clone();
@@ -94,10 +100,19 @@ impl QuotaHandle {
     }
 
     /// Asks whichever window leads (this one or another) for a cycle now.
-    pub fn refresh(&self) {
+    /// Answers the seconds the request still has to wait: a request inside the
+    /// anti-hammer gap is served later, and the caller says so rather than
+    /// pretending the click did nothing.
+    pub fn refresh(&self) -> i64 {
+        let wait = self.manual_wait();
         if let Err(e) = cache::request_refresh(&self.paths.refresh) {
             log::warn!("quota: cannot request a refresh: {e}");
         }
+        wait
+    }
+
+    fn manual_wait(&self) -> i64 {
+        self.shared.manual_wait.load(Ordering::Relaxed) as i64
     }
 }
 

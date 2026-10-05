@@ -59,6 +59,8 @@ pub enum HttpError {
     Insecure,
     /// A query string with characters that could change the address.
     BadQuery,
+    /// A header name or value that could inject a header of its own.
+    Header,
     /// A WinHTTP call failed with this `GetLastError` code.
     Os(u32),
 }
@@ -71,6 +73,7 @@ impl std::fmt::Display for HttpError {
             HttpError::Redirect(code) => write!(f, "unexpected redirect {code}"),
             HttpError::Insecure => f.write_str("plain HTTP refused"),
             HttpError::BadQuery => f.write_str("invalid query string"),
+            HttpError::Header => f.write_str("invalid header"),
             HttpError::Os(code) => write!(f, "WinHTTP error {code}"),
         }
     }
@@ -207,6 +210,13 @@ impl Http for WinHttp {
         })?;
         let mut block = String::new();
         for (name, value) in headers {
+            // The block is a raw header list: a value carrying CR/LF would end
+            // its header and start another one, so nothing control-bearing may
+            // reach it. Callers already filter their sources; this is the last
+            // gate before the bytes go on the wire.
+            if name.is_empty() || name.contains(':') || value.chars().any(char::is_control) {
+                return Err(HttpError::Header);
+            }
             block.push_str(name);
             block.push_str(": ");
             block.push_str(value);

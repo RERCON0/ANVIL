@@ -138,12 +138,18 @@ pub struct CredEnv {
 
 impl CredEnv {
     pub fn from_process(now: i64, sqlite: Option<Arc<Sqlite>>, own_keys: HashMap<ProviderId, String>) -> CredEnv {
-        let vars =
-            VARS.iter().filter_map(|name| std::env::var(name).ok().map(|value| ((*name).to_owned(), value))).collect();
+        let vars = VARS
+            .iter()
+            .filter_map(|name| {
+                std::env::var(name).ok().and_then(|value| header_safe(&value)).map(|v| ((*name).to_owned(), v))
+            })
+            .collect();
         let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from);
         CredEnv { home, vars, own_keys, sqlite, now }
     }
 
+    /// Trimmed on read as well as on capture: a test or a caller that inserts a
+    /// value directly still gets the same secret as one read from the process.
     fn var(&self, name: &str) -> Option<&str> {
         self.vars.get(name).map(|v| v.trim()).filter(|v| !v.is_empty())
     }
@@ -192,12 +198,18 @@ impl CredEnv {
     }
 }
 
+/// Reads at most `MAX_FILE` bytes, bounded on the handle: a CLI rewriting its
+/// own login can grow the file between a stat and a read, and the read must
+/// stay bounded whichever way that race goes.
 fn read_small(path: &Path) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_FILE {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
         return None;
     }
-    std::fs::read_to_string(path).ok()
+    let mut buf = String::new();
+    file.take(MAX_FILE + 1).read_to_string(&mut buf).ok()?;
+    (buf.len() as u64 <= MAX_FILE).then_some(buf)
 }
 
 /// A CLI may be rewriting its login file at the very moment it is read; one
@@ -223,8 +235,21 @@ fn marker(secret: &str) -> u64 {
     hasher.finish()
 }
 
+/// A header-safe text: trimmed, non-empty, and free of control characters.
+/// Everything read off disk or out of the environment goes into a raw WinHTTP
+/// header block, so a value carrying CR/LF would inject a header of its own.
 fn text(value: Option<&Value>) -> Option<String> {
-    value.and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned)
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
+        .map(str::to_owned)
+}
+
+/// The same rule for a plain string, used for the environment variables.
+fn header_safe(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty() && !trimmed.chars().any(char::is_control)).then(|| trimmed.to_owned())
 }
 
 fn credential(secret: String, source: Source) -> Credential {

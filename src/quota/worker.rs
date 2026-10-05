@@ -47,9 +47,23 @@ pub struct Engine {
     /// inside the gap waits for it to pass instead of being dropped.
     manual_pending: bool,
     retry_at: Option<i64>,
+    /// The snapshot built so far, so a panic part-way through a cycle still
+    /// leaves the providers that answered on screen.
+    partial: Option<Snapshot>,
 }
 
 impl Engine {
+    /// Seconds a manual refresh asked for inside the gap still has to wait.
+    /// The gap exists so a held-down button cannot hammer the providers, but a
+    /// click that is going to be deferred has to say so instead of looking like
+    /// a button that did nothing.
+    pub fn manual_wait(&self, now: i64) -> i64 {
+        match self.last_manual {
+            Some(at) => (MANUAL_GAP - (now - at)).max(0),
+            None => 0,
+        }
+    }
+
     /// Whether a cycle should run now. `snapshot_age` is the age of the newest
     /// data any window wrote (None: there is none), so a window that becomes
     /// leader does not re-poll what another one fetched a minute ago.
@@ -84,6 +98,34 @@ impl Engine {
         }
         let mut next = Snapshot::default();
         for id in ProviderId::ALL {
+            let entry = self.cycle_one(id, now, prefs, previous, &detect, &fetch);
+            if let Some(entry) = entry {
+                next.providers.push(entry);
+            }
+            // Kept so a panic further down still has the providers that did
+            // answer: the worker's own guard publishes this instead of nothing.
+            self.partial = Some(next.clone());
+        }
+        self.partial = None;
+        next
+    }
+
+    /// The snapshot built so far, if a panic cut the cycle short.
+    fn take_partial(&mut self) -> Option<Snapshot> {
+        self.partial.take()
+    }
+
+    /// One provider's entry, or None when it is not shown at all.
+    fn cycle_one(
+        &mut self,
+        id: ProviderId,
+        now: i64,
+        prefs: &Prefs,
+        previous: &Snapshot,
+        detect: &impl Fn(ProviderId) -> Detection,
+        fetch: &impl Fn(ProviderId, &Credential) -> Result<Fetched, FetchError>,
+    ) -> Option<ProviderSnapshot> {
+        {
             let old = previous.get(id);
             let keep = |state: ProviderState, source: String, plan: Option<String>| ProviderSnapshot {
                 id,
@@ -99,9 +141,9 @@ impl Engine {
             let entry = match detect(id) {
                 Detection::Missing => {
                     *memory = Memory::default();
-                    continue;
+                    None
                 }
-                Detection::Expired { source, .. } => keep(ProviderState::AuthExpired, source.label(), None),
+                Detection::Expired { source, .. } => Some(keep(ProviderState::AuthExpired, source.label(), None)),
                 Detection::Found(credential) => {
                     let source = credential.source.label();
                     let enabled = prefs.get(&id).copied().flatten().unwrap_or(true);
@@ -110,16 +152,16 @@ impl Engine {
                         memory.refused = None;
                     }
                     if !enabled {
-                        keep(previous_state, source, credential.plan)
+                        Some(keep(previous_state, source, credential.plan))
                     } else if memory.refused.is_some() {
-                        keep(ProviderState::AuthExpired, source, credential.plan)
+                        Some(keep(ProviderState::AuthExpired, source, credential.plan))
                     } else if memory.paused_until > now {
-                        keep(previous_state, source, credential.plan)
+                        Some(keep(previous_state, source, credential.plan))
                     } else {
                         match fetch(id, &credential) {
                             Ok(fetched) => {
                                 memory.failures = 0;
-                                ProviderSnapshot {
+                                Some(ProviderSnapshot {
                                     id,
                                     plan: fetched.plan.or(credential.plan),
                                     source,
@@ -128,12 +170,16 @@ impl Engine {
                                     balances: fetched.balances,
                                     fetched_at: Some(now),
                                     checked_at: now,
-                                }
+                                })
                             }
                             Err(error) => {
                                 if matches!(error, FetchError::Network(_)) {
                                     self.retry_at = Some(now + QUICK_RETRY);
                                 }
+                                // A provider's own error text is written to disk
+                                // and drawn in the GUI: a compromised or echoing
+                                // endpoint must not get the key onto either.
+                                let error = error.redacted(credential.secret.expose());
                                 let state = error.into_state(now, memory.failures);
                                 match &state {
                                     ProviderState::AuthExpired => memory.refused = Some(credential.marker),
@@ -143,15 +189,14 @@ impl Engine {
                                     }
                                     _ => {}
                                 }
-                                keep(state, source, credential.plan)
+                                Some(keep(state, source, credential.plan))
                             }
                         }
                     }
                 }
             };
-            next.providers.push(entry);
+            entry
         }
-        next
     }
 }
 
@@ -165,7 +210,8 @@ fn own_keys() -> HashMap<ProviderId, String> {
 }
 
 /// The thread body: observe `quota.json`, lead when the lock is free, poll on
-/// schedule. Ends within a second of `Shared::stop` (plus any request in flight).
+/// schedule. `Shared::stop` is checked between cycles, so a request in flight
+/// finishes first, bounded by the WinHTTP timeouts.
 pub(super) fn run(shared: Arc<Shared>, paths: Paths, user_agent: String) {
     let sqlite = Sqlite::load().map(Arc::new);
     if sqlite.is_none() {
@@ -199,6 +245,7 @@ pub(super) fn run(shared: Arc<Shared>, paths: Paths, user_agent: String) {
                 if http.is_none() {
                     http = WinHttp::new(&user_agent).map_err(|e| log::warn!("quota: WinHTTP: {e}")).ok();
                 }
+                shared.manual_wait.store(engine.manual_wait(now).max(0) as u64, Ordering::Relaxed);
                 if let (Some(http), Some(prefs)) = (&http, shared.prefs()) {
                     let previous = shared.snapshot();
                     let env = CredEnv::from_process(now, sqlite.clone(), own_keys());
@@ -219,8 +266,20 @@ pub(super) fn run(shared: Arc<Shared>, paths: Paths, user_agent: String) {
                             seen_snapshot = cache::mtime(&paths.snapshot);
                             shared.publish(next);
                         }
-                        Err(_) => log::error!("quota: a cycle panicked; the worker continues"),
+                        Err(_) => {
+                            // A panic must not cost every provider its snapshot
+                            // and a five-minute wait: serve what did complete.
+                            log::error!("quota: a cycle panicked; the worker continues");
+                            if let Some(partial) = engine.take_partial() {
+                                if let Err(e) = cache::write(&paths.snapshot, &partial) {
+                                    log::warn!("quota: cannot write {}: {e}", paths.snapshot.display());
+                                }
+                                seen_snapshot = cache::mtime(&paths.snapshot);
+                                shared.publish(partial);
+                            }
+                        }
                     }
+                    shared.manual_wait.store(engine.manual_wait(now).max(0) as u64, Ordering::Relaxed);
                 }
             }
         }

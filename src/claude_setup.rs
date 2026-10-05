@@ -114,6 +114,18 @@ fn render(map: Map<String, Value>) -> String {
     text
 }
 
+/// Just the `statusLine` this feature replaces, as a standalone document.
+/// An unparseable file backs up as `{}` rather than as its own text, so the
+/// backup never becomes a second copy of a document full of secrets.
+fn previous_status_line(settings: &str) -> String {
+    let map = parse_object(settings).unwrap_or_default();
+    let mut owned = Map::new();
+    if let Some(status_line) = map.get("statusLine") {
+        owned.insert("statusLine".into(), status_line.clone());
+    }
+    render(owned)
+}
+
 /// New settings text with our statusLine, and the statusLine it replaced.
 pub fn install(settings: Option<&str>, ours: &str) -> Result<(String, Option<Value>), String> {
     let mut map = match settings {
@@ -168,11 +180,15 @@ pub fn write_confirmed(path: &Path, expected: Option<&str>, replacement: &str) -
     if current != expected {
         return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "Claude settings changed after confirmation"));
     }
+    // The backup holds only the key this feature owns. The whole document is where
+    // users keep `ANTHROPIC_AUTH_TOKEN` and friends, and a copy in a file
+    // nobody knows to exclude from backups or cloud sync outlives a rotation.
     let mut backup = path.as_os_str().to_os_string();
     backup.push(".anvil-backup");
+    let owned = previous_status_line(&current);
     match std::fs::OpenOptions::new().write(true).create_new(true).open(PathBuf::from(backup)) {
         Ok(mut backup) => {
-            backup.write_all(current.as_bytes())?;
+            backup.write_all(owned.as_bytes())?;
             backup.sync_all()?;
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -322,7 +338,12 @@ mod tests {
         assert!(write_confirmed(&path, Some(&installed), OWNER).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
         write_confirmed(&path, Some(changed), OWNER).unwrap();
-        assert_eq!(std::fs::read_to_string(dir.path().join("settings.json.anvil-backup")).unwrap(), OWNER);
+        // The backup carries the statusLine this feature replaces and nothing else: the
+        // whole document is where `ANTHROPIC_AUTH_TOKEN` lives.
+        let backup = std::fs::read_to_string(dir.path().join("settings.json.anvil-backup")).unwrap();
+        assert!(!backup.contains("hooks"), "the backup must not copy unrelated keys: {backup}");
+        assert!(!backup.contains("ANTHROPIC"), "the backup must not copy credentials: {backup}");
+        assert!(backup.contains("statusline.mjs"), "the replaced statusLine is kept: {backup}");
         assert!(write_confirmed(&path, None, "{}").is_err(), "missing-file consent cannot overwrite a newly created file");
         let missing = dir.path().join("new/settings.json");
         write_confirmed(&missing, None, &installed).unwrap();

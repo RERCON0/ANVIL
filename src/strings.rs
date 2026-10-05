@@ -69,6 +69,9 @@ pub const CURSOR_BLOCK: &str = "Блок";
 pub const CURSOR_BAR: &str = "Черта";
 pub const CURSOR_UNDERLINE: &str = "Подчёркивание";
 pub const SETTINGS_BLINK: &str = "Мигание";
+pub const SETTINGS_BELL: &str = "Сигнал";
+pub const BELL_OFF: &str = "Выкл";
+pub const BELL_VISUAL: &str = "Визуальный";
 pub const SETTINGS_RIGHT_CLICK: &str = "Правая кнопка";
 pub const RIGHT_CLICK_CLIPBOARD: &str = "Буфер обмена";
 pub const RIGHT_CLICK_PASTE: &str = "Вставка";
@@ -124,7 +127,6 @@ pub const SETTINGS_CLAUDE_PENDING: &str = "Интеграция включена
 pub const SETTINGS_CLAUDE_GLOBAL_HINT: &str = "Установка меняет глобальную строку статуса Claude Code. Отключите интеграцию перед удалением ANVIL; после перемещения подтвердите новый путь.";
 pub const SETTINGS_CLAUDE_INSTALL: &str = "Установить / обновить интеграцию…";
 pub const SETTINGS_CLAUDE_RESTORE: &str = "Повторить восстановление строки статуса";
-pub const SETTINGS_CUSTOM_PROFILE: &str = "Пользовательский профиль";
 pub const SETTINGS_NO_PROFILES: &str = "Пользовательских профилей нет";
 pub const SETTINGS_APPLY_HINT: &str = "Изменения применяются сразу и сохраняются в config.json";
 pub const SETTINGS_HOTKEYS_HINT: &str = "Редактирование клавиш — только в config.json";
@@ -139,6 +141,10 @@ pub const SETTINGS_QUOTA_SET_KEY: &str = "Задать ключ…";
 pub const SETTINGS_QUOTA_CHANGE_KEY: &str = "Ключ…";
 pub const SETTINGS_QUOTA_DELETE_KEY: &str = "Удалить ключ";
 pub const SETTINGS_QUOTA_KEY_FAILED: &str = "Не удалось сохранить ключ в Диспетчере учётных данных Windows";
+pub const SETTINGS_QUOTA_KEY_DELETE_FAILED: &str = "Не удалось удалить ключ из Диспетчера учётных данных Windows";
+/// A refresh asked for inside the anti-hammer gap is served after a wait; the
+/// click has to say so instead of looking like a button that did nothing.
+pub const QUOTA_REFRESH_DEFERRED: &str = "Обновление уже запрошено — следующий цикл через {0} с";
 pub const SETTINGS_QUOTA_KEY_INVALID: &str = "Ключ пуст, слишком длинный или содержит переводы строк";
 pub const SETTINGS_QUOTA_WINDOWS_LATER: &str = "окна появятся после первого ответа";
 pub const QUOTA_NO_DATA: &str = "квоты: данных пока нет";
@@ -162,8 +168,6 @@ pub const QUOTA_AUTH_EXPIRED: &str = "вход устарел";
 pub const QUOTA_FORMAT_ERROR: &str = "ошибка формата";
 pub const QUOTA_RESET_IN: &str = "сброс через";
 pub const QUOTA_DATA_AT: &str = "данные от";
-pub const QUOTA_UPDATE_FAILED: &str = "не удалось обновить:";
-pub const QUOTA_RETRY_AT: &str = "повтор в";
 
 // Quotas: balances and the bottom line.
 pub const QUOTA_CREDITS: &str = "кредиты";
@@ -179,7 +183,6 @@ pub const QUOTA_NO_SUBSCRIPTION: &str = "нет подписки";
 pub const QUOTA_ZEN_OTHER_SERVER: &str = "вход OpenCode относится к другому серверу консоли";
 pub const QUOTA_PROVIDER_SAID: &str = "ответ провайдера:";
 pub const QUOTA_RATE_LIMITED: &str = "лимит запросов, повтор в";
-pub const QUOTA_MORE: &str = "ещё";
 pub const SETTINGS_QUOTA_OWN_KEY: &str = "Свой ключ…";
 pub const SETTINGS_QUOTA_ZEN_LOGIN: &str = "войдите в OpenCode: opencode auth login";
 
@@ -205,7 +208,6 @@ pub const WORKSPACE_STAGE: &str = "Стейджить";
 pub const WORKSPACE_UNSTAGE: &str = "Убрать";
 pub const WORKSPACE_STAGE_ALL: &str = "Стейджить всё";
 pub const WORKSPACE_UNSTAGE_ALL: &str = "Убрать всё";
-pub const WORKSPACE_DIFF_SIDE: &str = "Индекс / рабочее дерево";
 pub const WORKSPACE_COMMIT_HINT: &str = "Сообщение коммита (Ctrl+Enter)";
 pub const WORKSPACE_COMMIT: &str = "Зафиксировать";
 pub const WORKSPACE_AI: &str = "AI-сообщение";
@@ -214,7 +216,6 @@ pub const WORKSPACE_DIFF_STAGED: &str = "Индекс/дерево";
 pub const WORKSPACE_DIFF_LOADING: &str = "Загрузка diff…";
 pub const WORKSPACE_TOGGLE_HINT: &str = "Панель git";
 pub const WORKSPACE_TAB_CHANGES: &str = "Изменения";
-pub const WORKSPACE_TAB_COMMITS: &str = "коммиты";
 pub const WORKSPACE_TAB_FILES: &str = "Файлы";
 pub const WORKSPACE_COMMITS_TITLE: &str = "КОММИТЫ";
 pub const WORKSPACE_PUBLISH: &str = "Опубликовать";
@@ -228,7 +229,6 @@ pub fn workspace_changes_tab(count: usize) -> String {
         format!("{WORKSPACE_TAB_CHANGES} {count}")
     }
 }
-pub const WORKSPACE_NO_UPSTREAM: &str = "нет upstream";
 /// "Посчитать строки" toolbar button.
 pub const WORKSPACE_COUNT_LINES: &str = "Посчитать строки";
 /// Result of the line count: files and total lines.
