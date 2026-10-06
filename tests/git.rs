@@ -345,7 +345,19 @@ fn global_conditional_missing_sources_and_config_read_races_revoke_approval() {
     assert!(git::repository_stamp(root).unwrap().hazards().iter().any(|key| key == "filter.tilde.clean"));
     run(root, &["config", "--unset", "include.path"]);
     let global = std::path::PathBuf::from(std::env::var_os("GIT_CONFIG_GLOBAL").unwrap());
-    let condition = root.join(".git").to_string_lossy().replace('\\', "/");
+    // Git matches includeIf against its resolved gitdir spelling, not a DOS
+    // 8.3 alias in TEMP (used by Windows runners). Ask Git from the canonical
+    // working directory so the fixture actually selects the include everywhere.
+    let mut git_dir_command = Command::new("git");
+    git_dir_command.args(["rev-parse", "--absolute-git-dir"]).current_dir(root.canonicalize().unwrap());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        git_dir_command.creation_flags(0x0800_0000);
+    }
+    let git_dir_output = git_dir_command.output().unwrap();
+    assert!(git_dir_output.status.success());
+    let condition = String::from_utf8(git_dir_output.stdout).unwrap().trim().replace('\\', "/");
     let injected = root.join("injected.cfg");
     std::fs::write(
         &global,
@@ -373,6 +385,7 @@ fn global_conditional_missing_sources_and_config_read_races_revoke_approval() {
     assert_eq!(initial, routine, "unrelated user configuration does not change hazards");
     assert!(git::trust_approved(root, &routine));
     std::fs::write(&injected, "[filter \"injected\"]\n clean = hostile-command\n").unwrap();
+    run(root, &["config", "--includes", "--get", "filter.injected.clean"]);
     let changed = git::repository_stamp(root).unwrap();
     assert!(changed.hazards().iter().any(|key| key == "filter.injected.clean"));
     assert!(!git::trust_approved(root, &changed), "a missing global include target must have been watched");
