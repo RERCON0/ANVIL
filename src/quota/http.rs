@@ -210,11 +210,17 @@ impl Http for WinHttp {
         })?;
         let mut block = String::new();
         for (name, value) in headers {
-            // The block is a raw header list: a value carrying CR/LF would end
-            // its header and start another one, so nothing control-bearing may
-            // reach it. Callers already filter their sources; this is the last
-            // gate before the bytes go on the wire.
-            if name.is_empty() || name.contains(':') || value.chars().any(char::is_control) {
+            // The block is a raw header list: a name or value carrying CR/LF
+            // would end its header and start another one, so nothing
+            // control-bearing may reach it. Both halves are checked here, not
+            // just the value: a name is data too the moment one comes from a
+            // config file instead of a constant. Callers already filter their
+            // sources; this is the last gate before the bytes go on the wire.
+            if name.is_empty()
+                || name.contains(':')
+                || name.chars().any(char::is_control)
+                || value.chars().any(char::is_control)
+            {
                 return Err(HttpError::Header);
             }
             block.push_str(name);
@@ -393,8 +399,25 @@ mod tests {
         assert!(valid_query("batch=1&input=%7B%220%22%3Anull%7D"));
     }
 
-    /// WinHTTP checks its timers in steps of about four seconds, so the limit
-    /// is asserted against a server that stays silent for much longer.
+    /// The header block is raw bytes on the wire, so a name carrying CR/LF
+    /// would end its own header and open another one. Names are constants
+    /// today, but this is the gate that is supposed to hold when they are not.
+    #[test]
+    fn a_header_name_cannot_inject_a_second_header() {
+        let (port, request) = serve(reply("200 OK", "", b"{}"), Duration::ZERO);
+        let http = WinHttp::for_tests(5_000);
+        for bad in ["X-A\r\nX-B", "X-A\n", "X-A\r", "X-A\x00", ""] {
+            let result = http.get(&Endpoint::loopback(port, "/"), None, &[(bad, "1")]);
+            assert_eq!(result, Err(HttpError::Header), "{bad:?}");
+        }
+        // Refused before the socket is touched: the injected header never
+        // reaches the wire, not even as a request of its own.
+        assert!(matches!(request.try_recv(), Err(mpsc::TryRecvError::Empty)), "a rejected header must not be sent");
+    }
+
+    /// A silent server times out: WinHTTP checks its timers in steps of about
+    /// four seconds, so the limit is asserted against a server that stays
+    /// silent for much longer.
     #[test]
     fn a_silent_server_times_out() {
         let (port, _request) = serve(reply("200 OK", "", b"late"), Duration::from_secs(8));

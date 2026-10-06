@@ -41,12 +41,28 @@ pub fn compute(commits: &[Commit]) -> Vec<Row> {
     let mut lanes: Vec<Option<String>> = Vec::new();
 
     for commit in commits {
-        let mut lane = lanes.iter().position(|hash| hash.as_deref() == Some(commit.hash.as_str()));
-        if lane.is_none() {
-            lane = Some(lanes.len());
-            lanes.push(Some(commit.hash.clone()));
-        }
-        let lane = lane.expect("lane assigned");
+        // A lane for the commit's own hash, under the same cap as the parent
+        // lanes below: bounding only the fan-out let the lane count follow the
+        // commit count, and a shallow or grafted history is a long chain of
+        // hashes that never meet. A free lane is reused before one is opened;
+        // past the cap the commit shares the last lane, the approximation the
+        // doc comment already allows for a deep graph.
+        let lane = match lanes.iter().position(|hash| hash.as_deref() == Some(commit.hash.as_str())) {
+            Some(lane) => lane,
+            None => match lanes.iter().position(Option::is_none) {
+                Some(free) => {
+                    lanes[free] = Some(commit.hash.clone());
+                    free
+                }
+                // `lanes` is empty only here, and an empty vec is under the cap,
+                // so this arm always leaves at least one lane to index.
+                None if lanes.len() < MAX_LANES => {
+                    lanes.push(Some(commit.hash.clone()));
+                    lanes.len() - 1
+                }
+                None => lanes.len() - 1,
+            },
+        };
 
         let incoming = lanes.clone();
         // The node lane continues towards the first parent (or ends).
@@ -149,6 +165,21 @@ mod tests {
             time: 0,
             section,
         }
+    }
+
+    /// Documented cap, actually applied: the lane a commit's own hash opens is
+    /// bounded by `MAX_LANES` like the fan-out ones, not just by the number of
+    /// commits. A long chain of unrelated hashes (a grafted or rebased history)
+    /// must not widen the graph without limit.
+    #[test]
+    fn the_lane_count_stays_within_the_documented_cap() {
+        let commits: Vec<Commit> = (0..MAX_LANES * 3)
+            .map(|index| commit(&format!("{index:07x}"), &[], Section::History))
+            .collect();
+        let rows = compute(&commits);
+        assert_eq!(rows.len(), commits.len(), "every commit is still drawn");
+        let widest = rows.iter().map(|row| row.lane + 1).max().unwrap_or(0);
+        assert!(widest <= MAX_LANES, "lanes grew to {widest}, past the cap of {MAX_LANES}");
     }
 
     #[test]

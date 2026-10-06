@@ -18,6 +18,26 @@ pub(super) struct Invocation {
     pub model: Option<String>,
 }
 
+/// The credential values this invocation hands the child, so a caller that
+/// surfaces the child's diagnostics can scrub them first. Only environment
+/// names that actually carry a secret qualify: a model name redacted out of an
+/// error message would cost more than it protects.
+pub(super) fn command_secrets(command: &Command) -> Vec<String> {
+    command
+        .get_envs()
+        .filter_map(|(key, value)| {
+            let name = key.to_string_lossy().to_ascii_uppercase();
+            let is_secret = ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|marker| name.contains(marker));
+            is_secret.then(|| value.map(|value| value.to_string_lossy().into_owned())).flatten().filter(|value| value.len() >= 8)
+        })
+        .collect()
+}
+
+/// Replaces every known secret in `text` with an ellipsis.
+pub(super) fn redact(text: &str, secrets: &[String]) -> String {
+    secrets.iter().fold(text.to_owned(), |text, secret| text.replace(secret.as_str(), "…"))
+}
+
 pub(super) fn words(spec: &str) -> Result<Vec<String>, String> {
     let mut words = Vec::new();
     let mut word = String::new();
@@ -464,9 +484,12 @@ fn aider(command: &mut Command, dir: &Path) -> Result<(), String> {
     *command = Command::new(python);
     command.arg("-I");
     strip_runtime_injection(command);
+    // `verify-ssl` is deliberately not projected: turning certificate
+    // verification off would put the provider key on the wire to whoever is
+    // in the middle, and a commit-message generator gains nothing from it.
     const KEYS: &[&str] = &["model", "openai-api-key", "anthropic-api-key", "openai-api-base", "openai-api-version",
         "openai-api-deployment-id", "openai-organization-id", "api-key", "reasoning-effort", "thinking-tokens",
-        "verify-ssl", "timeout", "alias"];
+        "timeout", "alias"];
     let mut config = serde_json::json!({});
     if let Some(home) = home() {
         if let Some(text) = read_config(&home.join(".aider.conf.yml"))? {
@@ -486,11 +509,18 @@ fn aider(command: &mut Command, dir: &Path) -> Result<(), String> {
             command.env_remove(key);
         }
     }
-    let config_file = dir.join("aider.json");
-    save(&config_file, &config)?;
+    // The projected config carries API keys. It travels in the child's
+    // environment, never as a file: a plain write into %TEMP% leaves a copy
+    // readable by anything running as this user until the directory is swept,
+    // with whatever DACL the temp folder happens to carry.
+    let config = serde_json::to_string(&config).map_err(|e| e.to_string())?;
     let driver = dir.join("inference.py");
     std::fs::write(&driver, include_str!("ai_inference_aider.py")).map_err(|e| e.to_string())?;
-    command.arg(driver).arg(config_file).env("HOME", dir).env("USERPROFILE", dir);
+    command
+        .arg(driver)
+        .env("ANVIL_AIDER_CONFIG", config)
+        .env("HOME", dir)
+        .env("USERPROFILE", dir);
     Ok(())
 }
 
@@ -720,6 +750,33 @@ mod tests {
             .filter_map(|(key, value)| Some(format!("{}={}", key.to_string_lossy(), value?.to_string_lossy())))
             .collect();
         assert!(environment.iter().any(|pair| pair == "ANTHROPIC_AUTH_TOKEN=sk-ant-secret"), "the token must travel in the environment: {environment:?}");
+    }
+
+    /// A CLI that prints its own `Authorization` header on failure must not put
+    /// the key in the panel. Only environment entries that look like secrets
+    /// are scrubbed, so a model name in the same message survives for the user.
+    #[test]
+    fn child_diagnostics_are_scrubbed_of_the_credentials_we_handed_over() {
+        let mut command = Command::new("echo");
+        command.env("ANTHROPIC_AUTH_TOKEN", "sk-ant-very-secret-value");
+        command.env("ANTHROPIC_MODEL", "claude-opus-5");
+        command.env("HOME", "/tmp/x");
+        let secrets = command_secrets(&command);
+        assert_eq!(secrets, vec!["sk-ant-very-secret-value".to_owned()], "only real secrets are collected");
+
+        let stderr = "request failed\nAuthorization: Bearer sk-ant-very-secret-value\nmodel=claude-opus-5\n";
+        let scrubbed = redact(stderr, &secrets);
+        assert!(!scrubbed.contains("sk-ant-very-secret-value"), "{scrubbed}");
+        assert!(scrubbed.contains("claude-opus-5"), "diagnostics stay useful: {scrubbed}");
+    }
+
+    /// A short value is far more likely to be an ordinary setting that happens
+    /// to sit in a secret-sounding name than a credential.
+    #[test]
+    fn short_environment_values_are_not_treated_as_secrets() {
+        let mut command = Command::new("echo");
+        command.env("ANTHROPIC_API_KEY", "short");
+        assert!(command_secrets(&command).is_empty());
     }
 
     /// Credential copies must not survive a crash: only our own prefix is swept.

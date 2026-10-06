@@ -712,10 +712,23 @@ impl TerminalView {
         None
     }
 
-    fn wheel(&mut self, pane: &Pane, dy_points: f32, cell_height: f32) {
+    /// Wheel deltas accumulate in `wheel_lines` and are spent a whole line at a
+    /// time. `f32 as i32` saturates, so an anomalous or infinite delta from a
+    /// driver would otherwise reach `repeat`/`unsigned_abs` as `i32::MAX` and
+    /// ask for a two-gigabyte allocation (or two billion PTY writes).
+    /// Anything past a fast scroll is dropped; the accumulator is reset so the
+    /// next real event starts clean.
+    fn take_wheel_lines(&mut self, dy_points: f32, cell_height: f32) -> i32 {
+        const MAX_LINES: f32 = 1_000.0;
+        self.wheel_lines = if self.wheel_lines.is_finite() { self.wheel_lines.clamp(-MAX_LINES, MAX_LINES) } else { 0.0 };
         self.wheel_lines += dy_points / cell_height;
-        let lines = self.wheel_lines.trunc() as i32;
-        self.wheel_lines -= lines as f32;
+        let lines = self.wheel_lines.trunc();
+        self.wheel_lines -= lines;
+        if lines.is_finite() { lines as i32 } else { 0 }
+    }
+
+    fn wheel(&mut self, pane: &Pane, dy_points: f32, cell_height: f32) {
+        let lines = self.take_wheel_lines(dy_points, cell_height);
         if lines == 0 {
             return;
         }
@@ -735,9 +748,7 @@ impl TerminalView {
     }
 
     fn wheel_report(&mut self, pane: &Pane, dy_points: f32, cell_height: f32, mods: Mods, modes: MouseModes) {
-        self.wheel_lines += dy_points / cell_height;
-        let lines = self.wheel_lines.trunc() as i32;
-        self.wheel_lines -= lines as f32;
+        let lines = self.take_wheel_lines(dy_points, cell_height);
         let button = if lines > 0 { MouseButton::WheelUp } else { MouseButton::WheelDown };
         if let Some((col, row)) = self.hover_cell {
             for _ in 0..lines.unsigned_abs() {

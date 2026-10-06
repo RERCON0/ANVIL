@@ -106,19 +106,30 @@ pub struct PaneState {
 }
 
 impl SessionState {
+    /// Ceiling on session.json: a window with every tab, pane and collapsed
+    /// node is far below this.
+    const MAX_SESSION_BYTES: usize = 4 * 1024 * 1024;
+
     pub fn path() -> PathBuf {
         crate::config::app_dir().join("session.json")
     }
 
     /// Missing or broken file: empty state (the caller opens one default tab).
     pub fn load(path: &Path) -> SessionState {
-        match std::fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
-                log::warn!("ignoring broken {}: {e}", path.display());
-                SessionState::default()
-            }),
-            Err(_) => SessionState::default(),
-        }
+        // Bounded like every other file this process reads: a session file that
+        // grew huge (or was substituted) must cost a rejected read, not memory
+        // proportional to its size on each save/restore cycle.
+        let text = match crate::fsutil::read_limited(path, Self::MAX_SESSION_BYTES)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+        {
+            Some(text) => text,
+            None => return SessionState::default(),
+        };
+        serde_json::from_str(&text).unwrap_or_else(|e| {
+            log::warn!("ignoring broken {}: {e}", path.display());
+            SessionState::default()
+        })
     }
 
     /// What a window opened with Ctrl+Shift+N starts from: the size of the
@@ -182,6 +193,18 @@ fn is_local_dir(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An oversized or substituted session.json costs a rejected read, not
+    /// memory proportional to its size on every restore.
+    #[test]
+    fn an_oversized_session_file_loads_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(&path, vec![b'x'; SessionState::MAX_SESSION_BYTES + 1]).unwrap();
+        let loaded = SessionState::load(&path);
+        assert!(loaded.tabs.is_empty(), "an unreadable session must not half-restore");
+        assert!(loaded.active_tab == 0);
+    }
 
     #[test]
     fn removed_monitors_and_extreme_saved_dimensions_keep_the_title_reachable() {

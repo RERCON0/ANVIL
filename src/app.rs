@@ -147,7 +147,7 @@ pub struct AnvilApp {
     proc_snapshot: Vec<crate::procs::ProcInfo>,
     /// A process enumeration in flight. The Toolhelp snapshot blocks for
     /// milliseconds, which does not belong on the frame path.
-    proc_results: Option<std::sync::mpsc::Receiver<Vec<crate::procs::ProcInfo>>>,
+    proc_results: Option<std::sync::mpsc::Receiver<Option<Vec<crate::procs::ProcInfo>>>>,
     last_status_poll: Instant,
     last_proc_poll: Instant,
     last_tab_area: Rect,
@@ -1280,7 +1280,15 @@ impl AnvilApp {
             palette: self.palette.clone(),
             cursor_style: cursor_style(&self.config.terminal.cursor),
         };
-        let repaint = self.repaint.clone().unwrap_or_else(|| Arc::new(|| {}));
+        // `on_start` installs the real repaint before any pane can be spawned
+        // (tabs start empty and the first ones are created there). A pane built
+        // without one would hold a no-op that still latches `wake_pending`, so
+        // its output would wait for an unrelated repaint; say so instead of
+        // failing silently if that ever stops holding.
+        let repaint = self.repaint.clone().unwrap_or_else(|| {
+            log::error!("a pane was created before the window started; its repaints are no-ops");
+            Arc::new(|| {})
+        });
         let view = TerminalView::new(self.config.font.size);
         let start_cwd = options.cwd.clone();
         let base = PaneEntry {
@@ -1645,16 +1653,16 @@ impl AnvilApp {
     }
 
     /// Adopts a finished process enumeration and answers whether one was
-    /// waiting. The snapshot is empty when the enumeration failed, which is
-    /// what the previous blocking call also did.
+    /// waiting. A failed enumeration is not adopted: the previous snapshot
+    /// stays, and the caller retries on its next tick.
     #[must_use]
     fn absorb_proc_snapshot(&mut self) -> bool {
         match take_ready(&mut self.proc_results) {
-            Some(found) => {
+            Some(Some(found)) => {
                 self.proc_snapshot = found;
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
@@ -2107,8 +2115,13 @@ fn prepare_status_dir() -> (PathBuf, Option<PathBuf>) {
     let mine = directory.keep();
     let _ = std::fs::write(mine.join(".anvil-owner"), b"ANVIL status v1\n");
     std::thread::spawn(move || {
-        let alive = crate::procs::snapshot().into_iter().map(|p| p.pid).collect();
-        remove_stale_status_dirs(&base, &alive);
+        // Only a successful enumeration may decide what is gone: a failed
+        // snapshot would otherwise mark this very process dead and remove the
+        // directory it is about to write its status records into.
+        if let Some(found) = crate::procs::snapshot() {
+            let alive = found.into_iter().map(|p| p.pid).collect();
+            remove_stale_status_dirs(&base, &alive);
+        }
     });
     (mine.clone(), Some(mine))
 }

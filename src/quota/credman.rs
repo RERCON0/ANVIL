@@ -56,6 +56,12 @@ pub fn write(target: &str, secret: &str) -> Result<(), u32> {
     credential.UserName = user.as_mut_ptr();
     credential.CredentialBlobSize = blob.len() as u32;
     credential.CredentialBlob = blob.as_mut_ptr();
+    // Scope the record to this machine, not the domain profile: it must survive
+    // the next logon of this same user, but must never roam to another machine
+    // where it would be decrypted under a different user context. The blob
+    // itself is encrypted by the credential manager with this user's DPAPI
+    // master key regardless of this flag — `Persist` chooses where the record
+    // is kept, not the encryption scope.
     credential.Persist = CRED_PERSIST_LOCAL_MACHINE;
     // SAFETY: every pointer in `credential` refers to a buffer alive for the call.
     if unsafe { CredWriteW(&credential, 0) } == 0 {

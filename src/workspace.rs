@@ -72,22 +72,24 @@ impl Request {
 /// A request plus the repository root the panel showed when it was made.
 type Envelope = (Option<PathBuf>, Request);
 
-pub enum Response {
+/// The worker's answers. Private to the module: it carries the row indexes the
+/// worker built, which are not part of anything outside the panel.
+enum Response {
     /// Status plus the resolved repository root (None: not a repository).
     Status(Status, Option<PathBuf>),
     TrustRequired { identity: Option<git::RepositoryIdentity>, error: Option<String> },
     Trusted(git::RepositoryIdentity),
-    Diff { path: String, files: Vec<FileDiff>, text: String, staged: bool, side: Option<bool> },
+    Diff { path: String, files: Vec<FileDiff>, text: String, rows: Vec<TextRow>, staged: bool, side: Option<bool> },
     DiffChecked(DiffStamp),
     Refreshed,
     Committed(String),
     AiMessage(Result<String, String>),
     Log(CommitLog),
     CommitDetail { hash: String, detail: git::CommitDetail },
-    CommitDiff { hash: String, path: String, patch: Result<String, String> },
+    CommitDiff { hash: String, path: String, patch: Result<(String, Vec<TextRow>), String> },
     Files(Vec<String>),
     LineCount { files: usize, lines: u64 },
-    FileText { path: String, text: String, truncated: bool },
+    FileText { path: String, text: String, rows: Vec<TextRow>, truncated: bool },
     Applied,
     Fetched(String),
     Pushed(String),
@@ -215,6 +217,12 @@ pub struct Workspace {
     log_status_seen: bool,
     tx: Option<Sender<Envelope>>,
     rx: Option<Receiver<Response>>,
+    /// Requests sent and not yet answered. The worker answers every request
+    /// with exactly one response, so this is the queue depth: `poll` stays idle
+    /// while it is non-zero. Without it, the chained `Log`/`Files`/`Diff`
+    /// requests that follow a status are invisible to `busy`, and a slow
+    /// repository collects a fresh `Refresh` every poll interval on top of them.
+    inflight: usize,
 }
 
 impl Default for Workspace {
@@ -267,6 +275,7 @@ impl Default for Workspace {
             log_status_seen: false,
             tx: None,
             rx: None,
+            inflight: 0,
         }
     }
 }
@@ -282,8 +291,11 @@ impl Workspace {
         // One repository read at a time. A directory change while one runs is
         // not queued as another request: `last_cwd` is left alone, so the next
         // idle poll picks the new directory up. A shell that cd's through a
-        // script would otherwise queue one `git status` per step.
-        if self.busy || self.ai_generating {
+        // script would otherwise queue one `git status` per step. `inflight`
+        // covers the requests this panel chained itself (Log/Files/Diff), which
+        // never set `busy`: without it a slow disk grows the queue instead of
+        // simply polling less often.
+        if self.busy || self.ai_generating || self.inflight > 0 {
             return;
         }
         let cwd_changed = self.last_cwd.as_ref() != Some(&cwd);
@@ -293,7 +305,7 @@ impl Workspace {
         self.last_poll = Instant::now();
         self.last_cwd = Some(cwd.clone());
         self.busy = true;
-        self.send(Request::Refresh { cwd });
+        self.request(Request::Refresh { cwd });
     }
 
     /// A refresh is due right now (after stage/commit, or on open).
@@ -304,6 +316,15 @@ impl Workspace {
     fn send(&self, request: Request) {
         if let Some(tx) = &self.tx {
             let _ = tx.send((self.root.clone(), request));
+        }
+    }
+    /// `send` plus queue accounting. `send` itself stays `&self` for the read
+    /// paths; this is the mutating entry point every caller that queues work
+    /// for the worker goes through.
+    fn request(&mut self, request: Request) {
+        if self.tx.is_some() {
+            self.inflight += 1;
+            self.send(request);
         }
     }
     fn clear_repository_view(&mut self) {
@@ -364,7 +385,7 @@ impl Workspace {
             if let Some(identity) = self.pending_identity.clone() {
                 self.busy = true;
                 self.trust_approval_pending = true;
-                self.send(Request::Approve { identity });
+                self.request(Request::Approve { identity });
             }
         }
     }
@@ -395,11 +416,17 @@ impl Workspace {
             self.busy = false;
             self.ai_generating = false;
             self.trust_approval_pending = false;
+            self.inflight = 0;
             if self.notice.is_none() {
                 self.notice = Some((strings::WORKSPACE_WORKER_LOST.to_owned(), true));
             }
             return true;
         }
+        // Every response retires one queued request. `saturating_sub` because
+        // `Approve` is answered twice (Trusted, then the status it unlocked):
+        // the count may reach zero early, which costs one extra poll, never a
+        // permanently stalled panel.
+        self.inflight = self.inflight.saturating_sub(responses.len());
         for response in responses {
             repaint = true;
             match response {
@@ -453,14 +480,14 @@ impl Workspace {
                             self.diff_stamp = None;
                         } else {
                             let stamp = DiffStamp::for_view(self.root.as_deref(), &path, self.diff_side, &self.status);
-                            self.send(Request::CheckDiff { stamp });
+                            self.request(Request::CheckDiff { stamp });
                         }
                     }
                     if commit_state_changed && self.root.is_some() {
-                        self.send(Request::Log);
+                        self.request(Request::Log);
                     }
                     if inventory_changed || (self.tab == PanelTab::Files && !self.files_loaded) {
-                        self.send(Request::Files);
+                        self.request(Request::Files);
                     }
                 }
                 Response::DiffChecked(stamp) => {
@@ -470,15 +497,18 @@ impl Workspace {
                         && stamp.head == self.status.head_oid
                         && stamp.change.as_ref() == self.status.changes.iter().find(|c| c.path == stamp.path);
                     if current && self.diff_stamp.as_ref() != Some(&stamp) {
-                        self.send(Request::Diff { path: stamp.path.clone(), side: stamp.side });
+                        self.request(Request::Diff { path: stamp.path.clone(), side: stamp.side });
                         self.diff_stamp = Some(stamp);
                     }
                 }
-                Response::Diff { path, files, text, staged, side } => {
+                Response::Diff { path, files, text, rows, staged, side } => {
                     self.busy = false;
                     if self.diff_path.as_deref() == Some(path.as_str()) && self.diff_side == side {
                         if self.diff_text != text {
-                            self.diff_rows = text_rows(&text, true);
+                            // The rows were indexed on the worker thread: an
+                            // 8 MiB diff would otherwise build a row per line
+                            // inside the frame that shows it.
+                            self.diff_rows = rows;
                             self.diff_wrapped = WrappedRows::default();
                             self.diff_text = text;
                             self.diff_files = files;
@@ -490,16 +520,16 @@ impl Workspace {
                     self.busy = false;
                     self.diff_stamp = None;
                     self.last_poll = Instant::now() - POLL_INTERVAL;
-                    self.send(Request::Log);
+                    self.request(Request::Log);
                     if self.tab == PanelTab::Files {
-                        self.send(Request::Files);
+                        self.request(Request::Files);
                     }
                 }
                 Response::Committed(hash) => {
                     self.busy = false;
                     self.commit_message.clear();
                     self.notice = Some((strings::workspace_committed(&hash), false));
-                    self.send(Request::Log);
+                    self.request(Request::Log);
                     self.last_poll = Instant::now() - POLL_INTERVAL;
                 }
                 Response::AiMessage(result) => {
@@ -524,9 +554,16 @@ impl Workspace {
                     self.busy = false;
                     if self.detail.as_ref().is_some_and(|(current, _)| current == &hash) {
                         if let Some(file) = self.detail_file.as_mut().filter(|file| file.path == path) {
-                            file.patch = Some(patch);
-                            file.rows = file.patch.as_ref().and_then(|patch| patch.as_ref().ok())
-                                .map(|patch| text_rows(patch, true)).unwrap_or_default();
+                            match patch {
+                                Ok((patch, rows)) => {
+                                    file.rows = rows;
+                                    file.patch = Some(Ok(patch));
+                                }
+                                Err(error) => {
+                                    file.rows.clear();
+                                    file.patch = Some(Err(error));
+                                }
+                            }
                             file.wrapped = WrappedRows::default();
                         }
                     }
@@ -543,10 +580,10 @@ impl Workspace {
                     self.busy = false;
                     self.line_count = Some((files, lines));
                 }
-                Response::FileText { path, text, truncated } => {
+                Response::FileText { path, text, rows, truncated } => {
                     self.busy = false;
                     if !self.file_preview.as_ref().is_some_and(|(old_path, old_text, _)| old_path == &path && old_text == &text) {
-                        self.preview_rows = if is_markdown(&path) { Vec::new() } else { text_rows(&text, false) };
+                        self.preview_rows = rows;
                         self.preview_wrapped = WrappedRows::default();
                         self.markdown = MarkdownCache::default();
                     }
@@ -556,13 +593,13 @@ impl Workspace {
                     self.busy = false;
                     self.notice = Some((strings::workspace_fetch_done(&what), false));
                     self.last_poll = Instant::now() - POLL_INTERVAL;
-                    self.send(Request::Log);
+                    self.request(Request::Log);
                 }
                 Response::Pushed(branch) => {
                     self.busy = false;
                     self.notice = Some((strings::workspace_pushed(&branch), false));
                     self.last_poll = Instant::now() - POLL_INTERVAL;
-                    self.send(Request::Log);
+                    self.request(Request::Log);
                 }
                 Response::Error(message) => {
                     self.busy = false;
@@ -607,9 +644,9 @@ impl Workspace {
                         self.refresh_soon();
                         match tab {
                             PanelTab::Changes => {
-                                self.send(Request::Log);
+                                self.request(Request::Log);
                             }
-                            PanelTab::Files => self.send(Request::Files),
+                            PanelTab::Files => self.request(Request::Files),
                         }
                     }
                 }
@@ -619,8 +656,8 @@ impl Workspace {
                     }
                     if ui.add(theme::ghost_button("⟳")).on_hover_text(strings::WORKSPACE_REFRESH).clicked() {
                         self.refresh_soon();
-                        self.send(Request::Log);
-                        self.send(Request::Files);
+                        self.request(Request::Log);
+                        self.request(Request::Files);
                     }
                 });
             });
@@ -682,11 +719,11 @@ impl Workspace {
                 if !self.status.branch.is_empty() {
                     if ui.add(theme::accent_button(strings::WORKSPACE_PUBLISH)).on_hover_text(strings::WORKSPACE_PUSH_HINT).clicked() {
                         self.busy = true;
-                        self.send(Request::Push);
+                        self.request(Request::Push);
                     }
                     if ui.add(theme::ghost_button("fetch")).on_hover_text(strings::WORKSPACE_FETCH_HINT).clicked() {
                         self.busy = true;
-                        self.send(Request::Fetch);
+                        self.request(Request::Fetch);
                     }
                 }
             });
@@ -740,7 +777,7 @@ impl Workspace {
             if ui.add_enabled(can_commit, theme::accent_button(strings::WORKSPACE_COMMIT)).clicked() || (can_commit && ctrl_enter) {
                 self.busy = true;
                 self.notice = None;
-                self.send(Request::Commit { message: self.commit_message.clone() });
+                self.request(Request::Commit { message: self.commit_message.clone() });
             }
             let ai_label = match &self.ai_command {
                 Some(command) => strings::workspace_ai(command.split_whitespace().next().unwrap_or(command)),
@@ -753,7 +790,7 @@ impl Workspace {
                 self.ai_generating = true;
                 self.busy = true;
                 self.notice = None;
-                self.send(Request::AiMessage { command: self.ai_command.clone() });
+                self.request(Request::AiMessage { command: self.ai_command.clone() });
                 ui.ctx().request_repaint();
             }
         });
@@ -828,7 +865,7 @@ impl Workspace {
         });
         if let Some(hash) = opened {
             self.busy = true;
-            self.send(Request::CommitDetail { hash });
+            self.request(Request::CommitDetail { hash });
         }
     }
 
@@ -993,19 +1030,19 @@ impl Workspace {
             match prompt.kind {
                 PromptKind::NewFile if !text.is_empty() => {
                     self.busy = true;
-                    self.send(Request::WritePath { path: text, folder: false });
+                    self.request(Request::WritePath { path: text, folder: false });
                 }
                 PromptKind::NewFolder if !text.is_empty() => {
                     self.busy = true;
-                    self.send(Request::WritePath { path: text, folder: true });
+                    self.request(Request::WritePath { path: text, folder: true });
                 }
                 PromptKind::Rename(from) if !text.is_empty() => {
                     self.busy = true;
-                    self.send(Request::RenamePath { from, to: text });
+                    self.request(Request::RenamePath { from, to: text });
                 }
                 PromptKind::Delete { path, .. } => {
                     self.busy = true;
-                    self.send(Request::DeletePath { path });
+                    self.request(Request::DeletePath { path });
                 }
                 _ => {}
             }
@@ -1023,21 +1060,21 @@ impl Workspace {
         ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(has_selection, theme::ghost_button(strings::WORKSPACE_STAGE)).clicked() {
                 self.busy = true;
-                self.send(Request::Stage { paths: selected.clone(), staged: true });
+                self.request(Request::Stage { paths: selected.clone(), staged: true });
             }
             if ui.add_enabled(has_selection, theme::ghost_button(strings::WORKSPACE_UNSTAGE)).clicked() {
                 self.busy = true;
-                self.send(Request::Stage { paths: selected, staged: false });
+                self.request(Request::Stage { paths: selected, staged: false });
             }
             if ui.add(theme::ghost_button(strings::WORKSPACE_STAGE_ALL)).clicked() {
                 let paths: Vec<String> = self.status.changes.iter().filter(|c| c.unstaged()).map(|c| c.path.clone()).collect();
                 self.busy = true;
-                self.send(Request::Stage { paths, staged: true });
+                self.request(Request::Stage { paths, staged: true });
             }
             if ui.add(theme::ghost_button(strings::WORKSPACE_UNSTAGE_ALL)).clicked() {
                 let paths: Vec<String> = self.status.changes.iter().filter(|c| c.staged()).map(|c| c.path.clone()).collect();
                 self.busy = true;
-                self.send(Request::Stage { paths, staged: false });
+                self.request(Request::Stage { paths, staged: false });
             }
         });
         const ROW_HEIGHT: f32 = 21.0;
@@ -1157,7 +1194,7 @@ impl Workspace {
                                     self.diff_side = None;
                                     self.busy = true;
                                     self.diff_stamp = None;
-                                    self.send(Request::Diff { path, side: None });
+                                    self.request(Request::Diff { path, side: None });
                                 }
                             }
                         }
@@ -1188,7 +1225,7 @@ impl Workspace {
                     self.diff_stamp = None;
                     self.diff_side = Some(!self.diff_from_index);
                     self.busy = true;
-                    self.send(Request::Diff { path: path.clone(), side: self.diff_side });
+                    self.request(Request::Diff { path: path.clone(), side: self.diff_side });
                 }
             });
         });
@@ -1224,7 +1261,7 @@ impl Workspace {
         ui.spacing_mut().item_spacing.y = spacing;
         if let Some((index, header, from_index)) = hunks_to_apply {
             self.busy = true;
-            self.send(Request::ApplyHunks { path, index, header, from_index });
+            self.request(Request::ApplyHunks { path, index, header, from_index });
         }
     }
 
@@ -1240,7 +1277,7 @@ impl Workspace {
             Some(CommitDetailAction::OpenFile(path)) => {
                 self.detail_file = Some(CommitFile { path: path.clone(), patch: None, rows: Vec::new(), wrapped: WrappedRows::default() });
                 self.busy = true;
-                self.send(Request::CommitDiff { hash: hash.clone(), path });
+                self.request(Request::CommitDiff { hash: hash.clone(), path });
             }
             None => {}
         }
@@ -1497,11 +1534,11 @@ impl Workspace {
             }
             if ui.add(theme::ghost_button(strings::WORKSPACE_REFRESH)).clicked() {
                 self.busy = true;
-                self.send(Request::Files);
+                self.request(Request::Files);
             }
             if ui.add(theme::ghost_button(strings::WORKSPACE_COUNT_LINES)).clicked() {
                 self.busy = true;
-                self.send(Request::CountLines);
+                self.request(Request::CountLines);
             }
             if let Some((files, lines)) = self.line_count {
                 ui.label(RichText::new(strings::workspace_line_count(files, lines)).color(theme::colors().accent).font(theme::font(11.0)));
@@ -1538,7 +1575,7 @@ impl Workspace {
         self.file_rows = rows;
         if let Some(path) = open_file {
             self.busy = true;
-            self.send(Request::ReadFile { path });
+            self.request(Request::ReadFile { path });
         }
         if let Some((path, text, truncated)) = self.file_preview.as_ref() {
             ui.add_space(2.0);
@@ -1645,10 +1682,15 @@ struct TextRow {
 enum PatchKind { Add, Remove, Hunk, Context }
 
 impl PatchKind {
-    fn of(line: &str) -> Self {
-        if line.starts_with('+') && !line.starts_with("+++") { Self::Add }
-        else if line.starts_with('-') && !line.starts_with("---") { Self::Remove }
-        else if line.starts_with("@@") { Self::Hunk }
+    /// `in_hunk` is false while the file header is being read, which is the
+    /// only place a real `---`/`+++` pair appears. Inside a hunk those bytes
+    /// are content, so a removed `---` markdown rule paints as a removal
+    /// instead of silently losing its row.
+    fn of(line: &str, in_hunk: bool) -> Self {
+        if line.starts_with("@@") { Self::Hunk }
+        else if !in_hunk { Self::Context }
+        else if line.starts_with('+') { Self::Add }
+        else if line.starts_with('-') { Self::Remove }
         else { Self::Context }
     }
 }
@@ -1729,7 +1771,9 @@ fn text_rows(text: &str, patch: bool) -> Vec<TextRow> {
             hunk += 1;
             Some(index)
         } else { None };
-        TextRow { bytes: start..start + line.len(), number, hunk: hunk_index, kind: if patch { PatchKind::of(line) } else { PatchKind::Context } }
+        // Read the state after numbering: a `@@` line opens the hunk it names.
+        let kind = if patch { PatchKind::of(line, numbers.started) } else { PatchKind::Context };
+        TextRow { bytes: start..start + line.len(), number, hunk: hunk_index, kind }
     }).collect()
 }
 
@@ -2098,8 +2142,31 @@ struct PatchNumbers {
     started: bool,
 }
 
+/// Header lines that cannot be confused with content: inside a hunk git prefixes
+/// every line with a space, `+`, `-` or `\`, so a line beginning with any other
+/// byte is unambiguously file metadata. `---`/`+++` are deliberately absent —
+/// a removed line whose text starts with `--` is exactly `---`, and those are
+/// content.
+fn is_unambiguous_header(line: &str) -> bool {
+    line.starts_with("diff --git")
+        || line.starts_with("index ")
+        || line.starts_with("new file")
+        || line.starts_with("deleted file")
+        || line.starts_with("old mode")
+        || line.starts_with("new mode")
+        || line.starts_with("similarity")
+        || line.starts_with("rename ")
+        || line.starts_with("copy ")
+}
+
 impl PatchNumbers {
     fn line(&mut self, line: &str) -> Option<u64> {
+        if is_unambiguous_header(line) {
+            // A new file section: the `---`/`+++` pair that follows is a
+            // header again, so the next hunk must not read it as content.
+            self.started = false;
+            return None;
+        }
         if line.starts_with("@@") {
             if let Some((old, new)) = parse_hunk(line) {
                 self.old = old;
@@ -2108,19 +2175,12 @@ impl PatchNumbers {
             }
             return None;
         }
-        let header = line.starts_with("diff --git")
-            || line.starts_with("index ")
-            || line.starts_with("---")
-            || line.starts_with("+++")
-            || line.starts_with("new file")
-            || line.starts_with("deleted file")
-            || line.starts_with("old mode")
-            || line.starts_with("new mode")
-            || line.starts_with("similarity")
-            || line.starts_with("rename ")
-            || line.starts_with("copy ")
-            || line.starts_with("\\ No newline");
-        if header || !self.started {
+        if line.starts_with("\\ No newline") {
+            return None;
+        }
+        if !self.started {
+            // Still in the header block: `---`/`+++` and anything else here
+            // belongs to the file description, not to a numbered line.
             return None;
         }
         if line.starts_with('+') {
@@ -2401,20 +2461,26 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                 }
                 Request::Diff { path, side } => match &root {
                     Some(root) => {
+                        // A failed git must reach the panel: an empty diff reads
+                        // as "this file has no changes".
                         let (bytes, from_index) = match side {
-                            Some(staged) => (git::diff_bytes(root, &path, staged), staged),
-                            None => {
-                                let staged = git::diff_bytes(root, &path, true);
-                                if staged.trim_ascii().is_empty() {
-                                    (git::diff_bytes(root, &path, false), false)
-                                } else {
-                                    (staged, true)
-                                }
-                            }
+                            Some(staged) => match git::diff_bytes(root, &path, staged) {
+                                Ok(bytes) => (bytes, staged),
+                                Err(e) => { send(Response::Error(e)); continue; }
+                            },
+                            None => match git::diff_bytes(root, &path, true) {
+                                Ok(staged) if staged.trim_ascii().is_empty() => match git::diff_bytes(root, &path, false) {
+                                    Ok(bytes) => (bytes, false),
+                                    Err(e) => { send(Response::Error(e)); continue; }
+                                },
+                                Ok(staged) => (staged, true),
+                                Err(e) => { send(Response::Error(e)); continue; }
+                            },
                         };
                         let files = git::parse_diff(&bytes, from_index);
                         let text = String::from_utf8_lossy(&bytes).into_owned();
-                        send(Response::Diff { path, files, text, staged: from_index, side });
+                        let rows = text_rows(&text, true);
+                        send(Response::Diff { path, files, text, rows, staged: from_index, side });
                     }
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
                 },
@@ -2484,6 +2550,10 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                     } else {
                         root.as_ref().ok_or_else(|| strings::WORKSPACE_NO_REPO.to_owned())
                             .and_then(|root| git::commit_file_diff(root, &hash, &path))
+                            .map(|patch| {
+                                let rows = text_rows(&patch, true);
+                                (patch, rows)
+                            })
                     };
                     send(Response::CommitDiff { hash, path, patch });
                 }
@@ -2522,25 +2592,32 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                 },
                 Request::ReadFile { path } => match &root {
                     Some(root) => match git::read_file(root, &path, MAX_PREVIEW_BYTES) {
-                        Ok((text, truncated)) => send(Response::FileText { path, text, truncated }),
+                        Ok((text, truncated)) => {
+                            // Markdown is laid out by `MarkdownCache`, which
+                            // needs the text but no per-line rows.
+                            let rows = if is_markdown(&path) { Vec::new() } else { text_rows(&text, false) };
+                            send(Response::FileText { path, text, rows, truncated });
+                        }
                         Err(e) => send(Response::Error(e)),
                     },
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
                 },
                 Request::ApplyHunks { path, index, header, from_index } => match &root {
                     Some(root) => {
-                        let files = git::parse_diff(git::diff_bytes(root, &path, from_index), from_index);
-                        let result = files
-                            .iter()
-                            .find(|file| file.path == path)
-                            .ok_or_else(|| strings::WORKSPACE_NO_CHANGES_FOR_FILE.to_owned())
-                            .and_then(|file| match file.hunks.get(index) {
-                                // The file may have changed since it was shown:
-                                // apply only the hunk the user actually saw.
-                                Some(hunk) if hunk.header == header => git::apply_hunks(root, file, &[index], from_index),
-                                Some(_) => Err(strings::WORKSPACE_DIFF_STALE.to_owned()),
-                                None => Err(strings::WORKSPACE_DIFF_STALE.to_owned()),
-                            });
+                        let result = git::diff_bytes(root, &path, from_index).and_then(|bytes| {
+                            let files = git::parse_diff(&bytes, from_index);
+                            files
+                                .iter()
+                                .find(|file| file.path == path)
+                                .ok_or_else(|| strings::WORKSPACE_NO_CHANGES_FOR_FILE.to_owned())
+                                .and_then(|file| match file.hunks.get(index) {
+                                    // The file may have changed since it was shown:
+                                    // apply only the hunk the user actually saw.
+                                    Some(hunk) if hunk.header == header => git::apply_hunks(root, file, &[index], from_index),
+                                    Some(_) => Err(strings::WORKSPACE_DIFF_STALE.to_owned()),
+                                    None => Err(strings::WORKSPACE_DIFF_STALE.to_owned()),
+                                })
+                        });
                         match result {
                             Ok(()) => send(Response::Applied),
                             Err(e) => send(Response::Error(e)),
@@ -2597,10 +2674,14 @@ fn write_path(root: &Path, path: &str, folder: bool) -> Result<(), String> {
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        if full.exists() {
-            return Err(strings::WORKSPACE_FILE_EXISTS.to_owned());
+        // `create_new` is the check and the create: a file another process put
+        // here between an `exists()` and a `write()` is left alone instead of
+        // being silently truncated to zero bytes.
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&full) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(strings::WORKSPACE_FILE_EXISTS.to_owned()),
+            Err(e) => Err(e.to_string()),
         }
-        std::fs::write(&full, "").map_err(|e| e.to_string())
     }
 }
 
@@ -2766,7 +2847,17 @@ mod tests {
         response_tx.send(Response::DiffChecked(stamp)).unwrap();
         workspace.absorb();
         assert!(request_rx.try_iter().any(|(_, request)| matches!(request, Request::Diff { .. })));
-        response_tx.send(Response::Diff { path: "f.txt".to_owned(), files: Vec::new(), text: "@@ -1 +1 @@\n-old\n+new".to_owned(), staged: false, side: None }).unwrap();
+        let diff = "@@ -1 +1 @@\n-old\n+new";
+        response_tx
+            .send(Response::Diff {
+                path: "f.txt".to_owned(),
+                files: Vec::new(),
+                text: diff.to_owned(),
+                rows: text_rows(diff, true),
+                staged: false,
+                side: None,
+            })
+            .unwrap();
         workspace.absorb();
         assert_eq!(&workspace.diff_text[workspace.diff_rows.last().unwrap().bytes.clone()], "+new");
         assert!(git(dir.path(), &["add", "--", "f.txt"]));
@@ -2784,7 +2875,16 @@ mod tests {
         workspace.absorb();
         assert!(request_rx.try_iter().any(|(_, request)| matches!(request, Request::Diff { .. })), "explicit staging invalidates even unchanged metadata");
         workspace.diff_side = Some(true);
-        response_tx.send(Response::Diff { path: "f.txt".to_owned(), files: Vec::new(), text: "stale worktree".to_owned(), staged: false, side: Some(false) }).unwrap();
+        response_tx
+            .send(Response::Diff {
+                path: "f.txt".to_owned(),
+                files: Vec::new(),
+                text: "stale worktree".to_owned(),
+                rows: Vec::new(),
+                staged: false,
+                side: Some(false),
+            })
+            .unwrap();
         workspace.absorb();
         assert!(workspace.diff_text.ends_with("+new"), "late worktree response cannot replace a selected index diff");
     }
@@ -2967,10 +3067,20 @@ mod tests {
             response_tx.send(worker_rx.recv_timeout(Duration::from_secs(20)).expect("git worker response")).unwrap();
             workspace.absorb();
         };
+        // The UI polls only once the panel has no request left in flight, which
+        // is what stops a slow repository from queueing a refresh per interval.
+        let settle = |workspace: &mut Workspace| {
+            let mut guard = 0;
+            while workspace.inflight > 0 {
+                apply_response(workspace);
+                guard += 1;
+                assert!(guard < 32, "the panel must settle, not keep chaining requests");
+            }
+        };
         workspace.poll(root.clone());
         apply_response(&mut workspace);
         if let Some(identity) = workspace.pending_identity.clone() {
-            workspace.send(Request::Approve { identity });
+            workspace.request(Request::Approve { identity });
         }
         while workspace.log.commits.is_empty() {
             apply_response(&mut workspace);
@@ -2981,11 +3091,12 @@ mod tests {
         assert!(!workspace.log.commits[0].refs.iter().any(|reference| reference == "origin/main"));
 
         workspace.busy = true;
-        workspace.send(Request::Push);
+        workspace.request(Request::Push);
         while workspace.notice.is_none() {
             apply_response(&mut workspace);
         }
         assert!(!workspace.notice.as_ref().unwrap().1, "{:?}", workspace.notice);
+        settle(&mut workspace);
         workspace.poll(root.clone());
         while workspace.status.ahead != 0 {
             apply_response(&mut workspace);
@@ -3001,11 +3112,12 @@ mod tests {
         assert!(git(&peer, &["push", "--quiet"]));
         workspace.notice = None;
         workspace.busy = true;
-        workspace.send(Request::Fetch);
+        workspace.request(Request::Fetch);
         while workspace.notice.is_none() {
             apply_response(&mut workspace);
         }
         assert!(!workspace.notice.as_ref().unwrap().1, "{:?}", workspace.notice);
+        settle(&mut workspace);
         workspace.poll(root.clone());
         while workspace.status.behind != 1 {
             apply_response(&mut workspace);
@@ -3324,6 +3436,27 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.path().join("target.txt")).unwrap(), "concurrent target");
     }
 
+    /// std::fs::write opens with create+truncate, so creating a file and then
+    /// writing an empty one silently destroyed a file another process put
+    /// there in between (a checkout, a second window, an editor). The create
+    /// must be exclusive.
+    #[test]
+    fn creating_a_file_never_truncates_one_that_appeared_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_path(root, "new.txt", false).expect("create");
+        assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "");
+
+        // Stand in for the race: the file exists by the time we ask.
+        let result = write_path(root, "new.txt", false);
+        assert_eq!(result, Err(strings::WORKSPACE_FILE_EXISTS.to_owned()));
+        assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "", "an existing file is left as it was");
+
+        std::fs::write(root.join("taken.txt"), "someone else's work").unwrap();
+        assert!(write_path(root, "taken.txt", false).is_err());
+        assert_eq!(std::fs::read_to_string(root.join("taken.txt")).unwrap(), "someone else's work", "content survives");
+    }
+
     #[test]
     fn renaming_never_overwrites_another_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -3434,6 +3567,91 @@ mod tests {
             seen,
             vec![None, None, None, None, None, Some(10), Some(11), Some(11), Some(12)],
             "context takes the new number, removals the old one"
+        );
+    }
+
+    /// A removed line whose text starts with `--` is exactly `---`, and an
+    /// added one starting with `++` is exactly `+++`. Reading those as the
+    /// file header dropped the row and shifted every number below it.
+    /// The shape `git diff` actually prints for a file holding markdown rules:
+    /// the context line ` ---` is a `---` that must not be read as a header, and
+    /// the context line ` +++` likewise. Captured from a real repository.
+    #[test]
+    fn real_git_output_numbering_survives_markdown_rules() {
+        // `concat!` rather than a `\`-continued literal: that continuation eats
+        // the leading whitespace of the next line, and here the leading space
+        // *is* the context marker under test.
+        let diff = concat!(
+            "diff --git a/notes.md b/notes.md\n",
+            "index 8b92888..3162765 100644\n",
+            "--- a/notes.md\n",
+            "+++ b/notes.md\n",
+            "@@ -1,6 +1,6 @@\n",
+            " intro\n",
+            " ---\n",
+            "-old\n",
+            "+new\n",
+            " +++\n",
+            " middle\n",
+            " footer\n",
+        );
+        let rows = text_rows(diff, true);
+        let numbered: Vec<Option<u64>> = rows.iter().map(|row| row.number).collect();
+        assert_eq!(
+            numbered,
+            vec![None, None, None, None, None, Some(1), Some(2), Some(3), Some(3), Some(4), Some(5), Some(6)],
+            "old side: intro/---/old/+++/middle/footer; context rows take the new number, the removal the old one"
+        );
+        let kinds: Vec<PatchKind> = rows.iter().map(|row| row.kind).collect();
+        assert_eq!(kinds[5], PatchKind::Context, "the ` ---` context line is not a header");
+        assert_eq!(kinds[7], PatchKind::Remove, "the removed `old` line");
+        assert_eq!(kinds[8], PatchKind::Add, "the added `new` line");
+        assert_eq!(kinds[9], PatchKind::Context, "the ` +++` context line is not a header");
+    }
+
+    #[test]
+    fn patch_numbers_keep_content_that_looks_like_a_file_header() {
+        let diff = "diff --git a/notes.md b/notes.md\n\
+                    --- a/notes.md\n\
+                    +++ b/notes.md\n\
+                    @@ -1,4 +1,5 @@\n\
+                    intro\n\
+                    ----\n\
+                    ++++\n\
+                    outro\n";
+        let rows = text_rows(diff, true);
+        let numbers: Vec<Option<u64>> = rows.iter().map(|row| row.number).collect();
+        assert_eq!(numbers, vec![None, None, None, None, Some(1), Some(2), Some(2), Some(3)]);
+        let kinds: Vec<PatchKind> = rows.iter().map(|row| row.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![PatchKind::Context, PatchKind::Context, PatchKind::Context, PatchKind::Hunk,
+                PatchKind::Context, PatchKind::Remove, PatchKind::Add, PatchKind::Context],
+            "`----` is a removal and `++++` an addition, not header text"
+        );
+    }
+
+    /// The header block of the next file must not inherit the previous hunk's
+    /// numbering, or its `---`/`+++` pair is counted as one removal and one
+    /// addition.
+    #[test]
+    fn patch_numbers_restart_at_every_file_header() {
+        let diff = "diff --git a/a.md b/a.md\n\
+                    --- a/a.md\n\
+                    +++ b/a.md\n\
+                    @@ -1,1 +1,1 @@\n\
+                    -one\n\
+                    +two\n\
+                    diff --git a/b.md b/b.md\n\
+                    --- a/b.md\n\
+                    +++ b/b.md\n\
+                    @@ -7,1 +7,1 @@\n\
+                    -three\n";
+        let numbers: Vec<Option<u64>> = text_rows(diff, true).iter().map(|row| row.number).collect();
+        assert_eq!(
+            numbers,
+            vec![None, None, None, None, Some(1), Some(1), None, None, None, None, Some(7)],
+            "the second file numbers from its own hunk header"
         );
     }
 
@@ -3644,13 +3862,13 @@ mod tests {
     fn late_commit_diff_releases_busy_without_replacing_current_file() {
         let (tx, rx) = mpsc::channel();
         let mut workspace = Workspace { busy: true, rx: Some(rx), ..Default::default() };
-        tx.send(Response::CommitDiff { hash: "old".to_owned(), path: "old.txt".to_owned(), patch: Ok("old patch".to_owned()) }).unwrap();
+        tx.send(Response::CommitDiff { hash: "old".to_owned(), path: "old.txt".to_owned(), patch: Ok(("old patch".to_owned(), Vec::new())) }).unwrap();
         workspace.absorb();
         assert!(!workspace.busy && workspace.detail.is_none());
         workspace.busy = true;
         workspace.detail = Some(("new".to_owned(), git::CommitDetail { files: Vec::new(), header: String::new() }));
         workspace.detail_file = Some(CommitFile { path: "new.txt".to_owned(), patch: None, rows: Vec::new(), wrapped: WrappedRows::default() });
-        tx.send(Response::CommitDiff { hash: "new".to_owned(), path: "old.txt".to_owned(), patch: Ok("stale patch".to_owned()) }).unwrap();
+        tx.send(Response::CommitDiff { hash: "new".to_owned(), path: "old.txt".to_owned(), patch: Ok(("stale patch".to_owned(), Vec::new())) }).unwrap();
         workspace.absorb();
         assert!(!workspace.busy);
         assert!(workspace.detail_file.as_ref().unwrap().patch.is_none());

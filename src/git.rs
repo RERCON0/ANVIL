@@ -1538,7 +1538,12 @@ pub fn trust_approved(root: &Path, stamp: &RepositoryStamp) -> bool {
 
 pub fn remember_trust(root: &Path, stamp: RepositoryStamp) {
     if let Ok(mut trusted) = TRUSTED.lock() {
-        trusted.get_or_insert_with(HashMap::new).insert(root.to_path_buf(), stamp);
+        // Same bound as the stamp cache: a long-lived window that keeps opening
+        // unrelated repositories must not grow this without limit. Clearing is
+        // the same deliberate trade-off — approvals are re-asked, never assumed.
+        let cache = trusted.get_or_insert_with(HashMap::new);
+        if cache.len() >= MAX_CACHED_ROOTS && !cache.contains_key(root) { cache.clear(); }
+        cache.insert(root.to_path_buf(), stamp);
     }
 }
 
@@ -1743,32 +1748,51 @@ pub struct CommitDetail {
 }
 
 /// Upstream ref of the current branch: the configured one, else `origin/<branch>`.
+/// A configured `branch.<name>.remote` can hold anything, so the assembled
+/// value is checked before it is used as a revision: a leading `-` would make
+/// it an option, and a control character has no place in a ref name at all.
 pub fn upstream(root: &Path) -> Option<String> {
+    let usable = |value: &str| -> Option<String> {
+        let value = value.trim();
+        (!value.is_empty() && !value.starts_with('-') && !value.chars().any(char::is_control)).then(|| value.to_owned())
+    };
     if let Ok(text) = run_git(root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]) {
-        let text = text.trim();
-        if !text.is_empty() {
-            return Some(text.to_owned());
+        if let Some(text) = usable(&text) {
+            return Some(text);
         }
     }
-    let branch = run_git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
-    let branch = branch.trim();
-    if branch.is_empty() || branch == "HEAD" {
+    let branch = usable(&run_git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?)?;
+    if branch == "HEAD" {
         return None;
     }
-    let remote = branch_remote(root, branch, false).ok()?;
+    let remote = branch_remote(root, &branch, false).ok()?;
     if remote == "." {
         return None;
     }
-    run_git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/remotes/{remote}/{branch}")]).ok()?;
+    let reference = usable(&format!("refs/remotes/{remote}/{branch}"))?;
+    run_git(root, &["rev-parse", "--verify", "--quiet", "--end-of-options", &reference]).ok()?;
     Some(format!("{remote}/{branch}"))
 }
 
-fn rev_list_set(root: &Path, args: &[&str]) -> std::collections::HashSet<String> {
+/// Commits of one section. `revs` follow `--end-of-options`, so a branch or
+/// remote name beginning with `-` is a revision, never an option. A failed
+/// `rev-list` yields no markers rather than an error: the log itself still
+/// loads, only the "new here"/"new there" chips are missing, which is the
+/// lesser failure for a user reading history.
+fn rev_list_set(root: &Path, revs: &[&str]) -> std::collections::HashSet<String> {
     let mut full: Vec<&str> = vec!["rev-list", "--max-count=200"];
-    full.extend(args.iter().copied());
-    run_git(root, &full)
-        .map(|text| text.lines().map(|line| line.trim().to_owned()).filter(|line| !line.is_empty()).collect())
-        .unwrap_or_default()
+    if revs.iter().all(|rev| *rev == "HEAD") {
+        full.extend(["--not", "--remotes"]);
+    }
+    full.push("--end-of-options");
+    full.extend(revs.iter().copied());
+    match run_git(root, &full) {
+        Ok(text) => text.lines().map(|line| line.trim().to_owned()).filter(|line| !line.is_empty()).collect(),
+        Err(e) => {
+            log::warn!("rev-list: {e}");
+            Default::default()
+        }
+    }
 }
 
 /// Recent commits of HEAD (and the upstream), marked with their section.
@@ -1781,7 +1805,7 @@ pub fn log(root: &Path) -> Result<CommitLog, String> {
             rev_list_set(root, &[&format!("{upstream}..HEAD")]),
             rev_list_set(root, &[&format!("HEAD..{upstream}")]),
         ),
-        None => (rev_list_set(root, &["HEAD", "--not", "--remotes"]), Default::default()),
+        None => (rev_list_set(root, &["HEAD"]), Default::default()),
     };
     let format = "%H\x1f%h\x1f%P\x1f%an\x1f%ct\x1f%D\x1f%s\x1e".to_owned();
     let revs: Vec<&str> = match &upstream {
@@ -1794,6 +1818,8 @@ pub fn log(root: &Path) -> Result<CommitLog, String> {
         "--topo-order".to_owned(),
         format!("--pretty=format:{format}"),
     ];
+    // Every option precedes `--end-of-options`: git rejects options after it.
+    args.push("--end-of-options".to_owned());
     args.extend(revs.iter().map(|rev| (*rev).to_owned()));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let text = run_git(root, &arg_refs)?;
@@ -1878,7 +1904,8 @@ pub fn commit_detail(root: &Path, hash: &str) -> Result<CommitDetail, String> {
         let (additions, deletions) = stats.get(&path).copied().unwrap_or((0, 0));
         files.push((status, path, additions, deletions));
     }
-    let header = run_git(root, &["show", "--no-patch", "--format=%H%n%an <%ae>%n%ci%n%s%n%b", "--end-of-options", hash]).unwrap_or_default();
+    // A failed `show` must not read as an empty commit message.
+    let header = run_git(root, &["show", "--no-patch", "--format=%H%n%an <%ae>%n%ci%n%s%n%b", "--end-of-options", hash])?;
     Ok(CommitDetail { files, header })
 }
 
@@ -1902,7 +1929,7 @@ pub fn commit_file_diff(root: &Path, hash: &str, path: &str) -> Result<String, S
 /// ends is staged exactly. No external diff or textconv drivers (a repository
 /// could point them at any program), and fixed `a/`/`b/` prefixes whatever
 /// `diff.noprefix` or `diff.mnemonicPrefix` say, since `git apply` expects them.
-pub fn diff_bytes(root: &Path, path: &str, staged: bool) -> Vec<u8> {
+pub fn diff_bytes(root: &Path, path: &str, staged: bool) -> Result<Vec<u8>, String> {
     let mut args =
         vec!["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--unified=3", "--src-prefix=a/", "--dst-prefix=b/"];
     if staged {
@@ -1910,12 +1937,12 @@ pub fn diff_bytes(root: &Path, path: &str, staged: bool) -> Vec<u8> {
     }
     args.push("--");
     args.push(path);
-    run_git_bytes(root, &args).unwrap_or_default()
+    run_git_bytes(root, &args)
 }
 
 /// The same diff as text, for display.
-pub fn diff(root: &Path, path: &str, staged: bool) -> String {
-    String::from_utf8_lossy(&diff_bytes(root, path, staged)).into_owned()
+pub fn diff(root: &Path, path: &str, staged: bool) -> Result<String, String> {
+    Ok(String::from_utf8_lossy(&diff_bytes(root, path, staged)?).into_owned())
 }
 
 /// Stages or unstages the given paths.
@@ -2348,10 +2375,15 @@ pub fn ai_commit_message(
         let prompt = fit_ai_prompt(&process, prompt, &[])?;
         process.arg(prompt.as_ref());
         let label = format!("{backend:?}");
+        // Whatever credentials the invocation carries must not survive into the
+        // panel: the native Codex path already redacts its own token, and a CLI
+        // that echoes an `Authorization` header or the key itself in stderr
+        // would otherwise show it in the Workspace panel and in the notice.
+        let secrets = ai_commit::command_secrets(&process);
         let (success, stdout, stderr) = run_bounded(process, &label, timeout, 64 * 1024, None)?;
         let output = String::from_utf8_lossy(&stdout);
         if !success {
-            let stderr = String::from_utf8_lossy(&stderr);
+            let stderr = ai_commit::redact(&String::from_utf8_lossy(&stderr), &secrets);
             return Err(if !stderr.trim().is_empty() {
                 stderr.trim().to_owned()
             } else {

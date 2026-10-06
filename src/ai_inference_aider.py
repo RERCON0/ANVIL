@@ -47,9 +47,6 @@ def generate(config, prompt, model_override=None):
     if "timeout" in config:
         import aider.models
         aider.models.request_timeout = float(config["timeout"])
-    if "verify-ssl" in config:
-        from aider.llm import litellm
-        litellm.ssl_verify = str(config["verify-ssl"]).lower() not in ("false", "0", "no")
     name = model_override or config.get("model") or try_to_select_default_model()
     if not name:
         raise RuntimeError("Aider: configure a model and its API credential before generating commits")
@@ -78,13 +75,14 @@ def generate(config, prompt, model_override=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("config")
     parser.add_argument("--model")
     parser.add_argument("--message", required=True)
     args = parser.parse_args()
     try:
-        with open(args.config, encoding="utf-8") as stream:
-            config = json.load(stream)
+        # The projected config carries API keys, so it arrives in the
+        # environment rather than as a file on disk.
+        config = json.loads(os.environ["ANVIL_AIDER_CONFIG"])
+        os.environ.pop("ANVIL_AIDER_CONFIG", None)
         # Imported provider libraries may print diagnostics; keep protocol stdout clean.
         with contextlib.redirect_stdout(sys.stderr):
             message = generate(config, args.message, args.model)

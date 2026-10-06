@@ -24,6 +24,11 @@ const MAX_CACHED_GLYPHS: usize = 16_384;
 // Coverage is 8-bit: evaluate the gamma transfer once, not per uploaded texel.
 static COVERAGE_COLORS: LazyLock<[Color32; 256]> = LazyLock::new(|| std::array::from_fn(|coverage| AlphaFromCoverage::Gamma(0.55).color_from_coverage(coverage as f32 / 255.0)));
 
+/// Ceiling on one glyph's coverage buffer. The atlas is `ATLAS` texels on a
+/// side and a glyph never exceeds it in either direction at a legal font size;
+/// this only rejects what a crafted font file could ask for.
+const MAX_ATLAS_PIXELS: u64 = (ATLAS as u64 + 64) * (ATLAS as u64 + 64);
+
 /// One of the four faces of `TermFaces`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Face {
@@ -273,6 +278,7 @@ mod dwrite {
     use std::mem::ManuallyDrop;
     use std::os::windows::ffi::OsStrExt;
 
+    use super::MAX_ATLAS_PIXELS;
     use windows::core::{Interface, Result, PCWSTR};
     use windows::Win32::Foundation::{BOOL, DWRITE_E_FILEFORMAT};
     use windows::Win32::Graphics::DirectWrite::{
@@ -411,7 +417,17 @@ mod dwrite {
                 if w <= 0 || h <= 0 {
                     return Ok(Raster::Blank);
                 }
-                let mut coverage = vec![0u8; (w * h) as usize];
+                // `w`/`h` come from the font file, and the config accepts one
+                // from disk: an unchecked product would overflow (panic in
+                // debug, a wrapped length in release, which hands
+                // CreateAlphaTexture a buffer smaller than its rectangle) or
+                // ask for a gigabyte-sized allocation from a crafted face.
+                let pixels = (w as u64).checked_mul(h as u64).filter(|pixels| *pixels <= MAX_ATLAS_PIXELS);
+                let Some(pixels) = pixels else {
+                    log::warn!("glyph atlas: refusing a {w}x{h} coverage buffer");
+                    return Ok(Raster::Blank);
+                };
+                let mut coverage = vec![0u8; pixels as usize];
                 analysis.CreateAlphaTexture(DWRITE_TEXTURE_ALIASED_1x1, &bounds, &mut coverage)?;
                 Ok(Raster::Ink(Bitmap { offset: [bounds.left, bounds.top], size: [w as usize, h as usize], coverage }))
             }

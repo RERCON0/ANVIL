@@ -347,8 +347,15 @@ pub fn snapshot_reusing<L: EventListener>(
                 let b = if line == range.end.line.0 { range.end.column.0 + 1 } else { columns };
                 (a, b)
             };
+            // Clamp both ends here, not just `b`: the paint loop below computes
+            // `b - a` as a `usize`, which underflows if `a` were ever past the
+            // grid. Today alacritty clamps its selection points to the grid, so
+            // this is the same value — it just no longer depends on that
+            // library keeping the invariant for us.
+            let a = a.clamp(0, columns);
+            let b = b.clamp(0, columns);
             if a < b {
-                selection.push((row as usize, a, b.min(columns)));
+                selection.push((row as usize, a, b));
             }
         }
     }

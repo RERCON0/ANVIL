@@ -402,14 +402,14 @@ fn detects_reads_stages_and_commits() {
     let fresh = status.changes.iter().find(|c| c.path == "fresh.txt").unwrap();
     assert!(fresh.untracked && fresh.letter() == '?');
 
-    let diff = git::diff(&root, "tracked.txt", false);
+    let diff = git::diff(&root, "tracked.txt", false).expect("diff");
     assert!(diff.contains("+two"), "diff: {diff}");
 
     git::stage(&root, &["tracked.txt".to_owned()], true).expect("stage");
     let staged = git::status(&root).expect("status");
     let tracked = staged.changes.iter().find(|c| c.path == "tracked.txt").unwrap();
     assert!(tracked.staged(), "tracked.txt must be staged");
-    assert!(!git::diff(&root, "tracked.txt", true).is_empty(), "staged diff");
+    assert!(!git::diff(&root, "tracked.txt", true).expect("staged diff").is_empty(), "staged diff");
 
     let hash = git::commit(&root, "test: stage tracked".to_owned()).expect("commit");
     assert!(!hash.is_empty());
@@ -489,20 +489,20 @@ fn stages_and_unstages_a_single_hunk() {
     lines[29] = "SECOND change".into();
     std::fs::write(dir.path().join("big.txt"), lines.join("\n") + "\n").unwrap();
 
-    let diff = git::diff(&root, "big.txt", false);
+    let diff = git::diff(&root, "big.txt", false).expect("diff");
     let files = git::parse_diff(&diff, false);
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].hunks.len(), 2, "two hunks expected: {diff}");
 
     git::apply_hunks(&root, &files[0], &[0], false).expect("stage the first hunk");
-    let staged = git::diff(&root, "big.txt", true);
+    let staged = git::diff(&root, "big.txt", true).expect("staged diff");
     assert!(staged.contains("+FIRST change"), "{staged}");
     assert!(!staged.contains("SECOND change"), "only one hunk is staged: {staged}");
 
     let staged_files = git::parse_diff(&staged, true);
     git::apply_hunks(&root, &staged_files[0], &[], true).expect("take the hunk back");
-    assert!(git::diff(&root, "big.txt", true).trim().is_empty(), "index is clean again");
-    let unstaged = git::diff(&root, "big.txt", false);
+    assert!(git::diff(&root, "big.txt", true).expect("diff").trim().is_empty(), "index is clean again");
+    let unstaged = git::diff(&root, "big.txt", false).expect("diff");
     assert!(unstaged.contains("+FIRST change") && unstaged.contains("+SECOND change"));
 }
 
@@ -560,11 +560,11 @@ fn staging_a_hunk_keeps_the_exact_bytes() {
     let changed: &[u8] = b"first\r\n\xd1\xf2\xf0\xee\xea\xe0\r\n\xcf\xf0\xe8\xe2\xe5\xf2\r\nlast\r\n";
     std::fs::write(dir.path().join("cp1251.txt"), changed).unwrap();
 
-    let files = git::parse_diff(git::diff_bytes(&root, "cp1251.txt", false), false);
+    let files = git::parse_diff(git::diff_bytes(&root, "cp1251.txt", false).unwrap(), false);
     git::apply_hunks(&root, &files[0], &[0], false).expect("stage the hunk");
     assert_eq!(output(dir.path(), &["show", ":cp1251.txt"]), changed, "the index holds the worktree bytes");
 
-    let staged = git::parse_diff(git::diff_bytes(&root, "cp1251.txt", true), true);
+    let staged = git::parse_diff(git::diff_bytes(&root, "cp1251.txt", true).unwrap(), true);
     git::apply_hunks(&root, &staged[0], &[0], true).expect("unstage the hunk");
     assert_eq!(output(dir.path(), &["show", ":cp1251.txt"]), base, "unstaging restores the committed bytes");
 }
@@ -580,7 +580,7 @@ fn hunks_of_a_cyrillic_file_name_can_be_staged() {
     run(dir.path(), &["commit", "--quiet", "-m", "add файл.txt"]);
     std::fs::write(dir.path().join("файл.txt"), "one\ntwo\n").unwrap();
 
-    let files = git::parse_diff(git::diff_bytes(&root, "файл.txt", false), false);
+    let files = git::parse_diff(git::diff_bytes(&root, "файл.txt", false).unwrap(), false);
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].path, "файл.txt");
     git::apply_hunks(&root, &files[0], &[0], false).expect("stage the hunk");
@@ -806,7 +806,7 @@ fn staging_from_an_outer_repository_uses_gits_own_root() {
     let (ok, from_sub) = attempt(&sub, &["diff", "--cached", "--name-only"]);
     assert!(ok, "{from_sub}");
     assert_eq!(from_sub.lines().collect::<Vec<_>>(), ["sub/inner.txt"]);
-    assert!(git::diff(&root, "sub/inner.txt", true).contains("+inner"));
+    assert!(git::diff(&root, "sub/inner.txt", true).expect("diff").contains("+inner"));
 }
 
 #[test]

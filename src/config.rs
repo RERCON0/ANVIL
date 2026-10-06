@@ -305,6 +305,17 @@ pub fn app_dir() -> PathBuf {
     std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")).join("anvil")
 }
 
+/// config.json is re-read on every watcher event, and either copy of it can be
+/// hand-edited into something enormous. The read itself is bounded (not just
+/// the metadata), so a huge or substituted file costs one rejected read instead
+/// of memory proportional to its size.
+const MAX_CONFIG_BYTES: usize = 2 * 1024 * 1024;
+
+fn read_config_text(path: &Path) -> io::Result<String> {
+    String::from_utf8(crate::fsutil::read_limited(path, MAX_CONFIG_BYTES)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
 impl Config {
     pub fn path() -> PathBuf {
         app_dir().join("config.json")
@@ -313,7 +324,7 @@ impl Config {
     /// Missing file: defaults. Broken file: renamed to
     /// `config.json.broken-<unix seconds>`, defaults, and a notice.
     pub fn load(path: &Path) -> LoadOutcome {
-        let text = match std::fs::read_to_string(path) {
+        let text = match read_config_text(path) {
             Ok(t) => t,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return LoadOutcome { config: Config::default(), notice: None };
@@ -343,7 +354,7 @@ impl Config {
     /// mid-write) leaves the active configuration alone and never quarantines
     /// the file; only startup treats a broken file as corruption.
     pub fn load_for_reload(path: &Path) -> Result<Config, String> {
-        let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let text = read_config_text(path).map_err(|e| e.to_string())?;
         serde_json::from_str::<Config>(&text).map(Config::sanitized).map_err(|e| e.to_string())
     }
 
@@ -444,6 +455,19 @@ mod tests {
         }
         std::fs::write(&path, r#"{"version":1,"terminal":{"scrollback":999999999999}}"#).unwrap();
         assert_eq!(Config::load(&path).config.terminal.scrollback, MAX_SCROLLBACK);
+    }
+
+    /// config.json is re-read on every watcher event, so an oversized or
+    /// substituted file must be refused rather than read into memory whole.
+    #[test]
+    fn an_oversized_config_is_refused_instead_of_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, vec![b'x'; MAX_CONFIG_BYTES + 1]).unwrap();
+        let outcome = Config::load(&path);
+        assert!(outcome.notice.is_some(), "an unreadable config is reported, not silently defaulted");
+        assert!(path.exists(), "an oversized file is not quarantined as corrupt");
+        assert!(Config::load_for_reload(&path).is_err());
     }
 
     #[test]

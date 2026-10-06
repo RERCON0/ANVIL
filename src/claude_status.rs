@@ -179,19 +179,40 @@ impl StatusRecord {
         }
     }
 
+    /// `pane_id` reaches this process through `ANVIL_PANE_ID`, which ANVIL sets
+    /// to a `u64` but any program that spawns the statusLine command controls.
+    /// Only the digits ANVIL itself emits are accepted: a separator or `..`
+    /// would otherwise make `atomic_write` (which creates the parent) place the
+    /// record outside `status_dir` and overwrite a file of the caller's
+    /// choosing. Rejecting is silent — a pane without a badge is harmless, an
+    /// arbitrary write is not.
+    fn clean_pane_id(pane_id: &str) -> Option<&str> {
+        (!pane_id.is_empty() && pane_id.len() <= 20 && pane_id.bytes().all(|byte| byte.is_ascii_digit())).then_some(pane_id)
+    }
+
     pub fn file_path(status_dir: &Path, pane_id: &str) -> std::path::PathBuf {
-        status_dir.join(format!("{pane_id}.json"))
+        status_dir.join(format!("{}.json", Self::clean_pane_id(pane_id).unwrap_or("invalid")))
     }
 
     pub fn write(&self, status_dir: &Path, pane_id: &str) -> std::io::Result<()> {
+        let Some(pane_id) = Self::clean_pane_id(pane_id) else {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "pane id is not numeric"));
+        };
         let text = serde_json::to_string(self).map_err(std::io::Error::other)?;
         atomic_write(&Self::file_path(status_dir, pane_id), text.as_bytes())
     }
 
     pub fn read(path: &Path) -> Option<StatusRecord> {
-        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+        // Bounded: this file is re-read whenever its mtime moves, so a
+        // substituted or enormous one must cost a rejected read.
+        let bytes = crate::fsutil::read_limited(path, MAX_STATUS_BYTES).ok()?;
+        serde_json::from_slice(&bytes).ok()
     }
 }
+
+/// No status line is anywhere near this; the ceiling only stops a substituted
+/// file from being read into memory whole.
+const MAX_STATUS_BYTES: usize = 64 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -256,6 +277,24 @@ mod tests {
     fn empty_and_invalid_input_print_nothing() {
         assert_eq!(line("{}"), "");
         assert!(Payload::parse("не json").is_none());
+    }
+
+    /// `ANVIL_PANE_ID` is set by ANVIL, but anything that spawns the statusLine
+    /// command controls it. `atomic_write` creates the parent directory, so an
+    /// unchecked id would place the record wherever the string pointed.
+    #[test]
+    fn a_pane_id_cannot_choose_the_path() {
+        let base = tempfile::tempdir().unwrap();
+        let status_dir = base.path().join("run");
+        let record = StatusRecord::new(&Payload { model: Some("Opus".into()), ..Payload::default() }, None, 1);
+        for hostile in ["..\\..\\escaped", "../../escaped", "..", "1/../../x", "a\\b", "with space", "", "-1", "1.json"] {
+            assert!(record.write(&status_dir, hostile).is_err(), "{hostile:?} must be refused");
+        }
+        assert!(record.write(&status_dir, "7").is_ok());
+        assert!(status_dir.join("7.json").is_file());
+        assert!(!base.path().join("escaped.json").exists(), "nothing was written outside the status directory");
+        // A hostile id never reaches the reader either: it has no file to read.
+        assert!(StatusRecord::file_path(&status_dir, "..\\..\\escaped").starts_with(&status_dir));
     }
 
     #[test]

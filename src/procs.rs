@@ -162,9 +162,11 @@ fn process_command_line(pid: u32) -> Option<String> {
     }
 }
 
-/// All processes, via a Toolhelp snapshot. Empty on failure.
+/// All processes, via a Toolhelp snapshot. `None` when the snapshot itself
+/// failed — an empty list and "could not enumerate" are different answers, and
+/// callers that decide what is dead must not read the second as the first.
 #[cfg(windows)]
-pub fn snapshot() -> Vec<ProcInfo> {
+pub fn snapshot() -> Option<Vec<ProcInfo>> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -174,7 +176,7 @@ pub fn snapshot() -> Vec<ProcInfo> {
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snap == INVALID_HANDLE_VALUE {
-            return out;
+            return None;
         }
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
@@ -193,7 +195,7 @@ pub fn snapshot() -> Vec<ProcInfo> {
         }
         CloseHandle(snap);
     }
-    out
+    Some(out)
 }
 
 #[cfg(test)]

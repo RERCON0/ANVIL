@@ -445,21 +445,36 @@ pub static BY_EXTENSION: &[(&str, char, Color32)] = &[
 
 pub const DEFAULT_FILE: (char, Color32) = ('\u{e023}', Color32::from_rgb(0xD4, 0xD7, 0xD6));
 
+/// Both tables are sorted by their lower-case key, so comparing byte by byte
+/// with ASCII case folded keeps them ordered — and lets `for_file` skip
+/// building a lower-cased copy of every name it is asked about.
 fn lookup(table: &[(&str, char, Color32)], key: &str) -> Option<(char, Color32)> {
-    table.binary_search_by(|(name, _, _)| name.cmp(&key)).ok().map(|index| (table[index].1, table[index].2))
+    let order = |left: &str, right: &str| {
+        let (left, right) = (left.as_bytes(), right.as_bytes());
+        left.iter()
+            .zip(right.iter())
+            .map(|(a, b)| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()))
+            .find(|order| *order != std::cmp::Ordering::Equal)
+            .unwrap_or_else(|| left.len().cmp(&right.len()))
+    };
+    table.binary_search_by(|(name, _, _)| order(name, key)).ok().map(|index| (table[index].1, table[index].2))
 }
 
 /// Icon and colour of one file, by full name first, then by extension.
+///
+/// Runs once per visible row per frame, so it must not allocate: the table is
+/// already sorted in lower case, which lets `eq_ignore_ascii_case` stand in
+/// for a lower-cased copy of the name.
 pub fn for_file(name: &str) -> (char, Color32) {
-    let lower = name.to_ascii_lowercase();
-    let file_name = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
+    let file_name = name.rsplit(['/', '\\']).next().unwrap_or(name);
     if let Some(icon) = lookup(BY_FILE_NAME, file_name) {
         return icon;
     }
-    let extension = file_name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
-    if !extension.is_empty() && extension != file_name {
-        if let Some(icon) = lookup(BY_EXTENSION, extension) {
-            return icon;
+    if let Some((_, extension)) = file_name.rsplit_once('.') {
+        if !extension.is_empty() && extension.len() != file_name.len() {
+            if let Some(icon) = lookup(BY_EXTENSION, extension) {
+                return icon;
+            }
         }
     }
     DEFAULT_FILE
@@ -478,6 +493,20 @@ mod tests {
         assert_ne!(docker, DEFAULT_FILE.0, "by-name lookup");
         let (unknown, colour) = for_file("notes.unknownext");
         assert_eq!((unknown, colour), DEFAULT_FILE);
+    }
+
+    /// The lookup no longer builds a lower-cased copy of the name, so mixed
+    /// case has to be resolved by the comparison itself.
+    #[test]
+    fn lookup_ignores_case_without_rewriting_the_name() {
+        assert_eq!(for_file("src/WORKSPACE.RS"), for_file("src/workspace.rs"));
+        assert_eq!(for_file("SRC/App.Rs"), for_file("src/app.rs"));
+        assert_eq!(for_file("dockerfile"), for_file("Dockerfile"));
+        assert_eq!(for_file(".gitignore"), for_file(".gitignore"));
+        assert_eq!(for_file("Makefile"), for_file("makefile"));
+        assert_eq!(for_file("README.MD"), for_file("readme.md"));
+        assert_eq!(for_file("no-extension-here"), DEFAULT_FILE);
+        assert_eq!(for_file("trailing."), DEFAULT_FILE);
     }
 
     #[test]
