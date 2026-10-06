@@ -84,6 +84,7 @@ pub enum TabAction {
     ClosePane(PaneId),
     Split(PaneId, Dir),
     ToggleMaximized(PaneId),
+    Relocate { pane: PaneId, target: Option<PaneId>, dir: Dir, after: bool },
     Collapse(PaneId),
     RestoreCollapsed(PaneId),
     Clipboard(String),
@@ -108,6 +109,8 @@ pub struct Tab {
     pub ime_area: Option<Rect>,
     /// Terminal area of every live pane as last drawn, for `pane_at`.
     pub terminal_rects: Vec<(PaneId, Rect)>,
+    /// A label drag changes only the split tree; pane entries keep running.
+    dragging_pane: Option<PaneId>,
 }
 
 impl Tab {
@@ -128,6 +131,7 @@ impl Tab {
             has_activity: false,
             ime_area: None,
             terminal_rects: Vec::new(),
+            dragging_pane: None,
         }
     }
 
@@ -267,6 +271,19 @@ impl Tab {
                 .collect(),
         };
 
+        let held = ui.is_enabled() && self.maximized.is_none() && visible.len() > 1
+            && ui.input(|i| i.focused && i.modifiers.ctrl && i.modifiers.shift && !i.modifiers.alt && !i.modifiers.mac_cmd);
+        let was_dragging = self.dragging_pane.is_some();
+        if !held || self.dragging_pane.is_some_and(|id| !self.tree.contains(id))
+            || ui.input(|i| !i.pointer.primary_down() && !i.pointer.primary_released())
+        {
+            self.dragging_pane = None;
+        }
+        let label_hovered = held && ui.input(|i| i.pointer.hover_pos())
+            .is_some_and(|pos| visible.iter().any(|(_, rect)| pane_label_rect(*rect).contains(pos)));
+        let block_pointer = was_dragging || label_hovered;
+        let builder = if block_pointer { egui::UiBuilder::new().disabled() } else { egui::UiBuilder::new() };
+        ui.scope_builder(builder, |ui| {
         for (id, pane_rect) in &visible {
             let Some(entry) = self.panes.get_mut(id) else { continue };
             let input = ViewInput {
@@ -277,7 +294,7 @@ impl Tab {
                 paste_on_middle: env.paste_on_middle,
                 copy_on_select: env.copy_on_select,
                 fallbacks_loaded: env.fallbacks_loaded,
-                window_edge: env.window_edge,
+                window_edge: env.window_edge || block_pointer,
             };
             match &mut entry.content {
                 PaneContent::Live(pane) => {
@@ -417,7 +434,63 @@ impl Tab {
                 }
             }
         }
+        });
+        if held {
+            self.show_rearrange_labels(ui, layout_rect, &visible, env.window_edge, &mut actions);
+        }
         actions
+    }
+
+    fn show_rearrange_labels(
+        &mut self,
+        ui: &mut egui::Ui,
+        area: Rect,
+        visible: &[(PaneId, Rect)],
+        window_edge: bool,
+        actions: &mut Vec<TabAction>,
+    ) {
+        let c = theme::colors();
+        for (id, rect) in visible {
+            let label = pane_label_rect(*rect);
+            egui::Area::new(ui.id().with(("pane-rearrange-label", id)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(label.min)
+                .constrain(false)
+                .movable(false)
+                .fade_in(false)
+                .show(ui.ctx(), |ui| {
+                    let (label, response) = ui.allocate_exact_size(label.size(), Sense::click_and_drag());
+                    let dragging = self.dragging_pane == Some(*id);
+                    ui.painter().rect_filled(label, 0.0, if response.hovered() || dragging { c.field } else { c.chrome_bg });
+                    ui.painter().rect_stroke(label, 0.0, egui::Stroke::new(1.0, c.accent), egui::StrokeKind::Inside);
+                    let title = self.panes.get(id).map(PaneEntry::title_text).unwrap_or_default();
+                    ui.painter_at(label.shrink(6.0)).text(
+                        label.center(), Align2::CENTER_CENTER, title, theme::field_font(12.5), c.text,
+                    );
+                    if response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                    }
+                    if !window_edge && response.drag_started_by(egui::PointerButton::Primary) {
+                        self.dragging_pane = Some(*id);
+                    }
+                    let _ = response.on_hover_text(strings::PANE_REARRANGE_HINT);
+                });
+        }
+        let Some(source) = self.dragging_pane else { return };
+        let pointer = ui.input(|i| i.pointer.interact_pos());
+        let drop = pointer.and_then(|pos| pane_drop_at(area, visible, source, pos));
+        ui.ctx().set_cursor_icon(if drop.is_some() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::NotAllowed });
+        if let Some(drop) = drop {
+            let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, ui.id().with("pane-drop-preview")));
+            painter.rect_filled(drop.preview, 0.0, c.accent.gamma_multiply(0.18));
+            painter.rect_stroke(drop.preview, 0.0, egui::Stroke::new(2.0, c.accent), egui::StrokeKind::Inside);
+        }
+        if ui.input(|i| i.pointer.primary_released()) {
+            if let Some(drop) = drop {
+                actions.push(TabAction::Relocate { pane: source, target: drop.target, dir: drop.dir, after: drop.after });
+            }
+            self.dragging_pane = None;
+        }
     }
 }
 
@@ -444,6 +517,51 @@ fn screen_tail(pane: &Pane) -> String {
     }
     let start = lines.len().saturating_sub(LINES);
     lines[start..].join("\n")
+}
+
+fn pane_label_rect(rect: Rect) -> Rect {
+    Rect::from_center_size(rect.center(), Vec2::new((rect.width() - 16.0).clamp(1.0, 240.0), rect.height().min(32.0)))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PaneDrop {
+    target: Option<PaneId>,
+    dir: Dir,
+    after: bool,
+    preview: Rect,
+}
+
+/// The outer rim targets the whole tab; elsewhere the nearest pane side wins.
+fn pane_drop_at(area: Rect, visible: &[(PaneId, Rect)], source: PaneId, pos: Pos2) -> Option<PaneDrop> {
+    if !area.contains(pos) {
+        return None;
+    }
+    let edges = [
+        (pos.x - area.left(), Dir::Row, false),
+        (area.right() - pos.x, Dir::Row, true),
+        (pos.y - area.top(), Dir::Column, false),
+        (area.bottom() - pos.y, Dir::Column, true),
+    ];
+    let &(distance, dir, after) = edges.iter().min_by(|a, b| a.0.total_cmp(&b.0))?;
+    let rim = (area.width().min(area.height()) * 0.08).min(24.0);
+    let (target, rect, dir, after) = if distance <= rim {
+        (None, area, dir, after)
+    } else {
+        let &(target, rect) = visible.iter().find(|(id, rect)| *id != source && rect.contains(pos))?;
+        let x = (pos.x - rect.left()) / rect.width();
+        let y = (pos.y - rect.top()) / rect.height();
+        let sides = [(x, Dir::Row, false), (1.0 - x, Dir::Row, true), (y, Dir::Column, false), (1.0 - y, Dir::Column, true)];
+        let &(_, dir, after) = sides.iter().min_by(|a, b| a.0.total_cmp(&b.0))?;
+        (Some(target), rect, dir, after)
+    };
+    let mut preview = rect;
+    match (dir, after) {
+        (Dir::Row, false) => preview.max.x = rect.center().x,
+        (Dir::Row, true) => preview.min.x = rect.center().x,
+        (Dir::Column, false) => preview.max.y = rect.center().y,
+        (Dir::Column, true) => preview.min.y = rect.center().y,
+    }
+    Some(PaneDrop { target, dir, after, preview })
 }
 
 fn tree_rect(rect: Rect) -> crate::layout::split_tree::Rect {
@@ -478,6 +596,37 @@ mod tests {
         let mut tree = SplitTree::new(1);
         assert!(tree.insert(1, 2, Dir::Row, true));
         Tab::new(tree, HashMap::from([(1, entry()), (2, entry())]), 1)
+    }
+
+    #[test]
+    fn drop_sides_distinguish_a_nested_pane_from_the_whole_tab() {
+        let area = Rect::from_min_size(Pos2::new(100.0, 40.0), Vec2::new(1000.0, 600.0));
+        let target = Rect::from_min_size(Pos2::new(600.0, 40.0), Vec2::new(500.0, 600.0));
+        let visible = [(1, Rect::from_min_max(area.min, Pos2::new(595.0, 640.0))), (2, target)];
+        for (pos, dir, after) in [
+            (Pos2::new(620.0, 340.0), Dir::Row, false),
+            (Pos2::new(1060.0, 340.0), Dir::Row, true),
+            (Pos2::new(850.0, 80.0), Dir::Column, false),
+            (Pos2::new(850.0, 600.0), Dir::Column, true),
+        ] {
+            let drop = pane_drop_at(area, &visible, 1, pos).unwrap();
+            assert_eq!((drop.target, drop.dir, drop.after), (Some(2), dir, after));
+            assert!(target.contains_rect(drop.preview));
+            assert_eq!(drop.preview.area(), target.area() / 2.0);
+        }
+        for (pos, dir, after) in [
+            (Pos2::new(110.0, 340.0), Dir::Row, false),
+            (Pos2::new(1090.0, 340.0), Dir::Row, true),
+            (Pos2::new(850.0, 50.0), Dir::Column, false),
+            (Pos2::new(850.0, 630.0), Dir::Column, true),
+        ] {
+            let drop = pane_drop_at(area, &visible, 1, pos).unwrap();
+            assert_eq!((drop.target, drop.dir, drop.after), (None, dir, after));
+            assert_eq!(drop.preview.area(), area.area() / 2.0);
+        }
+        for pos in [Pos2::new(350.0, 340.0), Pos2::new(598.0, 340.0), Pos2::new(99.0, 340.0)] {
+            assert!(pane_drop_at(area, &visible, 1, pos).is_none(), "self, divider and outside drops must not move a pane");
+        }
     }
 
     #[test]

@@ -40,6 +40,7 @@ pub const MENU_SPLIT_RIGHT: &str = "Сплит вправо";
 pub const MENU_SPLIT_DOWN: &str = "Сплит вниз";
 pub const MENU_CLOSE_PANE: &str = "Закрыть панель";
 pub const PANE_CLOSE: &str = "Закрыть";
+pub const PANE_REARRANGE_HINT: &str = "Удерживайте Ctrl+Shift и перетащите панель к краю другой панели или вкладки";
 pub const SPAWN_FAILED: &str = "Не удалось запустить программу профиля";
 
 /// Message shown in a pane whose process exited with a non-zero code.

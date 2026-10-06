@@ -704,6 +704,14 @@ impl AnvilApp {
             TabAction::Focus(id) => self.focus_pane(id),
             TabAction::ClosePane(id) => self.close_pane(id),
             TabAction::Split(id, dir) => self.split_pane(id, dir),
+            TabAction::Relocate { pane, target, dir, after } => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    if tab.tree.relocate(pane, target, dir, after) {
+                        self.focus_pane(pane);
+                        ctx.request_repaint();
+                    }
+                }
+            }
             TabAction::ToggleMaximized(id) => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     tab.maximized = if tab.maximized == Some(id) { None } else { Some(id) };

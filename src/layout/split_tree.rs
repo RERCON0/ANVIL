@@ -136,6 +136,33 @@ impl SplitTree {
         Some(anchor)
     }
 
+    /// Moves `id` beside `target`, or to the outer edge of the remaining tree
+    /// when `target` is `None`. Right/below is `after`, left/above is before.
+    /// The moved pane shares its target's space equally, or takes half of the
+    /// whole tab at an outer edge. Invalid and self drops leave the tree unchanged.
+    pub fn relocate(&mut self, id: PaneId, target: Option<PaneId>, dir: Dir, after: bool) -> bool {
+        if target == Some(id)
+            || !self.contains(id)
+            || matches!(self.root, Node::Leaf(_))
+            || target.is_some_and(|target| !self.contains(target))
+        {
+            return false;
+        }
+        if self.remove(id).is_none() {
+            return false;
+        }
+        if let Some(target) = target {
+            self.insert(target, id, dir, after)
+        } else {
+            let remaining = std::mem::replace(&mut self.root, Node::Leaf(id));
+            let moved = Node::Leaf(id);
+            let children =
+                if after { vec![(0.5, remaining), (0.5, moved)] } else { vec![(0.5, moved), (0.5, remaining)] };
+            self.root = Node::Split { dir, children };
+            true
+        }
+    }
+
     /// Puts a removed pane back where it was, or right of `fallback` when its
     /// old neighbour is gone.
     pub fn restore(&mut self, id: PaneId, anchor: Anchor, fallback: PaneId) -> bool {
@@ -408,6 +435,154 @@ mod tests {
     }
     fn leaf(id: PaneId) -> Node {
         Node::Leaf(id)
+    }
+
+    fn relocation_tree() -> SplitTree {
+        SplitTree::from_root(row(vec![
+            (0.4, col(vec![(0.25, leaf(1)), (0.75, leaf(2))])),
+            (0.6, col(vec![(0.5, leaf(3)), (0.5, leaf(4))])),
+        ]))
+    }
+
+    fn assert_relocation_invariants(tree: &SplitTree, expected_ids: &[PaneId]) {
+        fn check(node: &Node) {
+            if let Node::Split { children, .. } = node {
+                assert!(children.len() >= 2, "single-child splits must collapse");
+                let sum: f32 = children.iter().map(|(weight, _)| *weight).sum();
+                assert!((sum - 1.0).abs() < 1e-6, "fractions sum to {sum}");
+                for (weight, child) in children {
+                    assert!(weight.is_finite() && *weight > 0.0, "invalid fraction {weight}");
+                    check(child);
+                }
+            }
+        }
+        let mut ids = tree.panes();
+        ids.sort_unstable();
+        assert_eq!(ids, expected_ids, "each pane must occur exactly once");
+        check(tree.root());
+    }
+
+    #[test]
+    fn relocate_nested_pane_in_all_four_directions() {
+        for dir in [Dir::Row, Dir::Column] {
+            for after in [false, true] {
+                let mut tree = relocation_tree();
+                assert!(tree.relocate(1, Some(3), dir, after));
+                let target_children = match dir {
+                    Dir::Row => {
+                        let pair = if after {
+                            vec![(0.5, leaf(3)), (0.5, leaf(1))]
+                        } else {
+                            vec![(0.5, leaf(1)), (0.5, leaf(3))]
+                        };
+                        vec![(0.5, row(pair)), (0.5, leaf(4))]
+                    }
+                    Dir::Column => {
+                        if after {
+                            vec![(0.25, leaf(3)), (0.25, leaf(1)), (0.5, leaf(4))]
+                        } else {
+                            vec![(0.25, leaf(1)), (0.25, leaf(3)), (0.5, leaf(4))]
+                        }
+                    }
+                };
+                assert_eq!(tree.root(), &row(vec![(0.4, leaf(2)), (0.6, col(target_children))]));
+                assert_relocation_invariants(&tree, &[1, 2, 3, 4]);
+            }
+        }
+    }
+
+    #[test]
+    fn relocate_to_all_outer_edges_preserves_remaining_nested_layout() {
+        for dir in [Dir::Row, Dir::Column] {
+            for after in [false, true] {
+                let mut tree = relocation_tree();
+                assert!(tree.relocate(1, None, dir, after));
+                let remaining = row(vec![
+                    (0.4, leaf(2)),
+                    (0.6, col(vec![(0.5, leaf(3)), (0.5, leaf(4))])),
+                ]);
+                let children = if after {
+                    vec![(0.5, remaining), (0.5, leaf(1))]
+                } else {
+                    vec![(0.5, leaf(1)), (0.5, remaining)]
+                };
+                assert_eq!(tree.root(), &Node::Split { dir, children });
+                let moved = tree.layout(AREA, 0.0).into_iter().find(|(id, _)| *id == 1).unwrap().1;
+                let expected = match (dir, after) {
+                    (Dir::Row, false) => Rect::new(0.0, 0.0, AREA.w / 2.0, AREA.h),
+                    (Dir::Row, true) => Rect::new(AREA.w / 2.0, 0.0, AREA.w / 2.0, AREA.h),
+                    (Dir::Column, false) => Rect::new(0.0, 0.0, AREA.w, AREA.h / 2.0),
+                    (Dir::Column, true) => Rect::new(0.0, AREA.h / 2.0, AREA.w, AREA.h / 2.0),
+                };
+                assert_eq!(moved, expected, "outer edge spans the whole perpendicular axis");
+                assert_relocation_invariants(&tree, &[1, 2, 3, 4]);
+            }
+        }
+    }
+
+    #[test]
+    fn relocate_within_one_split_redistributes_only_removed_and_target_space() {
+        let mut tree = SplitTree::from_root(row(vec![
+            (0.5, leaf(1)),
+            (0.25, leaf(2)),
+            (0.25, leaf(3)),
+        ]));
+        assert!(tree.relocate(1, Some(3), Dir::Row, true));
+        assert_eq!(tree.root(), &row(vec![(0.5, leaf(2)), (0.25, leaf(3)), (0.25, leaf(1))]));
+        assert_relocation_invariants(&tree, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn relocate_rejects_invalid_sources_targets_and_self_without_mutation() {
+        for dir in [Dir::Row, Dir::Column] {
+            for after in [false, true] {
+                let mut tree = relocation_tree();
+                let before = tree.clone();
+                for (id, target) in [(99, Some(3)), (1, Some(99)), (1, Some(1)), (99, None)] {
+                    assert!(!tree.relocate(id, target, dir, after));
+                    assert_eq!(tree, before);
+                }
+                let mut single = SplitTree::new(1);
+                for (id, target) in [(1, None), (1, Some(1)), (1, Some(99)), (99, None)] {
+                    assert!(!single.relocate(id, target, dir, after));
+                    assert_eq!(single.root(), &leaf(1), "last pane is never moved or removed");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_relocation_keeps_normalized_positive_fractions_and_all_ids() {
+        let mut tree = relocation_tree();
+        for _ in 0..4 {
+            for (id, target, dir, after) in [
+                (1, Some(4), Dir::Row, false),
+                (2, None, Dir::Column, true),
+                (3, Some(1), Dir::Column, false),
+                (4, None, Dir::Row, true),
+            ] {
+                assert!(tree.relocate(id, target, dir, after));
+                assert_relocation_invariants(&tree, &[1, 2, 3, 4]);
+            }
+        }
+    }
+
+    #[test]
+    fn relocate_round_trips_after_nested_and_outer_edge_moves() {
+        for target in [Some(3), None] {
+            for dir in [Dir::Row, Dir::Column] {
+                for after in [false, true] {
+                    let mut tree = relocation_tree();
+                    assert!(tree.relocate(1, target, dir, after));
+                    let json = serde_json::to_string(tree.root()).unwrap();
+                    let back: Node = serde_json::from_str(&json).unwrap();
+                    assert_eq!(&back, tree.root());
+                    let restored = SplitTree::from_root(back);
+                    assert_eq!(restored.panes(), tree.panes());
+                    assert_relocation_invariants(&restored, &[1, 2, 3, 4]);
+                }
+            }
+        }
     }
 
     /// A hand-edited session.json with an empty split used to panic on the UI

@@ -408,6 +408,22 @@ pub fn accent_button(text: impl Into<String>) -> Button<'static> {
         .fill(Color32::TRANSPARENT)
 }
 
+/// Accent button with a fading hover tint and an immediate, stronger pressed tint.
+/// Delegating to `accent_button` keeps its sizing, hitbox and disabled semantics.
+pub fn animated_accent_button(text: impl Into<String>) -> impl egui::Widget {
+    move |ui: &mut egui::Ui| {
+        let id = ui.next_auto_id();
+        // Like egui's Button, read this pass's interaction before allocating it.
+        let response = ui.ctx().read_response(id);
+        let enabled = ui.is_enabled();
+        let hovered = enabled && response.as_ref().is_some_and(Response::hovered);
+        let pressed = enabled && response.as_ref().is_some_and(Response::is_pointer_button_down_on);
+        let hover = ui.ctx().animate_bool_with_time(id.with("accent-hover"), hovered, 0.14);
+        let opacity = if !enabled { 0.0 } else if pressed { 0.32 } else { 0.15 * hover };
+        ui.add(accent_button(text).fill(colors().accent.gamma_multiply(opacity)))
+    }
+}
+
 /// `− [value] +` stepper with ghost buttons; returns true when the value changed.
 pub fn stepper_f32(ui: &mut egui::Ui, value: &mut f32, min: f32, max: f32, step: f32) -> bool {
     let mut changed = false;

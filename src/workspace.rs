@@ -717,7 +717,7 @@ impl Workspace {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if !self.status.branch.is_empty() {
-                    if ui.add(theme::accent_button(strings::WORKSPACE_PUBLISH)).on_hover_text(strings::WORKSPACE_PUSH_HINT).clicked() {
+                    if ui.add(theme::animated_accent_button(strings::WORKSPACE_PUBLISH)).on_hover_text(strings::WORKSPACE_PUSH_HINT).clicked() {
                         self.busy = true;
                         self.request(Request::Push);
                     }
