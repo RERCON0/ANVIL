@@ -1055,16 +1055,17 @@ impl Workspace {
 
     /// Stage buttons, the change tree and (when a file is picked) its diff.
     fn change_rows(&mut self, ui: &mut egui::Ui) {
-        let selected: Vec<String> = self.selected.iter().cloned().collect();
-        let has_selection = !selected.is_empty();
+        let has_selection = !self.selected.is_empty();
         ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(has_selection, theme::ghost_button(strings::WORKSPACE_STAGE)).clicked() {
+                let paths: Vec<String> = self.selected.iter().cloned().collect();
                 self.busy = true;
-                self.request(Request::Stage { paths: selected.clone(), staged: true });
+                self.request(Request::Stage { paths, staged: true });
             }
             if ui.add_enabled(has_selection, theme::ghost_button(strings::WORKSPACE_UNSTAGE)).clicked() {
+                let paths: Vec<String> = self.selected.iter().cloned().collect();
                 self.busy = true;
-                self.request(Request::Stage { paths: selected, staged: false });
+                self.request(Request::Stage { paths, staged: false });
             }
             if ui.add(theme::ghost_button(strings::WORKSPACE_STAGE_ALL)).clicked() {
                 let paths: Vec<String> = self.status.changes.iter().filter(|c| c.unstaged()).map(|c| c.path.clone()).collect();
@@ -1092,7 +1093,7 @@ impl Workspace {
         ui.spacing_mut().item_spacing.y = 0.0;
         ScrollArea::vertical().id_salt("workspace-changes").max_height(limit).auto_shrink([false, true])
             .show_rows(ui, ROW_HEIGHT, rows.len(), |ui, visible| {
-                for row in rows[visible].iter().cloned() {
+                for row in &rows[visible] {
                     let width = ui.available_width();
                     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, ROW_HEIGHT), Sense::click());
                     let painter = ui.painter_at(rect);
@@ -1101,11 +1102,11 @@ impl Workspace {
                     }
                     match row {
                         Row::Folder { path, depth, count } => {
-                            let collapsed = self.collapsed.contains(&path);
-                            let name = display(path.rsplit('/').next().unwrap_or(&path), 40);
+                            let collapsed = self.collapsed.contains(path);
+                            let name = display(path.rsplit('/').next().unwrap_or(path), 40);
                             let caret = if collapsed { "▸" } else { "▾" };
                             painter.text(
-                                egui::Pos2::new(rect.min.x + depth as f32 * INDENT, rect.center().y),
+                                egui::Pos2::new(rect.min.x + *depth as f32 * INDENT, rect.center().y),
                                 Align2::LEFT_CENTER,
                                 format!("{caret} {name}/"),
                                 theme::font(12.0),
@@ -1120,7 +1121,7 @@ impl Workspace {
                             );
                             if response.clicked() {
                                 if collapsed {
-                                    self.collapsed.remove(&path);
+                                    self.collapsed.remove(path);
                                 } else {
                                     self.collapsed.insert(path.clone());
                                 }
@@ -1128,9 +1129,9 @@ impl Workspace {
                             }
                         }
                         Row::File { change } => {
-                            let path = change.path.clone();
-                            let depth = change.path.matches('/').count();
-                            let selected = self.selected.contains(&path);
+                            let path = &change.path;
+                            let depth = path.matches('/').count();
+                            let selected = self.selected.contains(path);
                             let box_x = rect.min.x + depth as f32 * INDENT;
                             painter.text(
                                 egui::Pos2::new(box_x, rect.center().y),
@@ -1180,7 +1181,7 @@ impl Workspace {
                                 let checkbox_hit = response.interact_pointer_pos().is_some_and(|pos| pos.x < box_x + 28.0);
                                 if checkbox_hit {
                                     if selected {
-                                        self.selected.remove(&path);
+                                        self.selected.remove(path);
                                     } else {
                                         self.selected.insert(path.clone());
                                     }
@@ -1194,7 +1195,7 @@ impl Workspace {
                                     self.diff_side = None;
                                     self.busy = true;
                                     self.diff_stamp = None;
-                                    self.request(Request::Diff { path, side: None });
+                                    self.request(Request::Diff { path: path.clone(), side: None });
                                 }
                             }
                         }
@@ -1620,19 +1621,28 @@ impl Workspace {
     }
 
     /// Flattened rows: folder headers followed by their files, honoring
-    /// `collapsed` (changes are sorted by path, so folders come in order).
+    /// `collapsed`.
+    ///
+    /// `status.changes` is sorted by full path, which interleaves directories —
+    /// `src/a.rs`, `src/deep/c.rs`, `src/z.rs` puts `src` before and after
+    /// `src/deep`. Grouping consecutive equal directories therefore drew the
+    /// `src` header twice, once per run. Ordering by directory first makes each
+    /// folder one run: one header, full count. The sort is stable, so files keep
+    /// their path order inside a folder.
     fn rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
+        let mut changes: Vec<&Change> = self.status.changes.iter().collect();
+        changes.sort_by(|a, b| a.directory().cmp(b.directory()));
         let mut index = 0;
-        while index < self.status.changes.len() {
-            let dir = self.status.changes[index].directory().to_owned();
+        while index < changes.len() {
+            let dir = changes[index].directory();
             let mut end = index;
-            while end < self.status.changes.len() && self.status.changes[end].directory() == dir {
+            while end < changes.len() && changes[end].directory() == dir {
                 end += 1;
             }
             if !dir.is_empty() {
                 let depth = dir.matches('/').count();
-                rows.push(Row::Folder { path: dir.clone(), depth, count: end - index });
+                rows.push(Row::Folder { path: dir.to_owned(), depth, count: end - index });
                 let collapsed = (0..=depth).any(|level| {
                     let prefix = dir.split('/').take(level + 1).collect::<Vec<_>>().join("/");
                     self.collapsed.contains(&prefix)
@@ -1642,8 +1652,8 @@ impl Workspace {
                     continue;
                 }
             }
-            for change in &self.status.changes[index..end] {
-                rows.push(Row::File { change: change.clone() });
+            for change in &changes[index..end] {
+                rows.push(Row::File { change: (*change).clone() });
             }
             index = end;
         }
@@ -2093,8 +2103,11 @@ fn is_table_separator(line: &str) -> bool {
         })
 }
 
-fn table_cells(line: &str) -> Vec<String> {
-    line.trim().trim_matches('|').split('|').map(|cell| cell.trim().to_owned()).collect()
+/// Borrowed slices, not owned: a table is one `String` allocation per cell
+/// otherwise, and a pathological line of `|` can be millions of cells. The
+/// caller lays each cell up immediately and keeps only the galley.
+fn table_cells(line: &str) -> Vec<&str> {
+    line.trim().trim_matches('|').split('|').map(str::trim).collect()
 }
 
 
@@ -2289,7 +2302,10 @@ fn elide_front(painter: &egui::Painter, text: &str, font: egui::FontId, max_widt
             high = mid;
         }
     }
-    let kept: String = chars[chars.len() - low..].iter().collect();
+    // `low` is the first suffix count that does NOT fit, not the last that
+    // does, so keeping `low` characters overflows `max_width` by one — the
+    // off-by-one `chrome::tabbar::elide` was fixed for.
+    let kept: String = chars[chars.len() - low.saturating_sub(1)..].iter().collect();
     format!("…{kept}")
 }
 
@@ -3197,6 +3213,46 @@ mod tests {
         assert!(dir.path().join("keep.txt").exists(), "nothing was deleted");
     }
 
+    /// Eliding must never hand back something wider than the space it was
+    /// given: the file name is drawn into whatever the elided folder leaves.
+    /// The binary search finds the first suffix count that does *not* fit, so
+    /// keeping that many characters overflows by exactly one.
+    #[test]
+    fn eliding_the_front_never_exceeds_the_given_width() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        let output = ctx.run_ui(
+            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(800.0, 600.0))), ..Default::default() },
+            |ui| {
+                let painter = ui.painter().clone();
+                let font = theme::font(11.0);
+                let measure = |value: &str| painter.layout_no_wrap(value.to_owned(), font.clone(), egui::Color32::WHITE).size().x;
+                for path in [
+                    "src/term/glyphs.rs",
+                    "a/very/deeply/nested/path/to/some/file.rs",
+                    "x.rs",
+                    "src/a.rs",
+                    "C:/Users/someone/AppData/Local/Temp/anvil/status/notes.md",
+                ] {
+                    for limit in [4.0_f32, 12.0, 30.0, 60.0, 120.0, 400.0] {
+                        let elided = elide_front(&painter, path, font.clone(), limit);
+                        let width = measure(&elided);
+                        // Either it fits, or not even the ellipsis alone does
+                        // and no shorter result exists. The binary search
+                        // returns the first count that does NOT fit, so keeping
+                        // that many characters overflows by one whole glyph.
+                        assert!(
+                            width <= limit + 0.01 || measure("…") > limit,
+                            "{path:?} at {limit}pt -> {elided:?} measures {width}pt"
+                        );
+                        assert!(elided.starts_with('…') || elided == path, "{path:?} -> {elided:?}");
+                    }
+                }
+            },
+        );
+        let _ = output;
+    }
+
     fn changed_file(path: &str) -> git::Change {
         git::Change {
             path: path.to_owned(),
@@ -3208,6 +3264,48 @@ mod tests {
             additions: 3,
             deletions: 1,
         }
+    }
+
+    /// `git status` sorts by full path, so `src/a.rs`, `src/deep/c.rs` and
+    /// `src/z.rs` arrive with `src` interrupted by `src/deep`. Grouping only
+    /// consecutive equal directories drew the `src` header twice, each with a
+    /// count of one, instead of once with three.
+    #[test]
+    fn a_folder_is_one_header_however_its_files_are_interleaved() {
+        let folders = |rows: Vec<Row>| {
+            rows.iter()
+                .filter_map(|row| match row {
+                    Row::Folder { path, count, .. } => Some(format!("{path}:{count}")),
+                    Row::File { .. } => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let interleaved = Workspace {
+            status: Status {
+                changes: vec![
+                    changed_file("src/a.rs"),
+                    changed_file("src/deep/c.rs"),
+                    changed_file("src/z.rs"),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(folders(interleaved.rows()), vec!["src:2".to_owned(), "src/deep:1".to_owned()]);
+
+        let together = Workspace {
+            status: Status {
+                changes: vec![
+                    changed_file("src/a.rs"),
+                    changed_file("src/b.rs"),
+                    changed_file("src/deep/c.rs"),
+                    changed_file("src/z.rs"),
+                ],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(folders(together.rows()), vec!["src:3".to_owned(), "src/deep:1".to_owned()]);
     }
 
     fn shape_text(shape: &egui::Shape) -> Option<String> {

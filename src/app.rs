@@ -484,7 +484,13 @@ impl AnvilApp {
                         },
                     }
                 }
-                if index != active && pane.take_output_flag() {
+                // Drain on its own line, for every pane including the active
+                // tab's. Written as `index != active && take_output_flag()` the
+                // `&&` short-circuits, so an active tab never cleared the flag
+                // and the next switch to it lit a dot for output the user had
+                // just watched being printed.
+                let produced_output = pane.take_output_flag();
+                if produced_output && index != active {
                     tab.has_activity = true;
                 }
             }

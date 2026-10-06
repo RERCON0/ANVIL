@@ -155,7 +155,7 @@ fn process_command_line(pid: u32) -> Option<String> {
         let start = storage.as_ptr() as usize;
         let pointer = string.buffer as usize;
         let end = pointer.checked_add(string.length as usize)?;
-        if string.length % 2 != 0 || pointer % 2 != 0 || pointer < start || end > start + capacity {
+        if !string.length.is_multiple_of(2) || !pointer.is_multiple_of(2) || pointer < start || end > start + capacity {
             return None;
         }
         Some(String::from_utf16_lossy(std::slice::from_raw_parts(string.buffer, string.length as usize / 2)))

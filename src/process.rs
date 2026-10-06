@@ -101,10 +101,8 @@ mod windows {
         let mut found = None;
         let mut more = unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) };
         while more != 0 {
-            if entry.th32OwnerProcessID == child.id() {
-                if found.replace(entry.th32ThreadID).is_some() {
-                    return Err(io::Error::other("suspended child has multiple threads"));
-                }
+            if entry.th32OwnerProcessID == child.id() && found.replace(entry.th32ThreadID).is_some() {
+                return Err(io::Error::other("suspended child has multiple threads"));
             }
             more = unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) };
         }
@@ -326,6 +324,10 @@ mod tests {
                 std::io::stderr().write_all(&bytes(2048)).unwrap();
                 std::io::stdout().flush().unwrap();
                 std::io::stderr().flush().unwrap();
+                // Never awaited on purpose: the point of this fixture is a
+                // descendant that outlives its parent and must be killed by the
+                // job object, not one this process reaps.
+                #[allow(clippy::zombie_processes)]
                 let descendant = helper("descendant")
                     .stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit())
                     .spawn().unwrap();

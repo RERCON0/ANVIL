@@ -108,14 +108,12 @@ fn braille_dots(ch: char, rect: Rect, ppp: f32) -> Option<impl Iterator<Item = (
     let mask = ch as u32 - 0x2800;
     let radius = ((rect.width() / 2.0).min(rect.height() / 4.0) * 0.25 * ppp * 2.0).round().max(1.0) / (2.0 * ppp);
     let positions = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (0, 3), (1, 3)];
-    Some(positions.into_iter().enumerate().filter_map(move |(bit, (col, row))| {
-        (mask & (1 << bit) != 0).then(|| {
-            let center = Pos2::new(
-                snap(rect.min.x + rect.width() * (col as f32 + 0.5) / 2.0, ppp),
-                snap(rect.min.y + rect.height() * (row as f32 + 0.5) / 4.0, ppp),
-            );
-            (center, radius)
-        })
+    Some(positions.into_iter().enumerate().filter(move |(bit, _)| mask & (1 << bit) != 0).map(move |(_, (col, row))| {
+        let center = Pos2::new(
+            snap(rect.min.x + rect.width() * (col as f32 + 0.5) / 2.0, ppp),
+            snap(rect.min.y + rect.height() * (row as f32 + 0.5) / 4.0, ppp),
+        );
+        (center, radius)
     }))
 }
 
