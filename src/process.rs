@@ -37,13 +37,12 @@ mod windows {
         CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
     };
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-        JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Pipes::{
-        CreateNamedPipeW, GetNamedPipeClientProcessId, PeekNamedPipe, PIPE_NOWAIT,
-        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+        CreateNamedPipeW, GetNamedPipeClientProcessId, PeekNamedPipe, PIPE_NOWAIT, PIPE_REJECT_REMOTE_CLIENTS,
+        PIPE_TYPE_BYTE,
     };
     use windows_sys::Win32::System::Threading::{
         OpenThread, ResumeThread, CREATE_NO_WINDOW, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME,
@@ -68,10 +67,13 @@ mod windows {
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if unsafe {
             SetInformationJobObject(
-                job.as_raw_handle(), JobObjectExtendedLimitInformation,
-                &limits as *const _ as *const _, std::mem::size_of_val(&limits) as u32,
+                job.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const _,
+                std::mem::size_of_val(&limits) as u32,
             )
-        } == 0 {
+        } == 0
+        {
             return Err(io::Error::last_os_error());
         }
         Ok(job)
@@ -131,16 +133,20 @@ mod windows {
                 .collect();
         let writer = owned(unsafe {
             CreateNamedPipeW(
-                name.as_ptr(), PIPE_ACCESS_OUTBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                name.as_ptr(),
+                PIPE_ACCESS_OUTBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
                 PIPE_TYPE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
-                1, CHUNK as u32, 0, 0, null(),
+                1,
+                CHUNK as u32,
+                0,
+                0,
+                null(),
             )
         })?;
         // CreateFile connects this client without a blocking ConnectNamedPipe.
         // The child receives a normal, blocking read handle via std::Command.
-        let reader = owned(unsafe {
-            CreateFileW(name.as_ptr(), GENERIC_READ, 0, null(), OPEN_EXISTING, 0, null_mut())
-        })?;
+        let reader =
+            owned(unsafe { CreateFileW(name.as_ptr(), GENERIC_READ, 0, null(), OPEN_EXISTING, 0, null_mut()) })?;
         let mut pid = 0;
         if unsafe { GetNamedPipeClientProcessId(writer.as_raw_handle(), &mut pid) } == 0 {
             return Err(io::Error::last_os_error());
@@ -164,13 +170,14 @@ mod windows {
         chunk: &mut [u8; CHUNK],
     ) -> io::Result<usize> {
         let mut available = 0;
-        if unsafe {
-            PeekNamedPipe(stream.as_raw_handle(), null_mut(), 0, null_mut(), &mut available, null_mut())
-        } == 0 {
+        if unsafe { PeekNamedPipe(stream.as_raw_handle(), null_mut(), 0, null_mut(), &mut available, null_mut()) } == 0
+        {
             let error = io::Error::last_os_error();
             return if broken(&error) { Ok(0) } else { Err(error) };
         }
-        if available == 0 { return Ok(0); }
+        if available == 0 {
+            return Ok(0);
+        }
         let size = (available as usize).min(CHUNK);
         let count = stream.read(&mut chunk[..size])?;
         let keep = count.min(max_bytes - output.len());
@@ -205,7 +212,9 @@ mod windows {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         // Keep Command's native argument quoting, cwd and environment handling.
         command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
-        if started.elapsed() >= timeout { return Err(expired()); }
+        if started.elapsed() >= timeout {
+            return Err(expired());
+        }
         let child = command.spawn().map_err(error)?;
         let mut invocation = Invocation { child, job: Some(job) };
         if unsafe {
@@ -213,10 +222,13 @@ mod windows {
                 invocation.job.as_ref().expect("owned job").as_raw_handle(),
                 invocation.child.as_raw_handle(),
             )
-        } == 0 {
+        } == 0
+        {
             return Err(error(io::Error::last_os_error()));
         }
-        if started.elapsed() >= timeout { return Err(expired()); }
+        if started.elapsed() >= timeout {
+            return Err(expired());
+        }
         resume(&invocation.child).map_err(error)?;
         let mut stdout = invocation.child.stdout.take().expect("piped stdout");
         let mut stderr = invocation.child.stderr.take().expect("piped stderr");
@@ -226,7 +238,9 @@ mod windows {
         let mut sent = 0;
         let mut status = None;
         loop {
-            if started.elapsed() >= timeout { return Err(expired()); }
+            if started.elapsed() >= timeout {
+                return Err(expired());
+            }
             if status.is_none() {
                 status = invocation.child.try_wait().map_err(error)?;
                 if status.is_some() {
@@ -237,9 +251,13 @@ mod windows {
                 }
             }
             let read_out = drain(&mut stdout, &mut out, max_bytes, &mut chunk).map_err(error)?;
-            if started.elapsed() >= timeout { return Err(expired()); }
+            if started.elapsed() >= timeout {
+                return Err(expired());
+            }
             let read_err = drain(&mut stderr, &mut err, max_bytes, &mut chunk).map_err(error)?;
-            if started.elapsed() >= timeout { return Err(expired()); }
+            if started.elapsed() >= timeout {
+                return Err(expired());
+            }
             if let Some(status) = status {
                 if read_out == 0 && read_err == 0 {
                     return Ok((status.success(), out, err));
@@ -252,12 +270,17 @@ mod windows {
                     // PIPE_NOWAIT byte writes can be partial or zero; never
                     // write_all, never discard an unwritten suffix.
                     match pipe.write(&bytes[sent..end]) {
-                        Ok(count) => { sent += count; written = count; }
+                        Ok(count) => {
+                            sent += count;
+                            written = count;
+                        }
                         Err(e) if broken(&e) => writer = None,
                         Err(e) => return Err(error(e)),
                     }
                 }
-                if sent == bytes.len() { writer = None; } // EOF, including empty input
+                if sent == bytes.len() {
+                    writer = None;
+                } // EOF, including empty input
             }
             if read_out == 0 && read_err == 0 && written == 0 {
                 std::thread::sleep(POLL.min(timeout.saturating_sub(started.elapsed())));
@@ -280,8 +303,7 @@ mod tests {
         CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
     };
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, GetProcessHandleCount, OpenProcess, WaitForSingleObject,
-        PROCESS_SYNCHRONIZE,
+        GetCurrentProcess, GetProcessHandleCount, OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
     };
 
     const MODE: &str = "ANVIL_BOUNDED_TEST_MODE";
@@ -303,7 +325,9 @@ mod tests {
 
     #[test]
     fn helper_process() {
-        let Ok(mode) = std::env::var(MODE) else { return; };
+        let Ok(mode) = std::env::var(MODE) else {
+            return;
+        };
         match mode.as_str() {
             "duplex" => {
                 // Both output pipes fill before any stdin is read.
@@ -315,7 +339,9 @@ mod tests {
                 assert_eq!(input, bytes(1024 * 1024));
                 std::process::exit(0);
             }
-            "descendant" => loop { std::thread::sleep(Duration::from_secs(60)); },
+            "descendant" => loop {
+                std::thread::sleep(Duration::from_secs(60));
+            },
             "tree-success" | "tree-timeout" => {
                 // All three pipes are inherited; the descendant never reads or
                 // closes them, even after its direct parent has exited.
@@ -329,14 +355,24 @@ mod tests {
                 // job object, not one this process reaps.
                 #[allow(clippy::zombie_processes)]
                 let descendant = helper("descendant")
-                    .stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit())
-                    .spawn().unwrap();
+                    .stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .unwrap();
                 fs::write(std::env::var_os(PID_FILE).unwrap(), descendant.id().to_string()).unwrap();
-                if mode == "tree-success" { std::process::exit(0); }
-                loop { std::thread::sleep(Duration::from_secs(60)); }
+                if mode == "tree-success" {
+                    std::process::exit(0);
+                }
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
             }
             "context" => {
-                assert_eq!(std::env::current_dir().unwrap(), PathBuf::from(std::env::var_os("ANVIL_TEST_CWD").unwrap()));
+                assert_eq!(
+                    std::env::current_dir().unwrap(),
+                    PathBuf::from(std::env::var_os("ANVIL_TEST_CWD").unwrap())
+                );
                 assert_eq!(std::env::var("ANVIL_TEST_VALUE").unwrap(), "spaces \"quotes\" Юникод");
                 assert!(std::env::var_os("ANVIL_TEST_REMOVED").is_none());
                 std::io::stdout().write_all(MARKER).unwrap();
@@ -348,7 +384,9 @@ mod tests {
 
     struct Scratch(PathBuf);
     impl Drop for Scratch {
-        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     fn resources() -> (u32, usize) {
@@ -362,7 +400,9 @@ mod tests {
         let mut count = 0;
         let mut more = unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) };
         while more != 0 {
-            if entry.th32OwnerProcessID == std::process::id() { count += 1; }
+            if entry.th32OwnerProcessID == std::process::id() {
+                count += 1;
+            }
             more = unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) };
         }
         (handles, count)
@@ -397,7 +437,9 @@ mod tests {
             assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(87));
         } else {
             let status = unsafe { WaitForSingleObject(raw, 1000) };
-            unsafe { CloseHandle(raw); }
+            unsafe {
+                CloseHandle(raw);
+            }
             assert_eq!(status, WAIT_OBJECT_0, "descendant {pid} survived invocation");
         }
         true
@@ -422,18 +464,19 @@ mod tests {
         // through both pipes plus a megabyte in has no business finishing inside
         // a deadline a loaded machine can stretch, so give it room.
         let roomy = Duration::from_secs(20);
-        let (success, out, err) = run_bounded(
-            helper("duplex"), "own duplex helper", roomy, 4096,
-            Some(bytes(1024 * 1024)),
-        ).unwrap();
+        let (success, out, err) =
+            run_bounded(helper("duplex"), "own duplex helper", roomy, 4096, Some(bytes(1024 * 1024))).unwrap();
         assert!(success, "{}", String::from_utf8_lossy(&err));
         assert_eq!(out.len(), 4096);
         assert_eq!(err, bytes(4096));
         assert_eq!(raw_stdout(&out), &bytes(4096)[..raw_stdout(&out).len()]);
 
         let mut context = helper("context");
-        context.current_dir(&scratch.0).env("ANVIL_TEST_CWD", &scratch.0)
-            .env("ANVIL_TEST_VALUE", "spaces \"quotes\" Юникод").env_remove("ANVIL_TEST_REMOVED");
+        context
+            .current_dir(&scratch.0)
+            .env("ANVIL_TEST_CWD", &scratch.0)
+            .env("ANVIL_TEST_VALUE", "spaces \"quotes\" Юникод")
+            .env_remove("ANVIL_TEST_REMOVED");
         assert!(run_bounded(context, "own context helper", roomy, 4096, Some(Vec::new())).unwrap().0);
 
         let before = resources();
@@ -459,10 +502,8 @@ mod tests {
             let mut command = helper("tree-success");
             command.env(PID_FILE, &pid_path);
             let start = Instant::now();
-            let (success, out, err) = run_bounded(
-                command, "own success tree", tree_deadline, 4096,
-                Some(bytes(1024 * 1024)),
-            ).unwrap();
+            let (success, out, err) =
+                run_bounded(command, "own success tree", tree_deadline, 4096, Some(bytes(1024 * 1024))).unwrap();
             assert!(success);
             fastest_tree = fastest_tree.min(start.elapsed());
             assert!(raw_stdout(&out).starts_with(&bytes(2048)));
@@ -473,10 +514,7 @@ mod tests {
             let mut command = helper("tree-timeout");
             command.env(PID_FILE, &pid_path);
             let start = Instant::now();
-            let result = run_bounded(
-                command, "own timed-out tree", deadline, 4096,
-                Some(bytes(1024 * 1024)),
-            );
+            let result = run_bounded(command, "own timed-out tree", deadline, 4096, Some(bytes(1024 * 1024)));
             assert!(result.unwrap_err().contains("не ответил"));
             fastest_timeout = fastest_timeout.min(start.elapsed());
             checked += usize::from(assert_descendant_dead(&pid_path));
@@ -490,13 +528,13 @@ mod tests {
         assert!(after.0 <= before.0 + 2, "handles grew: {before:?} -> {after:?}");
         assert!(after.1 <= before.1, "pipe threads survived: {before:?} -> {after:?}");
 
-        assert!(run_bounded(
-            helper("duplex"), "zero deadline", Duration::ZERO, 0, None,
-        ).unwrap_err().contains("не ответил"));
+        assert!(run_bounded(helper("duplex"), "zero deadline", Duration::ZERO, 0, None,)
+            .unwrap_err()
+            .contains("не ответил"));
         // Empty caps still drain, rather than blocking a chatty child.
-        assert_eq!(run_bounded(
-            helper("duplex"), "zero cap", roomy, 0,
-            Some(bytes(1024 * 1024)),
-        ).unwrap(), (true, Vec::new(), Vec::new()));
+        assert_eq!(
+            run_bounded(helper("duplex"), "zero cap", roomy, 0, Some(bytes(1024 * 1024)),).unwrap(),
+            (true, Vec::new(), Vec::new())
+        );
     }
 }

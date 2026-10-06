@@ -40,9 +40,8 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(dir) = target.parent() {
         fs::create_dir_all(dir)?;
     }
-    let name = target
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
+    let name =
+        target.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let tag = COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut tmp_name = name.to_os_string();
@@ -67,13 +66,15 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// atomic replace does not turn the link into a regular file.
 fn resolve_link(path: &Path) -> PathBuf {
     match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => fs::read_link(path).map(|target| {
-            if target.is_absolute() {
-                target
-            } else {
-                path.parent().map(|dir| dir.join(&target)).unwrap_or(target)
-            }
-        }).unwrap_or_else(|_| path.to_path_buf()),
+        Ok(meta) if meta.file_type().is_symlink() => fs::read_link(path)
+            .map(|target| {
+                if target.is_absolute() {
+                    target
+                } else {
+                    path.parent().map(|dir| dir.join(&target)).unwrap_or(target)
+                }
+            })
+            .unwrap_or_else(|_| path.to_path_buf()),
         _ => path.to_path_buf(),
     }
 }
@@ -99,18 +100,15 @@ mod recycling {
     use std::cell::Cell;
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Component, Path, Prefix};
-    use windows::core::{implement, ComObject, HRESULT, IUnknownImpl, PCWSTR};
+    use windows::core::{implement, ComObject, IUnknownImpl, HRESULT, PCWSTR};
     use windows::Win32::Foundation::{E_ABORT, E_NOTIMPL, S_OK};
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-        COINIT_APARTMENTTHREADED,
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
     };
     use windows::Win32::UI::Shell::{
-        FileOperation, IFileOperation, IFileOperationProgressSink,
-        IFileOperationProgressSink_Impl, IShellItem, SHCreateItemFromParsingName,
-        FOFX_ADDUNDORECORD, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE,
-        FOF_NOERRORUI, FOF_NOCONFIRMATION, FOF_NO_CONNECTED_ELEMENTS, FOF_SILENT,
-        TSF_DELETE_RECYCLE_IF_POSSIBLE,
+        FileOperation, IFileOperation, IFileOperationProgressSink, IFileOperationProgressSink_Impl, IShellItem,
+        SHCreateItemFromParsingName, FOFX_ADDUNDORECORD, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE, FOF_NOCONFIRMATION,
+        FOF_NOERRORUI, FOF_NO_CONNECTED_ELEMENTS, FOF_SILENT, TSF_DELETE_RECYCLE_IF_POSSIBLE,
     };
 
     struct Apartment;
@@ -127,11 +125,8 @@ mod recycling {
     /// E_INVALIDARG. Windows file names cannot contain `/`, so the mapping is
     /// lossless and callers may keep using either separator.
     pub(super) fn shell_path(path: &Path) -> Vec<u16> {
-        let mut wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .map(|unit| if unit == b'/' as u16 { b'\\' as u16 } else { unit })
-            .collect();
+        let mut wide: Vec<u16> =
+            path.as_os_str().encode_wide().map(|unit| if unit == b'/' as u16 { b'\\' as u16 } else { unit }).collect();
         wide.push(0);
         wide
     }
@@ -167,7 +162,8 @@ mod recycling {
             _ => false,
         });
         if !local_disk || path.file_name().is_none() || stream {
-            return Err("Recycle Bin supports local files and directories, not roots, network/device paths or streams".to_owned());
+            return Err("Recycle Bin supports local files and directories, not roots, network/device paths or streams"
+                .to_owned());
         }
         // Only accept existing filesystem items, not arbitrary Shell namespace names.
         std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
@@ -184,20 +180,20 @@ mod recycling {
         let result = (|| -> windows::core::Result<()> {
             // SAFETY: COM is initialized on this thread, wide is NUL-terminated
             // and lives through parsing; generated bindings own interface lifetimes.
-            let operation: IFileOperation =
-                unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER) }?;
+            let operation: IFileOperation = unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER) }?;
             unsafe {
                 operation.SetOperationFlags(
-                    FOFX_RECYCLEONDELETE | FOFX_ADDUNDORECORD | FOF_NOERRORUI | FOF_NOCONFIRMATION
-                        | FOFX_EARLYFAILURE | FOF_SILENT | FOF_NO_CONNECTED_ELEMENTS,
+                    FOFX_RECYCLEONDELETE
+                        | FOFX_ADDUNDORECORD
+                        | FOF_NOERRORUI
+                        | FOF_NOCONFIRMATION
+                        | FOFX_EARLYFAILURE
+                        | FOF_SILENT
+                        | FOF_NO_CONNECTED_ELEMENTS,
                 )?;
             }
-            let item: IShellItem =
-                unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None) }?;
-            let guard = ComObject::new(RecycleGuard {
-                refused: Cell::new(false),
-                deleted: Cell::new(None),
-            });
+            let item: IShellItem = unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None) }?;
+            let guard = ComObject::new(RecycleGuard { refused: Cell::new(false), deleted: Cell::new(None) });
             let sink: IFileOperationProgressSink = guard.to_interface();
             // Advise covers every item, including any Shell fallback operation.
             let cookie = unsafe { operation.Advise(&sink) }?;
@@ -249,7 +245,13 @@ mod recycling {
             }
         }
 
-        fn PostDeleteItem(&self, _: u32, _: Option<&IShellItem>, result: HRESULT, recycled: Option<&IShellItem>) -> windows::core::Result<()> {
+        fn PostDeleteItem(
+            &self,
+            _: u32,
+            _: Option<&IShellItem>,
+            result: HRESULT,
+            recycled: Option<&IShellItem>,
+        ) -> windows::core::Result<()> {
             // A successful PerformOperations can still mean skipped/cancelled.
             // PostDeleteItem supplies the actual item HRESULT and a non-null
             // Recycle Bin item only for recycling, not permanent deletion.
@@ -266,25 +268,69 @@ mod recycling {
         fn PreRenameItem(&self, _: u32, _: Option<&IShellItem>, _: &PCWSTR) -> windows::core::Result<()> {
             Err(E_NOTIMPL.into())
         }
-        fn PostRenameItem(&self, _: u32, _: Option<&IShellItem>, _: &PCWSTR, _: HRESULT, _: Option<&IShellItem>) -> windows::core::Result<()> {
+        fn PostRenameItem(
+            &self,
+            _: u32,
+            _: Option<&IShellItem>,
+            _: &PCWSTR,
+            _: HRESULT,
+            _: Option<&IShellItem>,
+        ) -> windows::core::Result<()> {
             Err(E_NOTIMPL.into())
         }
-        fn PreMoveItem(&self, _: u32, _: Option<&IShellItem>, _: Option<&IShellItem>, _: &PCWSTR) -> windows::core::Result<()> {
+        fn PreMoveItem(
+            &self,
+            _: u32,
+            _: Option<&IShellItem>,
+            _: Option<&IShellItem>,
+            _: &PCWSTR,
+        ) -> windows::core::Result<()> {
             Err(E_NOTIMPL.into())
         }
-        fn PostMoveItem(&self, _: u32, _: Option<&IShellItem>, _: Option<&IShellItem>, _: &PCWSTR, _: HRESULT, _: Option<&IShellItem>) -> windows::core::Result<()> {
+        fn PostMoveItem(
+            &self,
+            _: u32,
+            _: Option<&IShellItem>,
+            _: Option<&IShellItem>,
+            _: &PCWSTR,
+            _: HRESULT,
+            _: Option<&IShellItem>,
+        ) -> windows::core::Result<()> {
             Err(E_NOTIMPL.into())
         }
-        fn PreCopyItem(&self, _: u32, _: Option<&IShellItem>, _: Option<&IShellItem>, _: &PCWSTR) -> windows::core::Result<()> {
+        fn PreCopyItem(
+            &self,
+            _: u32,
+            _: Option<&IShellItem>,
+            _: Option<&IShellItem>,
+            _: &PCWSTR,
+        ) -> windows::core::Result<()> {
             Err(E_NOTIMPL.into())
         }
-        fn PostCopyItem(&self, _: u32, _: Option<&IShellItem>, _: Option<&IShellItem>, _: &PCWSTR, _: HRESULT, _: Option<&IShellItem>) -> windows::core::Result<()> {
+        fn PostCopyItem(
+            &self,
+            _: u32,
+            _: Option<&IShellItem>,
+            _: Option<&IShellItem>,
+            _: &PCWSTR,
+            _: HRESULT,
+            _: Option<&IShellItem>,
+        ) -> windows::core::Result<()> {
             Err(E_NOTIMPL.into())
         }
         fn PreNewItem(&self, _: u32, _: Option<&IShellItem>, _: &PCWSTR) -> windows::core::Result<()> {
             Err(E_NOTIMPL.into())
         }
-        fn PostNewItem(&self, _: u32, _: Option<&IShellItem>, _: &PCWSTR, _: &PCWSTR, _: u32, _: HRESULT, _: Option<&IShellItem>) -> windows::core::Result<()> {
+        fn PostNewItem(
+            &self,
+            _: u32,
+            _: Option<&IShellItem>,
+            _: &PCWSTR,
+            _: &PCWSTR,
+            _: u32,
+            _: HRESULT,
+            _: Option<&IShellItem>,
+        ) -> windows::core::Result<()> {
             Err(E_NOTIMPL.into())
         }
         fn UpdateProgress(&self, _: u32, _: u32) -> windows::core::Result<()> {
@@ -314,7 +360,10 @@ mod tests {
         // The SDK puts the recycle flag in bit 7; the sink vetoes without it.
         assert_eq!(TSF_DELETE_RECYCLE_IF_POSSIBLE.0, 0x80);
         // Recycling comes back as a copy-engine success code, not S_OK.
-        assert_eq!(super::recycling::delete_outcome(windows::core::HRESULT(0x0027_0008), true), windows::core::HRESULT(0));
+        assert_eq!(
+            super::recycling::delete_outcome(windows::core::HRESULT(0x0027_0008), true),
+            windows::core::HRESULT(0)
+        );
         // A permanent delete reports success without a Recycle Bin item.
         assert_eq!(super::recycling::delete_outcome(windows::core::HRESULT(0), false), E_ABORT);
         // A real failure keeps its own code.
@@ -353,9 +402,7 @@ mod tests {
         // A fresh MTA thread deterministically fails before invoking the Shell,
         // independently of the user's Recycle Bin settings.
         std::thread::spawn(|| {
-            use windows::Win32::System::Com::{
-                CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED,
-            };
+            use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
             struct Apartment;
             impl Drop for Apartment {
                 fn drop(&mut self) {
@@ -371,7 +418,9 @@ mod tests {
             fs::write(&file, b"complete contents").unwrap();
             assert!(recycle_path(&folder).is_err());
             assert_eq!(fs::read(file).unwrap(), b"complete contents");
-        }).join().unwrap();
+        })
+        .join()
+        .unwrap();
     }
 
     #[cfg(not(windows))]

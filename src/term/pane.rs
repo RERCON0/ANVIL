@@ -240,7 +240,17 @@ impl Pane {
         // The thread ends by itself after Msg::Shutdown or when the process exits.
         let _ = event_loop.spawn();
 
-        Ok(Pane { id: opts.pane_id, term, cwd, shell_pid, notifier: Notifier(sender), events, shared, size, config: Mutex::new(config) })
+        Ok(Pane {
+            id: opts.pane_id,
+            term,
+            cwd,
+            shell_pid,
+            notifier: Notifier(sender),
+            events,
+            shared,
+            size,
+            config: Mutex::new(config),
+        })
     }
 
     pub fn write(&self, bytes: Vec<u8>) {
@@ -258,7 +268,8 @@ impl Pane {
             cell_height: cell_height.max(1),
         };
         let same = |a: WindowSize, b: WindowSize| {
-            (a.num_lines, a.num_cols, a.cell_width, a.cell_height) == (b.num_lines, b.num_cols, b.cell_width, b.cell_height)
+            (a.num_lines, a.num_cols, a.cell_width, a.cell_height)
+                == (b.num_lines, b.num_cols, b.cell_width, b.cell_height)
         };
         if same(size, self.size) {
             return;
@@ -328,7 +339,6 @@ impl Drop for Pane {
     }
 }
 
-
 /// Longest window title kept from a program.
 pub const MAX_TITLE_CHARS: usize = 256;
 
@@ -342,7 +352,11 @@ pub fn clip_title(title: String) -> String {
 }
 
 fn osc52_policy(allowed: bool) -> Osc52 {
-    if allowed { Osc52::OnlyCopy } else { Osc52::Disabled }
+    if allowed {
+        Osc52::OnlyCopy
+    } else {
+        Osc52::Disabled
+    }
 }
 
 #[cfg(test)]

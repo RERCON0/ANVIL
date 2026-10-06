@@ -70,7 +70,9 @@ pub struct ScanPty {
 
 impl ScanPty {
     pub fn new(pty: tty::Pty, cwd: Arc<Mutex<Option<PathBuf>>>) -> ScanPty {
-        ScanPty { reader: ScanningReader { pty, scanner: OscScanner::new(), guard: OscGuard::default(), cwd, poll: None } }
+        ScanPty {
+            reader: ScanningReader { pty, scanner: OscScanner::new(), guard: OscGuard::default(), cwd, poll: None },
+        }
     }
 }
 

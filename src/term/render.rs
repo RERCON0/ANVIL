@@ -60,7 +60,12 @@ pub fn cell_metrics(ctx: &egui::Context, fonts: &TermFonts) -> CellMetrics {
     let aligned = line.is_finite() && (line.height() - row).abs() <= row * 0.15;
     let round = |points: f32| (points * ppp).round() / ppp;
     let offset_y = if aligned { round(-ink_top) } else { 0.0 };
-    CellMetrics { width: snap_to_pixels(advance, ppp), height: snap_to_pixels(row, ppp), offset_y, baseline: offset_y + ascent }
+    CellMetrics {
+        width: snap_to_pixels(advance, ppp),
+        height: snap_to_pixels(row, ppp),
+        offset_y,
+        baseline: offset_y + ascent,
+    }
 }
 
 /// Longest OSC 8 target treated as a link. Real URLs are far shorter; a
@@ -68,7 +73,9 @@ pub fn cell_metrics(ctx: &egui::Context, fonts: &TermFonts) -> CellMetrics {
 pub const MAX_LINK_URI: usize = 2048;
 
 /// `link` when its target is short enough to act on.
-pub fn usable_link(link: alacritty_terminal::term::cell::Hyperlink) -> Option<alacritty_terminal::term::cell::Hyperlink> {
+pub fn usable_link(
+    link: alacritty_terminal::term::cell::Hyperlink,
+) -> Option<alacritty_terminal::term::cell::Hyperlink> {
     (link.uri().len() <= MAX_LINK_URI).then_some(link)
 }
 
@@ -108,13 +115,15 @@ fn braille_dots(ch: char, rect: Rect, ppp: f32) -> Option<impl Iterator<Item = (
     let mask = ch as u32 - 0x2800;
     let radius = ((rect.width() / 2.0).min(rect.height() / 4.0) * 0.25 * ppp * 2.0).round().max(1.0) / (2.0 * ppp);
     let positions = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (0, 3), (1, 3)];
-    Some(positions.into_iter().enumerate().filter(move |(bit, _)| mask & (1 << bit) != 0).map(move |(_, (col, row))| {
-        let center = Pos2::new(
-            snap(rect.min.x + rect.width() * (col as f32 + 0.5) / 2.0, ppp),
-            snap(rect.min.y + rect.height() * (row as f32 + 0.5) / 4.0, ppp),
-        );
-        (center, radius)
-    }))
+    Some(positions.into_iter().enumerate().filter(move |(bit, _)| mask & (1 << bit) != 0).map(
+        move |(_, (col, row))| {
+            let center = Pos2::new(
+                snap(rect.min.x + rect.width() * (col as f32 + 0.5) / 2.0, ppp),
+                snap(rect.min.y + rect.height() * (row as f32 + 0.5) / 4.0, ppp),
+            );
+            (center, radius)
+        },
+    ))
 }
 
 fn paint_braille(painter: &Painter, ch: char, rect: Rect, color: Color32) -> bool {
@@ -184,35 +193,53 @@ pub fn block_fills(ch: char, rect: Rect, color: Color32, fills: &mut CellFills) 
     let (hx, hy) = (w / 2.0, h / 2.0);
     let (ex, ey) = (w / 8.0, h / 8.0);
     match ch {
-        '\u{2580}' => fill(0.0, 0.0, w, hy),                       // ▀
-        '\u{2581}' => fill(0.0, h - ey, w, ey),                    // ▁
-        '\u{2582}' => fill(0.0, h - 2.0 * ey, w, 2.0 * ey),        // ▂
-        '\u{2583}' => fill(0.0, h - 3.0 * ey, w, 3.0 * ey),        // ▃
-        '\u{2584}' => fill(0.0, hy, w, hy),                        // ▄
-        '\u{2585}' => fill(0.0, h - 5.0 * ey, w, 5.0 * ey),        // ▅
-        '\u{2586}' => fill(0.0, h - 6.0 * ey, w, 6.0 * ey),        // ▆
-        '\u{2587}' => fill(0.0, h - 7.0 * ey, w, 7.0 * ey),        // ▇
-        '\u{2588}' => fill(0.0, 0.0, w, h),                        // █
-        '\u{2589}' => fill(0.0, 0.0, 7.0 * ex, h),                 // ▉
-        '\u{258A}' => fill(0.0, 0.0, 6.0 * ex, h),                 // ▊
-        '\u{258B}' => fill(0.0, 0.0, 5.0 * ex, h),                 // ▋
-        '\u{258C}' => fill(0.0, 0.0, hx, h),                       // ▌
-        '\u{258D}' => fill(0.0, 0.0, 3.0 * ex, h),                 // ▍
-        '\u{258E}' => fill(0.0, 0.0, 2.0 * ex, h),                 // ▎
-        '\u{258F}' => fill(0.0, 0.0, ex, h),                       // ▏
-        '\u{2590}' => fill(hx, 0.0, hx, h),                        // ▐
-        '\u{2594}' => fill(0.0, 0.0, w, ey),                       // ▔
-        '\u{2595}' => fill(w - ex, 0.0, ex, h),                    // ▕
-        '\u{2596}' => fill(0.0, hy, hx, hy),                       // ▖
-        '\u{2597}' => fill(hx, hy, hx, hy),                        // ▗
-        '\u{2598}' => fill(0.0, 0.0, hx, hy),                      // ▘
-        '\u{2599}' => { fill(0.0, 0.0, hx, hy); fill(0.0, hy, w, hy) } // ▙
-        '\u{259A}' => { fill(0.0, 0.0, hx, hy); fill(hx, hy, hx, hy) } // ▚
-        '\u{259B}' => { fill(0.0, 0.0, w, hy); fill(0.0, hy, hx, hy) } // ▛
-        '\u{259C}' => { fill(0.0, 0.0, w, hy); fill(hx, hy, hx, hy) }  // ▜
-        '\u{259D}' => fill(hx, 0.0, hx, hy),                       // ▝
-        '\u{259E}' => { fill(hx, 0.0, hx, hy); fill(0.0, hy, hx, hy) } // ▞
-        '\u{259F}' => { fill(hx, 0.0, hx, hy); fill(0.0, hy, w, hy) }  // ▟
+        '\u{2580}' => fill(0.0, 0.0, w, hy),                // ▀
+        '\u{2581}' => fill(0.0, h - ey, w, ey),             // ▁
+        '\u{2582}' => fill(0.0, h - 2.0 * ey, w, 2.0 * ey), // ▂
+        '\u{2583}' => fill(0.0, h - 3.0 * ey, w, 3.0 * ey), // ▃
+        '\u{2584}' => fill(0.0, hy, w, hy),                 // ▄
+        '\u{2585}' => fill(0.0, h - 5.0 * ey, w, 5.0 * ey), // ▅
+        '\u{2586}' => fill(0.0, h - 6.0 * ey, w, 6.0 * ey), // ▆
+        '\u{2587}' => fill(0.0, h - 7.0 * ey, w, 7.0 * ey), // ▇
+        '\u{2588}' => fill(0.0, 0.0, w, h),                 // █
+        '\u{2589}' => fill(0.0, 0.0, 7.0 * ex, h),          // ▉
+        '\u{258A}' => fill(0.0, 0.0, 6.0 * ex, h),          // ▊
+        '\u{258B}' => fill(0.0, 0.0, 5.0 * ex, h),          // ▋
+        '\u{258C}' => fill(0.0, 0.0, hx, h),                // ▌
+        '\u{258D}' => fill(0.0, 0.0, 3.0 * ex, h),          // ▍
+        '\u{258E}' => fill(0.0, 0.0, 2.0 * ex, h),          // ▎
+        '\u{258F}' => fill(0.0, 0.0, ex, h),                // ▏
+        '\u{2590}' => fill(hx, 0.0, hx, h),                 // ▐
+        '\u{2594}' => fill(0.0, 0.0, w, ey),                // ▔
+        '\u{2595}' => fill(w - ex, 0.0, ex, h),             // ▕
+        '\u{2596}' => fill(0.0, hy, hx, hy),                // ▖
+        '\u{2597}' => fill(hx, hy, hx, hy),                 // ▗
+        '\u{2598}' => fill(0.0, 0.0, hx, hy),               // ▘
+        '\u{2599}' => {
+            fill(0.0, 0.0, hx, hy);
+            fill(0.0, hy, w, hy)
+        } // ▙
+        '\u{259A}' => {
+            fill(0.0, 0.0, hx, hy);
+            fill(hx, hy, hx, hy)
+        } // ▚
+        '\u{259B}' => {
+            fill(0.0, 0.0, w, hy);
+            fill(0.0, hy, hx, hy)
+        } // ▛
+        '\u{259C}' => {
+            fill(0.0, 0.0, w, hy);
+            fill(hx, hy, hx, hy)
+        } // ▜
+        '\u{259D}' => fill(hx, 0.0, hx, hy),                // ▝
+        '\u{259E}' => {
+            fill(hx, 0.0, hx, hy);
+            fill(0.0, hy, hx, hy)
+        } // ▞
+        '\u{259F}' => {
+            fill(hx, 0.0, hx, hy);
+            fill(0.0, hy, w, hy)
+        } // ▟
         _ => return false,
     }
     true
@@ -322,7 +349,9 @@ pub fn snapshot_reusing<L: EventListener>(
             style: cell_style(cell.c, cell.fg, cell.bg, flags, colors, palette),
             wide: flags.contains(Flags::WIDE_CHAR),
             spacer: flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
-            in_primary_font: if (is_block_element(cell.c) || is_braille(cell.c)) && cell.zerowidth().is_some_and(|marks| !marks.is_empty()) {
+            in_primary_font: if (is_block_element(cell.c) || is_braille(cell.c))
+                && cell.zerowidth().is_some_and(|marks| !marks.is_empty())
+            {
                 has_glyph(cell.c)
             } else {
                 glyphs.in_primary(cell.c, has_glyph)
@@ -437,7 +466,8 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
     let mut hinted_mesh = egui::Mesh::default();
     let pixel = |points: f32| (points * ppp).round() as i32;
 
-    let advance = |bold: bool, italic: bool| painter.ctx().fonts_mut(|f| f.glyph_width(opt.fonts.for_style(bold, italic), 'M'));
+    let advance =
+        |bold: bool, italic: bool| painter.ctx().fonts_mut(|f| f.glyph_width(opt.fonts.for_style(bold, italic), 'M'));
     let mut primary_ink_center = None;
     // One buffer for the whole frame: `text_runs` allocated a Vec and a String
     // per run, for every row, on every frame.
@@ -452,7 +482,9 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
             if run.standalone {
                 let mut chars = run.text.chars();
                 let single = chars.next().filter(|_| chars.next().is_none());
-                if single.is_some_and(|ch| block_fills(ch, span, s.fg, &mut blocks) || paint_braille(painter, ch, span, s.fg)) {
+                if single.is_some_and(|ch| {
+                    block_fills(ch, span, s.fg, &mut blocks) || paint_braille(painter, ch, span, s.fg)
+                }) {
                     // Block fills are batched; Braille dots keep a fixed 2x4
                     // cell reference instead of fitting/recentering their ink.
                     if s.strike {
@@ -481,10 +513,20 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
                             // they are drawn: hinted when the atlas has them.
                             let center = *primary_ink_center.get_or_insert_with(|| {
                                 let primary = &opt.fonts.primary;
-                                let hinted_m = hinted.as_mut().and_then(|h| h.run(painter.ctx(), Face::Regular, primary.size * ppp, "M"));
+                                let hinted_m = hinted
+                                    .as_mut()
+                                    .and_then(|h| h.run(painter.ctx(), Face::Regular, primary.size * ppp, "M"));
                                 match hinted_m.as_deref() {
-                                    Some([(_, m)]) => opt.metrics.baseline + (m.offset[1] as f32 + m.size[1] as f32 / 2.0) / ppp,
-                                    _ => dy + painter.layout_no_wrap("M".to_owned(), primary.clone(), s.fg).mesh_bounds.center().y,
+                                    Some([(_, m)]) => {
+                                        opt.metrics.baseline + (m.offset[1] as f32 + m.size[1] as f32 / 2.0) / ppp
+                                    }
+                                    _ => {
+                                        dy + painter
+                                            .layout_no_wrap("M".to_owned(), primary.clone(), s.fg)
+                                            .mesh_bounds
+                                            .center()
+                                            .y
+                                    }
                                 }
                             });
                             pos.y = span.min.y + center - ink.center().y;
@@ -547,7 +589,8 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
                 if c.ch != ' ' && !paint_braille(painter, c.ch, cell, frame.default_bg) {
                     let font = opt.fonts.regular.clone();
                     let text = c.ch.to_string();
-                    let cursor_glyphs = hinted.as_mut().and_then(|h| h.run(painter.ctx(), Face::Regular, font.size * ppp, &text));
+                    let cursor_glyphs =
+                        hinted.as_mut().and_then(|h| h.run(painter.ctx(), Face::Regular, font.size * ppp, &text));
                     match (cursor_glyphs, hinted.as_ref().and_then(|h| h.texture_id())) {
                         (Some(cursor_glyphs), Some(texture)) => {
                             let mut mesh = egui::Mesh::with_texture(texture);
@@ -568,7 +611,11 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
                 painter.rect_filled(Rect::from_min_size(rect.min, Vec2::new(2.0, ch)), 0.0, color);
             }
             CursorShape::Underline => {
-                painter.rect_filled(Rect::from_min_size(Pos2::new(rect.min.x, rect.max.y - 2.0), Vec2::new(rect.width(), 2.0)), 0.0, color);
+                painter.rect_filled(
+                    Rect::from_min_size(Pos2::new(rect.min.x, rect.max.y - 2.0), Vec2::new(rect.width(), 2.0)),
+                    0.0,
+                    color,
+                );
             }
             CursorShape::HollowBlock => {
                 painter.rect_stroke(rect.shrink(0.5), 0.0, Stroke::new(1.0, color), egui::StrokeKind::Middle);
@@ -678,7 +725,11 @@ mod tests {
                 for mask in 0..=255u32 {
                     let ch = char::from_u32(0x2800 + mask).unwrap();
                     let dots: Vec<_> = braille_dots(ch, rect, ppp).unwrap().collect();
-                    let expected: Vec<_> = full.iter().enumerate().filter_map(|(bit, &dot)| (mask & (1 << bit) != 0).then_some(dot)).collect();
+                    let expected: Vec<_> = full
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(bit, &dot)| (mask & (1 << bit) != 0).then_some(dot))
+                        .collect();
                     assert_eq!(dots, expected, "pattern {mask:#x} at DPI {ppp}");
                     for (center, radius) in dots {
                         assert!(rect.contains(center - Vec2::splat(radius)));
@@ -718,17 +769,38 @@ mod tests {
             underline: Underline::None,
             strike: false,
         };
-        let cell = |ch: char| RenderCell { ch, combining: None, style, wide: false, spacer: false, in_primary_font: true, hyperlink: None };
-        let rows = vec![
-            "MM".chars().map(cell).collect::<Vec<_>>(),
-            "  ".chars().map(cell).collect(),
-        ];
-        let frame = Frame { rows, columns: 2, lines: 2, cursor: None, selection: Vec::new(), display_offset: 0, history_size: 0, default_bg: Color32::BLACK };
+        let cell = |ch: char| RenderCell {
+            ch,
+            combining: None,
+            style,
+            wide: false,
+            spacer: false,
+            in_primary_font: true,
+            hyperlink: None,
+        };
+        let rows = vec!["MM".chars().map(cell).collect::<Vec<_>>(), "  ".chars().map(cell).collect()];
+        let frame = Frame {
+            rows,
+            columns: 2,
+            lines: 2,
+            cursor: None,
+            selection: Vec::new(),
+            display_offset: 0,
+            history_size: 0,
+            default_bg: Color32::BLACK,
+        };
         let origin = Pos2::new(4.0, 4.0);
         let output = ctx.run_ui(Default::default(), |ui| {
             let painter = ui.ctx().layer_painter(egui::LayerId::background());
             let palette = Palette::dark();
-            let opt = PaintOptions { metrics, fonts: &fonts, palette: &palette, focused: true, cursor_on: true, highlights: &[] };
+            let opt = PaintOptions {
+                metrics,
+                fonts: &fonts,
+                palette: &palette,
+                focused: true,
+                cursor_on: true,
+                highlights: &[],
+            };
             paint(&painter, origin, &frame, &opt);
         });
         let mut inks = Vec::new();
@@ -739,7 +811,8 @@ mod tests {
             let atlas = mesh.texture_id != egui::TextureId::default();
             let mut i = 0;
             while i + 5 < mesh.indices.len() {
-                let verts: Vec<&egui::epaint::Vertex> = (0..6).map(|k| &mesh.vertices[mesh.indices[i + k] as usize]).collect();
+                let verts: Vec<&egui::epaint::Vertex> =
+                    (0..6).map(|k| &mesh.vertices[mesh.indices[i + k] as usize]).collect();
                 let white = |uv: Pos2| (uv - egui::epaint::WHITE_UV).length() < 1e-6;
                 let glyph = atlas || verts.iter().any(|v| !white(v.uv));
                 if glyph {
@@ -808,7 +881,14 @@ mod tests {
         let output = ctx.run_ui(Default::default(), |ui| {
             let painter = ui.ctx().layer_painter(egui::LayerId::background());
             let palette = Palette::dark();
-            let opt = PaintOptions { metrics, fonts: &fonts, palette: &palette, focused: true, cursor_on: true, highlights: &[] };
+            let opt = PaintOptions {
+                metrics,
+                fonts: &fonts,
+                palette: &palette,
+                focused: true,
+                cursor_on: true,
+                highlights: &[],
+            };
             paint(&painter, Pos2::new(10.3, 7.7), &frame, &opt);
         });
         let primitives = ctx.tessellate(output.shapes, ppp);
@@ -877,7 +957,14 @@ mod tests {
                 default_bg: Color32::BLACK,
             };
             let palette = Palette::dark();
-            let opt = PaintOptions { metrics: cell, fonts: &fonts, palette: &palette, focused: true, cursor_on: true, highlights: &[] };
+            let opt = PaintOptions {
+                metrics: cell,
+                fonts: &fonts,
+                palette: &palette,
+                focused: true,
+                cursor_on: true,
+                highlights: &[],
+            };
             paint(&painter, Pos2::ZERO, &frame, &opt);
         });
         let (bounds, clip) = output
@@ -925,7 +1012,10 @@ mod tests {
     fn permission_arrows_align_with_primary_text_instead_of_the_row_box() {
         let (arrow, clip, _) = paint_fallback_glyph('⏵');
         let (text, _, _) = paint_fallback_glyph('M');
-        assert!((arrow.center().y - text.center().y).abs() <= 0.5, "permission arrow {arrow:?} sits below primary text {text:?}");
+        assert!(
+            (arrow.center().y - text.center().y).abs() <= 0.5,
+            "permission arrow {arrow:?} sits below primary text {text:?}"
+        );
         assert!(clip.contains_rect(arrow.shrink(0.25)), "aligned arrow {arrow:?} is clipped by {clip:?}");
     }
 
@@ -967,14 +1057,35 @@ mod tests {
         let inked = row.iter().filter(|c| c.ch != ' ').count();
         let columns = row.len();
         let cursor = Some(CursorDraw { row: 0, col: 1, shape: CursorShape::Block, ch: 'b', wide: false });
-        let frame = Frame { rows: vec![row], columns, lines: 1, cursor, selection: Vec::new(), display_offset: 0, history_size: 0, default_bg: Color32::BLACK };
+        let frame = Frame {
+            rows: vec![row],
+            columns,
+            lines: 1,
+            cursor,
+            selection: Vec::new(),
+            display_offset: 0,
+            history_size: 0,
+            default_bg: Color32::BLACK,
+        };
         let output = ctx.run_ui(Default::default(), |ui| {
             let painter = ui.ctx().layer_painter(egui::LayerId::background());
             let palette = Palette::dark();
-            let opt = PaintOptions { metrics, fonts: &fonts, palette: &palette, focused: true, cursor_on: true, highlights: &[] };
+            let opt = PaintOptions {
+                metrics,
+                fonts: &fonts,
+                palette: &palette,
+                focused: true,
+                cursor_on: true,
+                highlights: &[],
+            };
             paint(&painter, Pos2::new(10.3, 7.7), &frame, &opt);
         });
-        let atlas = glyphs::shared(&ctx).expect("DirectWrite loads Consolas").lock().unwrap().texture_id().expect("glyphs were stored");
+        let atlas = glyphs::shared(&ctx)
+            .expect("DirectWrite loads Consolas")
+            .lock()
+            .unwrap()
+            .texture_id()
+            .expect("glyphs were stored");
         let mut quads = 0;
         for primitive in ctx.tessellate(output.shapes, ppp) {
             let egui::epaint::Primitive::Mesh(mesh) = &primitive.primitive else { continue };
@@ -987,14 +1098,21 @@ mod tests {
                 assert_eq!(mesh.texture_id, atlas, "a glyph drawn from epaint's unhinted font texture");
                 quads += 1;
                 let lo = |f: fn(&egui::epaint::Vertex) -> f32| verts.iter().map(|v| f(v)).fold(f32::INFINITY, f32::min);
-                let hi = |f: fn(&egui::epaint::Vertex) -> f32| verts.iter().map(|v| f(v)).fold(f32::NEG_INFINITY, f32::max);
+                let hi =
+                    |f: fn(&egui::epaint::Vertex) -> f32| verts.iter().map(|v| f(v)).fold(f32::NEG_INFINITY, f32::max);
                 for v in [lo(|v| v.pos.x), hi(|v| v.pos.x), lo(|v| v.pos.y), hi(|v| v.pos.y)] {
                     let px = v * ppp;
                     assert!((px - px.round()).abs() < 1e-3, "glyph edge off the pixel grid: {v} pt = {px} px");
                 }
                 let pixels = ((hi(|v| v.pos.x) - lo(|v| v.pos.x)) * ppp, (hi(|v| v.pos.y) - lo(|v| v.pos.y)) * ppp);
-                let texels = ((hi(|v| v.uv.x) - lo(|v| v.uv.x)) * glyphs::ATLAS as f32, (hi(|v| v.uv.y) - lo(|v| v.uv.y)) * glyphs::ATLAS as f32);
-                assert!((pixels.0 - texels.0).abs() < 1e-2 && (pixels.1 - texels.1).abs() < 1e-2, "{texels:?} texels stretched over {pixels:?} px");
+                let texels = (
+                    (hi(|v| v.uv.x) - lo(|v| v.uv.x)) * glyphs::ATLAS as f32,
+                    (hi(|v| v.uv.y) - lo(|v| v.uv.y)) * glyphs::ATLAS as f32,
+                );
+                assert!(
+                    (pixels.0 - texels.0).abs() < 1e-2 && (pixels.1 - texels.1).abs() < 1e-2,
+                    "{texels:?} texels stretched over {pixels:?} px"
+                );
             }
         }
         assert_eq!(quads, inked + 1, "every character, and the one under the cursor, is a hinted glyph");
@@ -1036,8 +1154,16 @@ mod tests {
         assert_eq!(bounds('\u{2588}'), rect, "a full block covers the whole cell");
         assert_eq!(bounds('\u{2580}'), Rect::from_min_size(Pos2::ZERO, Vec2::new(8.0, 8.0)), "upper half");
         assert_eq!(bounds('\u{2590}'), Rect::from_min_size(Pos2::new(4.0, 0.0), Vec2::new(4.0, 16.0)), "right half");
-        assert_eq!(bounds('\u{259D}'), Rect::from_min_size(Pos2::new(4.0, 0.0), Vec2::new(4.0, 8.0)), "upper right quadrant");
-        assert_eq!(bounds('\u{259B}'), Rect::from_min_size(Pos2::ZERO, Vec2::new(8.0, 16.0)), "three quadrants reach every edge");
+        assert_eq!(
+            bounds('\u{259D}'),
+            Rect::from_min_size(Pos2::new(4.0, 0.0), Vec2::new(4.0, 8.0)),
+            "upper right quadrant"
+        );
+        assert_eq!(
+            bounds('\u{259B}'),
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(8.0, 16.0)),
+            "three quadrants reach every edge"
+        );
         assert_eq!(bounds('\u{2593}'), rect, "shades fill the cell");
         assert!(fills('A').is_none(), "letters stay with the font");
         assert!(fills('\u{2500}').is_none(), "box drawing stays with the font");

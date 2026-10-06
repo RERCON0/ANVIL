@@ -16,7 +16,10 @@ pub enum Dir {
 pub enum Node {
     Leaf(PaneId),
     /// Fractions of the children sum to 1.
-    Split { dir: Dir, children: Vec<(f32, Node)> },
+    Split {
+        dir: Dir,
+        children: Vec<(f32, Node)>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -255,9 +258,7 @@ impl SplitTree {
             };
             let better = match best {
                 None => true,
-                Some((bd, bo, _)) => {
-                    distance < bd - 0.5 || ((distance - bd).abs() <= 0.5 && offcenter < bo - 0.5)
-                }
+                Some((bd, bo, _)) => distance < bd - 0.5 || ((distance - bd).abs() <= 0.5 && offcenter < bo - 0.5),
             };
             if better {
                 best = Some((distance, offcenter, *id));
@@ -497,15 +498,9 @@ mod tests {
             for after in [false, true] {
                 let mut tree = relocation_tree();
                 assert!(tree.relocate(1, None, dir, after));
-                let remaining = row(vec![
-                    (0.4, leaf(2)),
-                    (0.6, col(vec![(0.5, leaf(3)), (0.5, leaf(4))])),
-                ]);
-                let children = if after {
-                    vec![(0.5, remaining), (0.5, leaf(1))]
-                } else {
-                    vec![(0.5, leaf(1)), (0.5, remaining)]
-                };
+                let remaining = row(vec![(0.4, leaf(2)), (0.6, col(vec![(0.5, leaf(3)), (0.5, leaf(4))]))]);
+                let children =
+                    if after { vec![(0.5, remaining), (0.5, leaf(1))] } else { vec![(0.5, leaf(1)), (0.5, remaining)] };
                 assert_eq!(tree.root(), &Node::Split { dir, children });
                 let moved = tree.layout(AREA, 0.0).into_iter().find(|(id, _)| *id == 1).unwrap().1;
                 let expected = match (dir, after) {
@@ -522,11 +517,7 @@ mod tests {
 
     #[test]
     fn relocate_within_one_split_redistributes_only_removed_and_target_space() {
-        let mut tree = SplitTree::from_root(row(vec![
-            (0.5, leaf(1)),
-            (0.25, leaf(2)),
-            (0.25, leaf(3)),
-        ]));
+        let mut tree = SplitTree::from_root(row(vec![(0.5, leaf(1)), (0.25, leaf(2)), (0.25, leaf(3))]));
         assert!(tree.relocate(1, Some(3), Dir::Row, true));
         assert_eq!(tree.root(), &row(vec![(0.5, leaf(2)), (0.25, leaf(3)), (0.25, leaf(1))]));
         assert_relocation_invariants(&tree, &[1, 2, 3]);
@@ -670,7 +661,10 @@ mod tests {
         let d = t.dividers(AREA, GAP);
         assert_eq!(d.len(), 2);
         assert_eq!(d[0], Divider { path: vec![], index: 0, dir: Dir::Row, rect: Rect::new(150.0, 0.0, 6.0, 206.0) });
-        assert_eq!(d[1], Divider { path: vec![1], index: 0, dir: Dir::Column, rect: Rect::new(156.0, 100.0, 150.0, 6.0) });
+        assert_eq!(
+            d[1],
+            Divider { path: vec![1], index: 0, dir: Dir::Column, rect: Rect::new(156.0, 100.0, 150.0, 6.0) }
+        );
     }
 
     #[test]

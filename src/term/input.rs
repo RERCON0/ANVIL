@@ -283,7 +283,8 @@ mod tests {
     fn altgr_text_wins_over_ctrl_alt() {
         let press = KeyPress { key: Some(KeyName::Letter('Q')), mods: CTRL_ALT, text: Some("@".into()), altgr: true };
         assert_eq!(enc(press), "@");
-        let not_altgr = KeyPress { key: Some(KeyName::Letter('Q')), mods: CTRL_ALT, text: Some("q".into()), altgr: false };
+        let not_altgr =
+            KeyPress { key: Some(KeyName::Letter('Q')), mods: CTRL_ALT, text: Some("q".into()), altgr: false };
         assert_eq!(enc(not_altgr), "\x1b\x11");
     }
 

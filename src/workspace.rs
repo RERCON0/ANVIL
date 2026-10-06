@@ -36,31 +36,67 @@ const GUTTER: f32 = 64.0;
 const FOLDER_ICON: (char, egui::Color32) = ('\u{e032}', egui::Color32::from_rgb(0x7B, 0xB3, 0xD9));
 
 pub enum Request {
-    Refresh { cwd: PathBuf },
+    Refresh {
+        cwd: PathBuf,
+    },
     /// Approval is for precisely the repository/configuration shown by the UI.
-    Approve { identity: git::RepositoryIdentity },
+    Approve {
+        identity: git::RepositoryIdentity,
+    },
     /// `side`: Some(true) the index, Some(false) the worktree, None the
     /// index when it has changes for the file, else the worktree.
-    Diff { path: String, side: Option<bool> },
-    CheckDiff { stamp: DiffStamp },
-    Stage { paths: Vec<String>, staged: bool },
-    Commit { message: String },
-    AiMessage { command: Option<String> },
+    Diff {
+        path: String,
+        side: Option<bool>,
+    },
+    CheckDiff {
+        stamp: DiffStamp,
+    },
+    Stage {
+        paths: Vec<String>,
+        staged: bool,
+    },
+    Commit {
+        message: String,
+    },
+    AiMessage {
+        command: Option<String>,
+    },
     Log,
-    CommitDetail { hash: String },
-    CommitDiff { hash: String, path: String },
+    CommitDetail {
+        hash: String,
+    },
+    CommitDiff {
+        hash: String,
+        path: String,
+    },
     Files,
     /// Lines of every tracked file of the repository.
     CountLines,
-    ReadFile { path: String },
+    ReadFile {
+        path: String,
+    },
     /// `header` is the `@@ … @@` line the user saw; the worker refuses to apply
     /// when the freshly generated diff no longer has it at `index`.
-    ApplyHunks { path: String, index: usize, header: String, from_index: bool },
+    ApplyHunks {
+        path: String,
+        index: usize,
+        header: String,
+        from_index: bool,
+    },
     Fetch,
     Push,
-    WritePath { path: String, folder: bool },
-    RenamePath { from: String, to: String },
-    DeletePath { path: String },
+    WritePath {
+        path: String,
+        folder: bool,
+    },
+    RenamePath {
+        from: String,
+        to: String,
+    },
+    DeletePath {
+        path: String,
+    },
 }
 
 impl Request {
@@ -77,19 +113,44 @@ type Envelope = (Option<PathBuf>, Request);
 enum Response {
     /// Status plus the resolved repository root (None: not a repository).
     Status(Status, Option<PathBuf>),
-    TrustRequired { identity: Option<git::RepositoryIdentity>, error: Option<String> },
+    TrustRequired {
+        identity: Option<git::RepositoryIdentity>,
+        error: Option<String>,
+    },
     Trusted(git::RepositoryIdentity),
-    Diff { path: String, files: Vec<FileDiff>, text: String, rows: Vec<TextRow>, staged: bool, side: Option<bool> },
+    Diff {
+        path: String,
+        files: Vec<FileDiff>,
+        text: String,
+        rows: Vec<TextRow>,
+        staged: bool,
+        side: Option<bool>,
+    },
     DiffChecked(DiffStamp),
     Refreshed,
     Committed(String),
     AiMessage(Result<String, String>),
     Log(CommitLog),
-    CommitDetail { hash: String, detail: git::CommitDetail },
-    CommitDiff { hash: String, path: String, patch: Result<(String, Vec<TextRow>), String> },
+    CommitDetail {
+        hash: String,
+        detail: git::CommitDetail,
+    },
+    CommitDiff {
+        hash: String,
+        path: String,
+        patch: Result<(String, Vec<TextRow>), String>,
+    },
     Files(Vec<String>),
-    LineCount { files: usize, lines: u64 },
-    FileText { path: String, text: String, rows: Vec<TextRow>, truncated: bool },
+    LineCount {
+        files: usize,
+        lines: u64,
+    },
+    FileText {
+        path: String,
+        text: String,
+        rows: Vec<TextRow>,
+        truncated: bool,
+    },
     Applied,
     Fetched(String),
     Pushed(String),
@@ -364,24 +425,42 @@ impl Workspace {
     }
 
     fn trust_view(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new(strings::WORKSPACE_TRUST_TITLE).color(theme::colors().status_yellow).font(theme::font(13.0)));
+        ui.label(
+            RichText::new(strings::WORKSPACE_TRUST_TITLE).color(theme::colors().status_yellow).font(theme::font(13.0)),
+        );
         if let Some(identity) = &self.pending_identity {
-            ui.label(RichText::new(display(&identity.root.to_string_lossy(), 240)).color(theme::colors().text).font(theme::field_font(11.5)));
+            ui.label(
+                RichText::new(display(&identity.root.to_string_lossy(), 240))
+                    .color(theme::colors().text)
+                    .font(theme::field_font(11.5)),
+            );
         }
         ui.label(RichText::new(strings::WORKSPACE_TRUST_HINT).color(theme::colors().dim).font(theme::font(12.0)));
         if let Some(identity) = &self.pending_identity {
             let hazards = identity.stamp.hazards();
             if !hazards.is_empty() {
-                ui.label(RichText::new(strings::WORKSPACE_TRUST_HAZARDS).color(theme::colors().text).font(theme::font(11.5)));
+                ui.label(
+                    RichText::new(strings::WORKSPACE_TRUST_HAZARDS).color(theme::colors().text).font(theme::font(11.5)),
+                );
                 for hazard in hazards {
-                    ui.label(RichText::new(format!("· {hazard}")).color(theme::colors().status_yellow).font(theme::field_font(11.0)));
+                    ui.label(
+                        RichText::new(format!("· {hazard}"))
+                            .color(theme::colors().status_yellow)
+                            .font(theme::field_font(11.0)),
+                    );
                 }
             }
         }
         if let Some((notice, _)) = &self.notice {
             ui.label(RichText::new(notice).color(theme::colors().status_red).font(theme::font(11.5)));
         }
-        if ui.add_enabled(self.pending_identity.is_some() && !self.trust_approval_pending, theme::accent_button(strings::WORKSPACE_TRUST_APPROVE)).clicked() {
+        if ui
+            .add_enabled(
+                self.pending_identity.is_some() && !self.trust_approval_pending,
+                theme::accent_button(strings::WORKSPACE_TRUST_APPROVE),
+            )
+            .clicked()
+        {
             if let Some(identity) = self.pending_identity.clone() {
                 self.busy = true;
                 self.trust_approval_pending = true;
@@ -389,7 +468,6 @@ impl Workspace {
             }
         }
     }
-
 
     /// Applies worker responses; returns true when the UI should repaint.
     pub fn absorb(&mut self) -> bool {
@@ -449,10 +527,16 @@ impl Workspace {
                 Response::Status(status, root) => {
                     self.busy = false;
                     let root_changed = self.root != root;
-                    let inventory_changed = root_changed || self.status.head_oid != status.head_oid
-                        || self.status.changes.iter().map(|change| (&change.path, &change.original_path))
+                    let inventory_changed = root_changed
+                        || self.status.head_oid != status.head_oid
+                        || self
+                            .status
+                            .changes
+                            .iter()
+                            .map(|change| (&change.path, &change.original_path))
                             .ne(status.changes.iter().map(|change| (&change.path, &change.original_path)));
-                    let commit_state_changed = root_changed || !self.log_status_seen
+                    let commit_state_changed = root_changed
+                        || !self.log_status_seen
                         || self.status.head_oid != status.head_oid
                         || self.status.upstream_oid != status.upstream_oid
                         || self.status.branch != status.branch
@@ -582,7 +666,11 @@ impl Workspace {
                 }
                 Response::FileText { path, text, rows, truncated } => {
                     self.busy = false;
-                    if !self.file_preview.as_ref().is_some_and(|(old_path, old_text, _)| old_path == &path && old_text == &text) {
+                    if !self
+                        .file_preview
+                        .as_ref()
+                        .is_some_and(|(old_path, old_text, _)| old_path == &path && old_text == &text)
+                    {
                         self.preview_rows = rows;
                         self.preview_wrapped = WrappedRows::default();
                         self.markdown = MarkdownCache::default();
@@ -612,7 +700,13 @@ impl Workspace {
     }
 
     /// Draws the panel; returns actions the app must handle.
-    pub fn show(&mut self, ui: &mut egui::Ui, rect: Rect, pane: crate::layout::split_tree::PaneId, ai_command: Option<&str>) -> Vec<WorkspaceAction> {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        pane: crate::layout::split_tree::PaneId,
+        ai_command: Option<&str>,
+    ) -> Vec<WorkspaceAction> {
         if self.ai_command.as_deref() != ai_command {
             self.ai_command = ai_command.map(str::to_owned);
         }
@@ -637,7 +731,8 @@ impl Workspace {
                     // Framed like the other panel chips, with the selection dot
                     // of the settings rows inside.
                     let selected = self.tab == tab;
-                    let (dot, color) = if selected { ("●", theme::colors().accent) } else { ("○", theme::colors().dim) };
+                    let (dot, color) =
+                        if selected { ("●", theme::colors().accent) } else { ("○", theme::colors().dim) };
                     let text = egui::RichText::new(format!("{dot} {label}")).font(theme::field_font(12.5)).color(color);
                     if ui.add(egui::Button::new(text)).clicked() {
                         self.tab = tab;
@@ -681,7 +776,9 @@ impl Workspace {
     fn changes_mode(&mut self, ui: &mut egui::Ui) {
         if self.status.changes.is_empty() && self.status.branch.is_empty() {
             ui.add_space(4.0);
-            ui.label(RichText::new(strings::WORKSPACE_NO_REPO_HINT).color(theme::colors().faint).font(theme::font(12.0)));
+            ui.label(
+                RichText::new(strings::WORKSPACE_NO_REPO_HINT).color(theme::colors().faint).font(theme::font(12.0)),
+            );
             return;
         }
         if self.detail_view(ui) {
@@ -707,17 +804,31 @@ impl Workspace {
         ui.horizontal(|ui| {
             ui.label(RichText::new(name).color(theme::colors().text).font(theme::font(12.5)));
             if !self.status.branch.is_empty() {
-                ui.label(RichText::new(&self.status.branch).color(theme::colors().accent).font(theme::field_font(12.0)));
+                ui.label(
+                    RichText::new(&self.status.branch).color(theme::colors().accent).font(theme::field_font(12.0)),
+                );
                 if self.status.ahead > 0 {
-                    ui.label(RichText::new(format!("↑{}", self.status.ahead)).color(theme::colors().accent).font(theme::field_font(11.5)));
+                    ui.label(
+                        RichText::new(format!("↑{}", self.status.ahead))
+                            .color(theme::colors().accent)
+                            .font(theme::field_font(11.5)),
+                    );
                 }
                 if self.status.behind > 0 {
-                    ui.label(RichText::new(format!("↓{}", self.status.behind)).color(theme::colors().status_yellow).font(theme::field_font(11.5)));
+                    ui.label(
+                        RichText::new(format!("↓{}", self.status.behind))
+                            .color(theme::colors().status_yellow)
+                            .font(theme::field_font(11.5)),
+                    );
                 }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if !self.status.branch.is_empty() {
-                    if ui.add(theme::animated_accent_button(strings::WORKSPACE_PUBLISH)).on_hover_text(strings::WORKSPACE_PUSH_HINT).clicked() {
+                    if ui
+                        .add(theme::animated_accent_button(strings::WORKSPACE_PUBLISH))
+                        .on_hover_text(strings::WORKSPACE_PUSH_HINT)
+                        .clicked()
+                    {
                         self.busy = true;
                         self.request(Request::Push);
                     }
@@ -731,9 +842,19 @@ impl Workspace {
         let additions: u32 = self.status.changes.iter().map(|c| c.additions).sum();
         let deletions: u32 = self.status.changes.iter().map(|c| c.deletions).sum();
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("+{additions}")).color(theme::colors().status_green).font(theme::field_font(11.5)));
-            ui.label(RichText::new(format!("−{deletions}")).color(theme::colors().status_red).font(theme::field_font(11.5)));
-            ui.label(RichText::new(strings::workspace_staged(self.counts().0, self.counts().1)).color(theme::colors().faint).font(theme::font(11.0)));
+            ui.label(
+                RichText::new(format!("+{additions}"))
+                    .color(theme::colors().status_green)
+                    .font(theme::field_font(11.5)),
+            );
+            ui.label(
+                RichText::new(format!("−{deletions}")).color(theme::colors().status_red).font(theme::field_font(11.5)),
+            );
+            ui.label(
+                RichText::new(strings::workspace_staged(self.counts().0, self.counts().1))
+                    .color(theme::colors().faint)
+                    .font(theme::font(11.0)),
+            );
         });
         if let Some((notice, error)) = &self.notice {
             let colour = if *error { theme::colors().status_red } else { theme::colors().status_green };
@@ -774,7 +895,9 @@ impl Workspace {
         ui.horizontal_wrapped(|ui| {
             let has_staged = self.status.changes.iter().any(Change::staged);
             let can_commit = !self.ai_generating && !self.commit_message.trim().is_empty() && has_staged;
-            if ui.add_enabled(can_commit, theme::accent_button(strings::WORKSPACE_COMMIT)).clicked() || (can_commit && ctrl_enter) {
+            if ui.add_enabled(can_commit, theme::accent_button(strings::WORKSPACE_COMMIT)).clicked()
+                || (can_commit && ctrl_enter)
+            {
                 self.busy = true;
                 self.notice = None;
                 self.request(Request::Commit { message: self.commit_message.clone() });
@@ -783,9 +906,13 @@ impl Workspace {
                 Some(command) => strings::workspace_ai(command.split_whitespace().next().unwrap_or(command)),
                 None => strings::WORKSPACE_AI.to_owned(),
             };
-            let ai = ui
-                .add_enabled(!self.ai_generating && has_staged, theme::ghost_button(ai_label))
-                .on_hover_text(if has_staged { self.ai_command.as_deref().unwrap_or(strings::WORKSPACE_NO_AI_COMMAND) } else { strings::WORKSPACE_AI_NO_STAGE });
+            let ai = ui.add_enabled(!self.ai_generating && has_staged, theme::ghost_button(ai_label)).on_hover_text(
+                if has_staged {
+                    self.ai_command.as_deref().unwrap_or(strings::WORKSPACE_NO_AI_COMMAND)
+                } else {
+                    strings::WORKSPACE_AI_NO_STAGE
+                },
+            );
             if ai.clicked() {
                 self.ai_generating = true;
                 self.busy = true;
@@ -797,7 +924,11 @@ impl Workspace {
         if self.ai_generating {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(14.0).color(theme::colors().accent));
-                ui.label(RichText::new(strings::WORKSPACE_AI_GENERATING).color(theme::colors().accent).font(theme::font(11.5)));
+                ui.label(
+                    RichText::new(strings::WORKSPACE_AI_GENERATING)
+                        .color(theme::colors().accent)
+                        .font(theme::font(11.5)),
+                );
             });
         }
         ui.add_space(4.0);
@@ -808,12 +939,20 @@ impl Workspace {
     fn commits_section(&mut self, ui: &mut egui::Ui) {
         let ahead = self.status.ahead;
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("[ {} ]", strings::WORKSPACE_COMMITS_TITLE)).color(theme::colors().faint).font(theme::font(11.5)));
+            ui.label(
+                RichText::new(format!("[ {} ]", strings::WORKSPACE_COMMITS_TITLE))
+                    .color(theme::colors().faint)
+                    .font(theme::font(11.5)),
+            );
             if ahead > 0 {
-                ui.label(RichText::new(format!("↑{ahead}")).color(theme::colors().accent).font(theme::field_font(11.5)));
+                ui.label(
+                    RichText::new(format!("↑{ahead}")).color(theme::colors().accent).font(theme::field_font(11.5)),
+                );
             }
             if self.log.truncated {
-                ui.label(RichText::new(strings::WORKSPACE_TRUNCATED).color(theme::colors().faint).font(theme::font(10.5)));
+                ui.label(
+                    RichText::new(strings::WORKSPACE_TRUNCATED).color(theme::colors().faint).font(theme::font(10.5)),
+                );
             }
         });
         theme::hairline(ui);
@@ -874,7 +1013,8 @@ impl Workspace {
         const ROW_HEIGHT: f32 = 22.0;
         let commit = &self.log.commits[index];
         {
-            let row = self.graph.get(index).cloned().unwrap_or(graph::Row { lane: 0, lane_count: 1, segments: Vec::new() });
+            let row =
+                self.graph.get(index).cloned().unwrap_or(graph::Row { lane: 0, lane_count: 1, segments: Vec::new() });
             let (rect, response) = ui.allocate_exact_size(Vec2::new(width, ROW_HEIGHT), Sense::click());
             let painter = ui.painter_at(rect);
             if response.hovered() {
@@ -887,7 +1027,10 @@ impl Workspace {
                 let (from, to) = (lane_x(segment.from_lane), lane_x(segment.to_lane));
                 match segment.kind {
                     graph::Kind::Through => {
-                        painter.line_segment([egui::Pos2::new(from, rect.min.y), egui::Pos2::new(from, rect.max.y)], stroke);
+                        painter.line_segment(
+                            [egui::Pos2::new(from, rect.min.y), egui::Pos2::new(from, rect.max.y)],
+                            stroke,
+                        );
                     }
                     graph::Kind::Up if from == to => {
                         painter.line_segment([egui::Pos2::new(from, rect.min.y), egui::Pos2::new(from, mid)], stroke);
@@ -932,7 +1075,8 @@ impl Workspace {
             let text_x = rect.min.x + graph_width + 7.0;
             let time_text = crate::strings::relative_time(now, commit.time);
             let time_galley = painter.layout_no_wrap(time_text.clone(), theme::font(10.0), theme::colors().faint);
-            let hash_galley = painter.layout_no_wrap(commit.short.clone(), theme::field_font(10.0), theme::colors().faint);
+            let hash_galley =
+                painter.layout_no_wrap(commit.short.clone(), theme::field_font(10.0), theme::colors().faint);
             let right_width = time_galley.size().x + hash_galley.size().x + 12.0;
             let right_x = rect.max.x - 2.0;
             painter.galley(
@@ -950,17 +1094,19 @@ impl Workspace {
                 let name = display(reference.strip_prefix("HEAD -> ").unwrap_or(reference), 40);
                 let colour = ref_color(&name);
                 let galley = painter.layout_no_wrap(name, theme::field_font(10.0), theme::colors().chrome_bg);
-                let badge = Rect::from_min_size(
-                    egui::Pos2::new(badge_x, mid - 7.0),
-                    Vec2::new(galley.size().x + 10.0, 14.0),
-                );
+                let badge =
+                    Rect::from_min_size(egui::Pos2::new(badge_x, mid - 7.0), Vec2::new(galley.size().x + 10.0, 14.0));
                 // A chip is only worth drawing while the subject keeps room to
                 // the left of the time and hash column.
                 if badge.max.x > rect.max.x - right_width - 10.0 - MIN_SUBJECT_WIDTH {
                     break;
                 }
                 painter.rect_filled(badge, egui::CornerRadius::same(3), colour);
-                painter.galley(egui::Pos2::new(badge.min.x + 5.0, badge.min.y + 1.0), galley, theme::colors().chrome_bg);
+                painter.galley(
+                    egui::Pos2::new(badge.min.x + 5.0, badge.min.y + 1.0),
+                    galley,
+                    theme::colors().chrome_bg,
+                );
                 badge_x = badge.max.x + 4.0;
             }
             let subject_limit = rect.max.x - right_width - 8.0 - badge_x;
@@ -1003,9 +1149,7 @@ impl Workspace {
             let deleting = matches!(prompt.kind, PromptKind::Delete { .. });
             if !deleting {
                 let field = ui.add(
-                    egui::TextEdit::singleline(&mut prompt.text)
-                        .font(theme::field_font(12.0))
-                        .desired_width(180.0),
+                    egui::TextEdit::singleline(&mut prompt.text).font(theme::field_font(12.0)).desired_width(180.0),
                 );
                 if prompt.focus {
                     field.request_focus();
@@ -1068,12 +1212,14 @@ impl Workspace {
                 self.request(Request::Stage { paths, staged: false });
             }
             if ui.add(theme::ghost_button(strings::WORKSPACE_STAGE_ALL)).clicked() {
-                let paths: Vec<String> = self.status.changes.iter().filter(|c| c.unstaged()).map(|c| c.path.clone()).collect();
+                let paths: Vec<String> =
+                    self.status.changes.iter().filter(|c| c.unstaged()).map(|c| c.path.clone()).collect();
                 self.busy = true;
                 self.request(Request::Stage { paths, staged: true });
             }
             if ui.add(theme::ghost_button(strings::WORKSPACE_UNSTAGE_ALL)).clicked() {
-                let paths: Vec<String> = self.status.changes.iter().filter(|c| c.staged()).map(|c| c.path.clone()).collect();
+                let paths: Vec<String> =
+                    self.status.changes.iter().filter(|c| c.staged()).map(|c| c.path.clone()).collect();
                 self.busy = true;
                 self.request(Request::Stage { paths, staged: false });
             }
@@ -1091,8 +1237,11 @@ impl Workspace {
         let limit = (ui.available_height() * 0.45).clamp(ROW_HEIGHT * 3.0, 300.0);
         let spacing = ui.spacing().item_spacing.y;
         ui.spacing_mut().item_spacing.y = 0.0;
-        ScrollArea::vertical().id_salt("workspace-changes").max_height(limit).auto_shrink([false, true])
-            .show_rows(ui, ROW_HEIGHT, rows.len(), |ui, visible| {
+        ScrollArea::vertical().id_salt("workspace-changes").max_height(limit).auto_shrink([false, true]).show_rows(
+            ui,
+            ROW_HEIGHT,
+            rows.len(),
+            |ui, visible| {
                 for row in &rows[visible] {
                     let width = ui.available_width();
                     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, ROW_HEIGHT), Sense::click());
@@ -1156,10 +1305,17 @@ impl Workspace {
                                 theme::colors().text,
                             );
                             let letter = change.letter();
-                            let letter_galley = painter.layout_no_wrap(letter.to_string(), theme::field_font(11.5), status_color(letter));
+                            let letter_galley = painter.layout_no_wrap(
+                                letter.to_string(),
+                                theme::field_font(11.5),
+                                status_color(letter),
+                            );
                             let letter_width = letter_galley.size().x;
                             painter.galley(
-                                egui::Pos2::new(rect.max.x - 2.0 - letter_width, rect.center().y - letter_galley.size().y / 2.0),
+                                egui::Pos2::new(
+                                    rect.max.x - 2.0 - letter_width,
+                                    rect.center().y - letter_galley.size().y / 2.0,
+                                ),
                                 letter_galley,
                                 status_color(letter),
                             );
@@ -1178,7 +1334,8 @@ impl Workspace {
                                 theme::colors().faint,
                             );
                             if response.clicked() {
-                                let checkbox_hit = response.interact_pointer_pos().is_some_and(|pos| pos.x < box_x + 28.0);
+                                let checkbox_hit =
+                                    response.interact_pointer_pos().is_some_and(|pos| pos.x < box_x + 28.0);
                                 if checkbox_hit {
                                     if selected {
                                         self.selected.remove(path);
@@ -1201,7 +1358,8 @@ impl Workspace {
                         }
                     }
                 }
-            });
+            },
+        );
         ui.spacing_mut().item_spacing.y = spacing;
         self.change_rows_cache = rows;
 
@@ -1245,13 +1403,24 @@ impl Workspace {
                     let row = &self.diff_wrapped.rows[index];
                     let line = &self.diff_text[row.bytes.clone()];
                     if let Some(hunk_index) = row.hunk {
-                        let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), TEXT_ROW_HEIGHT), Sense::click());
+                        let (rect, response) =
+                            ui.allocate_exact_size(Vec2::new(ui.available_width(), TEXT_ROW_HEIGHT), Sense::click());
                         let label = if self.diff_from_index { "◂" } else { "▸" };
-                        ui.painter().text(rect.left_center(), Align2::LEFT_CENTER, label, theme::font(12.0), theme::colors().accent);
+                        ui.painter().text(
+                            rect.left_center(),
+                            Align2::LEFT_CENTER,
+                            label,
+                            theme::font(12.0),
+                            theme::colors().accent,
+                        );
                         paint_text_row(ui, rect, line, None, theme::colors().diff_hunk);
                         if response.clicked() {
                             if let Some(header) = self.diff_rows.iter().find(|row| row.hunk == Some(hunk_index)) {
-                                hunks_to_apply = Some((hunk_index, self.diff_text[header.bytes.clone()].to_owned(), self.diff_from_index));
+                                hunks_to_apply = Some((
+                                    hunk_index,
+                                    self.diff_text[header.bytes.clone()].to_owned(),
+                                    self.diff_from_index,
+                                ));
                             }
                         }
                     } else {
@@ -1276,7 +1445,12 @@ impl Workspace {
         match action {
             Some(CommitDetailAction::Back) => self.detail_file = None,
             Some(CommitDetailAction::OpenFile(path)) => {
-                self.detail_file = Some(CommitFile { path: path.clone(), patch: None, rows: Vec::new(), wrapped: WrappedRows::default() });
+                self.detail_file = Some(CommitFile {
+                    path: path.clone(),
+                    patch: None,
+                    rows: Vec::new(),
+                    wrapped: WrappedRows::default(),
+                });
                 self.busy = true;
                 self.request(Request::CommitDiff { hash: hash.clone(), path });
             }
@@ -1293,7 +1467,12 @@ enum CommitDetailAction {
 }
 
 /// The commit overview or one selected file; navigation stays outside the scroll.
-fn commit_detail_view(ui: &mut egui::Ui, hash: &str, detail: &git::CommitDetail, mut file: Option<&mut CommitFile>) -> Option<CommitDetailAction> {
+fn commit_detail_view(
+    ui: &mut egui::Ui,
+    hash: &str,
+    detail: &git::CommitDetail,
+    mut file: Option<&mut CommitFile>,
+) -> Option<CommitDetailAction> {
     let mut action = None;
     ui.horizontal(|ui| {
         if ui.add(theme::ghost_button(strings::WORKSPACE_BACK)).clicked() {
@@ -1312,31 +1491,35 @@ fn commit_detail_view(ui: &mut egui::Ui, hash: &str, detail: &git::CommitDetail,
         }
     });
     if let Some(file) = file.as_mut() {
-        ui.label(RichText::new(display(&file.path, file.path.len())).color(theme::colors().text).font(theme::font(12.5)));
+        ui.label(
+            RichText::new(display(&file.path, file.path.len())).color(theme::colors().text).font(theme::font(12.5)),
+        );
         match &file.patch {
-                None => {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new().size(14.0).color(theme::colors().accent));
-                        ui.label(strings::WORKSPACE_DIFF_LOADING);
+            None => {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new().size(14.0).color(theme::colors().accent));
+                    ui.label(strings::WORKSPACE_DIFF_LOADING);
+                });
+            }
+            Some(Err(error)) => {
+                ui.label(RichText::new(error).color(theme::colors().status_red));
+            }
+            Some(Ok(patch)) => {
+                file.wrapped.prepare(ui, patch, &file.rows);
+                let spacing = ui.spacing().item_spacing.y;
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ScrollArea::vertical()
+                    .id_salt(("workspace-commit-file", hash, &file.path))
+                    .auto_shrink([false, false])
+                    .show_rows(ui, TEXT_ROW_HEIGHT, file.wrapped.rows.len(), |ui, visible| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for index in visible {
+                            let row = &file.wrapped.rows[index];
+                            patch_line(ui, &patch[row.bytes.clone()], row.number, row.kind);
+                        }
                     });
-                }
-                Some(Err(error)) => {
-                    ui.label(RichText::new(error).color(theme::colors().status_red));
-                }
-                Some(Ok(patch)) => {
-                    file.wrapped.prepare(ui, patch, &file.rows);
-                    let spacing = ui.spacing().item_spacing.y;
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    ScrollArea::vertical().id_salt(("workspace-commit-file", hash, &file.path)).auto_shrink([false, false])
-                        .show_rows(ui, TEXT_ROW_HEIGHT, file.wrapped.rows.len(), |ui, visible| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            for index in visible {
-                                let row = &file.wrapped.rows[index];
-                                patch_line(ui, &patch[row.bytes.clone()], row.number, row.kind);
-                            }
-                        });
-                    ui.spacing_mut().item_spacing.y = spacing;
-                }
+                ui.spacing_mut().item_spacing.y = spacing;
+            }
         }
         return action;
     }
@@ -1351,7 +1534,11 @@ fn commit_detail_view(ui: &mut egui::Ui, hash: &str, detail: &git::CommitDetail,
         let subject = display(subject, subject.len());
         let body = display_multiline(body, body.len());
         ui.label(RichText::new(subject).color(theme::colors().text).font(theme::font(12.5)));
-        ui.label(RichText::new(format!("{} · {}", display(author, 80), display(date, 40))).color(theme::colors().faint).font(theme::font(10.5)));
+        ui.label(
+            RichText::new(format!("{} · {}", display(author, 80), display(date, 40)))
+                .color(theme::colors().faint)
+                .font(theme::font(10.5)),
+        );
         ui.label(RichText::new(full_hash).color(theme::colors().faint).font(theme::field_font(10.5)));
         if !body.is_empty() {
             ui.label(RichText::new(body).color(theme::colors().dim).font(theme::font(11.0)));
@@ -1360,13 +1547,23 @@ fn commit_detail_view(ui: &mut egui::Ui, hash: &str, detail: &git::CommitDetail,
         for (status, path, additions, deletions) in &detail.files {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(status.to_string()).color(status_color(*status)).font(theme::field_font(11.5)));
-                if ui.selectable_label(false, RichText::new(display(path, 120)).color(theme::colors().text).font(theme::font(11.5)))
-                    .on_hover_text(path).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+                if ui
+                    .selectable_label(
+                        false,
+                        RichText::new(display(path, 120)).color(theme::colors().text).font(theme::font(11.5)),
+                    )
+                    .on_hover_text(path)
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
                 {
                     action = Some(CommitDetailAction::OpenFile(path.clone()));
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(RichText::new(format!("+{additions} −{deletions}")).color(theme::colors().faint).font(theme::field_font(10.5)));
+                    ui.label(
+                        RichText::new(format!("+{additions} −{deletions}"))
+                            .color(theme::colors().faint)
+                            .font(theme::field_font(10.5)),
+                    );
                 });
             });
         }
@@ -1393,14 +1590,26 @@ impl Workspace {
             let mut hidden = folders[..shared].iter().any(|folder| !self.file_expanded.contains(folder));
             for (index, (segment, folder)) in dirs.iter().zip(folders.iter()).enumerate().skip(shared) {
                 if !hidden {
-                    rows.push(FileRow { depth: index, name: (*segment).to_owned(), dir: None, path: folder.clone(), folder: true });
+                    rows.push(FileRow {
+                        depth: index,
+                        name: (*segment).to_owned(),
+                        dir: None,
+                        path: folder.clone(),
+                        folder: true,
+                    });
                 }
                 if !self.file_expanded.contains(folder) {
                     hidden = true;
                 }
             }
             if !hidden && !name.is_empty() {
-                rows.push(FileRow { depth: dirs.len(), name: name[0].to_owned(), dir: None, path: path.clone(), folder: false });
+                rows.push(FileRow {
+                    depth: dirs.len(),
+                    name: name[0].to_owned(),
+                    dir: None,
+                    path: path.clone(),
+                    folder: false,
+                });
             }
             previous = folders;
         }
@@ -1414,14 +1623,26 @@ impl Workspace {
         self.file_rows = if self.file_filter.trim().is_empty() {
             self.file_tree()
         } else {
-            let mut matches: Vec<_> = self.files.iter()
+            let mut matches: Vec<_> = self
+                .files
+                .iter()
                 .filter_map(|path| crate::profiles::fuzzy_score(&self.file_filter, path).map(|score| (score, path)))
                 .collect();
             matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-            matches.into_iter().take(400).map(|(_, path)| {
-                let (dir, name) = path.rsplit_once('/').map_or(("", path.as_str()), |(dir, name)| (dir, name));
-                FileRow { depth: 0, name: display(name, 120), dir: Some(if dir.is_empty() { String::new() } else { format!("{}/", display(dir, 120)) }), path: path.clone(), folder: false }
-            }).collect()
+            matches
+                .into_iter()
+                .take(400)
+                .map(|(_, path)| {
+                    let (dir, name) = path.rsplit_once('/').map_or(("", path.as_str()), |(dir, name)| (dir, name));
+                    FileRow {
+                        depth: 0,
+                        name: display(name, 120),
+                        dir: Some(if dir.is_empty() { String::new() } else { format!("{}/", display(dir, 120)) }),
+                        path: path.clone(),
+                        folder: false,
+                    }
+                })
+                .collect()
         };
         self.cached_filter.clone_from(&self.file_filter);
         self.file_rows_dirty = false;
@@ -1494,11 +1715,21 @@ impl Workspace {
                 if dir_limit > 10.0 {
                     let dir = elide_front(&painter, dir, theme::font(11.0), dir_limit);
                     let galley = painter.layout_no_wrap(dir, theme::font(11.0), theme::colors().faint);
-                    painter.galley(egui::Pos2::new(x, rect.center().y - galley.size().y / 2.0), galley.clone(), theme::colors().faint);
+                    painter.galley(
+                        egui::Pos2::new(x, rect.center().y - galley.size().y / 2.0),
+                        galley.clone(),
+                        theme::colors().faint,
+                    );
                     x += galley.size().x;
                 }
             }
-            painter.text(egui::Pos2::new(x, rect.center().y), Align2::LEFT_CENTER, name, theme::font(11.5), theme::colors().text);
+            painter.text(
+                egui::Pos2::new(x, rect.center().y),
+                Align2::LEFT_CENTER,
+                name,
+                theme::font(11.5),
+                theme::colors().text,
+            );
             if response.clicked() {
                 opened = Some(row.path.clone());
             }
@@ -1518,7 +1749,11 @@ impl Workspace {
                 ui.close();
             }
             if ui.button(strings::WORKSPACE_DELETE).clicked() {
-                self.prompt = Some(Prompt { kind: PromptKind::Delete { path: path.clone(), folder: row.folder }, text: String::new(), focus: false });
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::Delete { path: path.clone(), folder: row.folder },
+                    text: String::new(),
+                    focus: false,
+                });
                 ui.close();
             }
         });
@@ -1542,7 +1777,11 @@ impl Workspace {
                 self.request(Request::CountLines);
             }
             if let Some((files, lines)) = self.line_count {
-                ui.label(RichText::new(strings::workspace_line_count(files, lines)).color(theme::colors().accent).font(theme::font(11.0)));
+                ui.label(
+                    RichText::new(strings::workspace_line_count(files, lines))
+                        .color(theme::colors().accent)
+                        .font(theme::font(11.0)),
+                );
             }
         });
         ui.add(
@@ -1563,7 +1802,10 @@ impl Workspace {
         let rows = std::mem::take(&mut self.file_rows);
         let spacing = ui.spacing().item_spacing.y;
         ui.spacing_mut().item_spacing.y = 0.0;
-        ScrollArea::vertical().id_salt("workspace-files").max_height(list_height).auto_shrink([false, false])
+        ScrollArea::vertical()
+            .id_salt("workspace-files")
+            .max_height(list_height)
+            .auto_shrink([false, false])
             .show_rows(ui, FILE_ROW_HEIGHT, rows.len(), |ui, visible| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 for index in visible {
@@ -1597,19 +1839,27 @@ impl Workspace {
                 self.preview_wrapped.prepare(ui, text, &self.preview_rows);
                 let spacing = ui.spacing().item_spacing.y;
                 ui.spacing_mut().item_spacing.y = 0.0;
-                ScrollArea::vertical().id_salt(("workspace-file-preview", path)).max_height(height).auto_shrink([false, false])
+                ScrollArea::vertical()
+                    .id_salt(("workspace-file-preview", path))
+                    .max_height(height)
+                    .auto_shrink([false, false])
                     .show_rows(ui, TEXT_ROW_HEIGHT, self.preview_wrapped.rows.len(), |ui, visible| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         for index in visible {
                             let row = &self.preview_wrapped.rows[index];
-                            let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), TEXT_ROW_HEIGHT), Sense::hover());
+                            let (rect, _) = ui
+                                .allocate_exact_size(Vec2::new(ui.available_width(), TEXT_ROW_HEIGHT), Sense::hover());
                             paint_text_row(ui, rect, &text[row.bytes.clone()], row.number, theme::colors().dim);
                         }
                     });
                 ui.spacing_mut().item_spacing.y = spacing;
             }
             if *truncated {
-                ui.label(RichText::new(strings::WORKSPACE_FILE_TRUNCATED).color(theme::colors().status_yellow).font(theme::font(11.0)));
+                ui.label(
+                    RichText::new(strings::WORKSPACE_FILE_TRUNCATED)
+                        .color(theme::colors().status_yellow)
+                        .font(theme::font(11.0)),
+                );
             }
         }
     }
@@ -1689,7 +1939,12 @@ struct TextRow {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PatchKind { Add, Remove, Hunk, Context }
+enum PatchKind {
+    Add,
+    Remove,
+    Hunk,
+    Context,
+}
 
 impl PatchKind {
     /// `in_hunk` is false while the file header is being read, which is the
@@ -1697,11 +1952,17 @@ impl PatchKind {
     /// are content, so a removed `---` markdown rule paints as a removal
     /// instead of silently losing its row.
     fn of(line: &str, in_hunk: bool) -> Self {
-        if line.starts_with("@@") { Self::Hunk }
-        else if !in_hunk { Self::Context }
-        else if line.starts_with('+') { Self::Add }
-        else if line.starts_with('-') { Self::Remove }
-        else { Self::Context }
+        if line.starts_with("@@") {
+            Self::Hunk
+        } else if !in_hunk {
+            Self::Context
+        } else if line.starts_with('+') {
+            Self::Add
+        } else if line.starts_with('-') {
+            Self::Remove
+        } else {
+            Self::Context
+        }
     }
 }
 
@@ -1712,11 +1973,8 @@ type FontCacheKey = (u32, u32, usize);
 // reuse from hiding a reset of the UV coordinates in cached Markdown.
 fn font_cache_key(ui: &egui::Ui, width: f32) -> (FontCacheKey, std::sync::Arc<egui::Galley>) {
     let font_generation = ui.fonts_mut(|fonts| fonts.layout_job(egui::text::LayoutJob::default()));
-    let key = (
-        width.to_bits(),
-        ui.ctx().pixels_per_point().to_bits(),
-        std::sync::Arc::as_ptr(&font_generation) as usize,
-    );
+    let key =
+        (width.to_bits(), ui.ctx().pixels_per_point().to_bits(), std::sync::Arc::as_ptr(&font_generation) as usize);
     (key, font_generation)
 }
 
@@ -1729,9 +1987,16 @@ struct WrappedRows {
 
 impl WrappedRows {
     fn prepare(&mut self, ui: &egui::Ui, text: &str, source: &[TextRow]) {
-        let width = (ui.available_width() - GUTTER - 4.0 - ui.spacing().scroll.bar_width - ui.spacing().scroll.bar_outer_margin).max(20.0);
+        let width = (ui.available_width()
+            - GUTTER
+            - 4.0
+            - ui.spacing().scroll.bar_width
+            - ui.spacing().scroll.bar_outer_margin)
+            .max(20.0);
         let (key, font_generation) = font_cache_key(ui, width);
-        if self.key == Some(key) { return; }
+        if self.key == Some(key) {
+            return;
+        }
         self.key = Some(key);
         self.font_generation = Some(font_generation);
         self.rows.clear();
@@ -1747,19 +2012,30 @@ impl WrappedRows {
                     let advance = if let Some(advance) = widths.get(&ch) {
                         *advance
                     } else {
-                        let advance = if ch == '\t' { fonts.glyph_width(&font, ' ') * 4.0 } else { fonts.glyph_width(&font, ch) };
+                        let advance =
+                            if ch == '\t' { fonts.glyph_width(&font, ' ') * 4.0 } else { fonts.glyph_width(&font, ch) };
                         widths.insert(ch, advance);
                         advance
                     };
                     if at > start && used + advance > width {
-                        self.rows.push(TextRow { bytes: start..at, number: if first { row.number } else { None }, hunk: if first { row.hunk } else { None }, kind: row.kind });
+                        self.rows.push(TextRow {
+                            bytes: start..at,
+                            number: if first { row.number } else { None },
+                            hunk: if first { row.hunk } else { None },
+                            kind: row.kind,
+                        });
                         first = false;
                         start = at;
                         used = 0.0;
                     }
                     used += advance;
                 }
-                self.rows.push(TextRow { bytes: start..row.bytes.end, number: if first { row.number } else { None }, hunk: if first { row.hunk } else { None }, kind: row.kind });
+                self.rows.push(TextRow {
+                    bytes: start..row.bytes.end,
+                    number: if first { row.number } else { None },
+                    hunk: if first { row.hunk } else { None },
+                    kind: row.kind,
+                });
             }
         });
     }
@@ -1770,21 +2046,26 @@ fn text_rows(text: &str, patch: bool) -> Vec<TextRow> {
     let mut numbers = PatchNumbers::default();
     let mut offset = 0;
     let mut hunk = 0;
-    text.split_inclusive('\n').enumerate().map(|(index, raw)| {
-        let line = raw.strip_suffix('\n').unwrap_or(raw);
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        let start = offset;
-        offset += raw.len();
-        let number = if patch { numbers.line(line) } else { Some(index as u64 + 1) };
-        let hunk_index = if patch && line.starts_with("@@") {
-            let index = hunk;
-            hunk += 1;
-            Some(index)
-        } else { None };
-        // Read the state after numbering: a `@@` line opens the hunk it names.
-        let kind = if patch { PatchKind::of(line, numbers.started) } else { PatchKind::Context };
-        TextRow { bytes: start..start + line.len(), number, hunk: hunk_index, kind }
-    }).collect()
+    text.split_inclusive('\n')
+        .enumerate()
+        .map(|(index, raw)| {
+            let line = raw.strip_suffix('\n').unwrap_or(raw);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let start = offset;
+            offset += raw.len();
+            let number = if patch { numbers.line(line) } else { Some(index as u64 + 1) };
+            let hunk_index = if patch && line.starts_with("@@") {
+                let index = hunk;
+                hunk += 1;
+                Some(index)
+            } else {
+                None
+            };
+            // Read the state after numbering: a `@@` line opens the hunk it names.
+            let kind = if patch { PatchKind::of(line, numbers.started) } else { PatchKind::Context };
+            TextRow { bytes: start..start + line.len(), number, hunk: hunk_index, kind }
+        })
+        .collect()
 }
 
 fn count_text_lines(reader: impl std::io::Read, cap: u64) -> std::io::Result<Option<u64>> {
@@ -1840,7 +2121,9 @@ pub struct DiffStamp {
 impl DiffStamp {
     fn for_view(root: Option<&Path>, path: &str, side: Option<bool>, status: &Status) -> Self {
         Self {
-            root: root.map(Path::to_owned), path: path.to_owned(), side,
+            root: root.map(Path::to_owned),
+            path: path.to_owned(),
+            side,
             head: status.head_oid.clone(),
             change: status.changes.iter().find(|change| change.path == path).cloned(),
             index: None,
@@ -1912,23 +2195,27 @@ impl MarkdownCell {
     fn new(x: f32, galley: std::sync::Arc<egui::Galley>, painter: &egui::Painter) -> Self {
         // A cached one-row galley avoids tessellating every wrapped line when only visible lines paint.
         let mut byte_offset = 0;
-        let lines = galley.rows.iter().map(|placed_row| {
-            let row = &placed_row.row;
-            let byte_end = byte_offset + galley.job.text[byte_offset..].chars().take(row.glyphs.len()).map(char::len_utf8).sum::<usize>();
-            let line_galley = (byte_offset < byte_end).then(|| {
-                painter.layout_job(markdown_row_job(&galley.job, byte_offset..byte_end))
-            });
-            byte_offset = byte_end;
-            if placed_row.ends_with_newline && galley.job.text.as_bytes().get(byte_offset) == Some(&b'\n') {
-                byte_offset += 1;
-            }
-            MarkdownLine {
-                x: placed_row.pos.x,
-                top: placed_row.pos.y,
-                bottom: placed_row.pos.y + row.size.y,
-                galley: line_galley,
-            }
-        }).collect();
+        let lines = galley
+            .rows
+            .iter()
+            .map(|placed_row| {
+                let row = &placed_row.row;
+                let byte_end = byte_offset
+                    + galley.job.text[byte_offset..].chars().take(row.glyphs.len()).map(char::len_utf8).sum::<usize>();
+                let line_galley = (byte_offset < byte_end)
+                    .then(|| painter.layout_job(markdown_row_job(&galley.job, byte_offset..byte_end)));
+                byte_offset = byte_end;
+                if placed_row.ends_with_newline && galley.job.text.as_bytes().get(byte_offset) == Some(&b'\n') {
+                    byte_offset += 1;
+                }
+                MarkdownLine {
+                    x: placed_row.pos.x,
+                    top: placed_row.pos.y,
+                    bottom: placed_row.pos.y + row.size.y,
+                    galley: line_galley,
+                }
+            })
+            .collect();
         Self { x, lines }
     }
 
@@ -1957,7 +2244,14 @@ fn markdown_row_job(source: &egui::text::LayoutJob, range: std::ops::Range<usize
 }
 
 impl MarkdownCache {
-    fn push(&mut self, ui: &egui::Ui, cells: Vec<(f32, std::sync::Arc<egui::Galley>)>, padding: f32, header: bool, rule: bool) {
+    fn push(
+        &mut self,
+        ui: &egui::Ui,
+        cells: Vec<(f32, std::sync::Arc<egui::Galley>)>,
+        padding: f32,
+        header: bool,
+        rule: bool,
+    ) {
         let height = cells.iter().map(|(_, galley)| galley.size().y).fold(0.0, f32::max) + padding;
         let cells = cells.into_iter().map(|(x, galley)| MarkdownCell::new(x, galley, ui.painter())).collect();
         self.rows.push(MarkdownRow { top: self.height, height, cells, header, rule });
@@ -1967,9 +2261,12 @@ impl MarkdownCache {
     fn prepare(&mut self, ui: &egui::Ui, text: &str) {
         // Account for the solid vertical scrollbar before layout, so the
         // cached wrapping width is the viewport width, not the parent width.
-        let width = (ui.available_width() - ui.spacing().scroll.bar_width - ui.spacing().scroll.bar_outer_margin).max(40.0);
+        let width =
+            (ui.available_width() - ui.spacing().scroll.bar_width - ui.spacing().scroll.bar_outer_margin).max(40.0);
         let (key, font_generation) = font_cache_key(ui, width);
-        if self.key == Some(key) { return; }
+        if self.key == Some(key) {
+            return;
+        }
         self.key = Some(key);
         self.font_generation = Some(font_generation);
         self.rows.clear();
@@ -1990,9 +2287,14 @@ impl MarkdownCache {
             } else if plain.starts_with('#') {
                 let level = plain.chars().take_while(|c| *c == '#').count().min(6);
                 let title = plain[level..].trim().trim_end_matches('#').trim();
-                let size = match level { 1 => 15.0, 2 => 13.5, _ => 12.5 };
+                let size = match level {
+                    1 => 15.0,
+                    2 => 13.5,
+                    _ => 12.5,
+                };
                 self.push(ui, Vec::new(), 6.0, false, false);
-                let galley = ui.painter().layout(title.to_owned(), theme::title_font(size), theme::colors().text, width);
+                let galley =
+                    ui.painter().layout(title.to_owned(), theme::title_font(size), theme::colors().text, width);
                 self.push(ui, vec![(0.0, galley)], 2.0, false, false);
             } else if matches!(plain, "---" | "***" | "___") {
                 self.push(ui, Vec::new(), 6.0, false, true);
@@ -2007,18 +2309,29 @@ impl MarkdownCache {
                 let column = ((width - gap * (columns - 1) as f32) / columns as f32).max(1.0);
                 for (index, row) in rows.into_iter().enumerate() {
                     let colour = if index == 0 { theme::colors().text } else { theme::colors().dim };
-                    let cells = row.iter().enumerate().map(|(cell, text)| {
-                        (cell as f32 * (column + gap), ui.painter().layout_job(inline_job(text, 11.5, colour, column)))
-                    }).collect();
+                    let cells = row
+                        .iter()
+                        .enumerate()
+                        .map(|(cell, text)| {
+                            (
+                                cell as f32 * (column + gap),
+                                ui.painter().layout_job(inline_job(text, 11.5, colour, column)),
+                            )
+                        })
+                        .collect();
                     self.push(ui, cells, 3.0, index == 0, true);
                 }
                 self.push(ui, Vec::new(), 6.0, false, false);
             } else {
                 let (text, colour) = if let Some(rest) = plain.strip_prefix("> ") {
                     (format!("│ {rest}"), theme::colors().faint)
-                } else if let Some(rest) = plain.strip_prefix("- ").or_else(|| plain.strip_prefix("* ")).or_else(|| plain.strip_prefix("+ ")) {
+                } else if let Some(rest) =
+                    plain.strip_prefix("- ").or_else(|| plain.strip_prefix("* ")).or_else(|| plain.strip_prefix("+ "))
+                {
                     (format!("• {rest}"), theme::colors().dim)
-                } else { (plain.to_owned(), theme::colors().dim) };
+                } else {
+                    (plain.to_owned(), theme::colors().dim)
+                };
                 let galley = ui.painter().layout_job(inline_job(&text, 11.5, colour, width));
                 self.push(ui, vec![(0.0, galley)], 2.0, false, false);
             }
@@ -2032,24 +2345,38 @@ impl MarkdownCache {
     }
 
     fn show(&self, ui: &mut egui::Ui, height: f32, path: &str) {
-        ScrollArea::vertical().id_salt(("workspace-markdown-preview", path)).max_height(height).auto_shrink([false, false])
+        ScrollArea::vertical()
+            .id_salt(("workspace-markdown-preview", path))
+            .max_height(height)
+            .auto_shrink([false, false])
             .show_viewport(ui, |ui, viewport| {
                 let origin = ui.cursor().min;
                 ui.set_min_height(self.height);
                 for index in self.visible(viewport.min.y, viewport.max.y) {
                     let row = &self.rows[index];
-                    let rect = Rect::from_min_size(origin + Vec2::new(0.0, row.top), Vec2::new(ui.available_width(), row.height));
-                    if row.header { ui.painter().rect_filled(rect, 0.0, theme::colors().tab_active_bg); }
+                    let rect = Rect::from_min_size(
+                        origin + Vec2::new(0.0, row.top),
+                        Vec2::new(ui.available_width(), row.height),
+                    );
+                    if row.header {
+                        ui.painter().rect_filled(rect, 0.0, theme::colors().tab_active_bg);
+                    }
                     for cell in &row.cells {
                         let visible = cell.visible(viewport.min.y - row.top, viewport.max.y - row.top);
                         for index in visible {
                             let line = &cell.lines[index];
                             if let Some(galley) = &line.galley {
-                                ui.painter().galley(rect.min + Vec2::new(cell.x + line.x, line.top), galley.clone(), theme::colors().dim);
+                                ui.painter().galley(
+                                    rect.min + Vec2::new(cell.x + line.x, line.top),
+                                    galley.clone(),
+                                    theme::colors().dim,
+                                );
                             }
                         }
                     }
-                    if row.rule { ui.painter().hline(rect.x_range(), rect.max.y - 1.0, Stroke::new(1.0, theme::colors().line)); }
+                    if row.rule {
+                        ui.painter().hline(rect.x_range(), rect.max.y - 1.0, Stroke::new(1.0, theme::colors().line));
+                    }
                 }
             });
     }
@@ -2060,8 +2387,18 @@ impl MarkdownCache {
 fn inline_job(text: &str, size: f32, colour: egui::Color32, width: f32) -> egui::text::LayoutJob {
     use egui::text::{LayoutJob, TextFormat};
     let plain = TextFormat { font_id: theme::font(size), color: colour, ..Default::default() };
-    let bold = TextFormat { font_id: theme::font(size), color: theme::colors().text, extra_letter_spacing: 0.2, ..Default::default() };
-    let code = TextFormat { font_id: theme::field_font(size - 0.5), color: theme::colors().text, background: theme::colors().tab_active_bg, ..Default::default() };
+    let bold = TextFormat {
+        font_id: theme::font(size),
+        color: theme::colors().text,
+        extra_letter_spacing: 0.2,
+        ..Default::default()
+    };
+    let code = TextFormat {
+        font_id: theme::field_font(size - 0.5),
+        color: theme::colors().text,
+        background: theme::colors().tab_active_bg,
+        ..Default::default()
+    };
     let mut job = LayoutJob::default();
     job.wrap.max_width = width;
     let mut rest = text;
@@ -2110,7 +2447,6 @@ fn table_cells(line: &str) -> Vec<&str> {
     line.trim().trim_matches('|').split('|').map(str::trim).collect()
 }
 
-
 /// One patch line: a right-aligned file line number in the gutter, then the
 /// patch line itself, with the change band behind both — as in the reference
 /// diff view. Added and removed lines get a full-width tinted band with the
@@ -2139,7 +2475,10 @@ fn paint_text_row(ui: &egui::Ui, rect: Rect, line: &str, number: Option<u64>, co
     if let Some(number) = number {
         painter.text(
             egui::Pos2::new(rect.min.x + GUTTER - 8.0, rect.min.y + 1.0),
-            Align2::RIGHT_TOP, number.to_string(), theme::field_font(10.5), theme::colors().faint,
+            Align2::RIGHT_TOP,
+            number.to_string(),
+            theme::field_font(10.5),
+            theme::colors().faint,
         );
     }
     let galley = painter.layout_no_wrap(line.to_owned(), theme::field_font(11.0), colour);
@@ -2344,7 +2683,9 @@ fn external_open_target(root: &Path, path: &str) -> Result<(PathBuf, bool), Stri
     let full = git::resolve_path(root, path)?;
     let extension = full.extension().and_then(|extension| extension.to_str()).unwrap_or("").to_ascii_lowercase();
     let mut prefix = [0_u8; 512];
-    let safe = std::fs::File::open(&full).ok().and_then(|mut file| file.read(&mut prefix).ok())
+    let safe = std::fs::File::open(&full)
+        .ok()
+        .and_then(|mut file| file.read(&mut prefix).ok())
         .is_some_and(|size| viewable_content(&extension, &prefix[..size]));
     Ok((full, safe))
 }
@@ -2358,7 +2699,9 @@ fn viewable_content(extension: &str, prefix: &[u8]) -> bool {
         "webp" => prefix.starts_with(b"RIFF") && prefix.get(8..12) == Some(b"WEBP"),
         "pdf" => prefix.starts_with(b"%PDF-"),
         "txt" | "log" | "csv" | "md" | "markdown" => {
-            !prefix.starts_with(b"MZ") && !prefix.starts_with(b"\x7fELF") && !prefix.starts_with(b"#!")
+            !prefix.starts_with(b"MZ")
+                && !prefix.starts_with(b"\x7fELF")
+                && !prefix.starts_with(b"#!")
                 && !prefix.contains(&0)
                 && std::str::from_utf8(prefix).map_or_else(|error| error.error_len().is_none(), |_| true)
         }
@@ -2396,11 +2739,13 @@ fn reveal_resolved(full: &Path) {
 /// The actual AI path reads only index content and index file/status context.
 /// Errors and an empty index never start a CLI or silently stage anything.
 fn staged_ai_prompt(root: &Path) -> Result<String, String> {
-    let status = git::run_git(root, &["diff", "--cached", "--name-status", "--no-ext-diff", "--no-textconv", "--no-color"])?;
+    let status =
+        git::run_git(root, &["diff", "--cached", "--name-status", "--no-ext-diff", "--no-textconv", "--no-color"])?;
     if status.trim().is_empty() {
         return Err(strings::WORKSPACE_AI_NO_STAGE.to_owned());
     }
-    let staged = git::run_git(root, &["diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color", "--unified=1"])?;
+    let staged =
+        git::run_git(root, &["diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color", "--unified=1"])?;
     let recent = git::recent_subjects(root, 8);
     Ok(git::ai_prompt(&status, staged.trim(), &recent))
 }
@@ -2417,7 +2762,11 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
             };
             if request.requires_current_repository() && expected_root != root {
                 let error = strings::WORKSPACE_REPO_CHANGED.to_owned();
-                send(if matches!(request, Request::AiMessage { .. }) { Response::AiMessage(Err(error)) } else { Response::Error(error) });
+                send(if matches!(request, Request::AiMessage { .. }) {
+                    Response::AiMessage(Err(error))
+                } else {
+                    Response::Error(error)
+                });
                 continue;
             }
             if let Request::Refresh { cwd: new_cwd } = &request {
@@ -2444,8 +2793,10 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
             }
             if let Request::Approve { identity: shown } = &request {
                 let current_matches = identity.as_ref().is_some_and(|current| {
-                    current.root == shown.root && current.stamp == shown.stamp
-                        && root.as_ref() == Some(&shown.root) && expected_root.as_ref() == Some(&shown.root)
+                    current.root == shown.root
+                        && current.stamp == shown.stamp
+                        && root.as_ref() == Some(&shown.root)
+                        && expected_root.as_ref() == Some(&shown.root)
                 });
                 if !current_matches {
                     root = identity.as_ref().map(|identity| identity.root.clone());
@@ -2466,15 +2817,13 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                 }
             }
             match request {
-                Request::Refresh { .. } | Request::Approve { .. } => {
-                    match &root {
-                        Some(root) => match git::status(root) {
-                            Ok(status) => send(Response::Status(status, Some(root.clone()))),
-                            Err(e) => send(Response::Error(e)),
-                        },
-                        None => send(Response::Status(Status::default(), None)),
-                    }
-                }
+                Request::Refresh { .. } | Request::Approve { .. } => match &root {
+                    Some(root) => match git::status(root) {
+                        Ok(status) => send(Response::Status(status, Some(root.clone()))),
+                        Err(e) => send(Response::Error(e)),
+                    },
+                    None => send(Response::Status(Status::default(), None)),
+                },
                 Request::Diff { path, side } => match &root {
                     Some(root) => {
                         // A failed git must reach the panel: an empty diff reads
@@ -2482,15 +2831,26 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                         let (bytes, from_index) = match side {
                             Some(staged) => match git::diff_bytes(root, &path, staged) {
                                 Ok(bytes) => (bytes, staged),
-                                Err(e) => { send(Response::Error(e)); continue; }
+                                Err(e) => {
+                                    send(Response::Error(e));
+                                    continue;
+                                }
                             },
                             None => match git::diff_bytes(root, &path, true) {
-                                Ok(staged) if staged.trim_ascii().is_empty() => match git::diff_bytes(root, &path, false) {
-                                    Ok(bytes) => (bytes, false),
-                                    Err(e) => { send(Response::Error(e)); continue; }
-                                },
+                                Ok(staged) if staged.trim_ascii().is_empty() => {
+                                    match git::diff_bytes(root, &path, false) {
+                                        Ok(bytes) => (bytes, false),
+                                        Err(e) => {
+                                            send(Response::Error(e));
+                                            continue;
+                                        }
+                                    }
+                                }
                                 Ok(staged) => (staged, true),
-                                Err(e) => { send(Response::Error(e)); continue; }
+                                Err(e) => {
+                                    send(Response::Error(e));
+                                    continue;
+                                }
                             },
                         };
                         let files = git::parse_diff(&bytes, from_index);
@@ -2532,14 +2892,18 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                     });
                     // An AI subprocess can outlive a configuration change; never
                     // publish its result using approval for the old digest.
-                    let current = root.as_ref().ok_or_else(|| strings::WORKSPACE_NO_REPO.to_owned())
-                        .and_then(|root| git::repository_stamp(root).map(|stamp| git::RepositoryIdentity { root: root.clone(), stamp }));
+                    let current = root.as_ref().ok_or_else(|| strings::WORKSPACE_NO_REPO.to_owned()).and_then(|root| {
+                        git::repository_stamp(root).map(|stamp| git::RepositoryIdentity { root: root.clone(), stamp })
+                    });
                     match current {
                         Ok(identity) if git::trust_approved(&identity.root, &identity.stamp) => {
                             send(Response::AiMessage(result));
                         }
                         Ok(identity) => {
-                            send(Response::TrustRequired { identity: Some(identity), error: Some(strings::WORKSPACE_TRUST_STALE.to_owned()) });
+                            send(Response::TrustRequired {
+                                identity: Some(identity),
+                                error: Some(strings::WORKSPACE_TRUST_STALE.to_owned()),
+                            });
                         }
                         Err(error) => {
                             send(Response::TrustRequired { identity: None, error: Some(error) });
@@ -2564,7 +2928,8 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                     let patch = if expected_root != root {
                         Err(strings::WORKSPACE_REPO_CHANGED.to_owned())
                     } else {
-                        root.as_ref().ok_or_else(|| strings::WORKSPACE_NO_REPO.to_owned())
+                        root.as_ref()
+                            .ok_or_else(|| strings::WORKSPACE_NO_REPO.to_owned())
                             .and_then(|root| git::commit_file_diff(root, &hash, &path))
                             .map(|patch| {
                                 let rows = text_rows(&patch, true);
@@ -2629,7 +2994,9 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                                 .and_then(|file| match file.hunks.get(index) {
                                     // The file may have changed since it was shown:
                                     // apply only the hunk the user actually saw.
-                                    Some(hunk) if hunk.header == header => git::apply_hunks(root, file, &[index], from_index),
+                                    Some(hunk) if hunk.header == header => {
+                                        git::apply_hunks(root, file, &[index], from_index)
+                                    }
                                     Some(_) => Err(strings::WORKSPACE_DIFF_STALE.to_owned()),
                                     None => Err(strings::WORKSPACE_DIFF_STALE.to_owned()),
                                 })
@@ -2800,9 +3167,14 @@ mod tests {
     fn row_ranges_preserve_unicode_crlf_numbers_and_last_line() {
         let text = "diff --git a/f b/f\r\n@@ -10,2 +20,3 @@\r\n-old\r\n+новый\r\n context\r\n+last";
         let rows = text_rows(text, true);
-        assert_eq!(rows.iter().map(|row| &text[row.bytes.clone()]).collect::<Vec<_>>(),
-            ["diff --git a/f b/f", "@@ -10,2 +20,3 @@", "-old", "+новый", " context", "+last"]);
-        assert_eq!(rows.iter().map(|row| row.number).collect::<Vec<_>>(), [None, None, Some(10), Some(20), Some(21), Some(22)]);
+        assert_eq!(
+            rows.iter().map(|row| &text[row.bytes.clone()]).collect::<Vec<_>>(),
+            ["diff --git a/f b/f", "@@ -10,2 +20,3 @@", "-old", "+новый", " context", "+last"]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.number).collect::<Vec<_>>(),
+            [None, None, Some(10), Some(20), Some(21), Some(22)]
+        );
         assert_eq!(rows[1].hunk, Some(0));
         let plain = "first\n\nпоследний";
         let rows = text_rows(plain, false);
@@ -2824,7 +3196,11 @@ mod tests {
         assert_eq!(workspace.file_rows.len(), files.len() + 1);
         assert_eq!(workspace.file_rows.last().unwrap().path, "src/file-50000.txt");
         workspace.update_file_rows();
-        assert_eq!(workspace.file_rows.last().unwrap().path, "src/file-50000.txt", "idle cache preserves the last navigable row");
+        assert_eq!(
+            workspace.file_rows.last().unwrap().path,
+            "src/file-50000.txt",
+            "idle cache preserves the last navigable row"
+        );
         workspace.file_filter = "file-50000".to_owned();
         workspace.update_file_rows();
         assert_eq!(workspace.file_rows[0].path, "src/file-50000.txt", "search actions use the full original path");
@@ -2840,15 +3216,22 @@ mod tests {
     #[test]
     fn unchanged_poll_keeps_diff_and_changed_metadata_reloads_it() {
         let dir = tempfile::tempdir().unwrap();
-        if !git(dir.path(), &["init", "--quiet"]) { return; }
+        if !git(dir.path(), &["init", "--quiet"]) {
+            return;
+        }
         std::fs::write(dir.path().join("f.txt"), "old\n").unwrap();
         let status = Status { branch: "main".to_owned(), changes: vec![changed_file("f.txt")], ..Default::default() };
         let (request_tx, request_rx) = mpsc::channel();
         let (response_tx, response_rx) = mpsc::channel();
         let mut workspace = Workspace {
-            root: Some(dir.path().to_owned()), status: status.clone(), diff_path: Some("f.txt".to_owned()),
+            root: Some(dir.path().to_owned()),
+            status: status.clone(),
+            diff_path: Some("f.txt".to_owned()),
             diff_stamp: Some(DiffStamp::read(Some(dir.path()), "f.txt", None, &status)),
-            log_status_seen: true, tx: Some(request_tx), rx: Some(response_rx), ..Default::default()
+            log_status_seen: true,
+            tx: Some(request_tx),
+            rx: Some(response_rx),
+            ..Default::default()
         };
         response_tx.send(Response::Status(status.clone(), workspace.root.clone())).unwrap();
         workspace.absorb();
@@ -2882,14 +3265,20 @@ mod tests {
         let stamp = DiffStamp::read(workspace.root.as_deref(), "f.txt", None, &status);
         response_tx.send(Response::DiffChecked(stamp)).unwrap();
         workspace.absorb();
-        assert!(request_rx.try_iter().any(|(_, request)| matches!(request, Request::Diff { .. })), "an externally changed index invalidates the open diff");
+        assert!(
+            request_rx.try_iter().any(|(_, request)| matches!(request, Request::Diff { .. })),
+            "an externally changed index invalidates the open diff"
+        );
         response_tx.send(Response::Applied).unwrap();
         response_tx.send(Response::Status(status.clone(), workspace.root.clone())).unwrap();
         workspace.absorb();
         let stamp = DiffStamp::read(workspace.root.as_deref(), "f.txt", None, &status);
         response_tx.send(Response::DiffChecked(stamp)).unwrap();
         workspace.absorb();
-        assert!(request_rx.try_iter().any(|(_, request)| matches!(request, Request::Diff { .. })), "explicit staging invalidates even unchanged metadata");
+        assert!(
+            request_rx.try_iter().any(|(_, request)| matches!(request, Request::Diff { .. })),
+            "explicit staging invalidates even unchanged metadata"
+        );
         workspace.diff_side = Some(true);
         response_tx
             .send(Response::Diff {
@@ -2908,8 +3297,13 @@ mod tests {
     #[test]
     fn multi_megabyte_preview_reads_and_maps_its_final_line() {
         let repository = tempfile::tempdir().unwrap();
-        if !git(repository.path(), &["init", "--quiet"]) { return; }
-        let text = format!("{}tail marker\n", "preview row with sufficient width for realistic workload........\n".repeat(120_000));
+        if !git(repository.path(), &["init", "--quiet"]) {
+            return;
+        }
+        let text = format!(
+            "{}tail marker\n",
+            "preview row with sufficient width for realistic workload........\n".repeat(120_000)
+        );
         assert!(text.len() > 7 * 1024 * 1024 && text.len() < MAX_PREVIEW_BYTES);
         std::fs::write(repository.path().join("large.txt"), &text).unwrap();
         let (tx, rx) = spawn_worker();
@@ -2917,7 +3311,9 @@ mod tests {
         let shown = approve_worker(&tx, &rx);
         tx.send((shown.clone(), Request::ReadFile { path: "large.txt".to_owned() })).unwrap();
         let response = rx.recv_timeout(Duration::from_secs(20)).unwrap();
-        let Response::FileText { text: loaded, truncated, .. } = &response else { panic!("real preview response expected") };
+        let Response::FileText { text: loaded, truncated, .. } = &response else {
+            panic!("real preview response expected")
+        };
         assert!(!truncated && loaded == &text, "supported multi-megabyte previews must not silently stop at 512 KiB");
         let (response_tx, response_rx) = mpsc::channel();
         let mut workspace = Workspace { rx: Some(response_rx), ..Default::default() };
@@ -2929,7 +3325,9 @@ mod tests {
         assert_eq!(last.number, Some(120_001));
         std::fs::write(repository.path().join("large.txt"), vec![b'x'; MAX_PREVIEW_BYTES + 1]).unwrap();
         tx.send((shown, Request::ReadFile { path: "large.txt".to_owned() })).unwrap();
-        let Response::FileText { text, truncated, .. } = rx.recv_timeout(Duration::from_secs(20)).unwrap() else { panic!("real capped response expected") };
+        let Response::FileText { text, truncated, .. } = rx.recv_timeout(Duration::from_secs(20)).unwrap() else {
+            panic!("real capped response expected")
+        };
         assert!(truncated && text.len() == MAX_PREVIEW_BYTES, "files beyond the cap still report truncation");
     }
 
@@ -2945,7 +3343,10 @@ mod tests {
                 egui::CentralPanel::default().show_inside(ui, |ui| {
                     ui.set_max_width(width);
                     cache.prepare(ui, text, &source);
-                    assert_eq!(cache.rows.iter().map(|row| &text[row.bytes.clone()]).collect::<String>(), text.replace('\n', ""));
+                    assert_eq!(
+                        cache.rows.iter().map(|row| &text[row.bytes.clone()]).collect::<String>(),
+                        text.replace('\n', "")
+                    );
                     assert_eq!(cache.rows.iter().filter(|row| row.hunk == Some(0)).count(), 1);
                     assert_eq!(cache.rows.iter().filter(|row| row.number == Some(10)).count(), 1);
                     assert!(cache.rows.last().unwrap().bytes.end == text.len());
@@ -2960,16 +3361,27 @@ mod tests {
     fn rich_markdown_viewport_reaches_last_block_and_keeps_inline_formats() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
-        let text = format!("# Heading\n| Name | Value |\n| --- | --- |\n| **bold** | `code` |\n{}\nlast marker", "paragraph with wrapping and **bold** text\n".repeat(2_000));
+        let text = format!(
+            "# Heading\n| Name | Value |\n| --- | --- |\n| **bold** | `code` |\n{}\nlast marker",
+            "paragraph with wrapping and **bold** text\n".repeat(2_000)
+        );
         let mut cache = MarkdownCache::default();
         let _ = ctx.run_ui(Default::default(), |ui| {
             egui::CentralPanel::default().show_inside(ui, |ui| {
                 ui.set_max_width(300.0);
                 cache.prepare(ui, &text);
                 assert!(cache.rows.iter().any(|row| row.header && row.cells.len() == 2));
-                assert!(cache.rows.iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.lines)
-                    .filter_map(|line| line.galley.as_ref()).flat_map(|galley| &galley.job.sections).any(|section| section.format.background == theme::colors().tab_active_bg),
-                    "inline code retains its rich background");
+                assert!(
+                    cache
+                        .rows
+                        .iter()
+                        .flat_map(|row| &row.cells)
+                        .flat_map(|cell| &cell.lines)
+                        .filter_map(|line| line.galley.as_ref())
+                        .flat_map(|galley| &galley.job.sections)
+                        .any(|section| section.format.background == theme::colors().tab_active_bg),
+                    "inline code retains its rich background"
+                );
                 let last = cache.rows.last().unwrap();
                 assert_eq!(last.cells[0].lines[0].galley.as_ref().unwrap().text(), "last marker");
                 let visible = cache.visible(last.top, cache.height);
@@ -3000,14 +3412,22 @@ mod tests {
     fn switching_repositories_drops_the_previous_view() {
         let mut workspace = Workspace {
             root: Some(PathBuf::from("C:/old")),
-            log: CommitLog { commits: vec![commit("0123456789", git::Section::History)], upstream: None, truncated: false },
+            log: CommitLog {
+                commits: vec![commit("0123456789", git::Section::History)],
+                upstream: None,
+                truncated: false,
+            },
             files: vec!["old.txt".to_owned()],
             file_preview: Some(("old.txt".to_owned(), "text".to_owned(), false)),
             detail: Some(("0123456789".to_owned(), git::CommitDetail { files: Vec::new(), header: String::new() })),
             ..Default::default()
         };
         workspace.selected.insert("old.txt".to_owned());
-        workspace.prompt = Some(Prompt { kind: PromptKind::Delete { path: "src".to_owned(), folder: true }, text: String::new(), focus: false });
+        workspace.prompt = Some(Prompt {
+            kind: PromptKind::Delete { path: "src".to_owned(), folder: true },
+            text: String::new(),
+            focus: false,
+        });
 
         let (request_tx, request_rx) = mpsc::channel();
         let (response_tx, response_rx) = mpsc::channel();
@@ -3022,7 +3442,10 @@ mod tests {
         assert!(workspace.selected.is_empty() && workspace.file_preview.is_none());
         assert!(workspace.prompt.is_none(), "a delete/rename prompt of the old repository must not survive");
         let requests: Vec<Request> = request_rx.try_iter().map(|(_, request)| request).collect();
-        assert!(requests.iter().any(|request| matches!(request, Request::Log)), "the new repository must be read again");
+        assert!(
+            requests.iter().any(|request| matches!(request, Request::Log)),
+            "the new repository must be read again"
+        );
     }
 
     fn git(dir: &Path, args: &[&str]) -> bool {
@@ -3066,7 +3489,9 @@ mod tests {
             return;
         }
         assert!(git(&remote, &["init", "--quiet", "--bare", "--initial-branch=main"]));
-        assert!(git(&root, &["config", "user.email", "anvil@test"]) && git(&root, &["config", "user.name", "ANVIL test"]));
+        assert!(
+            git(&root, &["config", "user.email", "anvil@test"]) && git(&root, &["config", "user.name", "ANVIL test"])
+        );
         assert!(git(&root, &["remote", "add", "origin", remote.to_str().unwrap()]));
         std::fs::write(root.join("file.txt"), "base\n").unwrap();
         assert!(git(&root, &["add", "file.txt"]) && git(&root, &["commit", "--quiet", "-m", "base"]));
@@ -3119,10 +3544,15 @@ mod tests {
         }
         let pushed = workspace.log.commits.iter().find(|commit| commit.hash == local_hash).unwrap();
         assert_eq!(pushed.section, git::Section::History, "pushed commits must leave the outgoing section");
-        assert!(pushed.refs.iter().any(|reference| reference == "origin/main"), "the remote label must move to the pushed tip");
+        assert!(
+            pushed.refs.iter().any(|reference| reference == "origin/main"),
+            "the remote label must move to the pushed tip"
+        );
 
         assert!(git(dir.path(), &["clone", "--quiet", remote.to_str().unwrap(), peer.to_str().unwrap()]));
-        assert!(git(&peer, &["config", "user.email", "anvil@test"]) && git(&peer, &["config", "user.name", "ANVIL test"]));
+        assert!(
+            git(&peer, &["config", "user.email", "anvil@test"]) && git(&peer, &["config", "user.name", "ANVIL test"])
+        );
         std::fs::write(peer.join("file.txt"), "base\nlocal\nremote\n").unwrap();
         assert!(git(&peer, &["add", "file.txt"]) && git(&peer, &["commit", "--quiet", "-m", "remote change"]));
         assert!(git(&peer, &["push", "--quiet"]));
@@ -3144,7 +3574,10 @@ mod tests {
         assert!(incoming.refs.iter().any(|reference| reference == "origin/main"));
         let local = workspace.log.commits.iter().find(|commit| commit.hash == local_hash).unwrap();
         assert_eq!(local.section, git::Section::History);
-        assert!(!local.refs.iter().any(|reference| reference == "origin/main"), "fetch must move the remote label to the incoming tip");
+        assert!(
+            !local.refs.iter().any(|reference| reference == "origin/main"),
+            "fetch must move the remote label to the incoming tip"
+        );
     }
 
     /// The "index / worktree" button asked for the same automatic side again,
@@ -3157,7 +3590,9 @@ mod tests {
             eprintln!("git is not installed; skipping");
             return;
         }
-        assert!(git(root, &["config", "user.email", "anvil@test"]) && git(root, &["config", "user.name", "ANVIL test"]));
+        assert!(
+            git(root, &["config", "user.email", "anvil@test"]) && git(root, &["config", "user.name", "ANVIL test"])
+        );
         std::fs::write(root.join("f.txt"), "one\n").unwrap();
         assert!(git(root, &["add", "f.txt"]) && git(root, &["commit", "--quiet", "-m", "init"]));
         std::fs::write(root.join("f.txt"), "one\nstaged\n").unwrap();
@@ -3178,7 +3613,10 @@ mod tests {
         let (text, staged) = diff(None);
         assert!(staged && text.contains("+staged"), "the index side first: {text}");
         let (text, staged) = diff(Some(false));
-        assert!(!staged && text.contains("+worktree") && !text.contains("+staged"), "the worktree side on request: {text}");
+        assert!(
+            !staged && text.contains("+worktree") && !text.contains("+staged"),
+            "the worktree side on request: {text}"
+        );
     }
 
     /// The worker resolves paths against the repository it last refreshed. A
@@ -3222,11 +3660,15 @@ mod tests {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
         let output = ctx.run_ui(
-            egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(800.0, 600.0))), ..Default::default() },
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(800.0, 600.0))),
+                ..Default::default()
+            },
             |ui| {
                 let painter = ui.painter().clone();
                 let font = theme::font(11.0);
-                let measure = |value: &str| painter.layout_no_wrap(value.to_owned(), font.clone(), egui::Color32::WHITE).size().x;
+                let measure =
+                    |value: &str| painter.layout_no_wrap(value.to_owned(), font.clone(), egui::Color32::WHITE).size().x;
                 for path in [
                     "src/term/glyphs.rs",
                     "a/very/deeply/nested/path/to/some/file.rs",
@@ -3282,11 +3724,7 @@ mod tests {
         };
         let interleaved = Workspace {
             status: Status {
-                changes: vec![
-                    changed_file("src/a.rs"),
-                    changed_file("src/deep/c.rs"),
-                    changed_file("src/z.rs"),
-                ],
+                changes: vec![changed_file("src/a.rs"), changed_file("src/deep/c.rs"), changed_file("src/z.rs")],
                 ..Default::default()
             },
             ..Default::default()
@@ -3316,7 +3754,12 @@ mod tests {
         }
     }
 
-    fn panel_frame(workspace: &mut Workspace, tab: PanelTab, pane: crate::layout::split_tree::PaneId, rect: egui::Rect) -> Vec<egui::Shape> {
+    fn panel_frame(
+        workspace: &mut Workspace,
+        tab: PanelTab,
+        pane: crate::layout::split_tree::PaneId,
+        rect: egui::Rect,
+    ) -> Vec<egui::Shape> {
         panel_frame_clipped(workspace, tab, pane, rect).into_iter().map(|clipped| clipped.shape).collect()
     }
 
@@ -3416,7 +3859,11 @@ mod tests {
     fn scrolling_the_history_keeps_the_header_in_place() {
         let commits: Vec<git::Commit> = (0..200).map(|i| commit(&format!("{i:010}"), git::Section::History)).collect();
         let mut workspace = Workspace {
-            status: Status { branch: "main".to_owned(), changes: vec![changed_file("src/lib.rs")], ..Default::default() },
+            status: Status {
+                branch: "main".to_owned(),
+                changes: vec![changed_file("src/lib.rs")],
+                ..Default::default()
+            },
             graph: graph::compute(&commits),
             log: CommitLog { commits, upstream: None, truncated: false },
             tab: PanelTab::Changes,
@@ -3440,10 +3887,16 @@ mod tests {
         };
         let before = frame(Vec::new(), 0.0).expect("the commit button is drawn");
         let over_history = egui::Pos2::new(300.0, 650.0);
-        let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::Vec2::new(0.0, -400.0), phase: egui::TouchPhase::Move, modifiers: Default::default() };
+        let wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::Vec2::new(0.0, -400.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: Default::default(),
+        };
         let mut after = Some(before);
         for step in 1..30 {
-            let events = if step == 1 { vec![egui::Event::PointerMoved(over_history), wheel.clone()] } else { Vec::new() };
+            let events =
+                if step == 1 { vec![egui::Event::PointerMoved(over_history), wheel.clone()] } else { Vec::new() };
             after = frame(events, step as f64 * 0.05);
         }
         assert_eq!(after, Some(before), "scrolling the history moved the commit box");
@@ -3473,10 +3926,10 @@ mod tests {
         for tab in [PanelTab::Changes, PanelTab::Files] {
             let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(900.0, 700.0));
             let shapes = panel_frame(&mut workspace, tab, 1, rect);
-            let clashes: Vec<String> = shapes.iter().filter_map(shape_text).filter(|text| text.contains("of ScrollArea")).collect();
+            let clashes: Vec<String> =
+                shapes.iter().filter_map(shape_text).filter(|text| text.contains("of ScrollArea")).collect();
             assert!(clashes.is_empty(), "egui reported an id clash in the {tab:?} tab: {clashes:?}");
         }
-
     }
 
     /// "Open in the system" runs ShellExecute's default verb: for a script or
@@ -3484,18 +3937,49 @@ mod tests {
     #[test]
     fn programs_and_scripts_are_not_opened() {
         let dir = tempfile::tempdir().unwrap();
-        for extension in ["exe", "BAT", "cmd", "ps1", "js", "vbs", "wsf", "hta", "lnk", "url", "py", "reg", "msi",
-            "sh", "pyz", "pyzw", "diagcab", "msix", "appx", "appinstaller", "xll", "rdp", "website", "unknown"] {
+        for extension in [
+            "exe",
+            "BAT",
+            "cmd",
+            "ps1",
+            "js",
+            "vbs",
+            "wsf",
+            "hta",
+            "lnk",
+            "url",
+            "py",
+            "reg",
+            "msi",
+            "sh",
+            "pyz",
+            "pyzw",
+            "diagcab",
+            "msix",
+            "appx",
+            "appinstaller",
+            "xll",
+            "rdp",
+            "website",
+            "unknown",
+        ] {
             let path = format!("file.{extension}");
             std::fs::write(dir.path().join(&path), b"ordinary text\n").unwrap();
             assert!(!external_open_target(dir.path(), &path).unwrap().1, "{path} must reveal, never execute");
         }
-        for (path, content) in [("notes.txt", b"read me\n".as_slice()), ("README.md", b"# title\n"),
-            ("image.png", b"\x89PNG\r\n\x1a\n"), ("paper.pdf", b"%PDF-1.7\n")] {
+        for (path, content) in [
+            ("notes.txt", b"read me\n".as_slice()),
+            ("README.md", b"# title\n"),
+            ("image.png", b"\x89PNG\r\n\x1a\n"),
+            ("paper.pdf", b"%PDF-1.7\n"),
+        ] {
             std::fs::write(dir.path().join(path), content).unwrap();
             assert!(external_open_target(dir.path(), path).unwrap().1, "{path} can use its viewer");
             std::fs::write(dir.path().join(path), b"MZrenamed executable").unwrap();
-            assert!(!external_open_target(dir.path(), path).unwrap().1, "renaming a program to {path} must not approve it");
+            assert!(
+                !external_open_target(dir.path(), path).unwrap().1,
+                "renaming a program to {path} must not approve it"
+            );
         }
         assert!(external_open_target(dir.path(), "../outside.txt").is_err());
         assert!(external_open_target(dir.path(), "notes.txt:stream").is_err());
@@ -3565,8 +4049,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "b", "the target is untouched");
         assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "a");
         rename_path(root, "a.txt", "A.txt").expect("a case-only rename");
-        let names: Vec<String> =
-            std::fs::read_dir(root).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        let names: Vec<String> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
         assert!(names.contains(&"A.txt".to_owned()), "{names:?}");
         rename_path(root, "A.txt", "c.txt").expect("a plain rename");
         assert_eq!(std::fs::read_to_string(root.join("c.txt")).unwrap(), "a");
@@ -3622,7 +4108,13 @@ mod tests {
             ..Default::default()
         };
         let panel = |path: &str| Workspace {
-            status: Status { branch: "main".to_owned(), changes: vec![changed_file(path)], additions: 3, deletions: 1, ..Default::default() },
+            status: Status {
+                branch: "main".to_owned(),
+                changes: vec![changed_file(path)],
+                additions: 3,
+                deletions: 1,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let mut left = panel("src/lib.rs");
@@ -3723,8 +4215,16 @@ mod tests {
         let kinds: Vec<PatchKind> = rows.iter().map(|row| row.kind).collect();
         assert_eq!(
             kinds,
-            vec![PatchKind::Context, PatchKind::Context, PatchKind::Context, PatchKind::Hunk,
-                PatchKind::Context, PatchKind::Remove, PatchKind::Add, PatchKind::Context],
+            vec![
+                PatchKind::Context,
+                PatchKind::Context,
+                PatchKind::Context,
+                PatchKind::Hunk,
+                PatchKind::Context,
+                PatchKind::Remove,
+                PatchKind::Add,
+                PatchKind::Context
+            ],
             "`----` is a removal and `++++` an addition, not header text"
         );
     }
@@ -3764,7 +4264,8 @@ mod tests {
             ],
             ..Default::default()
         };
-        let shape = |rows: Vec<FileRow>| rows.iter().map(|row| (row.depth, row.name.clone(), row.folder)).collect::<Vec<_>>();
+        let shape =
+            |rows: Vec<FileRow>| rows.iter().map(|row| (row.depth, row.name.clone(), row.folder)).collect::<Vec<_>>();
         // The tree starts folded: only the top level shows.
         assert_eq!(
             shape(workspace.file_tree()),
@@ -3836,7 +4337,9 @@ mod tests {
     fn hostile_clean_filter_requires_current_explicit_trust() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        if !git(root, &["init", "--quiet"]) { return; }
+        if !git(root, &["init", "--quiet"]) {
+            return;
+        }
         assert!(git(root, &["config", "user.email", "anvil@test"]));
         assert!(git(root, &["config", "user.name", "ANVIL test"]));
         std::fs::write(root.join("victim.txt"), "original\n").unwrap();
@@ -3844,7 +4347,8 @@ mod tests {
         assert!(git(root, &["add", "."]));
         assert!(git(root, &["commit", "--quiet", "-m", "initial"]));
         let marker = root.join("filter-ran");
-        let command = format!("printf executed > '{}'; cat", marker.to_string_lossy().replace('\\', "/").replace('\'', "'\\''"));
+        let command =
+            format!("printf executed > '{}'; cat", marker.to_string_lossy().replace('\\', "/").replace('\'', "'\\''"));
         assert!(git(root, &["config", "filter.hostile.clean", &command]));
         std::fs::write(root.join("victim.txt"), "modified with different size\n").unwrap();
         let (tx, rx) = spawn_worker();
@@ -3895,13 +4399,17 @@ mod tests {
     fn trust_survives_a_second_pane_and_routine_git_operations() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        if !git(root, &["init", "--quiet", "--initial-branch=main"]) { return; }
+        if !git(root, &["init", "--quiet", "--initial-branch=main"]) {
+            return;
+        }
         assert!(git(root, &["config", "user.email", "anvil@test"]));
         assert!(git(root, &["config", "user.name", "ANVIL test"]));
         assert!(git(root, &["config", "filter.hostile.clean", "cat"]));
         let (first_tx, first_rx) = spawn_worker();
         first_tx.send((None, Request::Refresh { cwd: root.to_owned() })).unwrap();
-        let Response::TrustRequired { identity: Some(identity), .. } = first_rx.recv_timeout(Duration::from_secs(20)).unwrap() else {
+        let Response::TrustRequired { identity: Some(identity), .. } =
+            first_rx.recv_timeout(Duration::from_secs(20)).unwrap()
+        else {
             panic!("a clean filter must ask for trust");
         };
         let shown = Some(identity.root.clone());
@@ -3927,7 +4435,9 @@ mod tests {
     fn ai_prompt_uses_real_index_without_unstaged_content() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        if !git(root, &["init", "--quiet"]) { return; }
+        if !git(root, &["init", "--quiet"]) {
+            return;
+        }
         assert!(git(root, &["config", "user.email", "anvil@test"]));
         assert!(git(root, &["config", "user.name", "ANVIL test"]));
         std::fs::write(root.join("mixed.txt"), "base\n").unwrap();
@@ -3941,7 +4451,9 @@ mod tests {
         std::fs::write(root.join("untracked.txt"), "UNTRACKED_SENTINEL\n").unwrap();
         let prompt = staged_ai_prompt(root).unwrap();
         assert!(prompt.contains("STAGED_SENTINEL") && prompt.contains("mixed.txt"));
-        for excluded in ["UNSTAGED_SENTINEL", "UNSTAGED_ONLY_SENTINEL", "UNTRACKED_SENTINEL", "unstaged-only.txt", "untracked.txt"] {
+        for excluded in
+            ["UNSTAGED_SENTINEL", "UNSTAGED_ONLY_SENTINEL", "UNTRACKED_SENTINEL", "unstaged-only.txt", "untracked.txt"]
+        {
             assert!(!prompt.contains(excluded), "unstaged data leaked: {excluded}");
         }
         assert!(git(root, &["reset", "--quiet", "HEAD"]));
@@ -3950,7 +4462,9 @@ mod tests {
         tx.send((None, Request::Refresh { cwd: root.to_owned() })).unwrap();
         let shown = approve_worker(&tx, &rx);
         tx.send((shown, Request::AiMessage { command: Some("nonexistent-ai-command".to_owned()) })).unwrap();
-        let Response::AiMessage(Err(message)) = rx.recv_timeout(Duration::from_secs(20)).unwrap() else { panic!("empty index must reject generation") };
+        let Response::AiMessage(Err(message)) = rx.recv_timeout(Duration::from_secs(20)).unwrap() else {
+            panic!("empty index must reject generation")
+        };
         assert_eq!(message, strings::WORKSPACE_AI_NO_STAGE, "the CLI must not start for an empty index");
         let missing = root.join("missing");
         assert!(staged_ai_prompt(&missing).is_err(), "index read errors cannot start generation");
@@ -3960,13 +4474,28 @@ mod tests {
     fn late_commit_diff_releases_busy_without_replacing_current_file() {
         let (tx, rx) = mpsc::channel();
         let mut workspace = Workspace { busy: true, rx: Some(rx), ..Default::default() };
-        tx.send(Response::CommitDiff { hash: "old".to_owned(), path: "old.txt".to_owned(), patch: Ok(("old patch".to_owned(), Vec::new())) }).unwrap();
+        tx.send(Response::CommitDiff {
+            hash: "old".to_owned(),
+            path: "old.txt".to_owned(),
+            patch: Ok(("old patch".to_owned(), Vec::new())),
+        })
+        .unwrap();
         workspace.absorb();
         assert!(!workspace.busy && workspace.detail.is_none());
         workspace.busy = true;
         workspace.detail = Some(("new".to_owned(), git::CommitDetail { files: Vec::new(), header: String::new() }));
-        workspace.detail_file = Some(CommitFile { path: "new.txt".to_owned(), patch: None, rows: Vec::new(), wrapped: WrappedRows::default() });
-        tx.send(Response::CommitDiff { hash: "new".to_owned(), path: "old.txt".to_owned(), patch: Ok(("stale patch".to_owned(), Vec::new())) }).unwrap();
+        workspace.detail_file = Some(CommitFile {
+            path: "new.txt".to_owned(),
+            patch: None,
+            rows: Vec::new(),
+            wrapped: WrappedRows::default(),
+        });
+        tx.send(Response::CommitDiff {
+            hash: "new".to_owned(),
+            path: "old.txt".to_owned(),
+            patch: Ok(("stale patch".to_owned(), Vec::new())),
+        })
+        .unwrap();
         workspace.absorb();
         assert!(!workspace.busy);
         assert!(workspace.detail_file.as_ref().unwrap().patch.is_none());
@@ -3976,13 +4505,16 @@ mod tests {
     fn revoked_trust_clears_views_and_releases_ai_busy() {
         let (tx, rx) = mpsc::channel();
         let mut workspace = Workspace {
-            busy: true, ai_generating: true, rx: Some(rx),
+            busy: true,
+            ai_generating: true,
+            rx: Some(rx),
             log: CommitLog { commits: vec![commit("0123456789", git::Section::History)], ..Default::default() },
             commit_message: "old draft".to_owned(),
             diff_text: "old diff".to_owned(),
             ..Default::default()
         };
-        tx.send(Response::TrustRequired { identity: None, error: Some("configuration unavailable".to_owned()) }).unwrap();
+        tx.send(Response::TrustRequired { identity: None, error: Some("configuration unavailable".to_owned()) })
+            .unwrap();
         workspace.absorb();
         assert!(!workspace.busy && !workspace.ai_generating && workspace.trust_required);
         assert!(workspace.log.commits.is_empty() && workspace.diff_text.is_empty());
@@ -3993,7 +4525,9 @@ mod tests {
     fn external_commit_state_refreshes_log_but_unchanged_unborn_status_does_not() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        if !git(root, &["init", "--quiet", "--initial-branch=main"]) { return; }
+        if !git(root, &["init", "--quiet", "--initial-branch=main"]) {
+            return;
+        }
         assert!(git(root, &["config", "user.email", "anvil@test"]));
         assert!(git(root, &["config", "user.name", "ANVIL test"]));
         let (worker_tx, worker_rx) = spawn_worker();

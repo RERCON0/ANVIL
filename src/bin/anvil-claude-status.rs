@@ -18,10 +18,7 @@ fn main() {
     // (never quarantined from here) means every field, as before.
     let fields = Config::load_for_reload(&Config::path()).map(|c| c.claude_status.line_fields).unwrap_or_default();
     let branch = if fields.branch {
-        payload
-            .dir
-            .as_deref()
-            .and_then(|d| git_branch(std::path::Path::new(d), Duration::from_millis(800)))
+        payload.dir.as_deref().and_then(|d| git_branch(std::path::Path::new(d), Duration::from_millis(800)))
     } else {
         None
     };

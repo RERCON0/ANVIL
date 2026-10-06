@@ -69,11 +69,21 @@ pub fn runs_claude(procs: &[ProcInfo], shell: u32) -> bool {
 }
 
 fn process_cli(process: &ProcInfo) -> Option<&'static str> {
-    let native = [("claude", "claude.exe"), ("opencode", "opencode.exe"), ("codex", "codex.exe"), ("gemini", "gemini.exe"), ("aider", "aider.exe")]
-        .into_iter()
-        .find_map(|(cli, executable)| (process.name.eq_ignore_ascii_case(cli) || process.name.eq_ignore_ascii_case(executable)).then_some(cli));
+    let native = [
+        ("claude", "claude.exe"),
+        ("opencode", "opencode.exe"),
+        ("codex", "codex.exe"),
+        ("gemini", "gemini.exe"),
+        ("aider", "aider.exe"),
+    ]
+    .into_iter()
+    .find_map(|(cli, executable)| {
+        (process.name.eq_ignore_ascii_case(cli) || process.name.eq_ignore_ascii_case(executable)).then_some(cli)
+    });
     native.or_else(|| {
-        process.name.eq_ignore_ascii_case("node.exe")
+        process
+            .name
+            .eq_ignore_ascii_case("node.exe")
             .then(|| process.command_line.as_deref().and_then(node_entrypoint_cli))
             .flatten()
     })
@@ -97,7 +107,9 @@ fn node_entrypoint_cli(command_line: &str) -> Option<&'static str> {
             while *script.add(length) != 0 {
                 length += 1;
             }
-            let path = String::from_utf16_lossy(std::slice::from_raw_parts(script, length)).replace('\\', "/").to_ascii_lowercase();
+            let path = String::from_utf16_lossy(std::slice::from_raw_parts(script, length))
+                .replace('\\', "/")
+                .to_ascii_lowercase();
             [
                 ("/node_modules/@anthropic-ai/claude-code/cli.js", "claude"),
                 ("/node_modules/@openai/codex/bin/codex.js", "codex"),
@@ -128,7 +140,13 @@ fn process_command_line(pid: u32) -> Option<String> {
     }
     #[link(name = "ntdll")]
     extern "system" {
-        fn NtQueryInformationProcess(process: HANDLE, class: u32, information: *mut std::ffi::c_void, length: u32, returned: *mut u32) -> i32;
+        fn NtQueryInformationProcess(
+            process: HANDLE,
+            class: u32,
+            information: *mut std::ffi::c_void,
+            length: u32,
+            returned: *mut u32,
+        ) -> i32;
     }
     // SAFETY: the queried class writes only to our bounded aligned allocation.
     // Validate the returned string lies wholly within it before reading.
@@ -184,13 +202,9 @@ pub fn snapshot() -> Option<Vec<ProcInfo>> {
         while ok {
             let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
             let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
-            let command_line = name.eq_ignore_ascii_case("node.exe").then(|| process_command_line(entry.th32ProcessID)).flatten();
-            out.push(ProcInfo {
-                pid: entry.th32ProcessID,
-                ppid: entry.th32ParentProcessID,
-                name,
-                command_line,
-            });
+            let command_line =
+                name.eq_ignore_ascii_case("node.exe").then(|| process_command_line(entry.th32ProcessID)).flatten();
+            out.push(ProcInfo { pid: entry.th32ProcessID, ppid: entry.th32ParentProcessID, name, command_line });
             ok = Process32NextW(snap, &mut entry) != 0;
         }
         CloseHandle(snap);
@@ -221,7 +235,8 @@ mod tests {
         let mut npm = p(12, 11, "node.exe");
         npm.command_line = Some(r#""C:\Program Files\nodejs\node.exe" "C:\Users\Jane Doe\npm\node_modules\@anthropic-ai\claude-code\cli.js" --debug"#.to_owned());
         assert!(runs_claude(&[shell.clone(), p(11, 10, "cmd.exe"), npm.clone()], 10));
-        npm.command_line = Some(r#"node.exe -e "console.log('/node_modules/@anthropic-ai/claude-code/cli.js')" "#.to_owned());
+        npm.command_line =
+            Some(r#"node.exe -e "console.log('/node_modules/@anthropic-ai/claude-code/cli.js')" "#.to_owned());
         assert!(!runs_claude(&[shell.clone(), p(11, 10, "cmd.exe"), npm], 10));
         assert!(!runs_claude(&[shell.clone(), p(11, 10, "node.exe")], 10));
         assert!(!runs_claude(&[shell, p(11, 10, "git.exe")], 10));

@@ -2,8 +2,8 @@
 //! read the status, stage, diff and commit.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use anvil::git;
 
@@ -201,8 +201,12 @@ fn network_includes_and_external_attributes_are_rejected_before_git_reads_them()
     let Some(dir) = repo() else { return };
     let config = dir.path().join(".git/config");
     let original = std::fs::read_to_string(&config).unwrap();
-    for (section, key) in [("include", "path"), ("includeIf \"onbranch:never-selected\"", "path"), ("core", "attributesFile")] {
-        for target in ["//127.0.0.1/ANVIL-denied/file", r"\\?\UNC\127.0.0.1\ANVIL-denied\file", "file://example.invalid/file"] {
+    for (section, key) in
+        [("include", "path"), ("includeIf \"onbranch:never-selected\"", "path"), ("core", "attributesFile")]
+    {
+        for target in
+            ["//127.0.0.1/ANVIL-denied/file", r"\\?\UNC\127.0.0.1\ANVIL-denied\file", "file://example.invalid/file"]
+        {
             std::fs::write(&config, format!("{original}\n[{section}]\n {key} = {}\n", quoted_config(target))).unwrap();
             assert!(git::repository_identity(dir.path()).unwrap_err().contains("сетевые"));
             assert!(git::run_git(dir.path(), &["config", "--includes", "--list"]).unwrap_err().contains("сетевые"));
@@ -215,13 +219,18 @@ fn initialized_submodule_hazards_and_identity_belong_to_parent_approval() {
     let Some(parent) = repo() else { return };
     let Some(source) = repo() else { return };
     let root = parent.path();
-    run(root, &["-c", "protocol.file.allow=always", "submodule", "add", "--quiet", source.path().to_str().unwrap(), "module"]);
+    run(
+        root,
+        &["-c", "protocol.file.allow=always", "submodule", "add", "--quiet", source.path().to_str().unwrap(), "module"],
+    );
     let child = root.join("module");
     let clean = git::repository_stamp(root).unwrap();
     assert!(clean.is_hazard_free());
     std::fs::write(child.join("tracked.txt"), "dirty child\n").unwrap();
-    assert!(git::status(root).unwrap().changes.iter().any(|change| change.path == "module" && change.unstaged()),
-        "ordinary submodule dirty checking remains enabled");
+    assert!(
+        git::status(root).unwrap().changes.iter().any(|change| change.path == "module" && change.unstaged()),
+        "ordinary submodule dirty checking remains enabled"
+    );
     let included = child.join("child-include.cfg");
     std::fs::write(&included, "[filter \"child\"]\n clean = first-command\n").unwrap();
     run(&child, &["config", "include.path", included.to_str().unwrap()]);
@@ -274,7 +283,10 @@ fn worktree_submodule_and_empty_repositories_have_routine_metadata() {
     assert!(identity.stamp.is_hazard_free());
     assert!(!git::status(&path).unwrap().branch.is_empty());
     let Some(module) = repo() else { return };
-    run(dir.path(), &["-c", "protocol.file.allow=always", "submodule", "add", "--quiet", module.path().to_str().unwrap(), "module"]);
+    run(
+        dir.path(),
+        &["-c", "protocol.file.allow=always", "submodule", "add", "--quiet", module.path().to_str().unwrap(), "module"],
+    );
     assert!(git::repository_identity(dir.path()).unwrap().unwrap().stamp.is_hazard_free());
     assert!(git::repository_identity(&dir.path().join("module")).unwrap().unwrap().stamp.is_hazard_free());
     let empty = tempfile::tempdir().unwrap();
@@ -299,9 +311,17 @@ fn global_conditional_missing_sources_and_config_read_races_revoke_approval() {
         std::fs::write(&global, "").unwrap();
         std::fs::write(&system, "").unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap());
-        child.args(["--exact", "global_conditional_missing_sources_and_config_read_races_revoke_approval", "--nocapture"])
-            .env(CHILD, "1").env("GIT_CONFIG_GLOBAL", &global).env("GIT_CONFIG_SYSTEM", &system)
-            .env("HOME", isolated.path()).env("XDG_CONFIG_HOME", isolated.path().join(".config"))
+        child
+            .args([
+                "--exact",
+                "global_conditional_missing_sources_and_config_read_races_revoke_approval",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_SYSTEM", &system)
+            .env("HOME", isolated.path())
+            .env("XDG_CONFIG_HOME", isolated.path().join(".config"))
             .env("GIT_TRACE2_EVENT", isolated.path().join("trace.json"));
         #[cfg(windows)]
         {
@@ -327,12 +347,28 @@ fn global_conditional_missing_sources_and_config_read_races_revoke_approval() {
     let global = std::path::PathBuf::from(std::env::var_os("GIT_CONFIG_GLOBAL").unwrap());
     let condition = root.join(".git").to_string_lossy().replace('\\', "/");
     let injected = root.join("injected.cfg");
-    std::fs::write(&global, format!("[includeIf {}]\n path = {}\n", quoted_config(&format!("gitdir:{condition}")), quoted_config(injected.to_str().unwrap()))).unwrap();
+    std::fs::write(
+        &global,
+        format!(
+            "[includeIf {}]\n path = {}\n",
+            quoted_config(&format!("gitdir:{condition}")),
+            quoted_config(injected.to_str().unwrap())
+        ),
+    )
+    .unwrap();
     run(root, &["config", "filter.approved.clean", "old-command"]);
     let initial = git::repository_stamp(root).unwrap();
     git::remember_trust(root, initial.clone());
     assert!(git::trust_approved(root, &initial));
-    std::fs::write(&global, format!("[user]\n name = unrelated global edit\n[includeIf {}]\n path = {}\n", quoted_config(&format!("gitdir:{condition}")), quoted_config(injected.to_str().unwrap()))).unwrap();
+    std::fs::write(
+        &global,
+        format!(
+            "[user]\n name = unrelated global edit\n[includeIf {}]\n path = {}\n",
+            quoted_config(&format!("gitdir:{condition}")),
+            quoted_config(injected.to_str().unwrap())
+        ),
+    )
+    .unwrap();
     let routine = git::repository_stamp(root).unwrap();
     assert_eq!(initial, routine, "unrelated user configuration does not change hazards");
     assert!(git::trust_approved(root, &routine));
@@ -376,7 +412,15 @@ fn global_conditional_missing_sources_and_config_read_races_revoke_approval() {
     let without_global = git::repository_stamp(root).unwrap();
     git::remember_trust(root, without_global.clone());
     assert!(git::trust_approved(root, &without_global), "removing the include chain leaves the rest valid");
-    std::fs::write(&global, format!("[includeIf {}]\n path = {}\n", quoted_config(&format!("gitdir:{condition}")), quoted_config(injected.to_str().unwrap()))).unwrap();
+    std::fs::write(
+        &global,
+        format!(
+            "[includeIf {}]\n path = {}\n",
+            quoted_config(&format!("gitdir:{condition}")),
+            quoted_config(injected.to_str().unwrap())
+        ),
+    )
+    .unwrap();
     std::fs::write(&injected, "[filter \"later\"]\n clean = later-command\n").unwrap();
     let recreated = git::repository_stamp(root).unwrap();
     assert!(recreated.hazards().iter().any(|key| key == "filter.later.clean"), "{:?}", recreated.hazards());
@@ -610,7 +654,8 @@ fn ai_message_runs_outside_the_repository_with_a_deadline() {
     let probe = env!("CARGO_BIN_EXE_anvil-probe");
     let command = format!("\"{probe}\" pwd");
     let first = git::ai_commit_message(Some(&command), "prompt", Duration::from_secs(20)).expect("the probe answers");
-    let second = git::ai_commit_message(Some(&command), "prompt", Duration::from_secs(20)).expect("the probe answers again");
+    let second =
+        git::ai_commit_message(Some(&command), "prompt", Duration::from_secs(20)).expect("the probe answers again");
     assert_ne!(first, second, "requests never reuse a config directory");
     assert!(!Path::new(&first).exists(), "first generation directory is removed");
     assert!(!Path::new(&second).exists(), "second generation directory is removed");
@@ -757,10 +802,7 @@ fn valid_nested_repositories_match_git() {
     let nested = outer.join("nested-repo");
     std::fs::create_dir_all(&nested).unwrap();
     run(&nested, &["init", "--quiet"]);
-    assert_eq!(
-        PathBuf::from(git_toplevel(&nested)).canonicalize().unwrap(),
-        nested.canonicalize().unwrap()
-    );
+    assert_eq!(PathBuf::from(git_toplevel(&nested)).canonicalize().unwrap(), nested.canonicalize().unwrap());
     assert_eq!(git::find_root(&nested).unwrap().canonicalize().unwrap(), nested.canonicalize().unwrap());
 
     // A valid gitfile points a nested directory at metadata elsewhere; git
@@ -822,12 +864,18 @@ fn commit_detail_lists_files_and_loads_only_the_selected_patch() {
     let head = git::log(&root).expect("log").commits.first().expect("a commit").hash.clone();
     let detail = git::commit_detail(&root, &head).expect("commit detail");
     assert!(
-        detail.files.iter().any(|(status, path, additions, _)| *status == 'M' && path == "tracked.txt" && *additions == 1),
+        detail
+            .files
+            .iter()
+            .any(|(status, path, additions, _)| *status == 'M' && path == "tracked.txt" && *additions == 1),
         "files: {:?}",
         detail.files
     );
     let patch = git::commit_file_diff(&root, &head, "tracked.txt").expect("selected file diff");
-    assert!(patch.contains("+two") && !patch.contains("literal-only") && !patch.contains("other-only"), "patch: {patch}");
+    assert!(
+        patch.contains("+two") && !patch.contains("literal-only") && !patch.contains("other-only"),
+        "patch: {patch}"
+    );
     let literal_patch = git::commit_file_diff(&root, &head, "файл[1].txt").expect("literal path diff");
     assert!(literal_patch.contains("+literal-only") && !literal_patch.contains("other-only"), "patch: {literal_patch}");
     assert!(detail.header.contains("add a line"), "header: {}", detail.header);

@@ -108,7 +108,8 @@ pub const SETTINGS_AI_MODEL_DEFAULT: &str = "По умолчанию в OpenCode
 pub const SETTINGS_AI_MODEL_SEARCH: &str = "Поиск модели, например DeepSeek";
 pub const SETTINGS_AI_MODEL_REFRESH: &str = "Обновить модели";
 pub const SETTINGS_AI_MODEL_LOADING: &str = "Загрузка моделей…";
-pub const SETTINGS_AI_MODEL_HINT: &str = "Выбор модели использует OpenCode и его подключённые провайдеры. Ключи — через opencode auth login.";
+pub const SETTINGS_AI_MODEL_HINT: &str =
+    "Выбор модели использует OpenCode и его подключённые провайдеры. Ключи — через opencode auth login.";
 pub const SETTINGS_AI_MODEL_NO_MATCH: &str = "Модели не найдены по этому запросу.";
 pub const SETTINGS_CLAUDE: &str = "Claude Code";
 pub const SETTINGS_CLAUDE_ENABLED: &str = "Строка статуса от ANVIL";
@@ -204,7 +205,8 @@ pub const CLAUDE_NEW_COMMAND: &str = "Новая команда:";
 pub const CLAUDE_INSTALL_WARNING: &str = "При отключении ANVIL восстановит предыдущую строку, если её не изменили. После перемещения или удаления ANVIL команда перестанет работать: отключите интеграцию до удаления или подтвердите обновление пути.";
 pub const CLAUDE_INSTALL_ACCEPT: &str = "Установить / обновить";
 pub const CLAUDE_HELPER_MISSING: &str = "Не найден anvil-claude-status.exe; интеграция не установлена.";
-pub const CLAUDE_DIRECTORY_CHANGED: &str = "Сначала отключите интеграцию и восстановите прежние настройки Claude Code, затем установите её в новом каталоге.";
+pub const CLAUDE_DIRECTORY_CHANGED: &str =
+    "Сначала отключите интеграцию и восстановите прежние настройки Claude Code, затем установите её в новом каталоге.";
 pub const PASTE_WARNING: &str = "Многострочная вставка может выполнить команды в оболочке.";
 pub const PASTE_PREVIEW_HINT: &str = "Bracketed paste отключён. Ничего не отправлено. Проверьте текст перед вставкой:";
 pub const PASTE_ACCEPT: &str = "Вставить и разрешить выполнение";
@@ -261,7 +263,8 @@ pub const WORKSPACE_NEW_FOLDER: &str = "Новая папка";
 pub const WORKSPACE_RENAME: &str = "Переименовать";
 pub const WORKSPACE_DELETE: &str = "Удалить в корзину";
 pub const WORKSPACE_DELETE_HINT: &str = "Папка целиком, включая скрытые и игнорируемые файлы, будет перемещена в корзину. Отмена или ошибка оставит её на месте.";
-pub const WORKSPACE_DELETE_FILE_HINT: &str = "Файл будет перемещён в корзину Windows. Отмена или ошибка оставят его на месте.";
+pub const WORKSPACE_DELETE_FILE_HINT: &str =
+    "Файл будет перемещён в корзину Windows. Отмена или ошибка оставят его на месте.";
 pub const WORKSPACE_OPEN_EXTERNAL: &str = "Открыть в системе";
 pub const WORKSPACE_REVEAL: &str = "Показать в проводнике";
 pub const WORKSPACE_FILE_FILTER: &str = "Фильтр файлов";
@@ -283,8 +286,10 @@ pub const WORKSPACE_TRUST_TITLE: &str = "Требуется доверие к р
 pub const WORKSPACE_TRUST_HINT: &str = "Конфигурация этого репозитория может запускать программы (фильтры, хуки, внешние diff-драйверы, программы подписи). Обычные настройки — ветки, remote, редактор — доверия не требуют и запрос не вызывают. До подтверждения ANVIL не читает статус, diff и историю и не выполняет Git-действия. Разрешение действует в этой сессии для этого репозитория и только для показанной конфигурации; её изменение сбрасывает разрешение, а ваш черновик коммита сохраняется.";
 pub const WORKSPACE_TRUST_HAZARDS: &str = "Могут запускать программы:";
 pub const WORKSPACE_TRUST_APPROVE: &str = "Доверять этой конфигурации";
-pub const WORKSPACE_TRUST_STALE: &str = "Репозиторий или конфигурация изменились — разрешение отменено. Проверьте папку и подтвердите заново.";
-pub const WORKSPACE_AI_NO_STAGE: &str = "Сначала добавьте изменения в индекс: AI составляет сообщение только по staged-изменениям.";
+pub const WORKSPACE_TRUST_STALE: &str =
+    "Репозиторий или конфигурация изменились — разрешение отменено. Проверьте папку и подтвердите заново.";
+pub const WORKSPACE_AI_NO_STAGE: &str =
+    "Сначала добавьте изменения в индекс: AI составляет сообщение только по staged-изменениям.";
 
 /// Russian relative time of a unix timestamp, as the commit list shows it.
 pub fn relative_time(now_secs: i64, then_secs: i64) -> String {

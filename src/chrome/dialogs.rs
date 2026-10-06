@@ -1,16 +1,10 @@
 //! User consent for global Claude settings changes and executable multiline paste.
 
-use std::path::PathBuf;
 use crate::strings;
+use std::path::PathBuf;
 
 pub enum DialogState {
-    ClaudeInstall {
-        path: PathBuf,
-        expected: Option<String>,
-        ours: String,
-        current: String,
-        keep_previous: bool,
-    },
+    ClaudeInstall { path: PathBuf, expected: Option<String>, ours: String, current: String, keep_previous: bool },
     Paste { pane_id: u64, text: String },
 }
 
@@ -21,11 +15,8 @@ pub enum DialogOutcome {
 }
 
 pub fn show(ctx: &egui::Context, dialog: &DialogState) -> DialogOutcome {
-    let mut outcome = if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        DialogOutcome::Cancel
-    } else {
-        DialogOutcome::None
-    };
+    let mut outcome =
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) { DialogOutcome::Cancel } else { DialogOutcome::None };
     egui::Window::new(crate::strings::APP_TITLE)
         .id(egui::Id::new("anvil-consent-dialog"))
         .collapsible(false)
@@ -95,7 +86,11 @@ mod tests {
         };
         assert!(matches!(frame(Vec::new()), DialogOutcome::None));
         let key = |key| egui::Event::Key {
-            key, physical_key: None, pressed: true, repeat: false, modifiers: Default::default(),
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
         };
         assert!(!matches!(frame(vec![key(egui::Key::Enter)]), DialogOutcome::Accept));
         assert!(matches!(frame(vec![key(egui::Key::Escape)]), DialogOutcome::Cancel));

@@ -1,10 +1,10 @@
 //! Git integration for the workspace panel. Shells out to `git` and parses its
 //! plumbing output; the parsers are pure and unit-tested.
 
+use crate::process::run_bounded;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use crate::process::run_bounded;
 
 /// One changed file, as `git status --porcelain=v2` reports it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -142,10 +142,18 @@ fn base_git_command(root: &Path, executable: &Path) -> Command {
     // Discovery belongs to the panel's cwd, not an inherited shell override.
     // These variables can also redirect Git to an unchecked metadata path.
     for key in [
-        "GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_INDEX_FILE", "GIT_SHALLOW_FILE",
-        "GIT_CONFIG", "GIT_CONFIG_COUNT",
-        "GIT_CONFIG_PARAMETERS", "GIT_CEILING_DIRECTORIES", "GIT_EXEC_PATH",
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+        "GIT_SHALLOW_FILE",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_EXEC_PATH",
     ] {
         command.env_remove(key);
     }
@@ -158,7 +166,12 @@ fn base_git_command(root: &Path, executable: &Path) -> Command {
 }
 
 /// Spawns `git` with prompts disabled, literal pathspecs and a hard deadline.
-fn run_git_capped(root: &Path, args: &[&str], timeout: std::time::Duration, max_bytes: usize) -> Result<Vec<u8>, String> {
+fn run_git_capped(
+    root: &Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
     let mut command = git_command(root)?;
     command.args(args);
     let label = format!("git {}", args.first().copied().unwrap_or(""));
@@ -169,7 +182,6 @@ fn run_git_capped(root: &Path, args: &[&str], timeout: std::time::Duration, max_
         Err(String::from_utf8_lossy(&stderr).trim().to_owned())
     }
 }
-
 
 /// True for a full object id (sha-1 or sha-256) — the only hashes ever passed
 /// back to `git`, so a crafted log record cannot smuggle an option.
@@ -228,7 +240,10 @@ fn resolve_inside(root: &Path, canonical_root: &Path, path: &str) -> Result<Path
             return Err(inside.to_owned());
         }
         let stem = part.split('.').next().unwrap_or(part).to_ascii_uppercase();
-        if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "LPT1" | "LPT2" | "LPT3") {
+        if matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "LPT1" | "LPT2" | "LPT3"
+        ) {
             return Err(inside.to_owned());
         }
         full.push(part);
@@ -288,9 +303,10 @@ struct ConfigSource {
 impl ConfigSource {
     fn read(path: &Path) -> ConfigSource {
         let resolved = local_path(path);
-        let state = resolved.as_ref().ok().and_then(|path| {
-            std::fs::metadata(path).ok().map(|meta| (meta.len(), meta.modified().ok()))
-        });
+        let state = resolved
+            .as_ref()
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok().map(|meta| (meta.len(), meta.modified().ok())));
         let resolved = resolved.unwrap_or_else(|_| path.to_path_buf());
         ConfigSource { path: resolved, aliases: std::collections::HashSet::from([path.to_path_buf()]), state }
     }
@@ -347,7 +363,9 @@ fn is_hazardous_key(key: &str, value: &str) -> bool {
         "protocol" => (rest == "allow" || rest.ends_with(".allow")) && !value.eq_ignore_ascii_case("never"),
         "url" => (rest.ends_with(".insteadof") || rest.ends_with(".pushinsteadof")) && !value.is_empty(),
         "remote" => {
-            rest.ends_with(".receivepack") || rest.ends_with(".uploadpack") || rest.ends_with(".proxy")
+            rest.ends_with(".receivepack")
+                || rest.ends_with(".uploadpack")
+                || rest.ends_with(".proxy")
                 || (rest.ends_with(".vcs") && !value.trim().is_empty())
                 || ((rest.ends_with(".url") || rest.ends_with(".pushurl"))
                     && matches!(value.trim_start().split_once("::"), Some(("ext" | "fd", _))))
@@ -426,8 +444,9 @@ pub fn repository_stamp(root: &Path) -> Result<RepositoryStamp, String> {
         // also carries the origins Git reported). It stays valid while every
         // file behind it is untouched and no new source has appeared.
         if cached.is_current()
-            && checked.sources.iter().all(|source| cached.source_index.get(&source.path)
-                .is_some_and(|index| cached.sources[*index] == *source))
+            && checked.sources.iter().all(|source| {
+                cached.source_index.get(&source.path).is_some_and(|index| cached.sources[*index] == *source)
+            })
         {
             return Ok(cached);
         }
@@ -446,25 +465,31 @@ fn read_stamp(root: &Path) -> Result<RepositoryStamp, String> {
     for _ in 0..3 {
         let checked = preflight(root)?;
         let mut sources = (*checked.sources).clone();
-        let mut source_index: HashMap<PathBuf, usize> = sources.iter().enumerate()
-            .map(|(index, source)| (source.path.clone(), index)).collect();
+        let mut source_index: HashMap<PathBuf, usize> =
+            sources.iter().enumerate().map(|(index, source)| (source.path.clone(), index)).collect();
         let mut snapshots = Vec::new();
         let mut output_bytes = 0;
         let mut alias_count: usize = sources.iter().map(|source| source.aliases.len()).sum();
         for repository in &checked.repositories {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() { return Err(config_refusal()); }
+            if remaining.is_zero() {
+                return Err(config_refusal());
+            }
             let mut command = base_git_command(&repository.root, &checked.executable);
             command.args(CONFIG_ARGS);
             let (success, config, _) = run_bounded(command, "git config", remaining, CONFIG_MAX_OUTPUT, None)?;
             output_bytes += config.len();
-            if !success || config.len() >= CONFIG_MAX_OUTPUT || config.last() != Some(&0)
+            if !success
+                || config.len() >= CONFIG_MAX_OUTPUT
+                || config.last() != Some(&0)
                 || output_bytes > 4 * CONFIG_MAX_OUTPUT
             {
                 return Err(config_refusal());
             }
             for origin in config_origins(&config, &repository.root)? {
-                if source_index.contains_key(&origin) { continue; }
+                if source_index.contains_key(&origin) {
+                    continue;
+                }
                 if sources.len() >= MAX_WATCHED_SOURCES || alias_count >= MAX_SOURCE_ALIASES {
                     return Err(config_refusal());
                 }
@@ -474,20 +499,29 @@ fn read_stamp(root: &Path) -> Result<RepositoryStamp, String> {
             }
             snapshots.push((repository, config));
         }
-        if !sources.iter().all(ConfigSource::is_current) { continue; }
+        if !sources.iter().all(ConfigSource::is_current) {
+            continue;
+        }
         // An origin discovered only from Git needs a second read under its
         // already captured stat; never bless output with a post-read snapshot.
         if sources.len() != checked.sources.len() {
             let mut changed = false;
             for (repository, config) in &snapshots {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() { return Err(config_refusal()); }
+                if remaining.is_zero() {
+                    return Err(config_refusal());
+                }
                 let mut command = base_git_command(&repository.root, &checked.executable);
                 command.args(CONFIG_ARGS);
                 let (success, confirm, _) = run_bounded(command, "git config", remaining, CONFIG_MAX_OUTPUT, None)?;
-                if !success || &confirm != config { changed = true; break; }
+                if !success || &confirm != config {
+                    changed = true;
+                    break;
+                }
             }
-            if changed || !sources.iter().all(ConfigSource::is_current) { continue; }
+            if changed || !sources.iter().all(ConfigSource::is_current) {
+                continue;
+            }
         }
         let mut combined = digest_of(&[], root, std::sync::Arc::new(sources));
         for (repository, config) in snapshots {
@@ -500,13 +534,17 @@ fn read_stamp(root: &Path) -> Result<RepositoryStamp, String> {
 }
 
 fn merge_repository_digest(combined: &mut RepositoryStamp, repository: &RepositoryPaths, stamp: &RepositoryStamp) {
-    if stamp.is_hazard_free() { return; }
+    if stamp.is_hazard_free() {
+        return;
+    }
     let digest = std::sync::Arc::make_mut(&mut combined.digest);
     // Length-prefix identity and content: moving the same dangerous config to
     // another initialized child must not inherit the previous child's trust.
     for part in [
-        repository.root.as_os_str().as_encoded_bytes(), repository.git_dir.as_os_str().as_encoded_bytes(),
-        repository.common_dir.as_os_str().as_encoded_bytes(), stamp.digest.as_slice(),
+        repository.root.as_os_str().as_encoded_bytes(),
+        repository.git_dir.as_os_str().as_encoded_bytes(),
+        repository.common_dir.as_os_str().as_encoded_bytes(),
+        stamp.digest.as_slice(),
     ] {
         digest.extend_from_slice(&(part.len() as u64).to_le_bytes());
         digest.extend_from_slice(part);
@@ -530,7 +568,9 @@ fn config_origins(config: &[u8], root: &Path) -> Result<Vec<PathBuf>, String> {
         if !local && !path_is_inside(&path, root) {
             continue;
         }
-        if origins.len() >= MAX_WATCHED_SOURCES { return Err(config_refusal()); }
+        if origins.len() >= MAX_WATCHED_SOURCES {
+            return Err(config_refusal());
+        }
         origins.insert(local_path(&path)?);
     }
     Ok(origins.into_iter().collect())
@@ -554,7 +594,8 @@ fn digest_of(config: &[u8], root: &Path, sources: std::sync::Arc<Vec<ConfigSourc
         };
         // Git prints `.git/config` relative to the work tree; resolve it
         // against the repository, never against the process working directory.
-        let path = origin_path(origin).ok().flatten().map(|path| if path.is_absolute() { path } else { root.join(path) });
+        let path =
+            origin_path(origin).ok().flatten().map(|path| if path.is_absolute() { path } else { root.join(path) });
         let local = matches!(scope, b"local" | b"worktree");
         let inside = path.as_deref().is_some_and(|path| path_is_inside(path, root));
         if !local && !inside {
@@ -573,7 +614,9 @@ fn digest_of(config: &[u8], root: &Path, sources: std::sync::Arc<Vec<ConfigSourc
     RepositoryStamp {
         digest: std::sync::Arc::new(digest),
         hazards: std::sync::Arc::new(hazards),
-        source_index: std::sync::Arc::new(sources.iter().enumerate().map(|(index, source)| (source.path.clone(), index)).collect()),
+        source_index: std::sync::Arc::new(
+            sources.iter().enumerate().map(|(index, source)| (source.path.clone(), index)).collect(),
+        ),
         sources,
     }
 }
@@ -581,7 +624,9 @@ fn digest_of(config: &[u8], root: &Path, sources: std::sync::Arc<Vec<ConfigSourc
 /// Git C-style quoting is byte-oriented (including three-digit octal bytes).
 /// A path without an opening quote is literal, backslashes included.
 fn git_unquote(path: &[u8]) -> Result<Vec<u8>, String> {
-    if !path.starts_with(b"\"") { return Ok(path.to_vec()); }
+    if !path.starts_with(b"\"") {
+        return Ok(path.to_vec());
+    }
     let mut decoded = Vec::with_capacity(path.len());
     let mut index = 1;
     while let Some(&byte) = path.get(index) {
@@ -593,8 +638,15 @@ fn git_unquote(path: &[u8]) -> Result<Vec<u8>, String> {
                 let escaped = *path.get(index).ok_or_else(config_refusal)?;
                 index += 1;
                 decoded.push(match escaped {
-                    b'a' => 7, b'b' => 8, b't' => b'\t', b'n' => b'\n',
-                    b'v' => 11, b'f' => 12, b'r' => b'\r', b'\\' => b'\\', b'"' => b'"',
+                    b'a' => 7,
+                    b'b' => 8,
+                    b't' => b'\t',
+                    b'n' => b'\n',
+                    b'v' => 11,
+                    b'f' => 12,
+                    b'r' => b'\r',
+                    b'\\' => b'\\',
+                    b'"' => b'"',
                     b'0'..=b'3' => {
                         let second = *path.get(index).ok_or_else(config_refusal)?;
                         let third = *path.get(index + 1).ok_or_else(config_refusal)?;
@@ -614,7 +666,9 @@ fn git_unquote(path: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 fn bytes_path(bytes: Vec<u8>) -> Result<PathBuf, String> {
-    if bytes.is_empty() || bytes.contains(&0) { return Err(config_refusal()); }
+    if bytes.is_empty() || bytes.contains(&0) {
+        return Err(config_refusal());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;
@@ -659,9 +713,14 @@ fn reject_remote_path(path: &Path) -> Result<(), String> {
     let lower = text.to_ascii_lowercase();
     let ordinary_verbatim = lower.starts_with("//?/") && lower.as_bytes().get(5) == Some(&b':');
     let text = if ordinary_verbatim { &text[4..] } else { &text };
-    if text.len() > 32767 { return Err(config_refusal()); }
-    if text.starts_with("//") || lower.starts_with("/??/") || lower.starts_with("/device/")
-        || text.chars().any(char::is_control) || text.contains("://")
+    if text.len() > 32767 {
+        return Err(config_refusal());
+    }
+    if text.starts_with("//")
+        || lower.starts_with("/??/")
+        || lower.starts_with("/device/")
+        || text.chars().any(char::is_control)
+        || text.contains("://")
         || text.char_indices().any(|(index, character)| character == ':' && index != 1)
     {
         return Err(network_refusal());
@@ -672,7 +731,9 @@ fn reject_remote_path(path: &Path) -> Result<(), String> {
         let numbered = stem.len() == 4
             && stem.get(..3).is_some_and(|head| head.eq_ignore_ascii_case("COM") || head.eq_ignore_ascii_case("LPT"))
             && matches!(stem.as_bytes()[3], b'1'..=b'9');
-        if numbered || ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].iter().any(|name| stem.eq_ignore_ascii_case(name)) {
+        if numbered
+            || ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].iter().any(|name| stem.eq_ignore_ascii_case(name))
+        {
             return Err(network_refusal());
         }
     }
@@ -720,8 +781,14 @@ fn local_path(path: &Path) -> Result<PathBuf, String> {
         while let Some(component) = components.next() {
             match component {
                 std::path::Component::CurDir => continue,
-                std::path::Component::Prefix(_) => { probe.push(component.as_os_str()); continue; }
-                std::path::Component::ParentDir => { probe.pop(); continue; }
+                std::path::Component::Prefix(_) => {
+                    probe.push(component.as_os_str());
+                    continue;
+                }
+                std::path::Component::ParentDir => {
+                    probe.pop();
+                    continue;
+                }
                 _ => probe.push(component.as_os_str()),
             }
             match std::fs::symlink_metadata(&probe) {
@@ -810,30 +877,46 @@ struct ConfigScan {
 impl ConfigScan {
     fn new(cwd: &Path) -> Self {
         Self {
-            sources: Vec::new(), visited: Default::default(), bytes: 0,
-            cwd: cwd.to_path_buf(), active: Default::default(), worktree_override: false,
+            sources: Vec::new(),
+            visited: Default::default(),
+            bytes: 0,
+            cwd: cwd.to_path_buf(),
+            active: Default::default(),
+            worktree_override: false,
             git_dir: cwd.to_path_buf(),
-            source_index: Default::default(), alias_index: Default::default(),
-            repositories: Vec::new(), repository_keys: Default::default(),
-            metadata_dirs: Default::default(), alternate_stores: Default::default(), metadata_entries: 0,
+            source_index: Default::default(),
+            alias_index: Default::default(),
+            repositories: Vec::new(),
+            repository_keys: Default::default(),
+            metadata_dirs: Default::default(),
+            alternate_stores: Default::default(),
+            metadata_entries: 0,
             global_paths: Default::default(),
         }
     }
 
     fn source(&mut self, path: &Path) -> Result<PathBuf, String> {
-        if let Some(&index) = self.alias_index.get(path) { return Ok(self.sources[index].path.clone()); }
-        if self.alias_index.len() >= MAX_SOURCE_ALIASES { return Err(config_refusal()); }
+        if let Some(&index) = self.alias_index.get(path) {
+            return Ok(self.sources[index].path.clone());
+        }
+        if self.alias_index.len() >= MAX_SOURCE_ALIASES {
+            return Err(config_refusal());
+        }
         let resolved = local_path(path)?;
         let index = if let Some(&index) = self.source_index.get(&resolved) {
             self.sources[index].aliases.insert(path.to_path_buf());
             index
         } else {
-            if self.sources.len() >= MAX_WATCHED_SOURCES { return Err(config_refusal()); }
+            if self.sources.len() >= MAX_WATCHED_SOURCES {
+                return Err(config_refusal());
+            }
             let index = self.sources.len();
             // Record the stat BEFORE reading, including absent metadata.
             let state = std::fs::metadata(&resolved).ok().map(|meta| (meta.len(), meta.modified().ok()));
             self.sources.push(ConfigSource {
-                path: resolved.clone(), aliases: std::collections::HashSet::from([path.to_path_buf()]), state,
+                path: resolved.clone(),
+                aliases: std::collections::HashSet::from([path.to_path_buf()]),
+                state,
             });
             self.source_index.insert(resolved.clone(), index);
             index
@@ -859,8 +942,11 @@ impl ConfigScan {
         // A growing file is bounded too, not just its initial metadata.
         use std::io::Read;
         let mut text = String::new();
-        std::fs::File::open(resolved).map_err(|e| e.to_string())?
-            .take(1024 * 1024 + 1).read_to_string(&mut text).map_err(|_| config_refusal())?;
+        std::fs::File::open(resolved)
+            .map_err(|e| e.to_string())?
+            .take(1024 * 1024 + 1)
+            .read_to_string(&mut text)
+            .map_err(|_| config_refusal())?;
         if text.len() > 1024 * 1024 {
             return Err(config_refusal());
         }
@@ -869,11 +955,19 @@ impl ConfigScan {
 
     fn config(&mut self, path: &Path, depth: usize) -> Result<(), String> {
         let resolved = self.source(path)?;
-        if depth > 10 { return Err(config_refusal()); }
-        if self.active.contains(&resolved) { return Err(config_refusal()); }
+        if depth > 10 {
+            return Err(config_refusal());
+        }
+        if self.active.contains(&resolved) {
+            return Err(config_refusal());
+        }
         let context = (resolved.clone(), self.cwd.clone(), self.git_dir.clone());
-        if self.visited.contains(&context) { return Ok(()); }
-        if self.visited.len() >= 1024 { return Err(config_refusal()); }
+        if self.visited.contains(&context) {
+            return Ok(());
+        }
+        if self.visited.len() >= 1024 {
+            return Err(config_refusal());
+        }
         self.visited.insert(context);
         self.active.insert(resolved.clone());
         let Some(text) = self.read(path)? else {
@@ -881,8 +975,12 @@ impl ConfigScan {
             return Ok(());
         };
         for (key, value) in config_paths(&text)? {
-            if key == "submodule.path" { continue; }
-            if key == "core.worktree" { self.worktree_override = true; }
+            if key == "submodule.path" {
+                continue;
+            }
+            if key == "core.worktree" {
+                self.worktree_override = true;
+            }
             let parent = if key.starts_with("include") {
                 path.parent().ok_or_else(config_refusal)?
             } else if key == "core.worktree" {
@@ -918,12 +1016,17 @@ fn config_paths(text: &str) -> Result<Vec<(String, String)>, String> {
     let mut quoted = false;
     while let Some(character) = characters.next() {
         if comment {
-            if character == '\n' { comment = false; logical.push(std::mem::take(&mut current)); }
+            if character == '\n' {
+                comment = false;
+                logical.push(std::mem::take(&mut current));
+            }
             continue;
         }
         match character {
             '\n' => {
-                if quoted { return Err(config_refusal()); }
+                if quoted {
+                    return Err(config_refusal());
+                }
                 logical.push(std::mem::take(&mut current));
             }
             '\\' => {
@@ -943,28 +1046,49 @@ fn config_paths(text: &str) -> Result<Vec<(String, String)>, String> {
             _ => current.push(character),
         }
     }
-    if quoted { return Err(config_refusal()); }
-    if !current.is_empty() { logical.push(current); }
+    if quoted {
+        return Err(config_refusal());
+    }
+    if !current.is_empty() {
+        logical.push(current);
+    }
     let mut section = String::new();
     let mut paths = Vec::new();
     for line in logical {
         let mut line = line.trim();
-        if line.is_empty() || line.starts_with(['#', ';']) { continue; }
+        if line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
         if let Some(header) = line.strip_prefix('[') {
             // A ] within a quoted subsection is not the section terminator.
             let mut quoted = false;
             let mut escaped = false;
-            let end = header.char_indices().find_map(|(index, character)| {
-                if escaped { escaped = false; return None; }
-                if character == '\\' { escaped = true; return None; }
-                if character == '"' { quoted = !quoted; }
-                (character == ']' && !quoted).then_some(index)
-            }).ok_or_else(config_refusal)?;
+            let end = header
+                .char_indices()
+                .find_map(|(index, character)| {
+                    if escaped {
+                        escaped = false;
+                        return None;
+                    }
+                    if character == '\\' {
+                        escaped = true;
+                        return None;
+                    }
+                    if character == '"' {
+                        quoted = !quoted;
+                    }
+                    (character == ']' && !quoted).then_some(index)
+                })
+                .ok_or_else(config_refusal)?;
             let rest = header[end + 1..].trim();
             section = header[..end].split([' ', '\t', '.']).next().unwrap_or("").to_ascii_lowercase();
-            if section.is_empty() { return Err(config_refusal()); }
+            if section.is_empty() {
+                return Err(config_refusal());
+            }
             line = rest;
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
         }
         let key_end = line.find(|c: char| c == '=' || c.is_whitespace()).unwrap_or(line.len());
         let name = &line[..key_end];
@@ -980,11 +1104,21 @@ fn config_paths(text: &str) -> Result<Vec<(String, String)>, String> {
             return Err(config_refusal());
         };
         let key = format!("{section}.{}", name.to_ascii_lowercase());
-        if matches!(key.as_str(), "include.path" | "includeif.path" | "core.attributesfile" | "core.excludesfile" | "core.worktree" | "submodule.path") {
+        if matches!(
+            key.as_str(),
+            "include.path"
+                | "includeif.path"
+                | "core.attributesfile"
+                | "core.excludesfile"
+                | "core.worktree"
+                | "submodule.path"
+        ) {
             if value.is_empty() {
                 // An empty include target is nonsense; an empty `core.*`
                 // path or submodule path means the key is unset.
-                if key.starts_with("include") { return Err(config_refusal()); }
+                if key.starts_with("include") {
+                    return Err(config_refusal());
+                }
                 continue;
             }
             paths.push((key, value));
@@ -1012,18 +1146,26 @@ fn config_value(value: &str) -> Result<String, String> {
             '#' | ';' if !quoted => break,
             '\\' => {
                 result.push(match characters.next().ok_or_else(config_refusal)? {
-                    'n' => '\n', 't' => '\t', 'b' => '\u{8}', '"' => '"', '\\' => '\\',
+                    'n' => '\n',
+                    't' => '\t',
+                    'b' => '\u{8}',
+                    '"' => '"',
+                    '\\' => '\\',
                     _ => return Err(config_refusal()),
                 });
                 kept = result.len();
             }
             _ => {
                 result.push(character);
-                if quoted || !character.is_whitespace() { kept = result.len(); }
+                if quoted || !character.is_whitespace() {
+                    kept = result.len();
+                }
             }
         }
     }
-    if quoted { return Err(config_refusal()); }
+    if quoted {
+        return Err(config_refusal());
+    }
     result.truncate(kept);
     Ok(result)
 }
@@ -1075,7 +1217,9 @@ fn git_prefix(executable: &Path) -> Result<PathBuf, String> {
         let binary = candidate.join("bin/git.exe");
         #[cfg(not(windows))]
         let binary = candidate.join("bin/git");
-        if local_path(&binary).is_ok_and(|binary| binary.is_file()) { return Ok(candidate); }
+        if local_path(&binary).is_ok_and(|binary| binary.is_file()) {
+            return Ok(candidate);
+        }
     }
     Ok(base.to_path_buf())
 }
@@ -1084,7 +1228,9 @@ fn git_prefix(executable: &Path) -> Result<PathBuf, String> {
 /// separator means the current drive's root, exactly as Git for Windows
 /// resolves it, not the process working directory.
 fn anchored_path(anchor: &Path, value: &Path) -> Result<PathBuf, String> {
-    if value.is_absolute() { return Ok(value.to_path_buf()); }
+    if value.is_absolute() {
+        return Ok(value.to_path_buf());
+    }
     let text = value.as_os_str().to_string_lossy();
     if text.starts_with(['/', '\\']) {
         let mut base = PathBuf::new();
@@ -1130,7 +1276,9 @@ fn git_executable() -> Result<PathBuf, String> {
         // A PATH entry that is not a plain local path (a UNC share, a
         // device path) is never a source of executables for the panel.
         let Ok(candidate) = local_path(&candidate) else { continue };
-        if candidate.is_file() { return Ok(candidate); }
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
     }
     Err("Не найден Git.".to_owned())
 }
@@ -1140,7 +1288,9 @@ fn global_configs(executable: &Path) -> Result<Vec<PathBuf>, String> {
     let no_system = std::env::var("GIT_CONFIG_NOSYSTEM").unwrap_or_default().to_ascii_lowercase();
     if !matches!(no_system.as_str(), "1" | "true" | "yes" | "on") {
         if let Some(system) = std::env::var_os("GIT_CONFIG_SYSTEM") {
-            if !system.is_empty() { paths.push(PathBuf::from(system)); }
+            if !system.is_empty() {
+                paths.push(PathBuf::from(system));
+            }
         } else {
             #[cfg(not(windows))]
             {
@@ -1164,7 +1314,9 @@ fn global_configs(executable: &Path) -> Result<Vec<PathBuf>, String> {
         }
     }
     if let Some(global) = std::env::var_os("GIT_CONFIG_GLOBAL") {
-        if !global.is_empty() { paths.push(PathBuf::from(global)); }
+        if !global.is_empty() {
+            paths.push(PathBuf::from(global));
+        }
     } else {
         let home = home_path()?;
         paths.push(home.join(".gitconfig"));
@@ -1233,7 +1385,9 @@ fn is_ref_space(ch: char) -> bool {
 
 fn discover_repository(cwd: &Path, scan: &mut ConfigScan) -> Result<Option<RepositoryPaths>, String> {
     let cwd = local_path(cwd)?;
-    if !cwd.is_dir() { return Ok(None); }
+    if !cwd.is_dir() {
+        return Ok(None);
+    }
     for root in cwd.ancestors() {
         let dot_git = root.join(".git");
         let marker = scan.source(&dot_git)?;
@@ -1273,16 +1427,22 @@ fn discover_repository(cwd: &Path, scan: &mut ConfigScan) -> Result<Option<Repos
 /// Directory snapshots catch newly inserted/replaced reparse entries, while
 /// only actual redirects need a guarded target lookup and an alias watch.
 fn inspect_metadata_tree(directory: &Path, scan: &mut ConfigScan, depth: usize) -> Result<(), String> {
-    if depth > MAX_METADATA_DEPTH { return Err(config_refusal()); }
+    if depth > MAX_METADATA_DEPTH {
+        return Err(config_refusal());
+    }
     let directory = scan.source(directory)?;
-    if !scan.metadata_dirs.insert(directory.clone()) { return Ok(()); }
+    if !scan.metadata_dirs.insert(directory.clone()) {
+        return Ok(());
+    }
     let entries = match std::fs::read_dir(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.to_string()),
     };
     for entry in entries {
-        if scan.metadata_entries >= MAX_METADATA_ENTRIES { return Err(config_refusal()); }
+        if scan.metadata_entries >= MAX_METADATA_ENTRIES {
+            return Err(config_refusal());
+        }
         scan.metadata_entries += 1;
         let entry = entry.map_err(|error| error.to_string())?;
         let kind = entry.file_type().map_err(|error| error.to_string())?;
@@ -1297,7 +1457,9 @@ fn inspect_metadata_tree(directory: &Path, scan: &mut ConfigScan, depth: usize) 
         if reparse {
             // Never ask is_dir/metadata about a target before local_path.
             let target = scan.source(&entry.path())?;
-            if target.is_dir() { inspect_metadata_tree(&entry.path(), scan, depth + 1)?; }
+            if target.is_dir() {
+                inspect_metadata_tree(&entry.path(), scan, depth + 1)?;
+            }
         } else if kind.is_dir() {
             inspect_metadata_tree(&entry.path(), scan, depth + 1)?;
         }
@@ -1310,34 +1472,47 @@ fn inspect_symbolic_head(repository: &RepositoryPaths, scan: &mut ConfigScan) ->
     let mut visited = std::collections::HashSet::new();
     for _ in 0..32 {
         let resolved = scan.source(&path)?;
-        if !visited.insert(resolved) { return Err(config_refusal()); }
+        if !visited.insert(resolved) {
+            return Err(config_refusal());
+        }
         let Some(text) = scan.read(&path)? else { return Ok(()) };
         let Some(reference) = text.strip_prefix("ref:") else { return Ok(()) };
         let reference = reference.trim_matches(is_ref_space);
-        if !reference.starts_with("refs/") || reference.contains('\\') || reference.contains(':')
+        if !reference.starts_with("refs/")
+            || reference.contains('\\')
+            || reference.contains(':')
             || reference.chars().any(char::is_control)
             || reference.split('/').any(|part| part.is_empty() || part == "." || part == "..")
         {
             return Err(config_refusal());
         }
         // Git's three per-worktree namespaces bypass commondir.
-        let per_worktree = ["refs/bisect/", "refs/worktree/", "refs/rewritten/"]
-            .iter().any(|prefix| reference.starts_with(prefix));
+        let per_worktree =
+            ["refs/bisect/", "refs/worktree/", "refs/rewritten/"].iter().any(|prefix| reference.starts_with(prefix));
         path = (if per_worktree { &repository.git_dir } else { &repository.common_dir }).join(reference);
     }
     Err(config_refusal())
 }
 
 fn inspect_objects(directory: &Path, scan: &mut ConfigScan, depth: usize) -> Result<(), String> {
-    if depth > 10 { return Err(config_refusal()); }
+    if depth > 10 {
+        return Err(config_refusal());
+    }
     if scan.alternate_stores.len() >= MAX_ALTERNATE_STORES
-        && !scan.alias_index.get(directory).is_some_and(|&index| scan.alternate_stores.contains(&scan.sources[index].path))
+        && !scan
+            .alias_index
+            .get(directory)
+            .is_some_and(|&index| scan.alternate_stores.contains(&scan.sources[index].path))
     {
         return Err(config_refusal());
     }
     let directory = scan.source(directory)?;
-    if scan.alternate_stores.contains(&directory) { return Ok(()); }
-    if scan.alternate_stores.len() >= MAX_ALTERNATE_STORES { return Err(config_refusal()); }
+    if scan.alternate_stores.contains(&directory) {
+        return Ok(());
+    }
+    if scan.alternate_stores.len() >= MAX_ALTERNATE_STORES {
+        return Err(config_refusal());
+    }
     scan.alternate_stores.insert(directory.clone());
     inspect_metadata_tree(&directory, scan, 0)?;
     if let Some(alternates) = scan.read(&directory.join("info/alternates"))? {
@@ -1351,16 +1526,24 @@ fn inspect_objects(directory: &Path, scan: &mut ConfigScan, depth: usize) -> Res
 }
 
 fn inspect_metadata(repository: &RepositoryPaths, scan: &mut ConfigScan, depth: usize) -> Result<(), String> {
-    if depth > 10 { return Err(config_refusal()); }
-    if !scan.repository_keys.insert((repository.root.clone(), repository.git_dir.clone())) { return Ok(()); }
-    if scan.repositories.len() >= MAX_REPOSITORIES { return Err(config_refusal()); }
+    if depth > 10 {
+        return Err(config_refusal());
+    }
+    if !scan.repository_keys.insert((repository.root.clone(), repository.git_dir.clone())) {
+        return Ok(());
+    }
+    if scan.repositories.len() >= MAX_REPOSITORIES {
+        return Err(config_refusal());
+    }
     scan.repositories.push(repository.clone());
     let previous_git_dir = std::mem::replace(&mut scan.git_dir, repository.git_dir.clone());
     let previous_cwd = std::mem::replace(&mut scan.cwd, repository.root.clone());
     // Relative global attribute/include settings apply in each child's cwd,
     // not just the superproject's. Context-keyed visited entries preserve this.
     let globals = scan.global_paths.clone();
-    for path in globals.iter() { scan.config(path, 0)?; }
+    for path in globals.iter() {
+        scan.config(path, 0)?;
+    }
     scan.config(&repository.common_dir.join("config"), 0)?;
     scan.config(&repository.git_dir.join("config.worktree"), 0)?;
     // Watch HEAD as well: includeIf.onbranch can change its selected source
@@ -1368,8 +1551,10 @@ fn inspect_metadata(repository: &RepositoryPaths, scan: &mut ConfigScan, depth: 
     inspect_symbolic_head(repository, scan)?;
     inspect_objects(&repository.common_dir.join("objects"), scan, 0)?;
     for directory in [
-        repository.common_dir.join("refs"), repository.git_dir.join("refs"),
-        repository.common_dir.join("reftable"), repository.git_dir.join("reftable"),
+        repository.common_dir.join("refs"),
+        repository.git_dir.join("refs"),
+        repository.common_dir.join("reftable"),
+        repository.git_dir.join("reftable"),
     ] {
         inspect_metadata_tree(&directory, scan, 0)?;
     }
@@ -1387,13 +1572,19 @@ fn inspect_metadata(repository: &RepositoryPaths, scan: &mut ConfigScan, depth: 
     // explicit request for their identity. Inspect their gitfiles FIRST too.
     if let Some(modules) = scan.read(&repository.root.join(".gitmodules"))? {
         for (key, value) in config_paths(&modules)? {
-            if key != "submodule.path" { continue; }
+            if key != "submodule.path" {
+                continue;
+            }
             let module = config_path(&value, &repository.root, &repository.root)?;
-            if !path_is_inside(&module, &repository.root) { return Err(config_refusal()); }
+            if !path_is_inside(&module, &repository.root) {
+                return Err(config_refusal());
+            }
             let marker = scan.source(&module.join(".git"))?;
             if marker.exists() {
                 if let Some(child) = discover_repository(&module, scan)? {
-                    if !same_path(&child.root, &local_path(&module)?) { return Err(config_refusal()); }
+                    if !same_path(&child.root, &local_path(&module)?) {
+                        return Err(config_refusal());
+                    }
                     inspect_metadata(&child, scan, depth + 1)?;
                 }
             }
@@ -1410,19 +1601,26 @@ fn head_is_unborn(root: &Path) -> Result<bool, String> {
     let mut scan = ConfigScan::new(root);
     let Some(head) = scan.read(&repository.git_dir.join("HEAD"))? else { return Ok(false) };
     let Some(reference) = head.trim().strip_prefix("ref: ") else { return Ok(false) };
-    if !reference.starts_with("refs/heads/") || reference.contains('\\')
+    if !reference.starts_with("refs/heads/")
+        || reference.contains('\\')
         || reference.split('/').any(|part| part.is_empty() || part == "." || part == "..")
     {
         return Err(config_refusal());
     }
     let reference_path = scan.source(&repository.common_dir.join(reference))?;
-    if reference_path.exists() { return Ok(false); }
+    if reference_path.exists() {
+        return Ok(false);
+    }
     // Reftable repositories store refs differently; leave their resolution
     // to Git, rather than treating them as empty.
-    if scan.source(&repository.common_dir.join("reftable"))?.exists() { return Ok(false); }
+    if scan.source(&repository.common_dir.join("reftable"))?.exists() {
+        return Ok(false);
+    }
     let packed = scan.read(&repository.common_dir.join("packed-refs"))?.unwrap_or_default();
     let packed_has_head = packed.lines().any(|line| line.split_once(' ').is_some_and(|(_, name)| name == reference));
-    if !scan.sources.iter().all(ConfigSource::is_current) { return Err(config_refusal()); }
+    if !scan.sources.iter().all(ConfigSource::is_current) {
+        return Err(config_refusal());
+    }
     Ok(!packed_has_head)
 }
 
@@ -1433,12 +1631,21 @@ static PREFLIGHT_CACHE: std::sync::Mutex<Option<PreflightCache>> = std::sync::Mu
 fn preflight(cwd: &Path) -> Result<std::sync::Arc<Preflight>, String> {
     // Env redirects are part of freshness, not just the files already found.
     let environment: PreflightEnvironment = [
-        "PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "XDG_CONFIG_HOME", "PROGRAMDATA",
-        "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM",
-    ].map(std::env::var_os);
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "XDG_CONFIG_HOME",
+        "PROGRAMDATA",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_NOSYSTEM",
+    ]
+    .map(std::env::var_os);
     let cwd = local_path(cwd)?;
-    let cached = PREFLIGHT_CACHE.lock().ok().and_then(|cache| cache.as_ref()
-        .and_then(|cache| cache.get(&cwd)).cloned());
+    let cached =
+        PREFLIGHT_CACHE.lock().ok().and_then(|cache| cache.as_ref().and_then(|cache| cache.get(&cwd)).cloned());
     if let Some((previous, checked)) = cached {
         if previous == environment && checked.sources.iter().all(ConfigSource::is_current) {
             return Ok(checked);
@@ -1448,11 +1655,17 @@ fn preflight(cwd: &Path) -> Result<std::sync::Arc<Preflight>, String> {
         let mut scan = ConfigScan::new(&cwd);
         let mut repository = discover_repository(&cwd, &mut scan)?;
         let executable = git_executable()?;
-        if let Some(repository) = &repository { scan.git_dir = repository.git_dir.clone(); }
-        if let Some(repository) = &repository { scan.cwd = repository.root.clone(); }
+        if let Some(repository) = &repository {
+            scan.git_dir = repository.git_dir.clone();
+        }
+        if let Some(repository) = &repository {
+            scan.cwd = repository.root.clone();
+        }
         scan.global_paths = std::sync::Arc::new(global_configs(&executable)?);
         let globals = scan.global_paths.clone();
-        for path in globals.iter() { scan.config(path, 0)?; }
+        for path in globals.iter() {
+            scan.config(path, 0)?;
+        }
         // Git's default external attribute/exclude files are path-bearing
         // configuration too, even with an explicit GIT_CONFIG_GLOBAL.
         let home = home_path()?;
@@ -1462,25 +1675,36 @@ fn preflight(cwd: &Path) -> Result<std::sync::Arc<Preflight>, String> {
         if let Some(repository) = &repository {
             inspect_metadata(repository, &mut scan, 0)?;
         }
-        if !scan.sources.iter().all(ConfigSource::is_current) { continue; }
+        if !scan.sources.iter().all(ConfigSource::is_current) {
+            continue;
+        }
         if scan.worktree_override {
             let mut command = base_git_command(&cwd, &executable);
             command.args(["rev-parse", "--show-toplevel"]);
             let (success, stdout, stderr) = run_bounded(command, "git rev-parse", GIT_TIMEOUT, GIT_MAX_OUTPUT, None)?;
-            if !success { return Err(String::from_utf8_lossy(&stderr).trim().to_owned()); }
+            if !success {
+                return Err(String::from_utf8_lossy(&stderr).trim().to_owned());
+            }
             let actual = PathBuf::from(String::from_utf8(stdout).map_err(|_| config_refusal())?.trim());
             if let Some(repository) = &mut repository {
                 repository.root = local_path(&actual)?;
-                if let Some(first) = scan.repositories.first_mut() { first.root = repository.root.clone(); }
+                if let Some(first) = scan.repositories.first_mut() {
+                    first.root = repository.root.clone();
+                }
             }
         }
         if scan.sources.iter().all(ConfigSource::is_current) {
             let checked = std::sync::Arc::new(Preflight {
-                repository, repositories: scan.repositories, sources: std::sync::Arc::new(scan.sources), executable,
+                repository,
+                repositories: scan.repositories,
+                sources: std::sync::Arc::new(scan.sources),
+                executable,
             });
             if let Ok(mut cache) = PREFLIGHT_CACHE.lock() {
                 let cache = cache.get_or_insert_with(HashMap::new);
-                if cache.len() >= MAX_CACHED_ROOTS && !cache.contains_key(&cwd) { cache.clear(); }
+                if cache.len() >= MAX_CACHED_ROOTS && !cache.contains_key(&cwd) {
+                    cache.clear();
+                }
                 cache.insert(cwd.clone(), (environment, checked.clone()));
             }
             return Ok(checked);
@@ -1501,7 +1725,6 @@ pub fn metadata_path(root: &Path, name: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-
 static STAMP_CACHE: std::sync::Mutex<Option<HashMap<PathBuf, RepositoryStamp>>> = std::sync::Mutex::new(None);
 
 fn cached_stamp(root: &Path) -> Option<RepositoryStamp> {
@@ -1511,7 +1734,9 @@ fn cached_stamp(root: &Path) -> Option<RepositoryStamp> {
 fn store_stamp(root: &Path, stamp: &RepositoryStamp) {
     if let Ok(mut cache) = STAMP_CACHE.lock() {
         let cache = cache.get_or_insert_with(HashMap::new);
-        if cache.len() >= MAX_CACHED_ROOTS && !cache.contains_key(root) { cache.clear(); }
+        if cache.len() >= MAX_CACHED_ROOTS && !cache.contains_key(root) {
+            cache.clear();
+        }
         cache.insert(root.to_path_buf(), stamp.clone());
     }
 }
@@ -1526,13 +1751,17 @@ static TRUSTED: std::sync::Mutex<Option<HashMap<PathBuf, RepositoryStamp>>> = st
 /// approval for exactly this digest, and a stale stamp never authorizes
 /// commands even when the digest still matches what was remembered.
 pub fn trust_approved(root: &Path, stamp: &RepositoryStamp) -> bool {
-    if !stamp.is_current() { return false; }
+    if !stamp.is_current() {
+        return false;
+    }
     if stamp.is_hazard_free() {
         return true;
     }
     TRUSTED
         .lock()
-        .map(|trusted| trusted.as_ref().is_some_and(|trusted| trusted.get(root).is_some_and(|approved| approved == stamp)))
+        .map(|trusted| {
+            trusted.as_ref().is_some_and(|trusted| trusted.get(root).is_some_and(|approved| approved == stamp))
+        })
         .unwrap_or(false)
 }
 
@@ -1542,11 +1771,12 @@ pub fn remember_trust(root: &Path, stamp: RepositoryStamp) {
         // unrelated repositories must not grow this without limit. Clearing is
         // the same deliberate trade-off — approvals are re-asked, never assumed.
         let cache = trusted.get_or_insert_with(HashMap::new);
-        if cache.len() >= MAX_CACHED_ROOTS && !cache.contains_key(root) { cache.clear(); }
+        if cache.len() >= MAX_CACHED_ROOTS && !cache.contains_key(root) {
+            cache.clear();
+        }
         cache.insert(root.to_path_buf(), stamp);
     }
 }
-
 
 /// Reads branch, ahead/behind and every change (staged, unstaged, untracked).
 pub fn status(root: &Path) -> Result<Status, String> {
@@ -1567,12 +1797,16 @@ pub fn status(root: &Path) -> Result<Status, String> {
             .filter(|oid| is_object_hash(oid));
     }
     if status.changes.iter().any(|change| change.unstaged() && !change.untracked) {
-        if let Ok(numstat) = run_git(root, &["diff", "--no-ext-diff", "--no-textconv", "--numstat", "-z", "--no-renames"]) {
+        if let Ok(numstat) =
+            run_git(root, &["diff", "--no-ext-diff", "--no-textconv", "--numstat", "-z", "--no-renames"])
+        {
             apply_numstat(&mut status.changes, &parse_numstat(numstat.as_bytes()), false);
         }
     }
     if status.changes.iter().any(Change::staged) {
-        if let Ok(numstat) = run_git(root, &["diff", "--no-ext-diff", "--no-textconv", "--cached", "--numstat", "-z", "--no-renames"]) {
+        if let Ok(numstat) =
+            run_git(root, &["diff", "--no-ext-diff", "--no-textconv", "--cached", "--numstat", "-z", "--no-renames"])
+        {
             apply_numstat(&mut status.changes, &parse_numstat(numstat.as_bytes()), true);
         }
     }
@@ -1798,13 +2032,14 @@ fn rev_list_set(root: &Path, revs: &[&str]) -> std::collections::HashSet<String>
 /// Recent commits of HEAD (and the upstream), marked with their section.
 pub fn log(root: &Path) -> Result<CommitLog, String> {
     const MAX_COMMITS: usize = 80;
-    if head_is_unborn(root)? { return Ok(CommitLog::default()); }
+    if head_is_unborn(root)? {
+        return Ok(CommitLog::default());
+    }
     let upstream = upstream(root);
     let (outgoing, incoming) = match &upstream {
-        Some(upstream) => (
-            rev_list_set(root, &[&format!("{upstream}..HEAD")]),
-            rev_list_set(root, &[&format!("HEAD..{upstream}")]),
-        ),
+        Some(upstream) => {
+            (rev_list_set(root, &[&format!("{upstream}..HEAD")]), rev_list_set(root, &[&format!("HEAD..{upstream}")]))
+        }
         None => (rev_list_set(root, &["HEAD"]), Default::default()),
     };
     let format = "%H\x1f%h\x1f%P\x1f%an\x1f%ct\x1f%D\x1f%s\x1e".to_owned();
@@ -1833,7 +2068,11 @@ pub fn log(root: &Path) -> Result<CommitLog, String> {
 /// the record/field separators; only records whose hash is a real object id are
 /// trusted, so a crafted subject cannot inject a "hash" that later reaches git
 /// as an option.
-fn parse_log(text: &str, outgoing: &std::collections::HashSet<String>, incoming: &std::collections::HashSet<String>) -> Vec<Commit> {
+fn parse_log(
+    text: &str,
+    outgoing: &std::collections::HashSet<String>,
+    incoming: &std::collections::HashSet<String>,
+) -> Vec<Commit> {
     let mut commits = Vec::new();
     for record in text.split('\u{1e}') {
         let record = record.trim_start_matches(['\n', '\r']);
@@ -1872,8 +2111,36 @@ pub fn commit_detail(root: &Path, hash: &str) -> Result<CommitDetail, String> {
     }
     // `--end-of-options` keeps a revision from ever being read as an option,
     // so every option must precede it: git rejects options that follow.
-    let name_status = run_git_bytes(root, &["show", "--no-color", "--format=", "--first-parent", "--diff-merges=first-parent", "--name-status", "-z", "--end-of-options", hash])?;
-    let numstat = run_git_bytes(root, &["show", "--no-color", "--no-ext-diff", "--no-textconv", "--format=", "--first-parent", "--diff-merges=first-parent", "--numstat", "-z", "--end-of-options", hash])?;
+    let name_status = run_git_bytes(
+        root,
+        &[
+            "show",
+            "--no-color",
+            "--format=",
+            "--first-parent",
+            "--diff-merges=first-parent",
+            "--name-status",
+            "-z",
+            "--end-of-options",
+            hash,
+        ],
+    )?;
+    let numstat = run_git_bytes(
+        root,
+        &[
+            "show",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--format=",
+            "--first-parent",
+            "--diff-merges=first-parent",
+            "--numstat",
+            "-z",
+            "--end-of-options",
+            hash,
+        ],
+    )?;
     let stats = parse_numstat(&numstat);
     let mut files = Vec::new();
     let mut records = name_status.split(|b| *b == 0).filter(|record| !record.is_empty());
@@ -1905,7 +2172,8 @@ pub fn commit_detail(root: &Path, hash: &str) -> Result<CommitDetail, String> {
         files.push((status, path, additions, deletions));
     }
     // A failed `show` must not read as an empty commit message.
-    let header = run_git(root, &["show", "--no-patch", "--format=%H%n%an <%ae>%n%ci%n%s%n%b", "--end-of-options", hash])?;
+    let header =
+        run_git(root, &["show", "--no-patch", "--format=%H%n%an <%ae>%n%ci%n%s%n%b", "--end-of-options", hash])?;
     Ok(CommitDetail { files, header })
 }
 
@@ -1917,9 +2185,20 @@ pub fn commit_file_diff(root: &Path, hash: &str, path: &str) -> Result<String, S
     run_git(
         root,
         &[
-            "show", "--no-color", "--no-ext-diff", "--no-textconv", "--unified=3", "--format=",
-            "--src-prefix=a/", "--dst-prefix=b/", "--first-parent", "--diff-merges=first-parent",
-            "--end-of-options", hash, "--", path,
+            "show",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--unified=3",
+            "--format=",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--first-parent",
+            "--diff-merges=first-parent",
+            "--end-of-options",
+            hash,
+            "--",
+            path,
         ],
     )
 }
@@ -1930,8 +2209,15 @@ pub fn commit_file_diff(root: &Path, hash: &str, path: &str) -> Result<String, S
 /// could point them at any program), and fixed `a/`/`b/` prefixes whatever
 /// `diff.noprefix` or `diff.mnemonicPrefix` say, since `git apply` expects them.
 pub fn diff_bytes(root: &Path, path: &str, staged: bool) -> Result<Vec<u8>, String> {
-    let mut args =
-        vec!["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--unified=3", "--src-prefix=a/", "--dst-prefix=b/"];
+    let mut args = vec![
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--unified=3",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+    ];
     if staged {
         args.push("--cached");
     }
@@ -1969,7 +2255,8 @@ pub fn stage(root: &Path, paths: &[String], staged: bool) -> Result<(), String> 
     }
     let mut git = git_command(root)?;
     git.args(command).args(from_stdin);
-    let (success, _, stderr) = run_bounded(git, &format!("git {}", command[0]), GIT_TIMEOUT, GIT_MAX_OUTPUT, Some(input))?;
+    let (success, _, stderr) =
+        run_bounded(git, &format!("git {}", command[0]), GIT_TIMEOUT, GIT_MAX_OUTPUT, Some(input))?;
     if success {
         Ok(())
     } else {
@@ -1985,7 +2272,8 @@ pub fn commit(root: &Path, message: String) -> Result<String, String> {
     // index.lock behind. Stdin also avoids Windows' command-line size limit.
     let mut command = git_command(root)?;
     command.args(["commit", "-F", "-"]);
-    let (success, _, stderr) = run_bounded(command, "git commit", GIT_TIMEOUT_COMMIT, GIT_MAX_OUTPUT, Some(message.into_bytes()))?;
+    let (success, _, stderr) =
+        run_bounded(command, "git commit", GIT_TIMEOUT_COMMIT, GIT_MAX_OUTPUT, Some(message.into_bytes()))?;
     if !success {
         return Err(String::from_utf8_lossy(&stderr).trim().to_owned());
     }
@@ -2021,7 +2309,9 @@ fn ai_cli_command(program: &str) -> Command {
         if explicit.file_stem().is_some_and(|name| name.eq_ignore_ascii_case("opencode")) {
             if let Some(parent) = explicit.parent().filter(|p| !p.as_os_str().is_empty()) {
                 for native in [parent.join("opencode.exe"), parent.join("node_modules/opencode-ai/bin/opencode.exe")] {
-                    if native.is_file() { return Command::new(native); }
+                    if native.is_file() {
+                        return Command::new(native);
+                    }
                 }
             }
         }
@@ -2175,9 +2465,8 @@ fn windows_command_units(command: &Command, batch: bool) -> usize {
         // Rust resolves a batch script to an absolute path before wrapping it
         // with cmd.exe. The verbatim prefix allowance is deliberately retained.
         let path = Path::new(command.get_program());
-        let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| {
-            std::env::current_dir().unwrap_or_default().join(path)
-        });
+        let absolute =
+            std::fs::canonicalize(path).unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(path));
         utf16_len(absolute.as_os_str()) + 8 + windows_batch_shell_units() + " /e:ON /v:OFF /d /c \"".len() + 1
     } else {
         utf16_len(command.get_program())
@@ -2188,12 +2477,19 @@ fn windows_command_units(command: &Command, batch: bool) -> usize {
 
 /// Budget the prompt against the fully resolved executable and every fixed
 /// flag. Prefixes are cut at UTF-8 boundaries; a cut is always visible.
-fn fit_ai_prompt<'a>(command: &Command, prompt: &'a str, suffix: &[String]) -> Result<std::borrow::Cow<'a, str>, String> {
-    let batch = Path::new(command.get_program()).extension().and_then(|extension| extension.to_str())
+fn fit_ai_prompt<'a>(
+    command: &Command,
+    prompt: &'a str,
+    suffix: &[String],
+) -> Result<std::borrow::Cow<'a, str>, String> {
+    let batch = Path::new(command.get_program())
+        .extension()
+        .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat"));
     let suffix_units = suffix.iter().map(|arg| 1 + windows_argument_units(arg.as_ref(), batch)).sum::<usize>();
     let limit = if batch { WINDOWS_BATCH_LIMIT } else { WINDOWS_COMMAND_LIMIT };
-    let available = limit.checked_sub(windows_command_units(command, batch) + suffix_units + 1)
+    let available = limit
+        .checked_sub(windows_command_units(command, batch) + suffix_units + 1)
         .ok_or_else(|| "Команда AI превышает лимит командной строки Windows".to_owned())?;
     if windows_argument_units(prompt.as_ref(), batch) <= available {
         return Ok(prompt.into());
@@ -2202,13 +2498,19 @@ fn fit_ai_prompt<'a>(command: &Command, prompt: &'a str, suffix: &[String]) -> R
     // safely rejects multiline batch arguments rather than shell-escaping them.
     let separator = if batch { ' ' } else { '\n' };
     let marker_units = windows_argument_units(AI_TRUNCATED.as_ref(), batch) + 1;
-    let room = available.checked_sub(marker_units)
-        .ok_or_else(|| "Команда AI не оставляет места для запроса".to_owned())?;
+    let room =
+        available.checked_sub(marker_units).ok_or_else(|| "Команда AI не оставляет места для запроса".to_owned())?;
     let mut used = 0;
     let mut backslashes = 0;
     let mut end = 0;
     for (offset, character) in prompt.char_indices() {
-        let extra = if character == '"' { backslashes + 1 } else if batch && matches!(character, '%' | '\r') { 7 } else { 0 };
+        let extra = if character == '"' {
+            backslashes + 1
+        } else if batch && matches!(character, '%' | '\r') {
+            7
+        } else {
+            0
+        };
         let size = character.len_utf16() + extra;
         if used + size > room {
             break;
@@ -2260,8 +2562,11 @@ pub const AI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// The model IDs offered by the installed OpenCode and its configured providers.
 pub fn opencode_models() -> Result<Vec<String>, String> {
     let ai_commit::Invocation { program, directory: _directory, .. } = ai_commit::prepare_models()?;
-    let Some(command) = program else { return Err("OpenCode: нет команды".to_owned()); };
-    let (success, stdout, stderr) = run_bounded(command, "opencode models", std::time::Duration::from_secs(30), 512 * 1024, None)?;
+    let Some(command) = program else {
+        return Err("OpenCode: нет команды".to_owned());
+    };
+    let (success, stdout, stderr) =
+        run_bounded(command, "opencode models", std::time::Duration::from_secs(30), 512 * 1024, None)?;
     if !success {
         return Err(String::from_utf8_lossy(&stderr).trim().to_owned());
     }
@@ -2277,7 +2582,8 @@ fn parse_opencode_models(text: &str) -> Vec<String> {
         .lines()
         .map(str::trim)
         .filter(|line| {
-            line.split_once('/').is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty() && !provider.contains(':'))
+            line.split_once('/')
+                .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty() && !provider.contains(':'))
                 && !line.chars().any(char::is_whitespace)
         })
         .map(str::to_owned)
@@ -2321,8 +2627,12 @@ fn opencode_commit_config(existing: Option<&str>) -> Result<String, String> {
 #[derive(serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OpenCodeEvent {
-    Text { part: OpenCodeText },
-    Error { error: serde_json::Value },
+    Text {
+        part: OpenCodeText,
+    },
+    Error {
+        error: serde_json::Value,
+    },
     #[serde(other)]
     Other,
 }
@@ -2335,7 +2645,8 @@ struct OpenCodeText {
 fn opencode_message(text: &str) -> Result<String, String> {
     let mut message = String::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let event: OpenCodeEvent = serde_json::from_str(line).map_err(|error| format!("OpenCode: неверный JSON-ответ ({error})"))?;
+        let event: OpenCodeEvent =
+            serde_json::from_str(line).map_err(|error| format!("OpenCode: неверный JSON-ответ ({error})"))?;
         match event {
             OpenCodeEvent::Text { part } => message.push_str(&part.text),
             OpenCodeEvent::Error { error } => {
@@ -2362,16 +2673,17 @@ pub fn sweep_stale_ai_state() {
 /// Generates a full commit message with an inference-only built-in profile.
 /// Every invocation owns a fresh private directory, removed on success/error.
 /// Explicit unknown custom executables remain user code, not safe profiles.
-pub fn ai_commit_message(
-    command: Option<&str>,
-    prompt: &str,
-    timeout: std::time::Duration,
-) -> Result<String, String> {
+pub fn ai_commit_message(command: Option<&str>, prompt: &str, timeout: std::time::Duration) -> Result<String, String> {
     use ai_commit::Backend;
-    let ai_commit::Invocation { program, directory: _directory, backend, model } = ai_commit::prepare(command.unwrap_or(""))?;
+    let ai_commit::Invocation { program, directory: _directory, backend, model } =
+        ai_commit::prepare(command.unwrap_or(""))?;
     let text = if let Some(mut process) = program {
-        if backend == Backend::Gemini { process.arg("--prompt"); }
-        if backend == Backend::Aider { process.arg("--message"); }
+        if backend == Backend::Gemini {
+            process.arg("--prompt");
+        }
+        if backend == Backend::Aider {
+            process.arg("--message");
+        }
         let prompt = fit_ai_prompt(&process, prompt, &[])?;
         process.arg(prompt.as_ref());
         let label = format!("{backend:?}");
@@ -2405,10 +2717,7 @@ pub fn ai_commit_message(
 fn clean_ai_message(text: &str) -> &str {
     let text = text.trim();
     let text = if text.starts_with("```") {
-        text.split_once('\n')
-            .and_then(|(_, body)| body.trim_end().strip_suffix("```"))
-            .map(str::trim)
-            .unwrap_or(text)
+        text.split_once('\n').and_then(|(_, body)| body.trim_end().strip_suffix("```")).map(str::trim).unwrap_or(text)
     } else {
         text
     };
@@ -2417,7 +2726,8 @@ fn clean_ai_message(text: &str) -> &str {
 
 /// Tracked plus untracked-but-not-ignored files, sorted.
 pub fn ls_files(root: &Path) -> Result<Vec<String>, String> {
-    let bytes = run_git_bytes(root, &["ls-files", "-z", "--deduplicate", "--cached", "--others", "--exclude-standard"])?;
+    let bytes =
+        run_git_bytes(root, &["ls-files", "-z", "--deduplicate", "--cached", "--others", "--exclude-standard"])?;
     let mut files: Vec<String> = bytes
         .split(|b| *b == 0)
         .filter(|record| !record.is_empty())
@@ -2436,10 +2746,7 @@ pub fn read_file(root: &Path, path: &str, max_bytes: usize) -> Result<(String, b
     let full = resolve_path(root, path)?;
     let mut file = std::fs::File::open(&full).map_err(|e| format!("{path}: {e}"))?;
     let mut buffer = Vec::with_capacity(max_bytes.min(64 * 1024));
-    file.by_ref()
-        .take(max_bytes as u64 + 1)
-        .read_to_end(&mut buffer)
-        .map_err(|e| format!("{path}: {e}"))?;
+    file.by_ref().take(max_bytes as u64 + 1).read_to_end(&mut buffer).map_err(|e| format!("{path}: {e}"))?;
     let truncated = buffer.len() > max_bytes;
     buffer.truncate(max_bytes);
     Ok((String::from_utf8_lossy(&buffer).into_owned(), truncated))
@@ -2697,7 +3004,12 @@ mod tests {
     #[test]
     fn parses_branch_and_ahead_behind() {
         let oid = "0123456789abcdef0123456789abcdef01234567";
-        let raw = status_bytes(&[&format!("# branch.oid {oid}"), "# branch.head main", "# branch.upstream origin/main", "# branch.ab +2 -1"]);
+        let raw = status_bytes(&[
+            &format!("# branch.oid {oid}"),
+            "# branch.head main",
+            "# branch.upstream origin/main",
+            "# branch.ab +2 -1",
+        ]);
         let status = parse_status(&raw);
         assert_eq!(status.branch, "main");
         assert_eq!(status.upstream.as_deref(), Some("origin/main"));
@@ -2739,7 +3051,10 @@ mod tests {
         assert_eq!(status.changes[0].path, "a file with spaces.txt");
         assert_eq!(status.changes[0].directory(), "");
         assert_eq!(status.changes[0].file_name(), "a file with spaces.txt");
-        assert_eq!(status.changes[0].directory(), "a file with spaces.txt".rsplit_once('/').map(|(d, _)| d).unwrap_or(""));
+        assert_eq!(
+            status.changes[0].directory(),
+            "a file with spaces.txt".rsplit_once('/').map(|(d, _)| d).unwrap_or("")
+        );
     }
 
     #[test]
@@ -2760,7 +3075,6 @@ mod tests {
         apply_numstat(&mut both, &stats, false);
         assert_eq!((both[0].additions, both[0].deletions), (24, 6));
     }
-
 
     const SAMPLE_DIFF: &str = "diff --git a/src/main.rs b/src/main.rs\n\
 index 111..222 100644\n\
@@ -2805,7 +3119,9 @@ index 111..222 100644\n\
 
     #[test]
     fn multi_file_diff_splits_paths() {
-        let text = format!("{SAMPLE_DIFF}diff --git a/other.txt b/other.txt\n--- a/other.txt\n+++ b/other.txt\n@@ -1 +1 @@\n-a\n+b\n");
+        let text = format!(
+            "{SAMPLE_DIFF}diff --git a/other.txt b/other.txt\n--- a/other.txt\n+++ b/other.txt\n@@ -1 +1 @@\n-a\n+b\n"
+        );
         let files = parse_diff(&text, true);
         assert_eq!(files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), vec!["src/main.rs", "other.txt"]);
         assert!(files[1].staged);
@@ -2872,14 +3188,20 @@ index 111..222 100644\n\
         }
         let text = String::from_utf8(raw).unwrap();
         let commits = parse_log(&text, &std::collections::HashSet::new(), &std::collections::HashSet::new());
-        assert_eq!(commits.iter().map(|commit| commit.hash.as_str()).collect::<Vec<_>>(), vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]);
+        assert_eq!(
+            commits.iter().map(|commit| commit.hash.as_str()).collect::<Vec<_>>(),
+            vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+        );
     }
 
     #[test]
     fn pathspec_magic_in_a_file_name_survives_as_a_literal_path() {
         // The worker sets GIT_LITERAL_PATHSPECS=1, so a name like this is a path,
         // not a pattern; what must hold locally is that the path is unchanged.
-        let files = parse_diff("diff --git a/:(glob)* b/:(glob)*\n--- a/:(glob)*\n+++ b/:(glob)*\n@@ -1 +1 @@\n-a\n+b\n", false);
+        let files = parse_diff(
+            "diff --git a/:(glob)* b/:(glob)*\n--- a/:(glob)*\n+++ b/:(glob)*\n@@ -1 +1 @@\n-a\n+b\n",
+            false,
+        );
         assert_eq!(files[0].path, ":(glob)*");
     }
 
@@ -2906,7 +3228,19 @@ index 111..222 100644\n\
         std::fs::create_dir_all(root.join("sub")).unwrap();
         std::fs::write(root.join("sub").join("a.txt"), "x").unwrap();
         assert!(resolve_path(root, "sub/a.txt").is_ok());
-        for bad in [".. ", "...", "sub/.. ", "sub/../..", "/abs", "C:/x", "\\\\server\\share", "sub/CON", "sub/a.txt:stream", "a\u{0}b", "sub/ a. "] {
+        for bad in [
+            ".. ",
+            "...",
+            "sub/.. ",
+            "sub/../..",
+            "/abs",
+            "C:/x",
+            "\\\\server\\share",
+            "sub/CON",
+            "sub/a.txt:stream",
+            "a\u{0}b",
+            "sub/ a. ",
+        ] {
             assert!(resolve_path(root, bad).is_err(), "{bad:?} must be rejected");
         }
         assert!(resolve_path(root, "").is_err());
@@ -2958,7 +3292,8 @@ index 111..222 100644\n\
         command.args(["run", "--model", "provider/model with spaces"]);
         let suffix = vec!["--no-auto-commits".to_owned(), "--no-git".to_owned()];
         let fixed = windows_command_units(&command, false)
-            + suffix.iter().map(|arg| 1 + windows_argument_units(arg.as_ref(), false)).sum::<usize>() + 1;
+            + suffix.iter().map(|arg| 1 + windows_argument_units(arg.as_ref(), false)).sum::<usize>()
+            + 1;
         let capacity = WINDOWS_COMMAND_LIMIT - fixed;
         let exact = "x".repeat(capacity);
         assert_eq!(fit_ai_prompt(&command, &exact, &suffix).unwrap(), exact);
@@ -2993,7 +3328,8 @@ index 111..222 100644\n\
             command.args(["--model", "provider/model with spaces"]);
             let suffix = vec!["--custom-flag".to_owned()];
             let fixed = windows_command_units(&command, true)
-                + suffix.iter().map(|arg| 1 + windows_argument_units(arg.as_ref(), true)).sum::<usize>() + 1;
+                + suffix.iter().map(|arg| 1 + windows_argument_units(arg.as_ref(), true)).sum::<usize>()
+                + 1;
             let exact = "x".repeat(WINDOWS_BATCH_LIMIT - fixed - 2);
             assert_eq!(fit_ai_prompt(&command, &exact, &suffix).unwrap(), exact);
             assert_eq!(fixed + windows_argument_units(exact.as_ref(), true), WINDOWS_BATCH_LIMIT);
@@ -3006,7 +3342,6 @@ index 111..222 100644\n\
             assert!(fit_ai_prompt(&command, "prompt", &suffix).is_err());
         }
     }
-
 
     #[cfg(windows)]
     #[test]
@@ -3062,7 +3397,9 @@ index 111..222 100644\n\
         );
         assert_eq!(opencode_message(response).unwrap(), "Detailed subject\n\n- Preserve the complete message.");
         assert_eq!(
-            opencode_message("{\"type\":\"error\",\"error\":{\"data\":{\"message\":\"Provider authentication failed\"}}}"),
+            opencode_message(
+                "{\"type\":\"error\",\"error\":{\"data\":{\"message\":\"Provider authentication failed\"}}}"
+            ),
             Err("Provider authentication failed".to_owned())
         );
     }
@@ -3153,11 +3490,14 @@ index 111..222 100644\n\
 
     #[test]
     fn config_parser_matches_git_values_and_fails_closed() {
-        let parsed = config_paths("[include]\n path = \"sec\"\\\r\nond.cfg # comment \"\n[includeIf \"gitdir:C:/repo\"]\n path = ~/x.cfg\n").unwrap();
-        assert_eq!(parsed, [
-            ("include.path".to_owned(), "second.cfg".to_owned()),
-            ("includeif.path".to_owned(), "~/x.cfg".to_owned()),
-        ]);
+        let parsed = config_paths(
+            "[include]\n path = \"sec\"\\\r\nond.cfg # comment \"\n[includeIf \"gitdir:C:/repo\"]\n path = ~/x.cfg\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            [("include.path".to_owned(), "second.cfg".to_owned()), ("includeif.path".to_owned(), "~/x.cfg".to_owned()),]
+        );
         // Unquoted Windows paths keep backslashes only when Git escapes them;
         // an unknown escape is a configuration Git itself rejects.
         assert!(config_paths("[include]\n path = C:\\x\n").is_err());
@@ -3175,7 +3515,9 @@ index 111..222 100644\n\
         assert_eq!(origin_path(br#"file:"store\040space""#).unwrap(), Some(PathBuf::from("store space")));
         assert_eq!(git_unquote(br#""\303\251""#).unwrap(), "é".as_bytes());
         assert_eq!(git_unquote(br#""\377""#).unwrap(), [255]);
-        for malformed in [r#""unterminated"#, r#""\4""#, r#""\400""#, r#""\12""#, r#""\q""#, r#""ok"suffix"#, r#""\000""#] {
+        for malformed in
+            [r#""unterminated"#, r#""\4""#, r#""\400""#, r#""\12""#, r#""\q""#, r#""ok"suffix"#, r#""\000""#]
+        {
             assert!(alternates_path(malformed).is_err(), "{malformed}");
             assert!(origin_path(format!("file:{malformed}").as_bytes()).is_err(), "{malformed}");
         }
@@ -3268,23 +3610,30 @@ index 111..222 100644\n\
     #[cfg(any(unix, windows))]
     #[test]
     fn nested_metadata_reparse_targets_are_guarded_before_following() {
-        for (entry, directory) in [
-            ("refs/heads", true), ("objects/pack", true),
-            ("objects/ab", true), ("reftable/tables.list", false),
-        ] {
+        for (entry, directory) in
+            [("refs/heads", true), ("objects/pack", true), ("objects/ab", true), ("reftable/tables.list", false)]
+        {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join(entry);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            if !metadata_link(Path::new("//127.0.0.1/ANVIL-denied"), &path, directory) { return; }
+            if !metadata_link(Path::new("//127.0.0.1/ANVIL-denied"), &path, directory) {
+                return;
+            }
             let mut scan = ConfigScan::new(dir.path());
-            assert!(inspect_metadata_tree(path.parent().unwrap(), &mut scan, 0).unwrap_err().contains("сетевые"), "{entry}");
+            assert!(
+                inspect_metadata_tree(path.parent().unwrap(), &mut scan, 0).unwrap_err().contains("сетевые"),
+                "{entry}"
+            );
         }
         let dir = tempfile::tempdir().unwrap();
         let git_dir = dir.path().join(".git");
         std::fs::create_dir_all(git_dir.join("refs")).unwrap();
         std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
-        if !metadata_link(Path::new("//127.0.0.1/ANVIL-denied"), &git_dir.join("refs/heads"), true) { return; }
-        let repository = RepositoryPaths { root: dir.path().to_path_buf(), git_dir: git_dir.clone(), common_dir: git_dir };
+        if !metadata_link(Path::new("//127.0.0.1/ANVIL-denied"), &git_dir.join("refs/heads"), true) {
+            return;
+        }
+        let repository =
+            RepositoryPaths { root: dir.path().to_path_buf(), git_dir: git_dir.clone(), common_dir: git_dir };
         assert!(inspect_symbolic_head(&repository, &mut ConfigScan::new(dir.path())).unwrap_err().contains("сетевые"));
     }
 
@@ -3294,7 +3643,11 @@ index 111..222 100644\n\
         std::fs::create_dir_all(dir.path().join("refs/heads")).unwrap();
         std::fs::write(dir.path().join("HEAD"), "ref:\trefs/heads/main\n").unwrap();
         std::fs::write(dir.path().join("refs/heads/main"), "ref: refs/heads/next\n").unwrap();
-        let repository = RepositoryPaths { root: dir.path().to_path_buf(), git_dir: dir.path().to_path_buf(), common_dir: dir.path().to_path_buf() };
+        let repository = RepositoryPaths {
+            root: dir.path().to_path_buf(),
+            git_dir: dir.path().to_path_buf(),
+            common_dir: dir.path().to_path_buf(),
+        };
         let mut scan = ConfigScan::new(dir.path());
         inspect_symbolic_head(&repository, &mut scan).unwrap();
         assert!(scan.source_index.contains_key(&dir.path().join("refs/heads/next")));
@@ -3313,7 +3666,11 @@ index 111..222 100644\n\
             std::fs::create_dir_all(git_dir.join(format!("refs/{namespace}"))).unwrap();
             std::fs::write(git_dir.join("HEAD"), format!("ref: refs/{namespace}/main\n")).unwrap();
             std::fs::write(git_dir.join(format!("refs/{namespace}/main")), "ref: refs/heads/next\n").unwrap();
-            let repository = RepositoryPaths { root: dir.path().to_path_buf(), git_dir: git_dir.clone(), common_dir: common_dir.clone() };
+            let repository = RepositoryPaths {
+                root: dir.path().to_path_buf(),
+                git_dir: git_dir.clone(),
+                common_dir: common_dir.clone(),
+            };
             let mut scan = ConfigScan::new(dir.path());
             inspect_symbolic_head(&repository, &mut scan).unwrap();
             assert!(scan.source_index.contains_key(&git_dir.join(format!("refs/{namespace}/main"))));
@@ -3356,13 +3713,21 @@ index 111..222 100644\n\
         let stamp = digest_of(&hazard, root, Default::default());
         assert!(!stamp.is_hazard_free());
         assert_eq!(stamp.hazards(), ["filter.hostile.clean"]);
-        let other = digest_of(&config_records(&[("local", "file:.git/config", "filter.hostile.clean", "cat -A")]), root, Default::default());
+        let other = digest_of(
+            &config_records(&[("local", "file:.git/config", "filter.hostile.clean", "cat -A")]),
+            root,
+            Default::default(),
+        );
         assert_ne!(stamp, other, "a changed command is a changed digest");
         // The cached digest is dropped when the file behind it moves on.
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config");
         std::fs::write(&config, b"[branch]\n").unwrap();
-        let before = digest_of(&config_records(&[("local", "file:config", "filter.x.clean", "one")]), root, std::sync::Arc::new(vec![ConfigSource::read(&config)]));
+        let before = digest_of(
+            &config_records(&[("local", "file:config", "filter.x.clean", "one")]),
+            root,
+            std::sync::Arc::new(vec![ConfigSource::read(&config)]),
+        );
         assert!(before.is_current());
         std::fs::write(&config, b"[branch]\nextra = 1\n").unwrap();
         assert!(!before.is_current(), "a written config file invalidates the digest");
@@ -3371,7 +3736,13 @@ index 111..222 100644\n\
     #[test]
     fn approvals_are_shared_in_memory_and_never_cover_the_stripe_of_a_digest() {
         let root = PathBuf::from("C:/repo");
-        let stamp = |value: &str| digest_of(&config_records(&[("local", "file:.git/config", "filter.x.clean", value)]), &root, Default::default());
+        let stamp = |value: &str| {
+            digest_of(
+                &config_records(&[("local", "file:.git/config", "filter.x.clean", value)]),
+                &root,
+                Default::default(),
+            )
+        };
         let first = stamp("one");
         let second = stamp("two");
         assert!(!trust_approved(&root, &first));
@@ -3421,8 +3792,13 @@ index 111..222 100644\n\
 
     #[test]
     fn built_in_specs_reject_unsafe_options() {
-        for spec in ["gemini --yolo", "claude --dangerously-skip-permissions", "aider --yes-always",
-            "opencode run --auto", "codex exec --dangerously-bypass-approvals-and-sandbox"] {
+        for spec in [
+            "gemini --yolo",
+            "claude --dangerously-skip-permissions",
+            "aider --yes-always",
+            "opencode run --auto",
+            "codex exec --dangerously-bypass-approvals-and-sandbox",
+        ] {
             let error = ai_commit::prepare(spec).err().unwrap_or_else(|| panic!("{spec} must be refused"));
             assert!(error.contains("AI:"), "{spec}: {error}");
         }
@@ -3431,10 +3807,7 @@ index 111..222 100644\n\
 
     #[test]
     fn wrapper_commands_cannot_downgrade_a_built_in_to_custom() {
-        for spec in [
-            "node C:\\npm\\node_modules\\@openai\\codex\\bin\\codex.js",
-            "cmd /c \"claude -p hi\"",
-        ] {
+        for spec in ["node C:\\npm\\node_modules\\@openai\\codex\\bin\\codex.js", "cmd /c \"claude -p hi\""] {
             let error = ai_commit::prepare(spec).err().unwrap_or_else(|| panic!("{spec} must be refused"));
             assert!(error.contains("AI:"), "{spec}: {error}");
         }
@@ -3450,19 +3823,26 @@ index 111..222 100644\n\
     #[test]
     fn codex_requests_never_advertise_or_accept_tools() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("auth.json"), r#"{"auth_mode":"chatgpt","tokens":{"access_token":"token","account_id":"account"}}"#).unwrap();
+        std::fs::write(
+            dir.path().join("auth.json"),
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"token","account_id":"account"}}"#,
+        )
+        .unwrap();
         std::fs::write(dir.path().join("config.toml"), "model = \"gpt-6-astra\"\n").unwrap();
         let (url, headers, body, token) = ai_commit::codex_request_for_tests(dir.path(), None, "diff").unwrap();
         assert_eq!(url, "https://chatgpt.com/backend-api/codex/responses");
         assert_eq!(token, "token", "the stored access token is used as-is");
-        assert!(headers.iter().any(|(name, value)| name.eq_ignore_ascii_case("ChatGPT-Account-ID") && value == "account"));
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("ChatGPT-Account-ID") && value == "account"));
         assert!(body.get("tools").is_none(), "no tool is advertised, so none can be called");
         assert_eq!(body.get("tool_choice").unwrap(), "none");
         assert_eq!(body.get("model").unwrap(), "gpt-6-astra");
 
         // An executable auth helper is not part of the request path: only the stored token is used.
         std::fs::write(dir.path().join("auth.json"), r#"{"auth_mode":"apikey","OPENAI_API_KEY":"key"}"#).unwrap();
-        let (url, headers, _, token) = ai_commit::codex_request_for_tests(dir.path(), Some("gpt-5.2-codex"), "diff").unwrap();
+        let (url, headers, _, token) =
+            ai_commit::codex_request_for_tests(dir.path(), Some("gpt-5.2-codex"), "diff").unwrap();
         assert_eq!(url, "https://api.openai.com/v1/responses");
         assert_eq!(token, "key");
         assert!(!headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("ChatGPT-Account-ID")));
@@ -3474,12 +3854,16 @@ index 111..222 100644\n\
 
     #[test]
     fn claude_managed_policy_gate_flags_executable_settings() {
-        let hooks = serde_json::json!({"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "evil.exe"}]}]}});
+        let hooks =
+            serde_json::json!({"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "evil.exe"}]}]}});
         assert!(ai_commit::policy_is_executable(&hooks, true));
         assert!(!ai_commit::policy_is_executable(&hooks, false), "bare mode runs no hooks module");
         assert!(ai_commit::policy_is_executable(&serde_json::json!({"apiKeyHelper": "evil.exe"}), false));
         assert!(ai_commit::policy_is_executable(&serde_json::json!({"managedMcpServers": {"x": {}}}), false));
-        assert!(ai_commit::policy_is_executable(&serde_json::json!({"env": {"NODE_OPTIONS": "--require evil"}}), false));
+        assert!(ai_commit::policy_is_executable(
+            &serde_json::json!({"env": {"NODE_OPTIONS": "--require evil"}}),
+            false
+        ));
         assert!(!ai_commit::policy_is_executable(&serde_json::json!({"permissions": {"deny": ["Read(./x)"]}}), true));
     }
 }

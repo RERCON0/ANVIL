@@ -591,10 +591,7 @@ mod tests {
         assert_eq!(km.lookup(&chord(CTRL_SHIFT, KeyName::Letter('T'))), Some(&Action::NewTab));
         assert_eq!(km.lookup(&chord(CTRL, KeyName::Tab)), Some(&Action::NextTab));
         assert_eq!(km.lookup(&chord(ALT, KeyName::Digit(0))), Some(&Action::Tab(10)));
-        assert_eq!(
-            km.lookup(&chord(CTRL_ALT, KeyName::Letter('P'))),
-            Some(&Action::Profile("powershell".into()))
-        );
+        assert_eq!(km.lookup(&chord(CTRL_ALT, KeyName::Letter('P'))), Some(&Action::Profile("powershell".into())));
         assert_eq!(km.lookup(&chord(CTRL, KeyName::Letter('C'))), Some(&Action::CtrlC));
         assert_eq!(km.lookup(&chord(CTRL, KeyName::Letter('V'))), None, "Ctrl+V goes to the app as ^V");
         assert_eq!(km.lookup(&chord(CTRL, KeyName::Space)), None, "Ctrl+Space goes to the app as NUL");

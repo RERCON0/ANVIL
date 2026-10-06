@@ -1,0 +1,11 @@
+title = "ANVIL secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic token in the provider-error redaction regression test"
+condition = "AND"
+paths = ['''^src/quota/model\.rs$''']
+regexTarget = "secret"
+regexes = ['''^sk-live-abcdef0123456789$''']

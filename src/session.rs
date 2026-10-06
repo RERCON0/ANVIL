@@ -153,10 +153,9 @@ impl SavedNode {
     pub fn to_node(&self, make_pane: &mut dyn FnMut(&PaneState) -> PaneId) -> Node {
         match self {
             SavedNode::Pane(p) => Node::Leaf(make_pane(p)),
-            SavedNode::Split { dir, children } => Node::Split {
-                dir: *dir,
-                children: children.iter().map(|(f, c)| (*f, c.to_node(make_pane))).collect(),
-            },
+            SavedNode::Split { dir, children } => {
+                Node::Split { dir: *dir, children: children.iter().map(|(f, c)| (*f, c.to_node(make_pane))).collect() }
+            }
         }
     }
 
@@ -327,10 +326,7 @@ mod tests {
             made.push((next, p.clone()));
             next
         });
-        assert_eq!(
-            node,
-            Node::Split { dir: Dir::Row, children: vec![(0.5, Node::Leaf(101)), (0.5, Node::Leaf(102))] }
-        );
+        assert_eq!(node, Node::Split { dir: Dir::Row, children: vec![(0.5, Node::Leaf(101)), (0.5, Node::Leaf(102))] });
         let back = SavedNode::from_node(&node, &|id| made.iter().find(|(i, _)| *i == id).unwrap().1.clone());
         assert_eq!(back, saved);
     }

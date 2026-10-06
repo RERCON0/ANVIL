@@ -25,10 +25,9 @@ path = "src/bin/anvil-probe.rs"
 test = false
 
 [features]
-default = []
-# Native Codex inference (official Responses protocol) needs an HTTP client
-# with TLS: enabling it adds reqwest/tokio/hyper/rustls and roughly 2.5 MB to
-# the release executable. `cargo build --release --features codex`.
+default = ["codex"]
+# Native Codex inference is included in normal builds and portable packages.
+# --no-default-features is available for development of the CLI-only backends.
 codex = ["dep:reqwest"]
 
 [dependencies]

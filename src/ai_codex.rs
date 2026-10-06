@@ -39,7 +39,10 @@ struct Login {
 
 fn login(home: &Path) -> Result<Login, String> {
     let auth = read_json(&home.join("auth.json"))?.unwrap_or(serde_json::json!({}));
-    let api_key = auth.get("OPENAI_API_KEY").and_then(serde_json::Value::as_str).map(str::to_owned)
+    let api_key = auth
+        .get("OPENAI_API_KEY")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
         .or_else(|| std::env::var("OPENAI_API_KEY").ok().filter(|key| !key.trim().is_empty()));
     let mode = auth.get("auth_mode").and_then(serde_json::Value::as_str);
     if mode == Some("apikey") || (mode.is_none() && api_key.is_some()) {
@@ -48,11 +51,18 @@ fn login(home: &Path) -> Result<Login, String> {
         }
     }
     let tokens = auth.get("tokens");
-    let access = tokens.and_then(|t| t.get("access_token")).and_then(serde_json::Value::as_str)
+    let access = tokens
+        .and_then(|t| t.get("access_token"))
+        .and_then(serde_json::Value::as_str)
         .filter(|token| !token.trim().is_empty())
-        .ok_or_else(|| "Codex: нет сохранённой авторизации; выполните `codex login` или задайте OPENAI_API_KEY".to_owned())?;
+        .ok_or_else(|| {
+            "Codex: нет сохранённой авторизации; выполните `codex login` или задайте OPENAI_API_KEY".to_owned()
+        })?;
     let id_token = tokens.and_then(|t| t.get("id_token")).and_then(serde_json::Value::as_str).unwrap_or("");
-    let account = tokens.and_then(|t| t.get("account_id")).and_then(serde_json::Value::as_str).map(str::to_owned)
+    let account = tokens
+        .and_then(|t| t.get("account_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
         .or_else(|| jwt_claim(id_token, "chatgpt_account_id"));
     let fedramp = jwt_claim(id_token, "chatgpt_account_is_fedramp").is_some_and(|value| value == "true");
     Ok(Login { base: "https://chatgpt.com/backend-api/codex", token: access.to_owned(), account, fedramp })
@@ -117,7 +127,12 @@ pub(super) fn request(home: &Path, override_model: Option<&str>, prompt: &str) -
 }
 
 #[cfg(feature = "codex")]
-pub(super) fn generate(home: &Path, override_model: Option<&str>, prompt: &str, timeout: std::time::Duration) -> Result<String, String> {
+pub(super) fn generate(
+    home: &Path,
+    override_model: Option<&str>,
+    prompt: &str,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
     let request = request(home, override_model, prompt)?;
     let client = reqwest::blocking::Client::builder()
         .timeout(timeout)
@@ -131,7 +146,8 @@ pub(super) fn generate(home: &Path, override_model: Option<&str>, prompt: &str, 
         use std::io::Read;
         let mut body = String::new();
         let _ = response.take(64 * 1024).read_to_string(&mut body);
-        let detail = serde_json::from_str::<serde_json::Value>(&body).ok()
+        let detail = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
             .and_then(|value| value.pointer("/error/message").and_then(serde_json::Value::as_str).map(str::to_owned))
             .unwrap_or(body);
         let detail: String = detail.replace(&request.token, "…").chars().take(400).collect();
@@ -147,15 +163,22 @@ pub(super) fn generate(home: &Path, override_model: Option<&str>, prompt: &str, 
 }
 
 #[cfg(feature = "codex")]
-fn send(client: &reqwest::blocking::Client, request: &Request, timeout: std::time::Duration) -> Result<reqwest::blocking::Response, String> {
-    let mut call = client.post(&request.url).header("Authorization", format!("Bearer {}", request.token)).json(&request.body);
+fn send(
+    client: &reqwest::blocking::Client,
+    request: &Request,
+    timeout: std::time::Duration,
+) -> Result<reqwest::blocking::Response, String> {
+    let mut call =
+        client.post(&request.url).header("Authorization", format!("Bearer {}", request.token)).json(&request.body);
     for (name, value) in &request.headers {
         call = call.header(*name, value);
     }
-    call.send().map_err(|e| if e.is_timeout() {
-        format!("Codex не ответил за {} с", timeout.as_secs())
-    } else {
-        format!("Codex: {e}")
+    call.send().map_err(|e| {
+        if e.is_timeout() {
+            format!("Codex не ответил за {} с", timeout.as_secs())
+        } else {
+            format!("Codex: {e}")
+        }
     })
 }
 
@@ -207,9 +230,15 @@ fn read_stream(reader: impl std::io::Read, timeout: std::time::Duration) -> Resu
                 }
             }
             Some("response.failed") | Some("error") | Some("response.incomplete") => {
-                failure = Some(event.pointer("/response/error/message").or_else(|| event.pointer("/error/message"))
-                    .or_else(|| event.get("message")).and_then(serde_json::Value::as_str)
-                    .unwrap_or("Codex: запрос отклонён").to_owned());
+                failure = Some(
+                    event
+                        .pointer("/response/error/message")
+                        .or_else(|| event.pointer("/error/message"))
+                        .or_else(|| event.get("message"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("Codex: запрос отклонён")
+                        .to_owned(),
+                );
                 break;
             }
             Some("response.completed") => break,

@@ -22,7 +22,9 @@ pub const ATLAS: usize = 1024;
 const MAX_CACHED_GLYPHS: usize = 16_384;
 
 // Coverage is 8-bit: evaluate the gamma transfer once, not per uploaded texel.
-static COVERAGE_COLORS: LazyLock<[Color32; 256]> = LazyLock::new(|| std::array::from_fn(|coverage| AlphaFromCoverage::Gamma(0.55).color_from_coverage(coverage as f32 / 255.0)));
+static COVERAGE_COLORS: LazyLock<[Color32; 256]> = LazyLock::new(|| {
+    std::array::from_fn(|coverage| AlphaFromCoverage::Gamma(0.55).color_from_coverage(coverage as f32 / 255.0))
+});
 
 /// Ceiling on one glyph's coverage buffer. The atlas is `ATLAS` texels on a
 /// side and a glyph never exceeds it in either direction at a legal font size;
@@ -210,7 +212,11 @@ impl TermGlyphs {
         // An empty texel right of and below every glyph keeps neighbours apart.
         let texel = self.shelves.place(w + 1, h + 1)?;
         let texture = self.texture.get_or_insert_with(|| {
-            ctx.load_texture("term-glyphs", ColorImage::filled([ATLAS, ATLAS], Color32::TRANSPARENT), TextureOptions::NEAREST)
+            ctx.load_texture(
+                "term-glyphs",
+                ColorImage::filled([ATLAS, ATLAS], Color32::TRANSPARENT),
+                TextureOptions::NEAREST,
+            )
         });
         let mut image = ColorImage::filled([w + 1, h + 1], Color32::TRANSPARENT);
         let colors = &*COVERAGE_COLORS;

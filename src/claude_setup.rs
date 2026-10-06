@@ -260,7 +260,8 @@ fn create_confirmed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut name = path.file_name()
+    let mut name = path
+        .file_name()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "settings path has no filename"))?
         .to_os_string();
     name.push(format!(".anvil-{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
@@ -416,7 +417,10 @@ mod tests {
         assert!(!backup.contains("hooks"), "the backup must not copy unrelated keys: {backup}");
         assert!(!backup.contains("ANTHROPIC"), "the backup must not copy credentials: {backup}");
         assert!(backup.contains("statusline.mjs"), "the replaced statusLine is kept: {backup}");
-        assert!(write_confirmed(&path, None, "{}").is_err(), "missing-file consent cannot overwrite a newly created file");
+        assert!(
+            write_confirmed(&path, None, "{}").is_err(),
+            "missing-file consent cannot overwrite a newly created file"
+        );
         let missing = dir.path().join("new/settings.json");
         write_confirmed(&missing, None, &installed).unwrap();
         assert_eq!(std::fs::read_to_string(missing).unwrap(), installed);

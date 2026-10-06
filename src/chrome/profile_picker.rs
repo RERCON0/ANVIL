@@ -60,7 +60,8 @@ pub fn show(ctx: &egui::Context, picker: &mut PickerState, profiles: &[(String, 
                 for (rank, (_, index)) in matches.iter().enumerate() {
                     let (id, name) = &profiles[*index];
                     let selected = rank == picker.selected;
-                    let response = ui.selectable_label(selected, egui::RichText::new(name).font(crate::theme::font(13.0)));
+                    let response =
+                        ui.selectable_label(selected, egui::RichText::new(name).font(crate::theme::font(13.0)));
                     if response.clicked() {
                         outcome = PickerOutcome::Selected(id.clone());
                     }
@@ -102,7 +103,12 @@ mod tests {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(1280.0, 800.0))),
             ..Default::default()
         };
-        let button = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
         input.events.push(egui::Event::PointerMoved(pos));
         input.events.push(button(true));
         input.events.push(button(false));
@@ -134,7 +140,10 @@ mod tests {
             }
             outcomes.push(show(ctx, &mut picker, &profiles));
         });
-        assert!(outcomes.iter().all(|outcome| matches!(outcome, PickerOutcome::None)), "the opening click closed the picker");
+        assert!(
+            outcomes.iter().all(|outcome| matches!(outcome, PickerOutcome::None)),
+            "the opening click closed the picker"
+        );
 
         // An idle frame keeps it open, a later click outside closes it.
         assert!(matches!(run(&ctx, &mut picker, egui::RawInput::default()), PickerOutcome::None));

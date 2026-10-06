@@ -87,7 +87,11 @@ mod tests {
         assert_eq!(quote_path(r"C:\it's", PathQuoting::Unix), r"'C:\it'\''s' ");
         assert_eq!(quote_path("C:\\it\u{2019}s", PathQuoting::PowerShell), "'C:\\it\u{2019}\u{2019}s' ");
         assert_eq!(quote_path(r"C:\100%^!", PathQuoting::Cmd), r#""C:\100%^!" "#, "cmd takes these literally");
-        assert_eq!(quote_path("C:\\a\r\nb\x1b[201~", PathQuoting::PowerShell), "'C:\\ab[201~' ", "no control characters");
+        assert_eq!(
+            quote_path("C:\\a\r\nb\x1b[201~", PathQuoting::PowerShell),
+            "'C:\\ab[201~' ",
+            "no control characters"
+        );
     }
 
     #[test]
@@ -98,10 +102,7 @@ mod tests {
     #[test]
     fn bracketed_wraps_and_strips_escapes() {
         assert_eq!(prepare_paste("ls\n", true), b"\x1b[200~ls\r\x1b[201~");
-        assert_eq!(
-            prepare_paste("x\x1b[201~rm -rf /\n", true),
-            b"\x1b[200~x[201~rm -rf /\r\x1b[201~"
-        );
+        assert_eq!(prepare_paste("x\x1b[201~rm -rf /\n", true), b"\x1b[200~x[201~rm -rf /\r\x1b[201~");
     }
 
     #[test]

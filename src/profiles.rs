@@ -233,7 +233,8 @@ pub fn detect_wsl() -> Vec<Profile> {
             .stdin(std::process::Stdio::null()),
         std::time::Duration::from_secs(2),
     );
-    output.filter(|output| output.status.success())
+    output
+        .filter(|output| output.status.success())
         .map(|output| parse_wsl_list(&output.stdout).into_iter().map(|distro| wsl_profile(&distro)).collect())
         .unwrap_or_default()
 }

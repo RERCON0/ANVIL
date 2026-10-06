@@ -18,13 +18,18 @@ fn main() {
         if std::thread::current().id() == main_thread {
             static SHOWN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
             if SHOWN.set(()).is_ok() {
-                show_fatal(&format!("ANVIL остановлен внутренней ошибкой.\n\n{info}\n\nПодробности: {}", dir.join("anvil.log").display()));
+                show_fatal(&format!(
+                    "ANVIL остановлен внутренней ошибкой.\n\n{info}\n\nПодробности: {}",
+                    dir.join("anvil.log").display()
+                ));
             }
         }
     }));
     // Credential copies from a crashed AI run are removed in the background:
     // startup never scans %TEMP% on the main thread.
-    if let Err(error) = std::thread::Builder::new().name("ai-state-sweep".to_owned()).spawn(anvil::git::sweep_stale_ai_state) {
+    if let Err(error) =
+        std::thread::Builder::new().name("ai-state-sweep".to_owned()).spawn(anvil::git::sweep_stale_ai_state)
+    {
         log::info!("cannot start the AI state sweep: {error}");
     }
     anvil::host::run(anvil::app::AnvilApp::new());

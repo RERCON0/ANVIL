@@ -42,7 +42,11 @@ pub fn title_bar(ui: &mut egui::Ui, rect: Rect, maximized: bool, window_edge: bo
         let response = ui.interact(r, ui.id().with(("window-button", kind)), Sense::click());
         let hovered = response.hovered();
         if hovered {
-            painter.rect_filled(r, 0.0, if kind == Button::Close { theme::colors().close_hover } else { theme::colors().window_button_hover });
+            painter.rect_filled(
+                r,
+                0.0,
+                if kind == Button::Close { theme::colors().close_hover } else { theme::colors().window_button_hover },
+            );
         }
         let color = if hovered && kind == Button::Close { Color32::WHITE } else { theme::colors().window_icon };
         // Plain glyphs, as in the owner's other apps: they need no icon font.

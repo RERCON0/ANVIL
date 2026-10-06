@@ -371,11 +371,8 @@ pub fn tag(ui: &mut egui::Ui, text: &str) {
 
 /// Flat `● label` / `○ label` choice with no box.
 pub fn choice(ui: &mut egui::Ui, label: &str, selected: bool) -> Response {
-    let (dot, dot_color, color) = if selected {
-        ("●", colors().accent, colors().accent)
-    } else {
-        ("○", colors().faint, colors().dim)
-    };
+    let (dot, dot_color, color) =
+        if selected { ("●", colors().accent, colors().accent) } else { ("○", colors().faint, colors().dim) };
     let mut job = egui::text::LayoutJob::default();
     job.append(
         &format!("{dot} "),
@@ -419,7 +416,13 @@ pub fn animated_accent_button(text: impl Into<String>) -> impl egui::Widget {
         let hovered = enabled && response.as_ref().is_some_and(Response::hovered);
         let pressed = enabled && response.as_ref().is_some_and(Response::is_pointer_button_down_on);
         let hover = ui.ctx().animate_bool_with_time(id.with("accent-hover"), hovered, 0.14);
-        let opacity = if !enabled { 0.0 } else if pressed { 0.32 } else { 0.15 * hover };
+        let opacity = if !enabled {
+            0.0
+        } else if pressed {
+            0.32
+        } else {
+            0.15 * hover
+        };
         ui.add(accent_button(text).fill(colors().accent.gamma_multiply(opacity)))
     }
 }
@@ -507,12 +510,8 @@ mod tests {
         ] {
             assert!(readable(fg, c.chrome_bg, design_fg, dark.chrome_bg), "{name}: {fg:?} on {:?}", c.chrome_bg);
         }
-        let hues = [
-            ("accent", c.accent),
-            ("green", c.status_green),
-            ("yellow", c.status_yellow),
-            ("red", c.status_red),
-        ];
+        let hues =
+            [("accent", c.accent), ("green", c.status_green), ("yellow", c.status_yellow), ("red", c.status_red)];
         for (name, hue) in hues {
             assert!(contrast_ratio(hue, c.chrome_bg) >= MIN_CONTRAST - 0.01, "{name} {hue:?} fades into the window");
         }

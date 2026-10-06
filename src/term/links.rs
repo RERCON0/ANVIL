@@ -48,7 +48,10 @@ mod tests {
     fn trimming() {
         assert_eq!(trim_url("https://x.io/a."), "https://x.io/a");
         assert_eq!(trim_url("https://x.io/a),"), "https://x.io/a");
-        assert_eq!(trim_url("https://en.wikipedia.org/wiki/Rust_(language)"), "https://en.wikipedia.org/wiki/Rust_(language)");
+        assert_eq!(
+            trim_url("https://en.wikipedia.org/wiki/Rust_(language)"),
+            "https://en.wikipedia.org/wiki/Rust_(language)"
+        );
         assert_eq!(trim_url("(https://x.io/a)"), "(https://x.io/a)");
         assert_eq!(trim_url("https://x.io/\"'"), "https://x.io/");
     }

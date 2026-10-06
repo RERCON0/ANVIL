@@ -84,7 +84,12 @@ pub enum TabAction {
     ClosePane(PaneId),
     Split(PaneId, Dir),
     ToggleMaximized(PaneId),
-    Relocate { pane: PaneId, target: Option<PaneId>, dir: Dir, after: bool },
+    Relocate {
+        pane: PaneId,
+        target: Option<PaneId>,
+        dir: Dir,
+        after: bool,
+    },
     Collapse(PaneId),
     RestoreCollapsed(PaneId),
     Clipboard(String),
@@ -211,10 +216,7 @@ impl Tab {
         if focused.claude.is_some() {
             return focused.claude.as_ref();
         }
-        self.panes
-            .values()
-            .filter_map(|p| p.claude.as_ref())
-            .max_by_key(|record| record.updated_at_ms)
+        self.panes.values().filter_map(|p| p.claude.as_ref()).max_by_key(|record| record.updated_at_ms)
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, rect: Rect, env: &FrameEnv) -> Vec<TabAction> {
@@ -239,7 +241,8 @@ impl Tab {
                     Vec2::new(galley.size().x + 18.0, strip.height() - 6.0),
                 );
                 let response = ui.interact(chip, ui.id().with(("collapsed", id)), Sense::click());
-                let fill = if response.hovered() { theme::colors().tab_active_bg } else { theme::colors().tab_hover_bg };
+                let fill =
+                    if response.hovered() { theme::colors().tab_active_bg } else { theme::colors().tab_hover_bg };
                 ui.painter().rect_filled(chip, 0.0, fill);
                 ui.painter().galley(
                     Pos2::new(chip.min.x + 9.0, chip.center().y - galley.size().y / 2.0),
@@ -271,169 +274,196 @@ impl Tab {
                 .collect(),
         };
 
-        let held = ui.is_enabled() && self.maximized.is_none() && visible.len() > 1
-            && ui.input(|i| i.focused && i.modifiers.ctrl && i.modifiers.shift && !i.modifiers.alt && !i.modifiers.mac_cmd);
+        let held = ui.is_enabled()
+            && self.maximized.is_none()
+            && visible.len() > 1
+            && ui.input(|i| {
+                i.focused && i.modifiers.ctrl && i.modifiers.shift && !i.modifiers.alt && !i.modifiers.mac_cmd
+            });
         let was_dragging = self.dragging_pane.is_some();
-        if !held || self.dragging_pane.is_some_and(|id| !self.tree.contains(id))
+        if !held
+            || self.dragging_pane.is_some_and(|id| !self.tree.contains(id))
             || ui.input(|i| !i.pointer.primary_down() && !i.pointer.primary_released())
         {
             self.dragging_pane = None;
         }
-        let label_hovered = held && ui.input(|i| i.pointer.hover_pos())
-            .is_some_and(|pos| visible.iter().any(|(_, rect)| pane_label_rect(*rect).contains(pos)));
+        let label_hovered = held
+            && ui
+                .input(|i| i.pointer.hover_pos())
+                .is_some_and(|pos| visible.iter().any(|(_, rect)| pane_label_rect(*rect).contains(pos)));
         let block_pointer = was_dragging || label_hovered;
         let builder = if block_pointer { egui::UiBuilder::new().disabled() } else { egui::UiBuilder::new() };
         ui.scope_builder(builder, |ui| {
-        for (id, pane_rect) in &visible {
-            let Some(entry) = self.panes.get_mut(id) else { continue };
-            let input = ViewInput {
-                palette: env.palette,
-                focused: focused == *id,
-                cursor_blink: env.cursor_blink,
-                right_click: env.right_click,
-                paste_on_middle: env.paste_on_middle,
-                copy_on_select: env.copy_on_select,
-                fallbacks_loaded: env.fallbacks_loaded,
-                window_edge: env.window_edge || block_pointer,
-            };
-            match &mut entry.content {
-                PaneContent::Live(pane) => {
-                    // Only the open panel needs the directory, so the shell's cwd query and
-                    // its PathBuf are not paid for a closed panel every frame.
-                    let cwd = entry.workspace.open.then(|| pane.current_dir());
-                    let (terminal_rect, panel_rect) = if entry.workspace.open {
-                        let width = crate::workspace::clamp_width(entry.workspace.width)
-                            .min((pane_rect.width() - 140.0).max(crate::workspace::MIN_WIDTH));
-                        let split = pane_rect.max.x - width;
-                        (
-                            Rect::from_min_max(pane_rect.min, Pos2::new(split, pane_rect.max.y)),
-                            Some(Rect::from_min_max(Pos2::new(split, pane_rect.min.y), pane_rect.max)),
-                        )
-                    } else {
-                        (*pane_rect, None)
-                    };
-                    self.terminal_rects.push((*id, terminal_rect));
-                    let output = entry.view.show(ui, terminal_rect, pane, &input);
-                    if focused == *id {
-                        self.ime_area = output.cursor_rect;
+            for (id, pane_rect) in &visible {
+                let Some(entry) = self.panes.get_mut(id) else { continue };
+                let input = ViewInput {
+                    palette: env.palette,
+                    focused: focused == *id,
+                    cursor_blink: env.cursor_blink,
+                    right_click: env.right_click,
+                    paste_on_middle: env.paste_on_middle,
+                    copy_on_select: env.copy_on_select,
+                    fallbacks_loaded: env.fallbacks_loaded,
+                    window_edge: env.window_edge || block_pointer,
+                };
+                match &mut entry.content {
+                    PaneContent::Live(pane) => {
+                        // Only the open panel needs the directory, so the shell's cwd query and
+                        // its PathBuf are not paid for a closed panel every frame.
+                        let cwd = entry.workspace.open.then(|| pane.current_dir());
+                        let (terminal_rect, panel_rect) = if entry.workspace.open {
+                            let width = crate::workspace::clamp_width(entry.workspace.width)
+                                .min((pane_rect.width() - 140.0).max(crate::workspace::MIN_WIDTH));
+                            let split = pane_rect.max.x - width;
+                            (
+                                Rect::from_min_max(pane_rect.min, Pos2::new(split, pane_rect.max.y)),
+                                Some(Rect::from_min_max(Pos2::new(split, pane_rect.min.y), pane_rect.max)),
+                            )
+                        } else {
+                            (*pane_rect, None)
+                        };
+                        self.terminal_rects.push((*id, terminal_rect));
+                        let output = entry.view.show(ui, terminal_rect, pane, &input);
+                        if focused == *id {
+                            self.ime_area = output.cursor_rect;
+                        }
+                        if output.pressed {
+                            actions.push(TabAction::Focus(*id));
+                        }
+                        for command in output.commands {
+                            actions.push(TabAction::Pane(*id, command));
+                        }
+                        if output.needs_fallbacks {
+                            actions.push(TabAction::NeedsFallbacks);
+                        }
+                        // Pane events and the output flag are pumped for every pane
+                        // by AnvilApp::poll_panes, not only for the visible tab.
+                        // Per-pane panel toggle, revealed while hovering the pane.
+                        let hovered = ui.input(|i| i.pointer.hover_pos()).is_some_and(|pos| pane_rect.contains(pos));
+                        if hovered && !entry.workspace.open {
+                            let button = Rect::from_min_size(
+                                Pos2::new(pane_rect.right() - 26.0, pane_rect.top() + 4.0),
+                                Vec2::splat(22.0),
+                            );
+                            let response = ui.interact(button, ui.id().with(("workspace-toggle", *id)), Sense::click());
+                            let painter = ui.painter_at(button);
+                            let color =
+                                if response.hovered() { theme::colors().icon_hover } else { theme::colors().icon };
+                            if response.hovered() {
+                                painter.rect_filled(button, 0.0, theme::colors().tab_hover_bg);
+                            }
+                            painter.text(button.center(), Align2::CENTER_CENTER, "≡", theme::font(14.0), color);
+                            let _ = response.clone().on_hover_text(strings::WORKSPACE_TOGGLE_HINT);
+                            if response.clicked() {
+                                entry.workspace.open = true;
+                                entry.workspace.refresh_soon();
+                            }
+                        }
+                        if let Some(panel_rect) = panel_rect {
+                            let cwd = cwd.clone().flatten().or_else(|| entry.start_cwd.clone());
+                            if let Some(cwd) = cwd {
+                                entry.workspace.poll(cwd);
+                                if entry.workspace.absorb() {
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                            let actions = entry.workspace.show(ui, panel_rect, *id, env.ai_command.as_deref());
+                            for action in actions {
+                                match action {
+                                    crate::workspace::WorkspaceAction::Close => entry.workspace.open = false,
+                                }
+                            }
+                            let handle = Rect::from_min_size(
+                                Pos2::new(panel_rect.min.x - 3.0, panel_rect.min.y),
+                                Vec2::new(6.0, panel_rect.height()),
+                            );
+                            let response =
+                                ui.interact(handle, ui.id().with(("workspace-handle", *id)), Sense::click_and_drag());
+                            if response.hovered() || response.dragged() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                            }
+                            if response.dragged() {
+                                entry.workspace.width =
+                                    crate::workspace::clamp_width(entry.workspace.width - response.drag_delta().x);
+                            }
+                        }
                     }
-                    if output.pressed {
-                        actions.push(TabAction::Focus(*id));
-                    }
-                    for command in output.commands {
-                        actions.push(TabAction::Pane(*id, command));
-                    }
-                    if output.needs_fallbacks {
-                        actions.push(TabAction::NeedsFallbacks);
-                    }
-                    // Pane events and the output flag are pumped for every pane
-                    // by AnvilApp::poll_panes, not only for the visible tab.
-                    // Per-pane panel toggle, revealed while hovering the pane.
-                    let hovered = ui.input(|i| i.pointer.hover_pos()).is_some_and(|pos| pane_rect.contains(pos));
-                    if hovered && !entry.workspace.open {
+                    PaneContent::Error(message) => {
+                        let painter = ui.painter_at(*pane_rect);
+                        painter.rect_filled(*pane_rect, 0.0, env.palette.background);
+                        painter.text(
+                            Pos2::new(pane_rect.min.x + theme::PANE_PADDING, pane_rect.min.y + theme::PANE_PADDING),
+                            Align2::LEFT_TOP,
+                            &*message,
+                            theme::font(12.5),
+                            theme::colors().tab_text,
+                        );
                         let button = Rect::from_min_size(
-                            Pos2::new(pane_rect.right() - 26.0, pane_rect.top() + 4.0),
-                            Vec2::splat(22.0),
+                            Pos2::new(
+                                pane_rect.min.x + theme::PANE_PADDING,
+                                pane_rect.min.y + theme::PANE_PADDING + 24.0,
+                            ),
+                            Vec2::new(90.0, 24.0),
                         );
-                        let response = ui.interact(button, ui.id().with(("workspace-toggle", *id)), Sense::click());
-                        let painter = ui.painter_at(button);
-                        let color = if response.hovered() { theme::colors().icon_hover } else { theme::colors().icon };
-                        if response.hovered() {
-                            painter.rect_filled(button, 0.0, theme::colors().tab_hover_bg);
-                        }
-                        painter.text(button.center(), Align2::CENTER_CENTER, "≡", theme::font(14.0), color);
-                        let _ = response.clone().on_hover_text(strings::WORKSPACE_TOGGLE_HINT);
+                        let response = ui.interact(button, ui.id().with(("pane-error-close", id)), Sense::click());
+                        let fill = if response.hovered() {
+                            theme::colors().tab_active_bg
+                        } else {
+                            theme::colors().tab_hover_bg
+                        };
+                        painter.rect_filled(button, 0.0, fill);
+                        painter.text(
+                            button.center(),
+                            Align2::CENTER_CENTER,
+                            strings::PANE_CLOSE,
+                            theme::font(12.5),
+                            theme::colors().tab_active_text,
+                        );
                         if response.clicked() {
-                            entry.workspace.open = true;
-                            entry.workspace.refresh_soon();
-                        }
-                    }
-                    if let Some(panel_rect) = panel_rect {
-                        let cwd = cwd.clone().flatten().or_else(|| entry.start_cwd.clone());
-                        if let Some(cwd) = cwd {
-                            entry.workspace.poll(cwd);
-                            if entry.workspace.absorb() {
-                                ui.ctx().request_repaint();
-                            }
-                        }
-                        let actions = entry.workspace.show(ui, panel_rect, *id, env.ai_command.as_deref());
-                        for action in actions {
-                            match action {
-                                crate::workspace::WorkspaceAction::Close => entry.workspace.open = false,
-                            }
-                        }
-                        let handle = Rect::from_min_size(
-                            Pos2::new(panel_rect.min.x - 3.0, panel_rect.min.y),
-                            Vec2::new(6.0, panel_rect.height()),
-                        );
-                        let response = ui.interact(handle, ui.id().with(("workspace-handle", *id)), Sense::click_and_drag());
-                        if response.hovered() || response.dragged() {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                        }
-                        if response.dragged() {
-                            entry.workspace.width = crate::workspace::clamp_width(entry.workspace.width - response.drag_delta().x);
+                            actions.push(TabAction::ClosePane(*id));
                         }
                     }
                 }
-                PaneContent::Error(message) => {
-                    let painter = ui.painter_at(*pane_rect);
-                    painter.rect_filled(*pane_rect, 0.0, env.palette.background);
-                    painter.text(
-                        Pos2::new(pane_rect.min.x + theme::PANE_PADDING, pane_rect.min.y + theme::PANE_PADDING),
-                        Align2::LEFT_TOP,
-                        &*message,
-                        theme::font(12.5),
-                        theme::colors().tab_text,
-                    );
-                    let button = Rect::from_min_size(
-                        Pos2::new(pane_rect.min.x + theme::PANE_PADDING, pane_rect.min.y + theme::PANE_PADDING + 24.0),
-                        Vec2::new(90.0, 24.0),
-                    );
-                    let response = ui.interact(button, ui.id().with(("pane-error-close", id)), Sense::click());
-                    let fill = if response.hovered() { theme::colors().tab_active_bg } else { theme::colors().tab_hover_bg };
-                    painter.rect_filled(button, 0.0, fill);
-                    painter.text(button.center(), Align2::CENTER_CENTER, strings::PANE_CLOSE, theme::font(12.5), theme::colors().tab_active_text);
-                    if response.clicked() {
-                        actions.push(TabAction::ClosePane(*id));
-                    }
+                // Terminal and its Git panel are one focus surface. Paint once,
+                // after both, so neither project looks active in an unfocused pane.
+                if focused != *id {
+                    ui.painter().rect_filled(*pane_rect, 0.0, theme::colors().pane_dim);
                 }
             }
-            // Terminal and its Git panel are one focus surface. Paint once,
-            // after both, so neither project looks active in an unfocused pane.
-            if focused != *id {
-                ui.painter().rect_filled(*pane_rect, 0.0, theme::colors().pane_dim);
-            }
-        }
 
-        if self.maximized.is_none() {
-            for divider in self.tree.dividers(tree_rect(layout_rect), theme::DIVIDER_WIDTH) {
-                let divider_rect = egui_rect(divider.rect);
-                let response = ui.interact(
-                    divider_rect,
-                    ui.id().with(("divider", divider.path.clone(), divider.index)),
-                    Sense::click_and_drag(),
-                );
-                let color = if response.hovered() || response.dragged() { theme::colors().divider_hover } else { theme::colors().divider };
-                ui.painter().rect_filled(divider_rect, 0.0, color);
-                if response.hovered() {
-                    ui.ctx().set_cursor_icon(match divider.dir {
-                        Dir::Row => egui::CursorIcon::ResizeHorizontal,
-                        Dir::Column => egui::CursorIcon::ResizeVertical,
-                    });
-                }
-                if response.dragged() {
-                    let delta = match divider.dir {
-                        Dir::Row => response.drag_delta().x,
-                        Dir::Column => response.drag_delta().y,
+            if self.maximized.is_none() {
+                for divider in self.tree.dividers(tree_rect(layout_rect), theme::DIVIDER_WIDTH) {
+                    let divider_rect = egui_rect(divider.rect);
+                    let response = ui.interact(
+                        divider_rect,
+                        ui.id().with(("divider", divider.path.clone(), divider.index)),
+                        Sense::click_and_drag(),
+                    );
+                    let color = if response.hovered() || response.dragged() {
+                        theme::colors().divider_hover
+                    } else {
+                        theme::colors().divider
                     };
-                    let min = match divider.dir {
-                        Dir::Row => env.min_pane_width,
-                        Dir::Column => env.min_pane_height,
-                    };
-                    self.tree.drag_divider(tree_rect(layout_rect), theme::DIVIDER_WIDTH, &divider, delta, min);
+                    ui.painter().rect_filled(divider_rect, 0.0, color);
+                    if response.hovered() {
+                        ui.ctx().set_cursor_icon(match divider.dir {
+                            Dir::Row => egui::CursorIcon::ResizeHorizontal,
+                            Dir::Column => egui::CursorIcon::ResizeVertical,
+                        });
+                    }
+                    if response.dragged() {
+                        let delta = match divider.dir {
+                            Dir::Row => response.drag_delta().x,
+                            Dir::Column => response.drag_delta().y,
+                        };
+                        let min = match divider.dir {
+                            Dir::Row => env.min_pane_width,
+                            Dir::Column => env.min_pane_height,
+                        };
+                        self.tree.drag_divider(tree_rect(layout_rect), theme::DIVIDER_WIDTH, &divider, delta, min);
+                    }
                 }
             }
-        }
         });
         if held {
             self.show_rearrange_labels(ui, layout_rect, &visible, env.window_edge, &mut actions);
@@ -461,11 +491,19 @@ impl Tab {
                 .show(ui.ctx(), |ui| {
                     let (label, response) = ui.allocate_exact_size(label.size(), Sense::click_and_drag());
                     let dragging = self.dragging_pane == Some(*id);
-                    ui.painter().rect_filled(label, 0.0, if response.hovered() || dragging { c.field } else { c.chrome_bg });
+                    ui.painter().rect_filled(
+                        label,
+                        0.0,
+                        if response.hovered() || dragging { c.field } else { c.chrome_bg },
+                    );
                     ui.painter().rect_stroke(label, 0.0, egui::Stroke::new(1.0, c.accent), egui::StrokeKind::Inside);
                     let title = self.panes.get(id).map(PaneEntry::title_text).unwrap_or_default();
                     ui.painter_at(label.shrink(6.0)).text(
-                        label.center(), Align2::CENTER_CENTER, title, theme::field_font(12.5), c.text,
+                        label.center(),
+                        Align2::CENTER_CENTER,
+                        title,
+                        theme::field_font(12.5),
+                        c.text,
                     );
                     if response.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
@@ -479,15 +517,25 @@ impl Tab {
         let Some(source) = self.dragging_pane else { return };
         let pointer = ui.input(|i| i.pointer.interact_pos());
         let drop = pointer.and_then(|pos| pane_drop_at(area, visible, source, pos));
-        ui.ctx().set_cursor_icon(if drop.is_some() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::NotAllowed });
+        ui.ctx().set_cursor_icon(if drop.is_some() {
+            egui::CursorIcon::Grabbing
+        } else {
+            egui::CursorIcon::NotAllowed
+        });
         if let Some(drop) = drop {
-            let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, ui.id().with("pane-drop-preview")));
+            let painter =
+                ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, ui.id().with("pane-drop-preview")));
             painter.rect_filled(drop.preview, 0.0, c.accent.gamma_multiply(0.18));
             painter.rect_stroke(drop.preview, 0.0, egui::Stroke::new(2.0, c.accent), egui::StrokeKind::Inside);
         }
         if ui.input(|i| i.pointer.primary_released()) {
             if let Some(drop) = drop {
-                actions.push(TabAction::Relocate { pane: source, target: drop.target, dir: drop.dir, after: drop.after });
+                actions.push(TabAction::Relocate {
+                    pane: source,
+                    target: drop.target,
+                    dir: drop.dir,
+                    after: drop.after,
+                });
             }
             self.dragging_pane = None;
         }
@@ -550,7 +598,8 @@ fn pane_drop_at(area: Rect, visible: &[(PaneId, Rect)], source: PaneId, pos: Pos
         let &(target, rect) = visible.iter().find(|(id, rect)| *id != source && rect.contains(pos))?;
         let x = (pos.x - rect.left()) / rect.width();
         let y = (pos.y - rect.top()) / rect.height();
-        let sides = [(x, Dir::Row, false), (1.0 - x, Dir::Row, true), (y, Dir::Column, false), (1.0 - y, Dir::Column, true)];
+        let sides =
+            [(x, Dir::Row, false), (1.0 - x, Dir::Row, true), (y, Dir::Column, false), (1.0 - y, Dir::Column, true)];
         let &(_, dir, after) = sides.iter().min_by(|a, b| a.0.total_cmp(&b.0))?;
         (Some(target), rect, dir, after)
     };
@@ -625,7 +674,10 @@ mod tests {
             assert_eq!(drop.preview.area(), area.area() / 2.0);
         }
         for pos in [Pos2::new(350.0, 340.0), Pos2::new(598.0, 340.0), Pos2::new(99.0, 340.0)] {
-            assert!(pane_drop_at(area, &visible, 1, pos).is_none(), "self, divider and outside drops must not move a pane");
+            assert!(
+                pane_drop_at(area, &visible, 1, pos).is_none(),
+                "self, divider and outside drops must not move a pane"
+            );
         }
     }
 

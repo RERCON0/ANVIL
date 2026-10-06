@@ -43,8 +43,8 @@ impl Palette {
             "#121212",
             "#bbbbbb",
             &[
-                "#1b1d1e", "#f92672", "#a6e22e", "#fd971f", "#66d9ef", "#9e6ffe", "#5e7175", "#ccccc6",
-                "#505354", "#ff669d", "#beed5f", "#e6db74", "#66d9ef", "#9e6ffe", "#a3babf", "#f8f8f2",
+                "#1b1d1e", "#f92672", "#a6e22e", "#fd971f", "#66d9ef", "#9e6ffe", "#5e7175", "#ccccc6", "#505354",
+                "#ff669d", "#beed5f", "#e6db74", "#66d9ef", "#9e6ffe", "#a3babf", "#f8f8f2",
             ],
         )
         .expect("built-in scheme")
@@ -57,8 +57,8 @@ impl Palette {
             "#f7f7f7",
             "#4a4543",
             &[
-                "#090300", "#db2d20", "#01a252", "#fded02", "#01a0e4", "#a16a94", "#b5e4f4", "#a5a2a2",
-                "#5c5855", "#e8bbd0", "#3a3432", "#4a4543", "#807d7c", "#d6d5d4", "#cdab53", "#f7f7f7",
+                "#090300", "#db2d20", "#01a252", "#fded02", "#01a0e4", "#a16a94", "#b5e4f4", "#a5a2a2", "#5c5855",
+                "#e8bbd0", "#3a3432", "#4a4543", "#807d7c", "#d6d5d4", "#cdab53", "#f7f7f7",
             ],
         )
         .expect("built-in scheme")
@@ -421,10 +421,7 @@ mod tests {
         assert_eq!(resolve(Color::Named(NamedColor::Red), &colors, &p, true), p.ansi[9]);
         assert_eq!(resolve(Color::Indexed(2), &colors, &p, true), p.ansi[10]);
         assert_eq!(resolve(Color::Indexed(200), &colors, &p, true), p.indexed(200));
-        assert_eq!(
-            resolve(Color::Spec(Rgb { r: 1, g: 2, b: 3 }), &colors, &p, false),
-            Color32::from_rgb(1, 2, 3)
-        );
+        assert_eq!(resolve(Color::Spec(Rgb { r: 1, g: 2, b: 3 }), &colors, &p, false), Color32::from_rgb(1, 2, 3));
         assert_eq!(resolve(Color::Named(NamedColor::Foreground), &colors, &p, false), p.foreground);
         assert_eq!(resolve(Color::Named(NamedColor::Background), &colors, &p, false), p.background);
         colors[NamedColor::Background] = Some(Rgb { r: 9, g: 9, b: 9 });

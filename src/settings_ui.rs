@@ -12,7 +12,6 @@ use crate::config::{Config, CursorShapeConfig, ProfileConfig, RightClick};
 use crate::strings;
 use crate::theme;
 
-
 /// Settings pages, one per entry of the vertical nav (as in the reference
 /// settings screen): appearance, terminal, profiles, the git panel, hotkeys
 /// and the Claude Code switch.
@@ -150,54 +149,62 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, cx: &mut SettingsContext, state: &mut
         quota_refresh: false,
     };
     ui.painter_at(rect).rect_filled(rect, 0.0, theme::colors().chrome_bg);
-    ui.scope_builder(egui::UiBuilder::new().max_rect(rect.shrink2(Vec2::new(18.0, 12.0))).id_salt("settings-page"), |ui| {
-        ui.label(RichText::new(strings::TAB_SETTINGS).color(theme::colors().text).font(theme::title_font(15.0)));
-        ui.label(RichText::new(strings::SETTINGS_APPLY_HINT).color(theme::colors().faint).font(theme::font(11.5)));
-        ui.add_space(10.0);
+    ui.scope_builder(
+        egui::UiBuilder::new().max_rect(rect.shrink2(Vec2::new(18.0, 12.0))).id_salt("settings-page"),
+        |ui| {
+            ui.label(RichText::new(strings::TAB_SETTINGS).color(theme::colors().text).font(theme::title_font(15.0)));
+            ui.label(RichText::new(strings::SETTINGS_APPLY_HINT).color(theme::colors().faint).font(theme::font(11.5)));
+            ui.add_space(10.0);
 
-        // One section at a time: the list on the left, its rows on the right.
-        let body = ui.available_rect_before_wrap();
-        let nav_width = 172.0_f32.min(body.width() * 0.4);
-        let nav_rect = Rect::from_min_size(body.min, Vec2::new(nav_width, body.height()));
-        ui.scope_builder(egui::UiBuilder::new().max_rect(nav_rect).id_salt("settings-nav"), |ui| {
-            for section in SettingsSection::ALL {
-                let selected = state.section == section;
-                let (row, response) = ui.allocate_exact_size(Vec2::new(nav_rect.width(), 26.0), Sense::click());
-                if selected {
-                    ui.painter().rect_filled(row, 0.0, theme::colors().tab_active_bg);
-                    ui.painter().rect_stroke(row, 0.0, Stroke::new(1.0, theme::colors().line), egui::StrokeKind::Middle);
-                } else if response.hovered() {
-                    ui.painter().rect_filled(row, 0.0, theme::colors().tab_hover_bg);
-                }
-                let color = if selected { theme::colors().accent } else { theme::colors().dim };
-                ui.painter().text(
-                    egui::Pos2::new(row.min.x + 10.0, row.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    section.title(),
-                    theme::font(12.5),
-                    color,
-                );
-                if response.clicked() {
-                    state.section = section;
-                }
-            }
-        });
-
-        let content_rect = Rect::from_min_max(egui::Pos2::new(nav_rect.max.x + 18.0, body.min.y), body.max);
-        ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect).id_salt("settings-content"), |ui| {
-            egui::ScrollArea::vertical().id_salt("settings-section").auto_shrink([false, false]).show(ui, |ui| {
-                match state.section {
-                    SettingsSection::Appearance => section_appearance(ui, cx, &mut outcome),
-                    SettingsSection::Terminal => section_terminal(ui, cx, &mut outcome),
-                    SettingsSection::Profiles => section_profiles(ui, cx, state, &mut outcome),
-                    SettingsSection::Workspace => section_git(ui, cx, state, &mut outcome),
-                    SettingsSection::Hotkeys => section_hotkeys(ui, cx, &mut outcome),
-                    SettingsSection::Claude => section_claude(ui, cx, &mut outcome),
-                    SettingsSection::Quota => section_quota(ui, cx, state, &mut outcome),
+            // One section at a time: the list on the left, its rows on the right.
+            let body = ui.available_rect_before_wrap();
+            let nav_width = 172.0_f32.min(body.width() * 0.4);
+            let nav_rect = Rect::from_min_size(body.min, Vec2::new(nav_width, body.height()));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(nav_rect).id_salt("settings-nav"), |ui| {
+                for section in SettingsSection::ALL {
+                    let selected = state.section == section;
+                    let (row, response) = ui.allocate_exact_size(Vec2::new(nav_rect.width(), 26.0), Sense::click());
+                    if selected {
+                        ui.painter().rect_filled(row, 0.0, theme::colors().tab_active_bg);
+                        ui.painter().rect_stroke(
+                            row,
+                            0.0,
+                            Stroke::new(1.0, theme::colors().line),
+                            egui::StrokeKind::Middle,
+                        );
+                    } else if response.hovered() {
+                        ui.painter().rect_filled(row, 0.0, theme::colors().tab_hover_bg);
+                    }
+                    let color = if selected { theme::colors().accent } else { theme::colors().dim };
+                    ui.painter().text(
+                        egui::Pos2::new(row.min.x + 10.0, row.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        section.title(),
+                        theme::font(12.5),
+                        color,
+                    );
+                    if response.clicked() {
+                        state.section = section;
+                    }
                 }
             });
-        });
-    });
+
+            let content_rect = Rect::from_min_max(egui::Pos2::new(nav_rect.max.x + 18.0, body.min.y), body.max);
+            ui.scope_builder(egui::UiBuilder::new().max_rect(content_rect).id_salt("settings-content"), |ui| {
+                egui::ScrollArea::vertical().id_salt("settings-section").auto_shrink([false, false]).show(ui, |ui| {
+                    match state.section {
+                        SettingsSection::Appearance => section_appearance(ui, cx, &mut outcome),
+                        SettingsSection::Terminal => section_terminal(ui, cx, &mut outcome),
+                        SettingsSection::Profiles => section_profiles(ui, cx, state, &mut outcome),
+                        SettingsSection::Workspace => section_git(ui, cx, state, &mut outcome),
+                        SettingsSection::Hotkeys => section_hotkeys(ui, cx, &mut outcome),
+                        SettingsSection::Claude => section_claude(ui, cx, &mut outcome),
+                        SettingsSection::Quota => section_quota(ui, cx, state, &mut outcome),
+                    }
+                });
+            });
+        },
+    );
     outcome
 }
 
@@ -352,7 +359,12 @@ fn section_terminal(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut S
     }
 }
 
-fn section_profiles(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut SettingsState, outcome: &mut SettingsOutcome) {
+fn section_profiles(
+    ui: &mut egui::Ui,
+    cx: &mut SettingsContext,
+    state: &mut SettingsState,
+    outcome: &mut SettingsOutcome,
+) {
     theme::section(ui, strings::SETTINGS_PROFILES);
     theme::tag(ui, strings::SETTINGS_DEFAULT_PROFILE);
     egui::ComboBox::from_id_salt("default-profile")
@@ -424,10 +436,7 @@ fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Settings
     theme::section(ui, strings::SETTINGS_WORKSPACE);
     theme::tag(ui, strings::SETTINGS_AI_COMMAND);
     let mut ai = cx.config.workspace.ai_commit_command.clone().unwrap_or_default();
-    if ui
-        .add(egui::TextEdit::singleline(&mut ai).font(theme::field_font(13.0)).desired_width(320.0))
-        .changed()
-    {
+    if ui.add(egui::TextEdit::singleline(&mut ai).font(theme::field_font(13.0)).desired_width(320.0)).changed() {
         let trimmed = ai.trim().to_owned();
         cx.config.workspace.ai_commit_command = (!trimmed.is_empty()).then_some(trimmed);
         outcome.changed = true;
@@ -447,7 +456,13 @@ fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Settings
                 .hint_text(strings::SETTINGS_AI_MODEL_SEARCH)
                 .desired_width(320.0),
         );
-        if ui.add_enabled(!matches!(state.model_catalog, ModelCatalog::Loading(_)), theme::ghost_button(strings::SETTINGS_AI_MODEL_REFRESH)).clicked() {
+        if ui
+            .add_enabled(
+                !matches!(state.model_catalog, ModelCatalog::Loading(_)),
+                theme::ghost_button(strings::SETTINGS_AI_MODEL_REFRESH),
+            )
+            .clicked()
+        {
             state.load_models(ui.ctx());
         }
     });
@@ -464,18 +479,31 @@ fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Settings
         ModelCatalog::Ready(Ok(models)) => {
             let query = state.model_filter.trim();
             let matching = models.iter().filter(|model| {
-                query.is_empty() || model.as_bytes().windows(query.len()).any(|part| part.eq_ignore_ascii_case(query.as_bytes()))
+                query.is_empty()
+                    || model.as_bytes().windows(query.len()).any(|part| part.eq_ignore_ascii_case(query.as_bytes()))
             });
             let has_matches = matching.clone().next().is_some();
             egui::ComboBox::from_id_salt("ai-commit-model")
                 .width(ui.available_width().min(560.0))
-                .selected_text(cx.config.workspace.ai_commit_model.as_deref().unwrap_or(strings::SETTINGS_AI_MODEL_DEFAULT))
+                .selected_text(
+                    cx.config.workspace.ai_commit_model.as_deref().unwrap_or(strings::SETTINGS_AI_MODEL_DEFAULT),
+                )
                 .show_ui(ui, |ui| {
                     outcome.changed |= ui
-                        .selectable_value(&mut cx.config.workspace.ai_commit_model, None, strings::SETTINGS_AI_MODEL_DEFAULT)
+                        .selectable_value(
+                            &mut cx.config.workspace.ai_commit_model,
+                            None,
+                            strings::SETTINGS_AI_MODEL_DEFAULT,
+                        )
                         .changed();
                     for model in matching {
-                        if ui.selectable_label(cx.config.workspace.ai_commit_model.as_deref() == Some(model.as_str()), model).clicked() {
+                        if ui
+                            .selectable_label(
+                                cx.config.workspace.ai_commit_model.as_deref() == Some(model.as_str()),
+                                model,
+                            )
+                            .clicked()
+                        {
                             cx.config.workspace.ai_commit_model = Some(model.clone());
                             cx.config.workspace.ai_commit_command = Some("opencode".to_owned());
                             outcome.changed = true;
@@ -483,7 +511,11 @@ fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Settings
                     }
                 });
             if !has_matches && !query.is_empty() {
-                ui.label(RichText::new(strings::SETTINGS_AI_MODEL_NO_MATCH).color(theme::colors().faint).font(theme::font(11.5)));
+                ui.label(
+                    RichText::new(strings::SETTINGS_AI_MODEL_NO_MATCH)
+                        .color(theme::colors().faint)
+                        .font(theme::font(11.5)),
+                );
             }
         }
         ModelCatalog::NotLoaded => {}
@@ -515,7 +547,9 @@ fn section_claude(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut Set
     let (current, color) = match cx.claude_line {
         LineState::Missing => (strings::SETTINGS_CLAUDE_LINE_MISSING.to_owned(), theme::colors().dim),
         LineState::Anvil => (strings::SETTINGS_CLAUDE_LINE_ANVIL.to_owned(), theme::colors().status_green),
-        LineState::Foreign(command) => (format!("{} {command}", strings::SETTINGS_CLAUDE_LINE_FOREIGN), theme::colors().text),
+        LineState::Foreign(command) => {
+            (format!("{} {command}", strings::SETTINGS_CLAUDE_LINE_FOREIGN), theme::colors().text)
+        }
         LineState::Broken(error) => {
             (format!("{} {error}", strings::SETTINGS_CLAUDE_LINE_BROKEN), theme::colors().status_yellow)
         }
@@ -534,9 +568,15 @@ fn section_claude(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut Set
     }
     ui.label(RichText::new(strings::SETTINGS_CLAUDE_ENABLED_HINT).color(theme::colors().faint).font(theme::font(11.5)));
     if cx.config.claude_status.declined_command.is_some() {
-        ui.label(RichText::new(strings::SETTINGS_CLAUDE_DECLINED).color(theme::colors().status_yellow).font(theme::font(12.0)));
+        ui.label(
+            RichText::new(strings::SETTINGS_CLAUDE_DECLINED)
+                .color(theme::colors().status_yellow)
+                .font(theme::font(12.0)),
+        );
     } else if enabled && cx.config.claude_status.installed_command.is_none() {
-        ui.label(RichText::new(strings::SETTINGS_CLAUDE_PENDING).color(theme::colors().status_green).font(theme::font(12.0)));
+        ui.label(
+            RichText::new(strings::SETTINGS_CLAUDE_PENDING).color(theme::colors().status_green).font(theme::font(12.0)),
+        );
     }
     ui.add_space(6.0);
 
@@ -591,7 +631,11 @@ fn section_claude(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut Set
     });
     outcome.changed |= changed;
     if !ours {
-        ui.label(RichText::new(strings::SETTINGS_CLAUDE_FIELDS_NEED_ANVIL).color(theme::colors().faint).font(theme::font(11.5)));
+        ui.label(
+            RichText::new(strings::SETTINGS_CLAUDE_FIELDS_NEED_ANVIL)
+                .color(theme::colors().faint)
+                .font(theme::font(11.5)),
+        );
     }
     ui.add_space(6.0);
     ui.label(strings::SETTINGS_CLAUDE_GLOBAL_HINT);
@@ -599,7 +643,8 @@ fn section_claude(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut Set
         outcome.install_claude = true;
     }
     if !enabled
-        && (cx.config.claude_status.installed_command.is_some() || cx.config.claude_status.previous_status_line.is_some())
+        && (cx.config.claude_status.installed_command.is_some()
+            || cx.config.claude_status.previous_status_line.is_some())
         && ui.add(theme::ghost_button(strings::SETTINGS_CLAUDE_RESTORE)).clicked()
     {
         outcome.restore_claude = true;
@@ -662,12 +707,8 @@ fn quota_provider_row(
         let balance = |b: &crate::quota::model::Balance| {
             (b.key.clone(), format!("{} ({})", b.label, crate::quota::view::balance_text(b)))
         };
-        let items: Vec<(String, String)> = s
-            .windows
-            .iter()
-            .map(|w| (w.key.clone(), w.label.clone()))
-            .chain(s.balances.iter().map(balance))
-            .collect();
+        let items: Vec<(String, String)> =
+            s.windows.iter().map(|w| (w.key.clone(), w.label.clone())).chain(s.balances.iter().map(balance)).collect();
         ui.horizontal_wrapped(|ui| {
             ui.add_space(22.0);
             if items.is_empty() && s.state == crate::quota::model::ProviderState::Idle {
@@ -805,7 +846,12 @@ fn quota_key_editor(
 }
 
 /// Inline editor for one custom profile.
-fn profile_editor(ui: &mut egui::Ui, state: &mut SettingsState, cx: &mut SettingsContext, outcome: &mut SettingsOutcome) {
+fn profile_editor(
+    ui: &mut egui::Ui,
+    state: &mut SettingsState,
+    cx: &mut SettingsContext,
+    outcome: &mut SettingsOutcome,
+) {
     let draft = &mut state.draft;
     ui.painter().rect_stroke(
         ui.max_rect().shrink(1.0),
@@ -857,7 +903,13 @@ fn profile_editor(ui: &mut egui::Ui, state: &mut SettingsState, cx: &mut Setting
 /// argument list instead of silently splitting `-File "C:\My Scripts\x.ps1"`.
 fn join_args(args: &[String]) -> String {
     args.iter()
-        .map(|arg| if arg.contains(' ') || arg.contains('"') { format!("\"{}\"", arg.replace('"', "'")) } else { arg.clone() })
+        .map(|arg| {
+            if arg.contains(' ') || arg.contains('"') {
+                format!("\"{}\"", arg.replace('"', "'"))
+            } else {
+                arg.clone()
+            }
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -885,12 +937,7 @@ fn split_args(text: &str) -> Vec<String> {
 }
 
 fn unique_profile_id(config: &Config, name: &str) -> String {
-    let slug: String = name
-        .trim()
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect();
+    let slug: String = name.trim().to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
     let slug = slug.trim_matches('-').to_owned();
     let base = if slug.is_empty() { "custom".to_owned() } else { slug };
     let mut id = base.clone();
@@ -911,7 +958,14 @@ pub fn open_path(path: &Path) {
     let file = wide(path.as_os_str());
     // SAFETY: NUL-terminated strings; no output parameters are used.
     unsafe {
-        ShellExecuteW(std::ptr::null_mut(), operation.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL);
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        );
     }
 }
 

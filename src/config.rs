@@ -131,7 +131,15 @@ pub struct ClaudeLineFields {
 
 impl Default for ClaudeLineFields {
     fn default() -> Self {
-        ClaudeLineFields { model: true, dir: true, branch: true, context: true, five_hour: true, seven_day: true, agent: true }
+        ClaudeLineFields {
+            model: true,
+            dir: true,
+            branch: true,
+            context: true,
+            five_hour: true,
+            seven_day: true,
+            agent: true,
+        }
     }
 }
 
@@ -331,7 +339,10 @@ impl Config {
             }
             Err(e) => {
                 log::warn!("cannot read {}: {e}", path.display());
-                return LoadOutcome { config: Config::default(), notice: Some(crate::strings::CONFIG_UNREADABLE.to_owned()) };
+                return LoadOutcome {
+                    config: Config::default(),
+                    notice: Some(crate::strings::CONFIG_UNREADABLE.to_owned()),
+                };
             }
         };
         match serde_json::from_str::<Config>(&text) {

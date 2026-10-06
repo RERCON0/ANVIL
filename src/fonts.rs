@@ -26,10 +26,7 @@ pub fn match_family(entries: &[(String, String)], family: &str, fonts_dir: &Path
     let mut files = FontFiles::default();
     for (name, file) in entries {
         let name = name.to_lowercase();
-        let face = name
-            .trim_end_matches(" (truetype)")
-            .trim_end_matches(" (opentype)")
-            .trim();
+        let face = name.trim_end_matches(" (truetype)").trim_end_matches(" (opentype)").trim();
         let source = Path::new(file);
         if !source.is_absolute()
             && source
@@ -89,10 +86,8 @@ pub fn registry_font_entries() -> Vec<(String, String)> {
     use windows_sys::Win32::System::Registry::{
         RegCloseKey, RegEnumValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ,
     };
-    let subkey: Vec<u16> = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let subkey: Vec<u16> =
+        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts".encode_utf16().chain(std::iter::once(0)).collect();
     let mut out = Vec::new();
     for root in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
         let mut key: HKEY = std::ptr::null_mut();
@@ -200,7 +195,12 @@ pub fn install(ctx: &egui::Context, family: &str, entries: &[(String, String)], 
     let (bold, bold_source) = face(&files.bold);
     let (italic, italic_source) = face(&files.italic);
     let (bold_italic, bold_italic_source) = face(&files.bold_italic);
-    let faces = TermFaces { regular: regular_source, bold: bold_source, italic: italic_source, bold_italic: bold_italic_source };
+    let faces = TermFaces {
+        regular: regular_source,
+        bold: bold_source,
+        italic: italic_source,
+        bold_italic: bold_italic_source,
+    };
     defs.font_data.insert("term-regular".into(), FontData::from_owned(regular).into());
     defs.font_data.insert("term-bold".into(), FontData::from_owned(bold).into());
     defs.font_data.insert("term-italic".into(), FontData::from_owned(italic).into());
@@ -209,7 +209,9 @@ pub fn install(ctx: &egui::Context, family: &str, entries: &[(String, String)], 
 
     let mut extra: Vec<String> = Vec::new();
     if fallbacks {
-        for (name, file) in [("fallback-symbols", "seguisym.ttf"), ("fallback-emoji", "seguiemj.ttf"), ("fallback-cjk", "msyh.ttc")] {
+        for (name, file) in
+            [("fallback-symbols", "seguisym.ttf"), ("fallback-emoji", "seguiemj.ttf"), ("fallback-cjk", "msyh.ttc")]
+        {
             match read_font(&dir.join(file)) {
                 Ok(bytes) => {
                     defs.font_data.insert(name.into(), FontData::from_owned(bytes).into());
@@ -240,7 +242,8 @@ pub fn install(ctx: &egui::Context, family: &str, entries: &[(String, String)], 
     // nudge on the body face leaves the text hanging below them. Titles sit a
     // hair higher.
     let ui = |name: &str, y_offset: f32| {
-        let data = FontData::from_static(CASCADIA).tweak(egui::FontTweak { y_offset_factor: y_offset, ..Default::default() });
+        let data =
+            FontData::from_static(CASCADIA).tweak(egui::FontTweak { y_offset_factor: y_offset, ..Default::default() });
         (name.to_owned(), data)
     };
     for (name, data) in [ui("ui", 0.0), ui("ui-tight", 0.0), ui("ui-title", -0.08)] {

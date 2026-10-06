@@ -187,7 +187,8 @@ impl StatusRecord {
     /// choosing. Rejecting is silent — a pane without a badge is harmless, an
     /// arbitrary write is not.
     fn clean_pane_id(pane_id: &str) -> Option<&str> {
-        (!pane_id.is_empty() && pane_id.len() <= 20 && pane_id.bytes().all(|byte| byte.is_ascii_digit())).then_some(pane_id)
+        (!pane_id.is_empty() && pane_id.len() <= 20 && pane_id.bytes().all(|byte| byte.is_ascii_digit()))
+            .then_some(pane_id)
     }
 
     pub fn file_path(status_dir: &Path, pane_id: &str) -> std::path::PathBuf {
@@ -267,10 +268,7 @@ mod tests {
             "\x1b[36m[Sonnet 5]\x1b[0m\x1b[2m | \x1b[0m\x1b[33m▓▓▓▓▓▓▓▓░░\x1b[0m \x1b[33m85%\x1b[0m\x1b[2m | \x1b[0m5h: \x1b[32m60%\x1b[0m\x1b[2m | \x1b[0m7d: \x1b[32m5%\x1b[0m"
         );
         let json = r#"{"context_window":{"used_percentage":0.4},"rate_limits":{"five_hour":{"used_percentage":60}}}"#;
-        assert_eq!(
-            line(json),
-            "\x1b[32m░░░░░░░░░░\x1b[0m \x1b[32m0%\x1b[0m\x1b[2m | \x1b[0m5h: \x1b[33m60%\x1b[0m"
-        );
+        assert_eq!(line(json), "\x1b[32m░░░░░░░░░░\x1b[0m \x1b[32m0%\x1b[0m\x1b[2m | \x1b[0m5h: \x1b[33m60%\x1b[0m");
     }
 
     #[test]
@@ -287,7 +285,8 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let status_dir = base.path().join("run");
         let record = StatusRecord::new(&Payload { model: Some("Opus".into()), ..Payload::default() }, None, 1);
-        for hostile in ["..\\..\\escaped", "../../escaped", "..", "1/../../x", "a\\b", "with space", "", "-1", "1.json"] {
+        for hostile in ["..\\..\\escaped", "../../escaped", "..", "1/../../x", "a\\b", "with space", "", "-1", "1.json"]
+        {
             assert!(record.write(&status_dir, hostile).is_err(), "{hostile:?} must be refused");
         }
         assert!(record.write(&status_dir, "7").is_ok());
@@ -330,7 +329,13 @@ mod tests {
             "\x1b[36m[Opus 5]\x1b[0m\x1b[2m | \x1b[0m\x1b[32m▓▓▓▓░░░░░░\x1b[0m \x1b[32m37%\x1b[0m\x1b[2m | \x1b[0m7d: \x1b[33m64%\x1b[0m"
         );
         let none = ClaudeLineFields {
-            model: false, dir: false, branch: false, context: false, five_hour: false, seven_day: false, agent: false,
+            model: false,
+            dir: false,
+            branch: false,
+            context: false,
+            five_hour: false,
+            seven_day: false,
+            agent: false,
         };
         assert_eq!(format_line_with(&p, Some("main"), 0, &none), "");
     }

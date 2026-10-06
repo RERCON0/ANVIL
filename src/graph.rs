@@ -119,10 +119,8 @@ pub fn compute(commits: &[Commit]) -> Vec<Row> {
                     push(&mut segments, Segment { from_lane: index, to_lane: index, kind: Kind::Through });
                 }
                 (Some(above), None) => {
-                    let target = outgoing
-                        .iter()
-                        .position(|hash| hash.as_deref() == Some(above.as_str()))
-                        .unwrap_or(lane);
+                    let target =
+                        outgoing.iter().position(|hash| hash.as_deref() == Some(above.as_str())).unwrap_or(lane);
                     push(&mut segments, Segment { from_lane: index, to_lane: target, kind: Kind::Up });
                 }
                 _ => {}
@@ -173,9 +171,8 @@ mod tests {
     /// must not widen the graph without limit.
     #[test]
     fn the_lane_count_stays_within_the_documented_cap() {
-        let commits: Vec<Commit> = (0..MAX_LANES * 3)
-            .map(|index| commit(&format!("{index:07x}"), &[], Section::History))
-            .collect();
+        let commits: Vec<Commit> =
+            (0..MAX_LANES * 3).map(|index| commit(&format!("{index:07x}"), &[], Section::History)).collect();
         let rows = compute(&commits);
         assert_eq!(rows.len(), commits.len(), "every commit is still drawn");
         let widest = rows.iter().map(|row| row.lane + 1).max().unwrap_or(0);

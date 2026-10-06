@@ -21,18 +21,18 @@ use crate::claude_setup::{self, Plan};
 use crate::claude_status::StatusRecord;
 use crate::config::{Bell, Config, CursorConfig, CursorShapeConfig};
 use crate::fonts;
-use crate::hotkeys::{Action, Keymap};
 use crate::host::route::KeyFocus;
 use crate::host::WindowCommand;
+use crate::hotkeys::{Action, Keymap};
 use crate::layout::split_tree::{Anchor, Dir, PaneId, SplitTree};
 use crate::profiles::{self, Profile};
 use crate::session::{self, PaneState, SessionState, TabState, WindowState};
 use crate::strings;
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 
-use crate::term::pane::PaneEvent;
 use crate::tabs::{FrameEnv, PaneContent, PaneEntry, Tab, TabAction};
 use crate::term::input::{encode, InputModes, KeyPress};
+use crate::term::pane::PaneEvent;
 use crate::term::pane::{Pane, SpawnOptions};
 use crate::term::paste;
 use crate::term::style::Palette;
@@ -336,57 +336,59 @@ impl AnvilApp {
         // start a text selection.
         let window_edge = resize_borders(&ctx, maximized, &mut commands);
 
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(theme::colors().chrome_bg))
-            .show_inside(ui, |ui| {
-                if self.ui.dialog.is_some() {
-                    ui.disable();
+        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::colors().chrome_bg)).show_inside(ui, |ui| {
+            if self.ui.dialog.is_some() {
+                ui.disable();
+            }
+            let full = ui.max_rect();
+            let title = Rect::from_min_size(full.min, Vec2::new(full.width(), theme::TITLEBAR_HEIGHT));
+            title_bar(ui, title, maximized, window_edge, &mut commands);
+            // The quota line takes the bottom of the window while quotas are on;
+            // tabs and panes get the rest, so nothing is ever drawn under it.
+            let footer = if self.quota.is_some() { crate::chrome::quota_bar::HEIGHT } else { 0.0 };
+            let bottom = Pos2::new(full.max.x, full.max.y - footer);
+            let body = Rect::from_min_max(Pos2::new(full.min.x, title.max.y), bottom);
+            if footer > 0.0 {
+                let line = Rect::from_min_max(Pos2::new(full.min.x, body.max.y), full.max);
+                let segments = self.current_quota_segments();
+                if crate::chrome::quota_bar::show(ui, line, segments).is_some() {
+                    refresh_quota = true;
                 }
-                let full = ui.max_rect();
-                let title = Rect::from_min_size(full.min, Vec2::new(full.width(), theme::TITLEBAR_HEIGHT));
-                title_bar(ui, title, maximized, window_edge, &mut commands);
-                // The quota line takes the bottom of the window while quotas are on;
-                // tabs and panes get the rest, so nothing is ever drawn under it.
-                let footer = if self.quota.is_some() { crate::chrome::quota_bar::HEIGHT } else { 0.0 };
-                let bottom = Pos2::new(full.max.x, full.max.y - footer);
-                let body = Rect::from_min_max(Pos2::new(full.min.x, title.max.y), bottom);
-                if footer > 0.0 {
-                    let line = Rect::from_min_max(Pos2::new(full.min.x, body.max.y), full.max);
-                    let segments = self.current_quota_segments();
-                    if crate::chrome::quota_bar::show(ui, line, segments).is_some() {
-                        refresh_quota = true;
-                    }
-                }
-                let tabbar_rect = Rect::from_min_size(body.min, Vec2::new(theme::TABBAR_WIDTH, body.height()));
-                let area = Rect::from_min_max(Pos2::new(body.min.x + theme::TABBAR_WIDTH, body.min.y), body.max);
-                ui.painter().vline(tabbar_rect.max.x - 0.5, tabbar_rect.y_range(), egui::Stroke::new(1.0, theme::colors().border));
+            }
+            let tabbar_rect = Rect::from_min_size(body.min, Vec2::new(theme::TABBAR_WIDTH, body.height()));
+            let area = Rect::from_min_max(Pos2::new(body.min.x + theme::TABBAR_WIDTH, body.min.y), body.max);
+            ui.painter().vline(
+                tabbar_rect.max.x - 0.5,
+                tabbar_rect.y_range(),
+                egui::Stroke::new(1.0, theme::colors().border),
+            );
 
-                let badge = &self.config.claude_status;
-                let show_badge = badge.badge && badge.badge_fields.any();
-                let infos: Vec<TabInfo> = (0..self.tabs.len())
-                    .map(|i| TabInfo {
-                        title: self.tabs[i].title().into(),
-                        active: i == self.active && !self.settings_open,
-                        activity: self.tabs[i].has_activity && i != self.active,
-                        // Hidden badge: no extra row height either.
-                        claude: show_badge.then(|| self.tabs[i].claude_status()).flatten(),
-                        color: self.tabs[i].color,
-                    })
-                    .collect();
-                let badge_fields = self.config.claude_status.badge_fields;
-                let tabbar_actions =
-                    tabbar::show(ui, tabbar_rect, &mut self.tabbar, &infos, self.settings_open, &badge_fields);
-                for action in tabbar_actions {
-                    self.apply_tabbar_action(action, &ctx);
-                }
+            let badge = &self.config.claude_status;
+            let show_badge = badge.badge && badge.badge_fields.any();
+            let infos: Vec<TabInfo> = (0..self.tabs.len())
+                .map(|i| TabInfo {
+                    title: self.tabs[i].title().into(),
+                    active: i == self.active && !self.settings_open,
+                    activity: self.tabs[i].has_activity && i != self.active,
+                    // Hidden badge: no extra row height either.
+                    claude: show_badge.then(|| self.tabs[i].claude_status()).flatten(),
+                    color: self.tabs[i].color,
+                })
+                .collect();
+            let badge_fields = self.config.claude_status.badge_fields;
+            let tabbar_actions =
+                tabbar::show(ui, tabbar_rect, &mut self.tabbar, &infos, self.settings_open, &badge_fields);
+            for action in tabbar_actions {
+                self.apply_tabbar_action(action, &ctx);
+            }
 
-                if self.settings_open {
-                    self.ime_area = None;
-                    self.show_settings(ui, area);
-                } else {
-                    self.show_active_tab(ui, area, &ctx, window_edge);
-                }
-            });
+            if self.settings_open {
+                self.ime_area = None;
+                self.show_settings(ui, area);
+            } else {
+                self.show_active_tab(ui, area, &ctx, window_edge);
+            }
+        });
 
         self.show_toasts(&ctx);
         self.show_picker(&ctx);
@@ -783,7 +785,9 @@ impl AnvilApp {
     // ---- terminal input -------------------------------------------------
 
     pub fn send_key(&mut self, press: &KeyPress) {
-        if self.ui.dialog.is_some() { return; }
+        if self.ui.dialog.is_some() {
+            return;
+        }
         // Ctrl or Alt alone is not "a key": it may start Ctrl+Shift+C on the
         // exit message.
         if !press.is_modifier_only() && self.tabs.get(self.active).is_some_and(Tab::focused_exited) {
@@ -809,7 +813,9 @@ impl AnvilApp {
     }
 
     pub fn send_text(&mut self, text: &str) {
-        if self.ui.dialog.is_some() { return; }
+        if self.ui.dialog.is_some() {
+            return;
+        }
         // The same guard as a key press: text goes nowhere once the process is
         // gone, and typing is what dismisses the exit message.
         if self.tabs.get(self.active).is_some_and(Tab::focused_exited) {
@@ -859,7 +865,9 @@ impl AnvilApp {
     }
 
     pub fn run_action(&mut self, action: &Action, ctx: &egui::Context) -> Vec<WindowCommand> {
-        if self.ui.dialog.is_some() { return Vec::new(); }
+        if self.ui.dialog.is_some() {
+            return Vec::new();
+        }
         let mut commands = Vec::new();
         match action {
             Action::NewTab => {
@@ -883,7 +891,9 @@ impl AnvilApp {
             Action::NextTab => self.cycle_tab(1),
             Action::PreviousTab => self.cycle_tab(-1),
             Action::MoveTabLeft => self.move_tab(self.active, self.active.saturating_sub(1)),
-            Action::MoveTabRight => self.move_tab(self.active, (self.active + 1).min(self.tabs.len().saturating_sub(1))),
+            Action::MoveTabRight => {
+                self.move_tab(self.active, (self.active + 1).min(self.tabs.len().saturating_sub(1)))
+            }
             Action::Tab(n) => {
                 let index = (*n as usize).saturating_sub(1);
                 if index < self.tabs.len() {
@@ -1030,7 +1040,11 @@ impl AnvilApp {
     /// CLI for AI commit messages: the configured one, else the AI CLI found
     /// in the focused pane's process tree (claude, opencode, codex, …).
     fn ai_command(&self) -> Option<String> {
-        let command = self.config.workspace.ai_commit_command.clone()
+        let command = self
+            .config
+            .workspace
+            .ai_commit_command
+            .clone()
             .or_else(|| self.focused_id().and_then(|id| self.ai_commands.get(&id).cloned()))?;
         match self.config.workspace.ai_commit_model.as_deref().filter(|model| !model.is_empty()) {
             Some(model) if command.trim() == "opencode" => Some(format!("opencode run --model {model}")),
@@ -1165,7 +1179,12 @@ impl AnvilApp {
         };
         let area = self.last_tab_area;
         let Some(tab) = self.tabs.get(self.active) else { return };
-        if let Some(id) = tab.tree.navigate(tab.focused, nav, crate::layout::split_tree::Rect::new(area.min.x, area.min.y, area.width(), area.height()), theme::DIVIDER_WIDTH) {
+        if let Some(id) = tab.tree.navigate(
+            tab.focused,
+            nav,
+            crate::layout::split_tree::Rect::new(area.min.x, area.min.y, area.width(), area.height()),
+            theme::DIVIDER_WIDTH,
+        ) {
             self.focus_pane(id);
         }
     }
@@ -1274,15 +1293,14 @@ impl AnvilApp {
             self.profiles = self.build_profiles();
         }
         let version = env!("CARGO_PKG_VERSION");
-        let env = profiles::pane_env(profile, id, Some(&self.status_dir), version, self.inherited_prompt_command.as_deref());
+        let env =
+            profiles::pane_env(profile, id, Some(&self.status_dir), version, self.inherited_prompt_command.as_deref());
         let options = SpawnOptions {
             pane_id: id,
             program: profile.command.clone(),
             args: profile.args.clone(),
             // Unknown pane folder: the profile's, else the user profile (11.2).
-            cwd: cwd
-                .or_else(|| profile.cwd.clone())
-                .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from)),
+            cwd: cwd.or_else(|| profile.cwd.clone()).or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from)),
             env,
             columns: 100,
             lines: 30,
@@ -1457,7 +1475,13 @@ impl AnvilApp {
                     .iter()
                     .find(|p| p.id == pane_state.profile_id)
                     .cloned()
-                    .or_else(|| pane_state.profile_id.strip_prefix("wsl-").filter(|distro| !distro.is_empty()).map(profiles::wsl_profile))
+                    .or_else(|| {
+                        pane_state
+                            .profile_id
+                            .strip_prefix("wsl-")
+                            .filter(|distro| !distro.is_empty())
+                            .map(profiles::wsl_profile)
+                    })
                     .unwrap_or_else(|| self.default_profile());
                 let cwd = session::usable_cwd(pane_state.cwd.as_deref());
                 let mut entry = self.spawn_entry(id, &profile, cwd);
@@ -1521,7 +1545,13 @@ impl AnvilApp {
                     workspace_width: Some(entry.workspace.width),
                     workspace_tab: Some(entry.workspace.tab.as_str().to_owned()),
                 })
-                .unwrap_or(PaneState { profile_id: String::new(), cwd: None, workspace_open: false, workspace_width: None, workspace_tab: None })
+                .unwrap_or(PaneState {
+                    profile_id: String::new(),
+                    cwd: None,
+                    workspace_open: false,
+                    workspace_width: None,
+                    workspace_tab: None,
+                })
         };
         let focused = tab.tree.panes().iter().position(|id| *id == tab.focused).unwrap_or(0);
         let order = tab.tree.panes();
@@ -1551,7 +1581,8 @@ impl AnvilApp {
     fn apply_config(&mut self, ctx: egui::Context, config: Config, save: bool) {
         let family_changed = config.font.family != self.config.font.family;
         let scheme_changed = config.color_scheme != self.config.color_scheme;
-        let profiles_changed = config.profiles != self.config.profiles || config.default_profile != self.config.default_profile;
+        let profiles_changed =
+            config.profiles != self.config.profiles || config.default_profile != self.config.default_profile;
         let claude_disabled = self.config.claude_status.enabled && !config.claude_status.enabled;
         let claude_enabled = !self.config.claude_status.enabled && config.claude_status.enabled;
         let previous_integration = claude_disabled.then(|| self.config.claude_status.clone());
@@ -1758,7 +1789,9 @@ impl AnvilApp {
         if !self.config.claude_status.enabled || self.ui.dialog.is_some() {
             return;
         }
-        let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) else { return };
+        let Some(exe_dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) else {
+            return;
+        };
         if !exe_dir.join("anvil-claude-status.exe").is_file() {
             self.toast(strings::CLAUDE_HELPER_MISSING.to_owned());
             return;
@@ -1782,30 +1815,44 @@ impl AnvilApp {
                 return;
             }
         };
-        let (current, keep_previous) = match claude_setup::plan(settings.as_deref(), &ours, self.config.claude_status.declined_command.as_deref()) {
-            Plan::Install => (String::new(), false),
-            Plan::Update => {
-                let current = settings.as_deref().and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-                    .and_then(|value| value.get("statusLine")?.get("command")?.as_str().map(str::to_owned)).unwrap_or_default();
-                (current, true)
-            }
-            Plan::AskReplace { current } => (current, false),
-            Plan::Broken(message) => {
-                log::warn!("{message}");
-                self.toast(strings::CLAUDE_SETTINGS_BROKEN.to_owned());
-                return;
-            }
-            Plan::AlreadyInstalled | Plan::Declined => return,
-        };
+        let (current, keep_previous) =
+            match claude_setup::plan(settings.as_deref(), &ours, self.config.claude_status.declined_command.as_deref())
+            {
+                Plan::Install => (String::new(), false),
+                Plan::Update => {
+                    let current = settings
+                        .as_deref()
+                        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+                        .and_then(|value| value.get("statusLine")?.get("command")?.as_str().map(str::to_owned))
+                        .unwrap_or_default();
+                    (current, true)
+                }
+                Plan::AskReplace { current } => (current, false),
+                Plan::Broken(message) => {
+                    log::warn!("{message}");
+                    self.toast(strings::CLAUDE_SETTINGS_BROKEN.to_owned());
+                    return;
+                }
+                Plan::AlreadyInstalled | Plan::Declined => return,
+            };
         if self.config.claude_status.declined_command.as_deref() == Some(current.as_str()) {
             return;
         }
         self.ui.dialog = Some(DialogState::ClaudeInstall { path, expected: settings, ours, current, keep_previous });
     }
 
-    fn install_claude(&mut self, path: &Path, ours: &str, expected: Option<&str>, keep_previous: bool) -> std::io::Result<()> {
+    fn install_claude(
+        &mut self,
+        path: &Path,
+        ours: &str,
+        expected: Option<&str>,
+        keep_previous: bool,
+    ) -> std::io::Result<()> {
         if !Path::new(ours.trim_matches('"')).is_file() {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Claude helper was moved or removed before confirmation"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Claude helper was moved or removed before confirmation",
+            ));
         }
         let (text, previous) = claude_setup::install(expected, ours).map_err(std::io::Error::other)?;
         claude_setup::write_confirmed(path, expected, &text)?;
@@ -1826,13 +1873,18 @@ impl AnvilApp {
         // CLAUDE_CONFIG_DIR. Moving ANVIL must not prevent restoring the original.
         let claude_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
         let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
-        let path = self.config.claude_status.installed_settings_path.clone()
+        let path = self
+            .config
+            .claude_status
+            .installed_settings_path
+            .clone()
             .or_else(|| claude_setup::settings_path(claude_dir.as_deref(), home.as_deref()));
         let Some(path) = path else { return };
         let Ok(fresh) = std::fs::read_to_string(&path) else { return };
         let ours = self.config.claude_status.installed_command.clone().or_else(|| {
             // Older opted-in configurations did not record their helper path.
-            serde_json::from_str::<serde_json::Value>(&fresh).ok()
+            serde_json::from_str::<serde_json::Value>(&fresh)
+                .ok()
                 .and_then(|value| value.get("statusLine")?.get("command")?.as_str().map(str::to_owned))
                 .filter(|command| claude_setup::is_anvil_status_command(command))
         });
@@ -1886,7 +1938,10 @@ impl AnvilApp {
                     let Some(pane) = entry.live() else { continue };
                     let names = crate::procs::detected_cli_names(&self.proc_snapshot, pane.shell_pid);
                     let has_claude = names.contains("claude");
-                    if let Some(command) = ["claude", "opencode", "codex", "gemini", "aider"].into_iter().find(|name| names.contains(*name)) {
+                    if let Some(command) = ["claude", "opencode", "codex", "gemini", "aider"]
+                        .into_iter()
+                        .find(|name| names.contains(*name))
+                    {
                         self.ai_commands.insert(*id, command.to_owned());
                     }
                     entry.has_claude = has_claude;
@@ -1979,7 +2034,12 @@ impl AnvilApp {
     }
 
     fn open_picker(&mut self, ctx: &egui::Context) {
-        self.ui.picker = Some(PickerState { filter: String::new(), selected: 0, focus: true, opened_pass: ctx.cumulative_pass_nr() });
+        self.ui.picker = Some(PickerState {
+            filter: String::new(),
+            selected: 0,
+            focus: true,
+            opened_pass: ctx.cumulative_pass_nr(),
+        });
     }
 
     fn show_picker(&mut self, ctx: &egui::Context) {
@@ -2074,7 +2134,8 @@ pub fn scheme_names(config: &Config) -> Vec<String> {
 }
 
 fn font_families(entries: &[(String, String)]) -> Vec<String> {
-    let mut families: Vec<String> = entries.iter()
+    let mut families: Vec<String> = entries
+        .iter()
         .filter_map(|(name, _)| {
             let name = name
                 .trim_end_matches(" (TrueType)")
@@ -2108,11 +2169,7 @@ fn status_dir() -> PathBuf {
 }
 
 fn run_base() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
-        .join("anvil")
-        .join("run")
+    std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("anvil").join("run")
 }
 
 /// Creates this process's status directory and removes the directories of

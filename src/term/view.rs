@@ -244,7 +244,9 @@ impl TerminalView {
                 if let Some(url) = &hovered_link {
                     ctx.open_url(egui::OpenUrl::new_tab(url.clone()));
                 } else if app_mouse {
-                    if let Some(bytes) = mouse::encode_report(MouseButton::Left, MouseAction::Press, col, row, mods, modes) {
+                    if let Some(bytes) =
+                        mouse::encode_report(MouseButton::Left, MouseAction::Press, col, row, mods, modes)
+                    {
                         pane.write(bytes);
                         self.press_reported = true;
                         self.last_reported_cell = Some((col, row));
@@ -273,7 +275,9 @@ impl TerminalView {
                 let (col, row) = clamp_cell(pos);
                 if app_mouse {
                     if self.press_reported && mouse::wants_report(MouseAction::Motion, true, modes) {
-                        if let Some(bytes) = mouse::encode_report(MouseButton::Left, MouseAction::Motion, col, row, mods, modes) {
+                        if let Some(bytes) =
+                            mouse::encode_report(MouseButton::Left, MouseAction::Motion, col, row, mods, modes)
+                        {
                             pane.write(bytes);
                             self.last_reported_cell = Some((col, row));
                         }
@@ -290,7 +294,9 @@ impl TerminalView {
         if primary_released {
             if std::mem::take(&mut self.press_reported) && modes.any() {
                 if let Some((col, row)) = pointer.map(clamp_cell).or(self.last_reported_cell) {
-                    if let Some(bytes) = mouse::encode_report(MouseButton::Left, MouseAction::Release, col, row, mods, modes) {
+                    if let Some(bytes) =
+                        mouse::encode_report(MouseButton::Left, MouseAction::Release, col, row, mods, modes)
+                    {
                         pane.write(bytes);
                     }
                 }
@@ -303,14 +309,22 @@ impl TerminalView {
         if hovered {
             // Terminal mouse reports need each raw tick, not egui's smoothed tail.
             let line_speed = ctx.options(|o| o.input_options.line_scroll_speed);
-            let dy = ui.input(|i| i.events.iter().filter_map(|event| match event {
-                egui::Event::MouseWheel { unit, delta, modifiers, .. } if !modifiers.shift => Some(delta.y * match unit {
-                    egui::MouseWheelUnit::Point => 1.0,
-                    egui::MouseWheelUnit::Line => line_speed,
-                    egui::MouseWheelUnit::Page => i.viewport_rect().height(),
-                }),
-                _ => None,
-            }).sum::<f32>());
+            let dy = ui.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|event| match event {
+                        egui::Event::MouseWheel { unit, delta, modifiers, .. } if !modifiers.shift => Some(
+                            delta.y
+                                * match unit {
+                                    egui::MouseWheelUnit::Point => 1.0,
+                                    egui::MouseWheelUnit::Line => line_speed,
+                                    egui::MouseWheelUnit::Page => i.viewport_rect().height(),
+                                },
+                        ),
+                        _ => None,
+                    })
+                    .sum::<f32>()
+            });
             if dy != 0.0 {
                 if app_mouse {
                     self.wheel_report(pane, dy, metrics.height, mods, modes);
@@ -359,37 +373,41 @@ impl TerminalView {
         if std::mem::take(&mut self.menu_open) {
             egui::Popup::open_id(&ctx, menu_id);
         }
-        egui::Popup::from_response(&response).id(menu_id).open_memory(None).close_behavior(egui::PopupCloseBehavior::CloseOnClick).show(|ui| {
-            if ui.button(strings::MENU_COPY).clicked() {
-                commands.push(PaneCommand::Copy);
-                ui.close();
-            }
-            if ui.button(strings::MENU_PASTE).clicked() {
-                commands.push(PaneCommand::Paste);
-                ui.close();
-            }
-            if ui.button(strings::MENU_SELECT_ALL).clicked() {
-                commands.push(PaneCommand::SelectAll);
-                ui.close();
-            }
-            if ui.button(strings::MENU_CLEAR).clicked() {
-                commands.push(PaneCommand::Clear);
-                ui.close();
-            }
-            ui.separator();
-            if ui.button(strings::MENU_SPLIT_RIGHT).clicked() {
-                commands.push(PaneCommand::SplitRight);
-                ui.close();
-            }
-            if ui.button(strings::MENU_SPLIT_DOWN).clicked() {
-                commands.push(PaneCommand::SplitDown);
-                ui.close();
-            }
-            if ui.button(strings::MENU_CLOSE_PANE).clicked() {
-                commands.push(PaneCommand::ClosePane);
-                ui.close();
-            }
-        });
+        egui::Popup::from_response(&response)
+            .id(menu_id)
+            .open_memory(None)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
+            .show(|ui| {
+                if ui.button(strings::MENU_COPY).clicked() {
+                    commands.push(PaneCommand::Copy);
+                    ui.close();
+                }
+                if ui.button(strings::MENU_PASTE).clicked() {
+                    commands.push(PaneCommand::Paste);
+                    ui.close();
+                }
+                if ui.button(strings::MENU_SELECT_ALL).clicked() {
+                    commands.push(PaneCommand::SelectAll);
+                    ui.close();
+                }
+                if ui.button(strings::MENU_CLEAR).clicked() {
+                    commands.push(PaneCommand::Clear);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button(strings::MENU_SPLIT_RIGHT).clicked() {
+                    commands.push(PaneCommand::SplitRight);
+                    ui.close();
+                }
+                if ui.button(strings::MENU_SPLIT_DOWN).clicked() {
+                    commands.push(PaneCommand::SplitDown);
+                    ui.close();
+                }
+                if ui.button(strings::MENU_CLOSE_PANE).clicked() {
+                    commands.push(PaneCommand::ClosePane);
+                    ui.close();
+                }
+            });
 
         // Search highlights for the visible screen.
         let (highlights, frame) = {
@@ -470,7 +488,14 @@ impl TerminalView {
             &painter,
             inner.min,
             &frame,
-            &PaintOptions { metrics, fonts: &fonts, palette: input.palette, focused: input.focused, cursor_on, highlights: &highlights },
+            &PaintOptions {
+                metrics,
+                fonts: &fonts,
+                palette: input.palette,
+                focused: input.focused,
+                cursor_on,
+                highlights: &highlights,
+            },
         );
 
         // Ctrl+hover underline for links.
@@ -479,7 +504,10 @@ impl TerminalView {
             if let Some((_, start, end)) = self.link_span(row, col) {
                 let y = inner.min.y + (row + 1) as f32 * metrics.height - 1.0;
                 painter.line_segment(
-                    [Pos2::new(inner.min.x + start as f32 * metrics.width, y), Pos2::new(inner.min.x + end as f32 * metrics.width, y)],
+                    [
+                        Pos2::new(inner.min.x + start as f32 * metrics.width, y),
+                        Pos2::new(inner.min.x + end as f32 * metrics.width, y),
+                    ],
                     egui::Stroke::new(1.0, input.palette.foreground),
                 );
             }
@@ -534,7 +562,10 @@ impl TerminalView {
 
         // Search bar overlay.
         if self.search.open {
-            let bar = Rect::from_min_size(Pos2::new((rect.right() - 330.0).max(rect.left()), rect.top() + 4.0), Vec2::new(326.0, 26.0));
+            let bar = Rect::from_min_size(
+                Pos2::new((rect.right() - 330.0).max(rect.left()), rect.top() + 4.0),
+                Vec2::new(326.0, 26.0),
+            );
             let mut nav_next = false;
             let mut nav_prev = false;
             let mut close = false;
@@ -561,7 +592,11 @@ impl TerminalView {
                             // Keep the field focused: the user is mid-expression.
                             ui.colored_label(egui::Color32::from_rgb(0xf9, 0x26, 0x72), "!");
                         }
-                        if ui.selectable_label(self.search.case_sensitive, "Aa").on_hover_text(strings::SEARCH_CASE).clicked() {
+                        if ui
+                            .selectable_label(self.search.case_sensitive, "Aa")
+                            .on_hover_text(strings::SEARCH_CASE)
+                            .clicked()
+                        {
                             self.search.case_sensitive = !self.search.case_sensitive;
                             self.search.current = None;
                         }
@@ -609,7 +644,11 @@ impl TerminalView {
     }
 
     fn release_right_press(&mut self, released: bool) -> Option<Instant> {
-        if released { self.right_press_at.take() } else { None }
+        if released {
+            self.right_press_at.take()
+        } else {
+            None
+        }
     }
 
     /// Recomputes the current match and scrolls it into view.
@@ -643,7 +682,10 @@ impl TerminalView {
             }
             None => {
                 let cursor = term.grid().cursor.point;
-                Point::new(Line(cursor.line.0.clamp(-history, last_line)), Column(cursor.column.0.min(total_columns - 1)))
+                Point::new(
+                    Line(cursor.line.0.clamp(-history, last_line)),
+                    Column(cursor.column.0.min(total_columns - 1)),
+                )
             }
         };
         let direction = if forward { Direction::Right } else { Direction::Left };
@@ -674,10 +716,8 @@ impl TerminalView {
     }
 
     fn link_span(&self, row: usize, col: usize) -> Option<(String, usize, usize)> {
-        if let Some((_, start, end, uri)) = self
-            .last_links
-            .iter()
-            .find(|(link_row, start, end, _)| *link_row == row && (*start..*end).contains(&col))
+        if let Some((_, start, end, uri)) =
+            self.last_links.iter().find(|(link_row, start, end, _)| *link_row == row && (*start..*end).contains(&col))
         {
             if links::is_openable(uri) {
                 return Some((uri.clone(), *start, *end));
@@ -720,11 +760,16 @@ impl TerminalView {
     /// next real event starts clean.
     fn take_wheel_lines(&mut self, dy_points: f32, cell_height: f32) -> i32 {
         const MAX_LINES: f32 = 1_000.0;
-        self.wheel_lines = if self.wheel_lines.is_finite() { self.wheel_lines.clamp(-MAX_LINES, MAX_LINES) } else { 0.0 };
+        self.wheel_lines =
+            if self.wheel_lines.is_finite() { self.wheel_lines.clamp(-MAX_LINES, MAX_LINES) } else { 0.0 };
         self.wheel_lines += dy_points / cell_height;
         let lines = self.wheel_lines.trunc();
         self.wheel_lines -= lines;
-        if lines.is_finite() { lines as i32 } else { 0 }
+        if lines.is_finite() {
+            lines as i32
+        } else {
+            0
+        }
     }
 
     fn wheel(&mut self, pane: &Pane, dy_points: f32, cell_height: f32) {
@@ -761,10 +806,7 @@ impl TerminalView {
 }
 
 fn find_scheme(text: &str, from: usize) -> Option<usize> {
-    ["https://", "http://", "ftp://", "mailto:"]
-        .iter()
-        .filter_map(|s| text[from..].find(s).map(|i| i + from))
-        .min()
+    ["https://", "http://", "ftp://", "mailto:"].iter().filter_map(|s| text[from..].find(s).map(|i| i + from)).min()
 }
 
 fn mouse_modes(mode: &TermMode) -> MouseModes {
@@ -825,7 +867,6 @@ fn collect_matches<L: EventListener>(
     out
 }
 
-
 /// `(row, first column, end column, target)` of every OSC 8 link on screen.
 /// Cells of one link share its target (one OSC 8 sequence), so a run is
 /// recognised by identity and its target copied once, not compared and
@@ -877,10 +918,16 @@ mod tests {
     }
 
     fn cell(ch: char, hyperlink: Option<Hyperlink>) -> RenderCell {
-        let style = CellStyle { fg: Color32::WHITE, bg: Color32::BLACK, bold: false, italic: false, underline: Underline::None, strike: false };
+        let style = CellStyle {
+            fg: Color32::WHITE,
+            bg: Color32::BLACK,
+            bold: false,
+            italic: false,
+            underline: Underline::None,
+            strike: false,
+        };
         RenderCell { ch, combining: None, style, wide: false, spacer: false, in_primary_font: true, hyperlink }
     }
-
 
     #[test]
     fn right_press_survives_frames_until_release() {

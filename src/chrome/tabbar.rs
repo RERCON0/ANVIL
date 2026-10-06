@@ -181,7 +181,8 @@ pub fn show(
     if settings_open {
         painter.rect_filled(settings_rect, 0.0, theme::colors().tab_active_bg);
     }
-    let settings_color = if settings_open || settings.hovered() { theme::colors().icon_hover } else { theme::colors().icon };
+    let settings_color =
+        if settings_open || settings.hovered() { theme::colors().icon_hover } else { theme::colors().icon };
     let label = painter.layout_no_wrap(strings::TAB_SETTINGS.to_owned(), theme::font(12.5), settings_color);
     let label_pos = Pos2::new(settings_rect.min.x + 24.0, settings_rect.center().y - label.size().y / 2.0);
     // Align to the visible letters, not the font's ascent/descent box: the
@@ -669,7 +670,10 @@ mod tests {
         };
         let texts =
             |fields: &ClaudeBadgeFields| badge_parts(&record, fields).into_iter().map(|(t, _)| t).collect::<Vec<_>>();
-        assert_eq!(texts(&ClaudeBadgeFields::default()), vec!["Opus 5", "▓▓▓▓░░░░░░ 37%", "5h 17", "7d 64", "reviewer"]);
+        assert_eq!(
+            texts(&ClaudeBadgeFields::default()),
+            vec!["Opus 5", "▓▓▓▓░░░░░░ 37%", "5h 17", "7d 64", "reviewer"]
+        );
         let fields = ClaudeBadgeFields { model: false, five_hour: false, ..ClaudeBadgeFields::default() };
         assert_eq!(texts(&fields), vec!["▓▓▓▓░░░░░░ 37%", "7d 64", "reviewer"]);
         assert_eq!(badge_parts(&record, &fields)[0].1, Some(37.4), "percent parts carry their value for the colour");

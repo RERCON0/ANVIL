@@ -54,7 +54,8 @@ impl GlWindow {
                 NonZeroU32::new(h).unwrap_or(NonZeroU32::MIN),
             );
         // SAFETY: the raw handle belongs to `window`, which outlives the surface.
-        let gl_surface = unsafe { gl_display.create_window_surface(&gl_config, &surface_attributes).expect("GL surface") };
+        let gl_surface =
+            unsafe { gl_display.create_window_surface(&gl_config, &surface_attributes).expect("GL surface") };
         let gl_context = not_current.make_current(&gl_surface).expect("make GL context current");
         let _ = gl_surface.set_swap_interval(&gl_context, glutin::surface::SwapInterval::Wait(NonZeroU32::MIN));
         GlWindow { window, gl_context, gl_display, gl_surface }
