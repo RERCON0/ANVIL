@@ -450,10 +450,31 @@ mod tests {
         &output[start + MARKER.len()..]
     }
 
-    // Keep resource accounting in a single test so its own cases cannot run
-    // concurrently. The isolated native probe runs this exact test serially.
+    // Process-wide resource accounting needs its own harness process: a mutex
+    // in this test cannot exclude unrelated tests opening handles or threads.
     #[test]
     fn bounded_invocation_owns_pipes_tree_and_deadline() {
+        const PROBE: &str = "ANVIL_BOUNDED_RESOURCE_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let (_, module) = module_path!().split_once("::").unwrap();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact",
+                &format!("{module}::bounded_invocation_owns_pipes_tree_and_deadline"),
+                "--nocapture",
+                "--test-threads=1",
+            ]);
+            command.env(PROBE, "1");
+            let (success, out, err) =
+                run_bounded(command, "isolated resource probe", Duration::from_secs(120), 32 * 1024, None).unwrap();
+            assert!(
+                success,
+                "isolated probe failed:\n{}\n{}",
+                String::from_utf8_lossy(&out),
+                String::from_utf8_lossy(&err)
+            );
+            return;
+        }
         let scratch = Scratch(std::env::temp_dir().join(format!(
             "anvil-bounded-regression-{}-{}",
             std::process::id(),

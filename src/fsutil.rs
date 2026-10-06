@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Limit the read itself, not just a metadata check that can race a writer.
 pub fn read_limited(path: &Path, cap: usize) -> io::Result<Vec<u8>> {
-    let file = fs::File::open(path)?;
+    let file = retry_file_sharing(|| fs::File::open(path))?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
     }
@@ -54,12 +54,34 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&tmp, &target)
+        retry_file_sharing(|| fs::rename(&tmp, &target))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     result
+}
+
+/// NTFS can briefly deny an open/replace while another atomic replacement is
+/// finishing or a reader/scanner holds the destination. Retry only the Windows
+/// access/sharing/lock errors, with one short deadline; never delete the target
+/// as a fallback or retry writes that could have partially modified a file.
+fn retry_file_sharing<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    #[cfg(windows)]
+    {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            match operation() {
+                Err(error) if matches!(error.raw_os_error(), Some(5 | 32 | 33)) && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => return result,
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    operation()
 }
 
 /// Follows an existing symlink (one level, as dotfile setups use) so an
@@ -460,7 +482,7 @@ mod tests {
                 for round in 0..20 {
                     let payload = format!("{{\"writer\":{writer},\"round\":{round}}}");
                     atomic_write(&path, payload.as_bytes()).unwrap();
-                    let read = fs::read_to_string(&path).unwrap();
+                    let read = String::from_utf8(read_limited(&path, 128).unwrap()).unwrap();
                     assert!(read.starts_with('{') && read.ends_with('}'), "torn write: {read:?}");
                 }
             }));
@@ -470,5 +492,31 @@ mod tests {
         }
         let final_text = fs::read_to_string(&path).unwrap();
         assert!(serde_json::from_str::<serde_json::Value>(&final_text).is_ok(), "final file is valid JSON");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_replace_waits_for_a_temporary_reader_lock() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        atomic_write(&path, b"old complete payload").unwrap();
+        // A real handle which permits reads/writes but denies replacement.
+        let reader =
+            fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE).open(&path).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let output = path.clone();
+        let writer = std::thread::spawn(move || sender.send(atomic_write(&output, b"new complete payload")).unwrap());
+        assert!(matches!(receiver.recv_timeout(Duration::from_millis(50)), Err(mpsc::RecvTimeoutError::Timeout)));
+        assert_eq!(read_limited(&path, 128).unwrap(), b"old complete payload");
+        drop(reader);
+        receiver.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        writer.join().unwrap();
+        assert_eq!(read_limited(&path, 128).unwrap(), b"new complete payload");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1, "no temporary file remains");
     }
 }
