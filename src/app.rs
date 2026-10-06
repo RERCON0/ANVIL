@@ -13,6 +13,7 @@ use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle};
 use egui::{Align2, FontId, Pos2, Rect, Vec2};
 use winit::window::{Window, WindowAttributes};
 
+use crate::chrome::collapsed_list;
 use crate::chrome::dialogs::{self, DialogState};
 use crate::chrome::profile_picker;
 use crate::chrome::tabbar::{self, TabInfo};
@@ -61,10 +62,20 @@ pub struct PickerState {
     pub opened_pass: u64,
 }
 
+/// The list of panes hidden by Ctrl+Alt+C, opened with Ctrl+Alt+L.
+#[derive(Default)]
+pub struct CollapsedListState {
+    pub selected: usize,
+    /// The pass the list appeared in, so the click that opened
+    /// it does not close it at once (see PickerState).
+    pub opened_pass: u64,
+}
+
 #[derive(Default)]
 pub struct UiState {
     pub toasts: Vec<Toast>,
     pub picker: Option<PickerState>,
+    pub collapsed_list: Option<CollapsedListState>,
     pub dialog: Option<DialogState>,
 }
 
@@ -376,8 +387,9 @@ impl AnvilApp {
                 })
                 .collect();
             let badge_fields = self.config.claude_status.badge_fields;
+            let collapsed: usize = self.tabs.iter().map(|tab| tab.collapsed.len()).sum();
             let tabbar_actions =
-                tabbar::show(ui, tabbar_rect, &mut self.tabbar, &infos, self.settings_open, &badge_fields);
+                tabbar::show(ui, tabbar_rect, &mut self.tabbar, &infos, self.settings_open, &badge_fields, collapsed);
             for action in tabbar_actions {
                 self.apply_tabbar_action(action, &ctx);
             }
@@ -392,6 +404,7 @@ impl AnvilApp {
 
         self.show_toasts(&ctx);
         self.show_picker(&ctx);
+        self.show_collapsed_list(&ctx);
         self.show_dialog(&ctx);
         if let Some(at) = self.session_dirty {
             if at.elapsed() >= Duration::from_secs(1) {
@@ -432,7 +445,7 @@ impl AnvilApp {
     pub fn key_focus(&self, ctx: &egui::Context) -> KeyFocus {
         // Open overlays own the keyboard even when their widgets lost focus,
         // otherwise Esc would reach the shell and leave a stuck popup.
-        let overlay = self.ui.picker.is_some() || self.ui.dialog.is_some();
+        let overlay = self.ui.picker.is_some() || self.ui.collapsed_list.is_some() || self.ui.dialog.is_some();
         KeyFocus {
             egui_wants_keyboard: ctx.egui_wants_keyboard_input() || overlay,
             terminal_focused: !self.settings_open && self.tabs.get(self.active).is_some(),
@@ -694,6 +707,7 @@ impl AnvilApp {
                 self.new_tab_at_end(&profile, cwd);
             }
             tabbar::TabbarAction::Profiles => self.open_picker(ctx),
+            tabbar::TabbarAction::CollapsedList => self.open_collapsed_list(ctx),
             tabbar::TabbarAction::Settings => {
                 self.settings_open = true;
                 ctx.request_repaint();
@@ -940,6 +954,7 @@ impl AnvilApp {
                 }
             }
             Action::ProfileSelector => self.open_picker(ctx),
+            Action::CollapsedList => self.open_collapsed_list(ctx),
             Action::Settings => self.settings_open = true,
             Action::ToggleFullscreen => commands.push(WindowCommand::ToggleFullscreen),
             Action::ToggleFrameStats => self.toggle_debug_overlay(),
@@ -1160,6 +1175,21 @@ impl AnvilApp {
     }
 
     fn restore_collapsed(&mut self, id: PaneId) {
+        let active = self.active;
+        self.restore_collapsed_in(active, id);
+    }
+
+    /// Restores a pane hidden by Ctrl+Alt+C. The pane may live in a
+    /// background tab (the collapsed list offers panes from every
+    /// tab), so the tab is activated first.
+    fn restore_collapsed_in(&mut self, tab: usize, id: PaneId) {
+        if tab != self.active {
+            if self.tabs.get(tab).is_none() {
+                return;
+            }
+            self.active = tab;
+            self.settings_open = false;
+        }
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let Some(index) = tab.collapsed.iter().position(|(pane, _)| *pane == id) else { return };
         let (_, anchor) = tab.collapsed.remove(index);
@@ -1529,7 +1559,7 @@ impl AnvilApp {
                 entry.workspace.tab = crate::workspace::PanelTab::parse(name);
             }
             let neighbor = order.get(saved.neighbor).copied().unwrap_or(focused);
-            tab.collapsed.push((id, Anchor { neighbor, dir: saved.dir, after: saved.after }));
+            tab.collapsed.push((id, Anchor { neighbor, dir: saved.dir, after: saved.after, fraction: saved.fraction }));
             tab.panes.insert(id, entry);
         }
         Some(tab)
@@ -1563,6 +1593,7 @@ impl AnvilApp {
                 neighbor: order.iter().position(|pane| *pane == anchor.neighbor).unwrap_or(focused),
                 dir: anchor.dir,
                 after: anchor.after,
+                fraction: anchor.fraction,
             })
             .collect();
         TabState {
@@ -2055,6 +2086,44 @@ impl AnvilApp {
                     let cwd = self.focused_cwd();
                     self.new_tab_at_end(&profile, cwd);
                 }
+            }
+        }
+    }
+
+    fn open_collapsed_list(&mut self, ctx: &egui::Context) {
+        self.ui.collapsed_list = Some(CollapsedListState { selected: 0, opened_pass: ctx.cumulative_pass_nr() });
+    }
+
+    fn show_collapsed_list(&mut self, ctx: &egui::Context) {
+        let Some(list) = self.ui.collapsed_list.as_mut() else { return };
+        // Every tab's hidden panes, so a pane collapsed in a
+        // background tab can be found and brought back too.
+        let rows: Vec<collapsed_list::CollapsedRow> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .flat_map(|(index, tab)| {
+                let tab_title = tab.title().to_owned();
+                tab.collapsed.iter().filter_map(move |(pane, _)| {
+                    let entry = tab.panes.get(pane)?;
+                    let preview = entry.live().map(crate::tabs::screen_tail).unwrap_or_default();
+                    Some(collapsed_list::CollapsedRow {
+                        tab: index,
+                        pane: *pane,
+                        tab_title: tab_title.clone(),
+                        pane_title: entry.title_text().to_owned(),
+                        preview,
+                    })
+                })
+            })
+            .collect();
+        let outcome = collapsed_list::show(ctx, list, &rows);
+        match outcome {
+            collapsed_list::CollapsedListOutcome::None => {}
+            collapsed_list::CollapsedListOutcome::Closed => self.ui.collapsed_list = None,
+            collapsed_list::CollapsedListOutcome::Restore { tab, pane } => {
+                self.ui.collapsed_list = None;
+                self.restore_collapsed_in(tab, pane);
             }
         }
     }

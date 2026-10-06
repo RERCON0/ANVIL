@@ -542,8 +542,9 @@ impl Tab {
     }
 }
 
-/// The last few non-empty screen lines of a pane, for the collapsed-chip hover.
-fn screen_tail(pane: &Pane) -> String {
+/// The last few non-empty screen lines of a pane, for the
+/// collapsed-chip hover and the collapsed-panes list.
+pub(crate) fn screen_tail(pane: &Pane) -> String {
     const LINES: usize = 14;
     let term = pane.term.lock();
     let mut lines: Vec<String> = Vec::new();
@@ -647,6 +648,17 @@ mod tests {
         Tab::new(tree, HashMap::from([(1, entry()), (2, entry())]), 1)
     }
 
+    /// Uneven panes, so a restore that quietly redistributes the
+    /// width shows up as a changed root.
+    fn three_panes() -> Tab {
+        use crate::layout::split_tree::Node;
+        let tree = SplitTree::from_root(Node::Split {
+            dir: Dir::Row,
+            children: vec![(0.5, Node::Leaf(1)), (0.25, Node::Leaf(2)), (0.25, Node::Leaf(3))],
+        });
+        Tab::new(tree, HashMap::from([(1, entry()), (2, entry()), (3, entry())]), 1)
+    }
+
     #[test]
     fn drop_sides_distinguish_a_nested_pane_from_the_whole_tab() {
         let area = Rect::from_min_size(Pos2::new(100.0, 40.0), Vec2::new(1000.0, 600.0));
@@ -740,6 +752,25 @@ mod tests {
         assert_eq!(tab.maximized, Some(1), "focusing the maximized pane keeps it maximized");
         tab.set_focus(2);
         assert_eq!((tab.focused, tab.maximized), (2, None));
+    }
+
+    /// The end-to-end shape of Ctrl+Alt+C / Ctrl+Alt+R on the leftmost
+    /// pane of three: every cycle must land on the same layout. The
+    /// fractions used to be dropped on restore, so the right-hand panes
+    /// grew on each pass and the collapsed one shrank.
+    #[test]
+    fn collapse_and_restore_cycles_leave_the_layout_untouched() {
+        let mut tab = three_panes();
+        let before = tab.tree.root().clone();
+        for _ in 0..5 {
+            let anchor = tab.tree.remove(1).expect("pane 1 is not the last");
+            tab.collapsed.push((1, anchor));
+            tab.focused = tab.tree.panes().first().copied().unwrap_or(1);
+            let (_, anchor) = tab.collapsed.pop().expect("the pane is there");
+            assert!(tab.tree.restore(1, anchor, 1));
+            tab.set_focus(1);
+            assert_eq!(tab.tree.root(), &before, "a cycle changed the layout");
+        }
     }
 
     /// Closing the only visible pane while another one sat collapsed left a

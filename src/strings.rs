@@ -139,7 +139,8 @@ pub const SETTINGS_CLAUDE_INSTALL: &str = "Установить / обновит
 pub const SETTINGS_CLAUDE_RESTORE: &str = "Повторить восстановление строки статуса";
 pub const SETTINGS_NO_PROFILES: &str = "Пользовательских профилей нет";
 pub const SETTINGS_APPLY_HINT: &str = "Изменения применяются сразу и сохраняются в config.json";
-pub const SETTINGS_HOTKEYS_HINT: &str = "Редактирование клавиш — только в config.json";
+pub const SETTINGS_HOTKEYS_HINT: &str =
+    "Редактирование клавиш — только в config.json: имена и аккорды там пишутся по-английски, через дефис";
 
 // Quotas.
 pub const SETTINGS_QUOTA: &str = "Квоты";
@@ -327,6 +328,69 @@ pub fn workspace_ai(command: &str) -> String {
 // Profile picker.
 pub const PICKER_FILTER: &str = "Фильтр";
 pub const PICKER_EMPTY: &str = "Ничего не найдено";
+
+// Collapsed panes list.
+pub const COLLAPSED_HINT: &str = "Enter — вернуть пейн · Esc — закрыть";
+pub const COLLAPSED_EMPTY: &str = "Нет свёрнутых пейнов. Ctrl+Alt+C прячет пейн от глаз";
+pub const TAB_COLLAPSED: &str = "Свёрнутые панели";
+
+/// The Russian name of a hotkey action, for the settings list. The
+/// action ids stay the config.json spelling; only the shown name is
+/// translated, so the list doubles as a guide to editing config.json.
+pub fn hotkey_label(action: &crate::hotkeys::Action) -> String {
+    use crate::hotkeys::Action as A;
+    match action {
+        A::NewTab => "Новая вкладка".to_owned(),
+        A::NewWindow => "Новое окно".to_owned(),
+        A::CloseTab => "Закрыть вкладку".to_owned(),
+        A::ReopenTab => "Вернуть вкладку".to_owned(),
+        A::RenameTab => "Переименовать вкладку".to_owned(),
+        A::NextTab => "Следующая вкладка".to_owned(),
+        A::PreviousTab => "Предыдущая вкладка".to_owned(),
+        A::MoveTabLeft => "Сдвинуть вкладку влево".to_owned(),
+        A::MoveTabRight => "Сдвинуть вкладку вправо".to_owned(),
+        A::Tab(n) => format!("Вкладка {n}"),
+        A::SplitRight => "Сплит вправо".to_owned(),
+        A::SplitBottom => "Сплит вниз".to_owned(),
+        A::PaneNavLeft => "Пейн: влево".to_owned(),
+        A::PaneNavRight => "Пейн: вправо".to_owned(),
+        A::PaneNavUp => "Пейн: вверх".to_owned(),
+        A::PaneNavDown => "Пейн: вниз".to_owned(),
+        A::PaneNavPrevious => "Пейн: предыдущий".to_owned(),
+        A::PaneNavNext => "Пейн: следующий".to_owned(),
+        A::PaneMaximize => "Развернуть пейн".to_owned(),
+        A::ClosePane => "Закрыть пейн".to_owned(),
+        A::PaneCollapse => "Свернуть пейн".to_owned(),
+        A::PaneRestore => "Вернуть свёрнутый пейн".to_owned(),
+        A::CollapsedList => "Список свёрнутых пейнов".to_owned(),
+        A::Profile(id) => format!("Профиль: {id}"),
+        A::ProfileSelector => "Выбор профиля".to_owned(),
+        A::Settings => "Настройки".to_owned(),
+        A::ToggleFullscreen => "Полный экран".to_owned(),
+        A::ToggleFrameStats => "Время кадра (отладка)".to_owned(),
+        A::CtrlC => "Прерывание (Ctrl+C)".to_owned(),
+        A::Copy => "Копировать".to_owned(),
+        A::Paste => "Вставить".to_owned(),
+        A::SelectAll => "Выделить всё".to_owned(),
+        A::Clear => "Очистить".to_owned(),
+        A::ZoomIn => "Масштаб: увеличить".to_owned(),
+        A::ZoomOut => "Масштаб: уменьшить".to_owned(),
+        A::ResetZoom => "Масштаб: сбросить".to_owned(),
+        A::PreviousWord => "Предыдущее слово".to_owned(),
+        A::NextWord => "Следующее слово".to_owned(),
+        A::DeletePreviousWord => "Удалить предыдущее слово".to_owned(),
+        A::DeleteNextWord => "Удалить следующее слово".to_owned(),
+        A::DeleteLine => "Удалить строку".to_owned(),
+        A::Search => "Поиск".to_owned(),
+        A::ToggleWorkspace => "Панель git".to_owned(),
+        A::ScrollToTop => "Прокрутка: в начало".to_owned(),
+        A::ScrollToBottom => "Прокрутка: в конец".to_owned(),
+        A::ScrollPageUp => "Прокрутка: страница вверх".to_owned(),
+        A::ScrollPageDown => "Прокрутка: страница вниз".to_owned(),
+        A::ScrollUp => "Прокрутка: вверх".to_owned(),
+        A::ScrollDown => "Прокрутка: вниз".to_owned(),
+    }
+}
 
 #[cfg(test)]
 mod tests {

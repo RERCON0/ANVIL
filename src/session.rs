@@ -80,6 +80,16 @@ pub struct CollapsedPane {
     pub neighbor: usize,
     pub dir: Dir,
     pub after: bool,
+    /// The pane's share of the split it left, so a restore
+    /// after a restart gives it back its width. Absent in
+    /// sessions saved before the field existed; a restore
+    /// then splits the neighbour evenly, as it used to.
+    #[serde(default = "even_split")]
+    pub fraction: f32,
+}
+
+fn even_split() -> f32 {
+    0.5
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -281,6 +291,7 @@ mod tests {
                         neighbor: 0,
                         dir: Dir::Row,
                         after: true,
+                        fraction: 0.5,
                     }],
                 },
             ],

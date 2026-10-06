@@ -80,6 +80,8 @@ pub enum Action {
     ClosePane,
     PaneCollapse,
     PaneRestore,
+    /// Open the list of panes hidden by PaneCollapse.
+    CollapsedList,
     /// New tab with the profile of this id.
     Profile(String),
     ProfileSelector,
@@ -133,6 +135,7 @@ const SIMPLE_ACTIONS: &[(&str, Action)] = &[
     ("close-pane", Action::ClosePane),
     ("pane-collapse", Action::PaneCollapse),
     ("pane-restore", Action::PaneRestore),
+    ("collapsed-list", Action::CollapsedList),
     ("profile-selector", Action::ProfileSelector),
     ("settings", Action::Settings),
     ("toggle-fullscreen", Action::ToggleFullscreen),
@@ -200,6 +203,7 @@ impl Action {
             Action::ClosePane => "close-pane",
             Action::PaneCollapse => "pane-collapse",
             Action::PaneRestore => "pane-restore",
+            Action::CollapsedList => "collapsed-list",
             Action::ProfileSelector => "profile-selector",
             Action::Settings => "settings",
             Action::ToggleFullscreen => "toggle-fullscreen",
@@ -314,6 +318,7 @@ pub const DEFAULT_BINDINGS: &[(&str, &[&str])] = &[
     ("close-pane", &["Ctrl-Shift-L"]),
     ("pane-collapse", &["Ctrl-Alt-C"]),
     ("pane-restore", &["Ctrl-Alt-R"]),
+    ("collapsed-list", &["Ctrl-Alt-L"]),
     ("profile:powershell", &["Ctrl-Alt-P"]),
     ("profile-selector", &["Ctrl-Shift-E"]),
     ("settings", &["Ctrl-,"]),
@@ -535,6 +540,19 @@ mod tests {
     const CTRL_ALT: Mods = Mods { ctrl: true, alt: true, shift: false, meta: false };
     const ALT: Mods = Mods { ctrl: false, alt: true, shift: false, meta: false };
 
+    /// The settings list is the only place an action is named for a
+    /// human, so every one of them needs a Russian label. A missing
+    /// one falls back to the id, which is English.
+    #[test]
+    fn every_action_has_a_russian_label() {
+        for (id, _) in DEFAULT_BINDINGS {
+            let action = Action::from_id(id).unwrap();
+            let label = crate::strings::hotkey_label(&action);
+            assert!(!label.is_empty(), "{id} has no label");
+            assert!(label.chars().any(char::is_alphabetic), "{id}: {label}");
+        }
+    }
+
     #[test]
     fn conflicts_are_reported_without_changing_override_priority() {
         let overrides =
@@ -552,6 +570,20 @@ mod tests {
             assert!(Action::from_id(id).is_some(), "{id}");
             for c in *chords {
                 parse_chord(c).unwrap_or_else(|e| panic!("{e}"));
+            }
+        }
+    }
+
+    /// Two chords must never drive two different actions: the first
+    /// binding wins silently and the second one looks broken.
+    #[test]
+    fn no_default_chord_is_bound_twice() {
+        let mut seen: BTreeMap<String, String> = BTreeMap::new();
+        for (id, chords) in DEFAULT_BINDINGS {
+            for chord in *chords {
+                let canonical = format_chord(&parse_chord(chord).unwrap()).to_ascii_lowercase();
+                let previous = seen.insert(canonical, (*id).to_owned());
+                assert_eq!(previous, None, "{id} and {previous:?} share {chord}");
             }
         }
     }

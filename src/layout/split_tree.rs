@@ -50,12 +50,33 @@ pub enum NavDir {
     Down,
 }
 
-/// Where a removed pane was: next to `neighbor` along `dir`, after it or before it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Where a removed pane was: next to `neighbor` along `dir`, after it
+/// or before it, keeping the share of the split the pane occupied.
+/// The share lets a restore give the pane its width back instead of
+/// halving a neighbour that grew to fill the gap.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Anchor {
     pub neighbor: PaneId,
     pub dir: Dir,
     pub after: bool,
+    pub fraction: f32,
+}
+
+/// The narrowest share a restored pane may claim, so a hand-edited
+/// session.json cannot bring back a pane no wider than a divider. The
+/// divider drag enforces a pixel minimum that is wider than this on
+/// any real window.
+const MIN_FRACTION: f32 = 0.02;
+
+/// A fraction a saved session may carry: finite and inside the split.
+/// Anything else (a hand-edited file) falls back to an even split,
+/// which is what a restore used to do anyway.
+fn sane_fraction(fraction: f32) -> f32 {
+    if fraction.is_finite() && (MIN_FRACTION..=1.0 - MIN_FRACTION).contains(&fraction) {
+        fraction
+    } else {
+        0.5
+    }
 }
 
 /// The gap between child `index` and `index + 1` of the split at `path`.
@@ -116,9 +137,20 @@ impl SplitTree {
         count(&self.root)
     }
 
-    /// Puts `new` next to `target` along `dir`, after it (right/below) or before.
+    /// Puts `new` next to `target` along `dir`, after it (right/below) or
+    /// before, sharing the space equally: `new` takes half of what `target`
+    /// had. Used by splits and by dragging a pane to a new place.
     pub fn insert(&mut self, target: PaneId, new: PaneId, dir: Dir, after: bool) -> bool {
         insert_in(&mut self.root, target, new, dir, after)
+    }
+
+    /// Puts `new` back next to `target` along `dir`, after it or before,
+    /// with the share of the split it occupied before it was removed. The
+    /// other children are scaled into the rest of the split, keeping their
+    /// proportions, so a collapse/restore cycle does not stretch the panes
+    /// that stayed on screen.
+    pub fn insert_with_fraction(&mut self, target: PaneId, new: PaneId, dir: Dir, after: bool, fraction: f32) -> bool {
+        insert_fraction_in(&mut self.root, target, new, dir, after, sane_fraction(fraction))
     }
 
     pub fn split_right(&mut self, target: PaneId, new: PaneId) -> bool {
@@ -167,10 +199,11 @@ impl SplitTree {
     }
 
     /// Puts a removed pane back where it was, or right of `fallback` when its
-    /// old neighbour is gone.
+    /// old neighbour is gone. The pane keeps the share of the split it had
+    /// before it was removed.
     pub fn restore(&mut self, id: PaneId, anchor: Anchor, fallback: PaneId) -> bool {
         if self.contains(anchor.neighbor) {
-            self.insert(anchor.neighbor, id, anchor.dir, anchor.after)
+            self.insert_with_fraction(anchor.neighbor, id, anchor.dir, anchor.after, anchor.fraction)
         } else {
             self.split_right(fallback, id)
         }
@@ -337,11 +370,14 @@ fn insert_in(node: &mut Node, target: PaneId, new: PaneId, dir: Dir, after: bool
 fn remove_in(node: &mut Node, id: PaneId) -> Option<Anchor> {
     let Node::Split { dir, children } = node else { return None };
     if let Some(i) = children.iter().position(|(_, c)| matches!(c, Node::Leaf(x) if *x == id)) {
+        // The pane's own share of the split, remembered so a
+        // restore can give it back its width.
+        let fraction = children[i].0;
         children.remove(i);
         let anchor = if i > 0 {
-            Anchor { neighbor: last_leaf(&children[i - 1].1), dir: *dir, after: true }
+            Anchor { neighbor: last_leaf(&children[i - 1].1), dir: *dir, after: true, fraction }
         } else {
-            Anchor { neighbor: first_leaf(&children[0].1), dir: *dir, after: false }
+            Anchor { neighbor: first_leaf(&children[0].1), dir: *dir, after: false, fraction }
         };
         let rest: f32 = children.iter().map(|(f, _)| *f).sum();
         if rest > 0.0 {
@@ -350,6 +386,40 @@ fn remove_in(node: &mut Node, id: PaneId) -> Option<Anchor> {
         return Some(anchor);
     }
     children.iter_mut().find_map(|(_, c)| remove_in(c, id))
+}
+
+/// Like `insert_in`, but the new pane takes `fraction` of the
+/// split and every other child is scaled into `1 - fraction`,
+/// keeping its proportion of the rest.
+fn insert_fraction_in(node: &mut Node, target: PaneId, new: PaneId, dir: Dir, after: bool, fraction: f32) -> bool {
+    match node {
+        Node::Leaf(id) if *id == target => {
+            let (old, fresh) = (Node::Leaf(target), Node::Leaf(new));
+            let rest = 1.0 - fraction;
+            let children =
+                if after { vec![(rest, old), (fraction, fresh)] } else { vec![(fraction, fresh), (rest, old)] };
+            *node = Node::Split { dir, children };
+            true
+        }
+        Node::Leaf(_) => false,
+        Node::Split { dir: d, children } => {
+            if *d == dir {
+                if let Some(i) = children.iter().position(|(_, c)| matches!(c, Node::Leaf(id) if *id == target)) {
+                    // The pane returns with its old share; the panes that
+                    // grew to fill the gap are scaled back down.
+                    let rest = 1.0 - fraction;
+                    let total: f32 = children.iter().map(|(f, _)| *f).sum();
+                    let scale = if total > 0.0 { rest / total } else { 0.0 };
+                    for (f, _) in children.iter_mut() {
+                        *f *= scale;
+                    }
+                    children.insert(if after { i + 1 } else { i }, (fraction, Node::Leaf(new)));
+                    return true;
+                }
+            }
+            children.iter_mut().any(|(_, c)| insert_fraction_in(c, target, new, dir, after, fraction))
+        }
+    }
 }
 
 fn collapse(node: &mut Node) {
@@ -622,9 +692,9 @@ mod tests {
         let mut t = SplitTree::new(1);
         t.split_right(1, 2);
         t.split_down(2, 3);
-        assert_eq!(t.remove(3), Some(Anchor { neighbor: 2, dir: Dir::Column, after: true }));
+        assert_eq!(t.remove(3), Some(Anchor { neighbor: 2, dir: Dir::Column, after: true, fraction: 0.5 }));
         assert_eq!(t.root(), &row(vec![(0.5, leaf(1)), (0.5, leaf(2))]));
-        assert_eq!(t.remove(1), Some(Anchor { neighbor: 2, dir: Dir::Row, after: false }));
+        assert_eq!(t.remove(1), Some(Anchor { neighbor: 2, dir: Dir::Row, after: false, fraction: 0.5 }));
         assert_eq!(t.root(), &leaf(2));
         assert_eq!(t.remove(2), None, "last pane stays");
         assert_eq!(t.remove(42), None);
@@ -641,14 +711,72 @@ mod tests {
     fn restore_returns_pane_to_its_place_or_falls_back() {
         let mut t = SplitTree::from_root(row(vec![(0.4, leaf(1)), (0.3, leaf(2)), (0.3, leaf(3))]));
         let anchor = t.remove(2).unwrap();
+        assert_eq!(anchor.fraction, 0.3);
         assert!(t.restore(2, anchor, 1));
         assert_eq!(t.panes(), vec![1, 2, 3]);
+        // The pane comes back with its own share, not half of a
+        // neighbour: the layout is exactly what it was.
+        assert_eq!(t.root(), &row(vec![(0.4, leaf(1)), (0.3, leaf(2)), (0.3, leaf(3))]));
 
         let anchor = t.remove(1).unwrap();
         assert_eq!(anchor.neighbor, 2);
         t.remove(2);
         assert!(t.restore(1, anchor, 3));
         assert_eq!(t.panes(), vec![3, 1], "neighbour gone: right of fallback");
+    }
+
+    /// A collapse/restore cycle must not stretch the panes that
+    /// stayed on screen: the restore used to halve one neighbour
+    /// and let the rest grow on every cycle, until the leftmost
+    /// panes were unreadable.
+    #[test]
+    fn collapse_restore_cycle_keeps_every_fraction() {
+        let original = row(vec![(0.5, leaf(1)), (0.25, leaf(2)), (0.25, leaf(3))]);
+        for collapsed in [1, 2, 3] {
+            let mut t = SplitTree::from_root(original.clone());
+            for _ in 0..5 {
+                let anchor = t.remove(collapsed).unwrap();
+                assert!(t.restore(collapsed, anchor, 1));
+                assert_eq!(t.root(), &original, "pane {collapsed} changed the layout");
+                assert_relocation_invariants(&t, &[1, 2, 3]);
+            }
+        }
+    }
+
+    /// A pane collapsed from a two-pane split comes back as an
+    /// even split, with its remembered share intact.
+    #[test]
+    fn restore_after_the_split_collapsed_to_one_child() {
+        let mut t = SplitTree::from_root(row(vec![(0.5, leaf(1)), (0.5, leaf(2))]));
+        let anchor = t.remove(1).unwrap();
+        assert_eq!(t.root(), &leaf(2));
+        assert!(t.restore(1, anchor, 2));
+        assert_eq!(t.root(), &row(vec![(0.5, leaf(1)), (0.5, leaf(2))]));
+    }
+
+    /// A nested pane comes back inside its own split, not as a
+    /// sibling of the whole column.
+    #[test]
+    fn restore_returns_a_nested_pane_to_its_split() {
+        let original = row(vec![(0.4, leaf(1)), (0.6, col(vec![(0.25, leaf(2)), (0.75, leaf(3))]))]);
+        let mut t = SplitTree::from_root(original.clone());
+        let anchor = t.remove(2).unwrap();
+        assert_eq!(anchor.fraction, 0.25);
+        assert!(t.restore(2, anchor, 1));
+        assert_eq!(t.root(), &original);
+    }
+
+    /// A fraction a hand-edited session.json cannot use: not
+    /// finite, or outside the split.
+    #[test]
+    fn a_bogus_fraction_falls_back_to_an_even_split() {
+        for bogus in [f32::NAN, f32::INFINITY, -1.0, 0.0, 1.0, 2.0, f32::MIN] {
+            let mut t = SplitTree::from_root(row(vec![(0.4, leaf(1)), (0.6, leaf(2))]));
+            let mut anchor = t.remove(1).unwrap();
+            anchor.fraction = bogus;
+            assert!(t.restore(1, anchor, 2), "{bogus} must still restore");
+            assert_eq!(t.root(), &row(vec![(0.5, leaf(1)), (0.5, leaf(2))]), "bogus fraction {bogus}");
+        }
     }
 
     #[test]

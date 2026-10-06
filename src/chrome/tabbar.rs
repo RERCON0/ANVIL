@@ -94,6 +94,7 @@ pub enum TabbarAction {
     Move(usize, usize),
     NewTab,
     Profiles,
+    CollapsedList,
     Settings,
 }
 
@@ -104,6 +105,7 @@ pub fn show(
     tabs: &[TabInfo],
     settings_open: bool,
     badge_fields: &ClaudeBadgeFields,
+    collapsed: usize,
 ) -> Vec<TabbarAction> {
     let mut actions = Vec::new();
     let painter = ui.painter_at(rect);
@@ -173,6 +175,26 @@ pub fn show(
     painter.text(profile_rect.center(), Align2::CENTER_CENTER, "»", theme::font(14.0), profile_color);
     if profile.on_hover_text(strings::TAB_PROFILES).clicked() {
         actions.push(TabbarAction::Profiles);
+    }
+
+    // The list of panes hidden by Ctrl+Alt+C. The glyph is
+    // drawn with strokes: the icon font has no symbol for
+    // "hidden panes", and a text label would not fit.
+    let collapsed_rect = Rect::from_min_size(Pos2::new(rect.min.x + 80.0, y + 8.0), Vec2::new(28.0, 24.0));
+    let collapsed_button = ui.interact(collapsed_rect, ui.id().with("tab-collapsed"), Sense::click());
+    let collapsed_color = if collapsed_button.hovered() { theme::colors().icon_hover } else { theme::colors().icon };
+    let center = collapsed_rect.center();
+    let stroke = Stroke::new(1.5, collapsed_color);
+    for dy in [-4.0, 0.0, 4.0] {
+        painter
+            .line_segment([Pos2::new(center.x - 5.0, center.y + dy), Pos2::new(center.x + 5.0, center.y + dy)], stroke);
+    }
+    if collapsed > 0 {
+        let count = painter.layout_no_wrap(collapsed.to_string(), theme::font(11.0), collapsed_color);
+        painter.galley(Pos2::new(collapsed_rect.max.x + 4.0, center.y - count.size().y / 2.0), count, collapsed_color);
+    }
+    if collapsed_button.on_hover_text(strings::TAB_COLLAPSED).clicked() {
+        actions.push(TabbarAction::CollapsedList);
     }
 
     let settings_rect =
@@ -469,7 +491,7 @@ mod tests {
     ) -> (egui::FullOutput, Vec<TabbarAction>) {
         let mut actions = Vec::new();
         let output = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), events, ..Default::default() }, |ui| {
-            actions = show(ui, rect, state, tabs, false, &Default::default());
+            actions = show(ui, rect, state, tabs, false, &Default::default(), 0);
         });
         (output, actions)
     }
@@ -699,7 +721,7 @@ mod tests {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(180.0, 120.0));
         let mut actions = Vec::new();
         let _ = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
-            actions = show(ui, rect, &mut state, &many, false, &Default::default());
+            actions = show(ui, rect, &mut state, &many, false, &Default::default(), 0);
         });
         assert!(actions.is_empty(), "painting alone reports no actions");
         // Every row is laid out inside the scrolled content, not clipped away.
@@ -722,7 +744,7 @@ mod tests {
             let mut state = TabbarState::default();
             let mut actions = Vec::new();
             let output = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
-                actions = show(ui, rect, &mut state, std::slice::from_ref(&tab), false, &Default::default());
+                actions = show(ui, rect, &mut state, std::slice::from_ref(&tab), false, &Default::default(), 0);
             });
             assert!(actions.is_empty());
             output

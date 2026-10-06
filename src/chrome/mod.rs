@@ -1,3 +1,4 @@
+pub mod collapsed_list;
 pub mod dialogs;
 pub mod edges;
 pub mod profile_picker;

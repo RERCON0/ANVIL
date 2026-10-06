@@ -527,8 +527,11 @@ fn section_hotkeys(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut Se
     ui.label(RichText::new(strings::SETTINGS_HOTKEYS_HINT).color(theme::colors().faint).font(theme::font(11.5)));
     ui.add_space(2.0);
     for (action, chords) in cx.keymap_rows {
+        let label = crate::hotkeys::Action::from_id(action)
+            .map(|action| strings::hotkey_label(&action))
+            .unwrap_or_else(|| action.clone());
         ui.horizontal(|ui| {
-            ui.label(RichText::new(action).color(theme::colors().dim).font(theme::font(12.0)));
+            ui.label(RichText::new(label).color(theme::colors().dim).font(theme::font(12.0)));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(RichText::new(chords.join(", ")).color(theme::colors().text).font(theme::field_font(12.0)));
             });
