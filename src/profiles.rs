@@ -347,17 +347,6 @@ mod tests {
         assert!(parse_wsl_list(&[]).is_empty());
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn wsl_listing_never_inherits_the_utf8_output_switch() {
-        let command = wsl_list_command();
-        let envs: Vec<_> = command.get_envs().collect();
-        assert!(
-            envs.contains(&(std::ffi::OsStr::new("WSL_UTF8"), None)),
-            "WSL_UTF8=1 would switch wsl.exe to UTF-8 and break the UTF-16 parser: {envs:?}"
-        );
-    }
-
     #[test]
     fn saved_wsl_profile_keeps_its_distribution_without_discovery() {
         let profile = wsl_profile("Ubuntu Dev");

@@ -52,8 +52,9 @@ def check_no_build_paths(data, name):
         if len(path.parts) < 2:  # a drive or filesystem root would match every path
             continue
         for text in {str(path), path.as_posix()}:
-            if text.encode().lower() in haystack:
-                raise ValueError(f"Builder directory {text} is embedded in {name}")
+            for encoding in ("utf-8", "utf-16le"):
+                if text.encode(encoding).lower() in haystack:
+                    raise ValueError(f"Builder directory {text} is embedded in {name}")
 
 
 def tree_is_clean(root=ROOT):

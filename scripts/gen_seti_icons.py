@@ -13,9 +13,9 @@
 # The outputs are committed, so a normal build never needs this script.
 # Edit the hand-written part of src/file_icons.rs in RUST_TAIL below, not in the
 # generated file. test_gen_seti_icons.py compares a fresh generation with the
-# committed fonts/seti.ttf and src/file_icons.rs, but it needs fontTools and CI
-# does not install it: the test is skipped there, so run it locally after any
-# change to this script, vendor/seti/ or src/file_icons.rs.
+# committed fonts/seti.ttf, but it needs fontTools and CI does not install it:
+# the test is skipped there, so run it locally after any change to this script
+# or vendor/seti/. The Rust tail is covered by the ordinary `cargo test`.
 
 import re
 import shutil
@@ -32,8 +32,8 @@ CONST_ICON = re.compile(r'export const (SETI_[A-Z_]+): SetiIcon = \{\s*char:\s*"
 
 
 # Hand-written part of src/file_icons.rs (everything after the generated tables).
-# Keep it identical to the committed file (checked by scripts/test_gen_seti_icons.py,
-# which runs locally with fontTools and is skipped in CI).
+# It is written verbatim into the file; edit it here, and run `cargo test` for
+# the icon-lookup tests that cover it.
 RUST_TAIL = r'''/// Both tables are sorted by their lower-case key, so comparing byte by byte
 /// with ASCII case folded keeps them ordered — and lets `for_file` skip
 /// building a lower-cased copy of every name it is asked about.
@@ -91,7 +91,6 @@ mod tests {
         assert_eq!(for_file("src/WORKSPACE.RS"), for_file("src/workspace.rs"));
         assert_eq!(for_file("SRC/App.Rs"), for_file("src/app.rs"));
         assert_eq!(for_file("dockerfile"), for_file("Dockerfile"));
-        assert_eq!(for_file(".gitignore"), for_file(".gitignore"));
         assert_eq!(for_file("Makefile"), for_file("makefile"));
         assert_eq!(for_file("README.MD"), for_file("readme.md"));
         assert_eq!(for_file("no-extension-here"), DEFAULT_FILE);

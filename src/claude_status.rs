@@ -42,8 +42,15 @@ const MAX_TEXT_CHARS: usize = 256;
 /// printed into the terminal, so it must not bring escape sequences of its own.
 /// The length cap keeps the status file below the size the reader accepts.
 fn label(text: &str) -> Option<String> {
-    let text: String = text.chars().filter(|ch| !ch.is_control()).take(MAX_TEXT_CHARS).collect();
+    let text: String = text.chars().filter(|ch| printable(*ch)).take(MAX_TEXT_CHARS).collect();
     (!text.is_empty()).then_some(text)
+}
+
+/// Same formatting-control boundary as the repository labels in the UI:
+/// invisible direction overrides must not spoof a model, agent or branch.
+fn printable(ch: char) -> bool {
+    !ch.is_control()
+        && !matches!(ch, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
 }
 
 /// The longest working directory kept. A path cut short names another
@@ -51,11 +58,12 @@ fn label(text: &str) -> Option<String> {
 /// the cap also keeps the status record below the size the reader accepts.
 const MAX_PATH_CHARS: usize = 8192;
 
-/// A working directory as a printable string: control characters removed, never
-/// truncated.
+/// A working directory is a lookup target, not just a label. Reject controls
+/// and excessive length without deleting or truncating bytes: rewriting the
+/// path could inspect a different repository.
 fn path_label(text: &str) -> Option<String> {
-    let text: String = text.chars().filter(|ch| !ch.is_control()).collect();
-    (!text.is_empty() && text.chars().count() <= MAX_PATH_CHARS).then_some(text)
+    (!text.is_empty() && !text.chars().any(char::is_control) && text.chars().count() <= MAX_PATH_CHARS)
+        .then(|| text.to_owned())
 }
 
 impl Payload {
@@ -141,9 +149,11 @@ pub fn format_line_with(p: &Payload, branch: Option<&str>, now_ms: i64, fields: 
         parts.push(format!("{CYAN}[{model}]{RESET}"));
     }
     if let Some(dir) = p.dir.as_ref().filter(|_| fields.dir) {
-        parts.push(basename(dir).to_owned());
+        if let Some(dir) = label(basename(dir)) {
+            parts.push(dir);
+        }
     }
-    if let Some(branch) = branch.filter(|b| !b.is_empty() && fields.branch) {
+    if let Some(branch) = branch.filter(|_| fields.branch).and_then(label) {
         let color = if branch == "main" || branch == "master" { RED } else { GREEN };
         parts.push(format!("{color}{branch}{RESET}"));
     }
@@ -310,7 +320,7 @@ mod tests {
             Payload::parse(&serde_json::json!({"workspace": {"current_dir": dir}}).to_string()).unwrap().dir
         };
         assert_eq!(parse(&long), Some(long.clone()));
-        assert_eq!(parse("C:/pro\u{1b}j"), Some("C:/proj".to_owned()));
+        assert_eq!(parse("C:/pro\u{1b}j"), None, "a lookup target must not become a different path");
         assert_eq!(parse(&"d".repeat(MAX_PATH_CHARS + 1)), None);
     }
 
@@ -330,7 +340,7 @@ mod tests {
         assert!(model.starts_with("Opus]52;c;AAAA2Jxxx"), "{model}");
         assert_eq!(model.chars().count(), 256);
         assert_eq!(payload.agent.as_deref(), Some("[2J"));
-        assert_eq!(payload.dir.as_deref(), Some("C:/x/proj"));
+        assert_eq!(payload.dir, None, "a path containing controls is rejected whole");
         // Only ANVIL's own colour sequences remain in the printed line.
         let printed = format_line(&payload, None, 0);
         assert_eq!(printed.matches('\u{1b}').count(), printed.matches("\u{1b}[").count(), "{printed:?}");
@@ -340,6 +350,26 @@ mod tests {
         let record = StatusRecord::new(&payload, None, 1);
         record.write(dir.path(), "3").unwrap();
         assert_eq!(StatusRecord::read(&StatusRecord::file_path(dir.path(), "3")), Some(record));
+    }
+
+    #[test]
+    fn status_labels_cannot_override_text_direction() {
+        let dir = "C:/project\u{202e}gpj.exe";
+        let payload = Payload::parse(
+            &serde_json::json!({
+                "model": {"display_name": "Opus\u{202e}spoof"},
+                "agent": {"name": "agent\u{2066}spoof"},
+                "cwd": dir,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(payload.dir.as_deref(), Some(dir), "the actual lookup path stays exact");
+        let printed = format_line(&payload, Some("branch\u{202e}spoof"), 0);
+        assert!(!printed.contains('\u{202e}') && !printed.contains('\u{2066}'), "{printed:?}");
+        assert!(printed.contains("projectgpj.exe") && printed.contains("branchspoof"), "{printed:?}");
+        let record = StatusRecord::new(&payload, Some("branch\u{202e}spoof"), 0);
+        assert_eq!(record.branch.as_deref(), Some("branchspoof"));
     }
 
     #[test]

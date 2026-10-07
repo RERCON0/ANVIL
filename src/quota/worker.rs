@@ -16,20 +16,13 @@ use super::sqlite::Sqlite;
 use super::time::now_unix;
 use super::{credman, providers, Shared};
 
-/// Seconds between cycles.
-pub const INTERVAL: i64 = 300;
+/// Seconds between cycles: every enabled provider is polled this often, so a
+/// limit that melts during a session shows up within half a minute.
+pub const INTERVAL: i64 = 30;
 /// A manual refresh is honoured at most this often.
 pub const MANUAL_GAP: i64 = 30;
 /// An observing window retries the lock this often.
 const LEAD_RETRY: i64 = 30;
-/// After a network failure (often: just woke from sleep, network not up yet)
-/// the next cycle comes this soon instead of a full interval later.
-pub const QUICK_RETRY: i64 = 60;
-/// Quick retries in a row before the normal interval takes over, each one
-/// twice as late as the one before. A cycle polls every provider, so a failure
-/// that does not go away (one blocked host, a login store that stays
-/// unreadable) must not turn into a request per minute for all of them.
-const QUICK_RETRIES: u32 = 3;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Memory {
@@ -51,13 +44,6 @@ pub struct Engine {
     /// A refresh was asked for and no cycle has served it yet; one asked
     /// inside the gap waits for it to pass instead of being dropped.
     manual_pending: bool,
-    retry_at: Option<i64>,
-    /// Cycles in a row that ended with a failure worth a quick retry.
-    #[serde(default)]
-    quick_retries: u32,
-    /// The running cycle met such a failure.
-    #[serde(skip)]
-    transient: bool,
     /// The snapshot built so far, so a panic part-way through a cycle still
     /// leaves the providers that answered on screen.
     #[serde(skip)]
@@ -73,7 +59,6 @@ impl Engine {
         let now = now_unix();
         engine.last_cycle = engine.last_cycle.map(|at| at.clamp(0, now));
         engine.last_manual = engine.last_manual.map(|at| at.clamp(0, now));
-        engine.retry_at = engine.retry_at.map(|at| at.clamp(0, now + INTERVAL));
         for memory in engine.memory.values_mut() {
             memory.paused_until = memory.paused_until.clamp(0, now + super::model::MAX_PAUSE);
         }
@@ -91,23 +76,10 @@ impl Engine {
 
     fn begin_cycle(&mut self, now: i64) {
         self.last_cycle = Some(now);
-        self.retry_at = None;
-        self.transient = false;
         if self.manual_pending {
             self.manual_pending = false;
             self.last_manual = Some(now);
         }
-    }
-
-    /// Plans the quick retry the finished cycle asked for, or starts the
-    /// sequence over after a clean one.
-    fn plan_quick_retry(&mut self, now: i64) {
-        if !std::mem::take(&mut self.transient) {
-            self.quick_retries = 0;
-            return;
-        }
-        self.retry_at = (self.quick_retries < QUICK_RETRIES).then(|| now + (QUICK_RETRY << self.quick_retries));
-        self.quick_retries = self.quick_retries.saturating_add(1);
     }
 
     fn manual_deadline(&self) -> i64 {
@@ -142,9 +114,6 @@ impl Engine {
         if self.manual_pending && self.last_manual.is_none_or(|at| now - at >= MANUAL_GAP) {
             return true;
         }
-        if self.retry_at.is_some_and(|at| now >= at) {
-            return true;
-        }
         match self.last_cycle {
             Some(at) => now - at >= INTERVAL,
             None => snapshot_age.is_none_or(|age| age >= INTERVAL),
@@ -169,7 +138,6 @@ impl Engine {
                 }
             }
         }
-        self.plan_quick_retry(now);
         self.partial.take().unwrap_or_default()
     }
 
@@ -218,7 +186,6 @@ impl Engine {
                     None
                 }
                 Detection::Unreadable => {
-                    self.transient |= enabled;
                     let state = if memory.paused_until > now {
                         ProviderState::RateLimited { retry_at: memory.paused_until }
                     } else {
@@ -261,7 +228,6 @@ impl Engine {
                                 })
                             }
                             Err(error) => {
-                                self.transient |= matches!(error, FetchError::Network(_));
                                 // A provider's own error text is written to disk
                                 // and drawn in the GUI: a compromised or echoing
                                 // endpoint must not get the key onto either.
@@ -363,7 +329,7 @@ pub(super) fn run(shared: Arc<Shared>, paths: Paths, user_agent: String) {
                         }
                         Err(_) => {
                             // A panic must not cost every provider its snapshot
-                            // and a five-minute wait: serve what did complete.
+                            // and a whole interval: serve what did complete.
                             log::error!("quota: a cycle panicked; the worker continues");
                             if let Some(partial) = engine.take_partial() {
                                 if let Err(e) = cache::write(&paths.snapshot, &partial) {
@@ -405,6 +371,81 @@ mod tests {
         })
     }
 
+    /// Every enabled provider is polled on every cycle: the cadence belongs to
+    /// the schedule, not to a chosen subset of providers.
+    #[test]
+    fn every_detected_provider_is_polled_on_every_cycle() {
+        let mut engine = Engine::default();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let detect = |id| {
+            if matches!(id, ProviderId::Claude | ProviderId::Zai) {
+                login(1)
+            } else {
+                Detection::Missing
+            }
+        };
+        let fetch = |id, _: &Credential| {
+            calls.borrow_mut().push(id);
+            ok()
+        };
+        let first = engine.cycle(1_000, &Prefs::new(), &Snapshot::default(), detect, fetch);
+        assert_eq!(*calls.borrow(), [ProviderId::Claude, ProviderId::Zai]);
+        calls.borrow_mut().clear();
+        assert!(!engine.due(1_000 + INTERVAL - 1, Some(INTERVAL - 1), false));
+        assert!(engine.due(1_000 + INTERVAL, Some(INTERVAL), false), "half a minute is the whole interval");
+        let next = engine.cycle(1_000 + INTERVAL, &Prefs::new(), &first, detect, fetch);
+        assert_eq!(*calls.borrow(), [ProviderId::Claude, ProviderId::Zai], "a cycle refetches every provider");
+        for id in [ProviderId::Claude, ProviderId::Zai] {
+            assert_eq!(next.get(id).unwrap().fetched_at, Some(1_000 + INTERVAL));
+        }
+    }
+
+    /// A 429 pauses one provider without slowing the rest: the others keep
+    /// their half-minute cadence, and the paused one keeps its last windows
+    /// until `Retry-After` has passed.
+    #[test]
+    fn a_rate_limit_pauses_one_provider_without_slowing_the_rest() {
+        let mut engine = Engine::default();
+        let calls = std::cell::RefCell::new(Vec::new());
+        let detect = |id| {
+            if matches!(id, ProviderId::Claude | ProviderId::ChatGpt | ProviderId::Kimi) {
+                login(1)
+            } else {
+                Detection::Missing
+            }
+        };
+        let first = engine.cycle(1_000, &Prefs::new(), &Snapshot::default(), detect, |id, _| {
+            calls.borrow_mut().push(id);
+            ok()
+        });
+        assert_eq!(*calls.borrow(), [ProviderId::Claude, ProviderId::ChatGpt, ProviderId::Kimi]);
+        calls.borrow_mut().clear();
+        let limited = engine.cycle(1_030, &Prefs::new(), &first, detect, |id, _| {
+            calls.borrow_mut().push(id);
+            if id == ProviderId::Claude {
+                Err(FetchError::Status { code: 429, retry_after: Some(120) })
+            } else {
+                ok()
+            }
+        });
+        let claude = limited.get(ProviderId::Claude).unwrap();
+        assert_eq!((&claude.state, claude.fetched_at), (&ProviderState::RateLimited { retry_at: 1_150 }, Some(1_000)));
+        calls.borrow_mut().clear();
+        let next = engine.cycle(1_060, &Prefs::new(), &limited, detect, |id, _| {
+            calls.borrow_mut().push(id);
+            ok()
+        });
+        assert_eq!(*calls.borrow(), [ProviderId::ChatGpt, ProviderId::Kimi], "Retry-After holds the paused provider");
+        assert_eq!(next.get(ProviderId::Claude).unwrap().fetched_at, Some(1_000));
+        calls.borrow_mut().clear();
+        let recovered = engine.cycle(1_150, &Prefs::new(), &next, detect, |id, _| {
+            calls.borrow_mut().push(id);
+            ok()
+        });
+        assert_eq!(*calls.borrow(), [ProviderId::Claude, ProviderId::ChatGpt, ProviderId::Kimi], "the pause is over");
+        assert_eq!(recovered.get(ProviderId::Claude).unwrap().fetched_at, Some(1_150));
+    }
+
     #[test]
     fn corrupt_schedule_timestamps_cannot_overflow_or_postpone_cycles_forever() {
         let dir = tempfile::tempdir().unwrap();
@@ -412,7 +453,6 @@ mod tests {
         let engine = Engine {
             last_cycle: Some(i64::MIN),
             last_manual: Some(i64::MAX),
-            retry_at: Some(i64::MAX),
             memory: HashMap::from([(ProviderId::Zai, Memory { paused_until: i64::MAX, ..Default::default() })]),
             ..Default::default()
         };
@@ -468,54 +508,37 @@ mod tests {
         let mut engine = Engine::default();
         assert!(engine.due(1_000, None, false), "no data at all");
         let mut engine = Engine::default();
-        assert!(!engine.due(1_000, Some(60), false), "another window fetched a minute ago");
+        assert!(!engine.due(1_000, Some(INTERVAL - 1), false), "another window fetched moments ago");
         assert!(engine.due(1_000, Some(INTERVAL), false));
         engine.cycle(1_000, &Prefs::new(), &Snapshot::default(), |_| Detection::Missing, |_, _| ok());
         assert!(!engine.due(1_000 + INTERVAL - 1, None, false));
         assert!(engine.due(1_000 + INTERVAL, None, false));
     }
 
+    /// A failed provider is simply asked again on the next cycle: the interval
+    /// is the only cadence, and a failure neither delays the cycle nor turns
+    /// into a request storm faster than it.
     #[test]
-    fn a_network_failure_brings_the_next_cycle_closer() {
+    fn a_failed_provider_is_retried_on_the_next_cycle() {
         let mut engine = Engine::default();
-        let down = |_: ProviderId, _: &Credential| Err(FetchError::Network("no route".into()));
-        engine.cycle(1_000, &Prefs::new(), &Snapshot::default(), only(ProviderId::Zai, || login(1)), down);
-        assert!(!engine.due(1_000 + QUICK_RETRY - 1, None, false));
-        assert!(engine.due(1_000 + QUICK_RETRY, None, false));
-        engine.cycle(
-            1_000 + QUICK_RETRY,
-            &Prefs::new(),
-            &Snapshot::default(),
-            only(ProviderId::Zai, || login(1)),
-            |_, _| ok(),
+        let calls = Cell::new(0);
+        let down = |_: ProviderId, _: &Credential| {
+            calls.set(calls.get() + 1);
+            Err(FetchError::Network("no route".into()))
+        };
+        let failed = engine.cycle(1_000, &Prefs::new(), &Snapshot::default(), only(ProviderId::Zai, || login(1)), down);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            failed.get(ProviderId::Zai).unwrap().state,
+            ProviderState::UpdateFailed { reason: "no route".into() }
         );
-        assert!(!engine.due(1_000 + 2 * QUICK_RETRY, None, false), "back to the normal interval");
-    }
-
-    /// A failure that does not go away must not keep the whole cycle (every
-    /// provider's request) at one per minute: the quick retries back off, give
-    /// up in favour of the interval, and start over after a clean cycle.
-    #[test]
-    fn a_failure_that_persists_backs_the_quick_retries_off_and_then_stops() {
-        let mut engine = Engine::default();
-        let down = |_: ProviderId, _: &Credential| Err(FetchError::Network("blocked".into()));
-        let detect = only(ProviderId::Zai, || login(1));
-        let mut at = 1_000;
-        for gap in [QUICK_RETRY, 2 * QUICK_RETRY, 4 * QUICK_RETRY] {
-            engine.cycle(at, &Prefs::new(), &Snapshot::default(), &detect, down);
-            assert!(!engine.due(at + gap - 1, None, false), "gap {gap}");
-            assert!(engine.due(at + gap, None, false), "gap {gap}");
-            at += gap;
-        }
-        engine.cycle(at, &Prefs::new(), &Snapshot::default(), &detect, down);
-        assert!(!engine.due(at + 4 * QUICK_RETRY, None, false), "no quick retry is left");
-        assert!(!engine.due(at + INTERVAL - 1, None, false));
-        assert!(engine.due(at + INTERVAL, None, false), "the normal interval still applies");
-        at += INTERVAL;
-        engine.cycle(at, &Prefs::new(), &Snapshot::default(), &detect, |_, _| ok());
-        at += INTERVAL;
-        engine.cycle(at, &Prefs::new(), &Snapshot::default(), &detect, down);
-        assert!(engine.due(at + QUICK_RETRY, None, false), "a clean cycle starts the sequence over");
+        assert!(!engine.due(1_000 + INTERVAL - 1, None, false));
+        assert!(engine.due(1_000 + INTERVAL, None, false));
+        engine.cycle(1_000 + INTERVAL, &Prefs::new(), &failed, only(ProviderId::Zai, || login(1)), |_, _| {
+            calls.set(calls.get() + 1);
+            ok()
+        });
+        assert_eq!(calls.get(), 2, "the provider is asked again on the next cycle");
     }
 
     fn run(engine: &mut Engine, now: i64) {
@@ -533,7 +556,7 @@ mod tests {
     }
 
     /// Two keys saved back to back ask for two refreshes: the second must wait
-    /// out the gap and then run, not vanish until the next 5-minute cycle.
+    /// out the gap and then run, not vanish until the next cycle.
     #[test]
     fn a_refresh_asked_inside_the_gap_runs_once_the_gap_has_passed() {
         let mut engine = Engine::default();
@@ -691,8 +714,8 @@ mod tests {
             (&p.state, p.fetched_at, &p.windows),
             (&ProviderState::StoreUnreadable, Some(1), &first.providers[0].windows)
         );
-        assert!(!engine.due(2 + QUICK_RETRY - 1, None, false));
-        assert!(engine.due(2 + QUICK_RETRY, None, false));
+        assert!(!engine.due(2 + INTERVAL - 1, None, false));
+        assert!(engine.due(2 + INTERVAL, None, false));
         let limited = engine.cycle(100, &Prefs::new(), &second, only(ProviderId::Zai, || login(1)), |_, _| {
             Err(FetchError::Status { code: 429, retry_after: Some(120) })
         });
@@ -721,15 +744,5 @@ mod tests {
         assert_eq!(engine.manual_wait(300), MANUAL_GAP);
         assert_eq!(engine.manual_wait(320), 10);
         assert_eq!(engine.manual_wait(340), 0);
-    }
-
-    #[test]
-    fn a_disabled_provider_with_an_unreadable_store_does_not_speed_up_network_polling() {
-        let mut engine = Engine::default();
-        let prefs = Prefs::from([(ProviderId::Zai, Some(false))]);
-        engine.cycle(1, &prefs, &Snapshot::default(), only(ProviderId::Zai, || Detection::Unreadable), |_, _| {
-            panic!("disabled provider cannot be requested")
-        });
-        assert!(!engine.due(1 + QUICK_RETRY, None, false));
     }
 }

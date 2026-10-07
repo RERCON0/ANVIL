@@ -345,8 +345,8 @@ impl ConfigSource {
 
 /// Whether every file in `sources` still looks as it did. The sources of one
 /// repository share long prefixes (every loose-object directory sits under the
-/// same `.git/objects`), so one `Walk` lets each path component be inspected
-/// once per sweep instead of once per source.
+/// same `.git/objects`), so a bounded `Walk` avoids repeated prefix inspection
+/// while there is room in its cache.
 fn all_current(sources: &[ConfigSource]) -> bool {
     let mut walk = Walk::default();
     sources.iter().all(|source| source.is_current(&mut walk))
@@ -794,11 +794,25 @@ enum Entry {
 
 /// Prefix lookups of one pass over many paths (a freshness sweep, a scan).
 /// Never kept between passes: a later pass must see the filesystem as it is.
-#[derive(Default)]
-struct Walk(HashMap<PathBuf, Entry>);
+/// Missing paths can have thousands of components, whose full prefixes would
+/// occupy quadratic space. Cache only a bounded amount; inspect the remainder
+/// normally instead of refusing an otherwise valid path.
+const MAX_WALK_CACHE_BYTES: usize = 4 * 1024 * 1024;
+
+struct Walk {
+    entries: HashMap<PathBuf, Entry>,
+    remaining_bytes: usize,
+}
+
+impl Default for Walk {
+    fn default() -> Self {
+        Self { entries: HashMap::new(), remaining_bytes: MAX_WALK_CACHE_BYTES }
+    }
+}
 
 fn local_path(path: &Path) -> Result<PathBuf, String> {
-    local_path_in(path, &mut Walk::default())
+    // A one-shot lookup has no other source paths to share its prefixes with.
+    local_path_in(path, &mut Walk { remaining_bytes: 0, ..Walk::default() })
 }
 
 /// Resolve one component at a time. read_link reads the LOCAL reparse entry,
@@ -834,7 +848,7 @@ fn local_path_in(path: &Path, walk: &mut Walk) -> Result<PathBuf, String> {
                 }
                 _ => probe.push(component.as_os_str()),
             }
-            let entry = match walk.0.get(&probe) {
+            let entry = match walk.entries.get(&probe) {
                 Some(entry) => entry.clone(),
                 None => {
                     let entry = match std::fs::symlink_metadata(&probe) {
@@ -860,7 +874,19 @@ fn local_path_in(path: &Path, walk: &mut Walk) -> Result<PathBuf, String> {
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Entry::Absent,
                         Err(error) => return Err(error.to_string()),
                     };
-                    walk.0.insert(probe.clone(), entry.clone());
+                    let target_bytes = match &entry {
+                        Entry::Link(target) => target.as_os_str().len(),
+                        _ => 0,
+                    };
+                    let cache_bytes = probe
+                        .as_os_str()
+                        .len()
+                        .saturating_add(target_bytes)
+                        .saturating_add(std::mem::size_of::<(PathBuf, Entry)>());
+                    if cache_bytes <= walk.remaining_bytes {
+                        walk.entries.insert(probe.clone(), entry.clone());
+                        walk.remaining_bytes -= cache_bytes;
+                    }
                     entry
                 }
             };
@@ -3798,6 +3824,37 @@ index 111..222 100644\n\
         // Removes the junction itself, never what it points at.
         std::fs::remove_dir(&real).unwrap();
         assert!(!current, "the swapped component has to be noticed");
+    }
+
+    /// An absent include can have nearly 32767 characters and thousands of
+    /// components. Remembering every full prefix used to cost over 250 MiB,
+    /// despite there being just one watched source.
+    #[cfg(windows)]
+    #[test]
+    fn a_deep_missing_include_does_not_amplify_the_prefix_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut missing = dir.path().join("missing");
+        while missing.as_os_str().len() + 2 < 32000 {
+            missing.push("x");
+        }
+        let mut scan = ConfigScan::new(dir.path());
+        assert_eq!(scan.read(&missing).unwrap(), None, "exhausting the cache is not a path refusal");
+        let retained: usize = scan
+            .walk
+            .entries
+            .iter()
+            .map(|(path, entry)| {
+                path.as_os_str().len()
+                    + match entry {
+                        Entry::Link(target) => target.as_os_str().len(),
+                        _ => 0,
+                    }
+                    + std::mem::size_of::<(PathBuf, Entry)>()
+            })
+            .sum();
+        assert!(retained <= MAX_WALK_CACHE_BYTES, "prefix cache retained {retained} bytes");
+        assert!(all_current(&scan.sources), "freshness checks still accept the absent include");
+        assert_eq!(scan.read(&missing).unwrap(), None, "the missing source stays readable after the budget is used");
     }
 
     #[test]

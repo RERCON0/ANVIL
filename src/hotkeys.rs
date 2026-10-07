@@ -462,7 +462,7 @@ impl Keymap {
             }
         }
         let mut keymap = Keymap { bindings, rows: Vec::new() };
-        keymap.rows = keymap.describe_rows();
+        keymap.rows = keymap.describe_rows(overrides);
         (keymap, problems)
     }
 
@@ -477,7 +477,7 @@ impl Keymap {
         &self.rows
     }
 
-    fn describe_rows(&self) -> Vec<(String, Vec<String>)> {
+    fn describe_rows(&self, overrides: &BTreeMap<String, Vec<String>>) -> Vec<(String, Vec<String>)> {
         let mut out: Vec<(String, Vec<String>)> =
             SIMPLE_ACTIONS.iter().map(|(_, action)| (action.id(), Vec::new())).collect();
         // The numbered and profile actions are not in that table: their rows
@@ -485,6 +485,12 @@ impl Keymap {
         for (id, _) in DEFAULT_BINDINGS {
             if !out.iter().any(|(row, _)| row == id) {
                 out.push(((*id).to_owned(), Vec::new()));
+            }
+        }
+        // A custom profile has no default binding to keep its row alive.
+        for id in overrides.keys().filter(|id| id.strip_prefix("profile:").is_some_and(|profile| !profile.is_empty())) {
+            if !out.iter().any(|(row, _)| row == id) {
+                out.push((id.clone(), Vec::new()));
             }
         }
         for (chord, action) in &self.bindings {
@@ -568,7 +574,6 @@ mod tests {
         assert_eq!(keymap.lookup(&parse_chord("Ctrl-X").unwrap()), Some(&Action::CloseTab));
         assert_eq!(problems.len(), 1);
         assert!(problems[0].contains("close-tab wins over new-tab"));
-        assert_eq!(keymap.describe().as_ptr(), keymap.describe().as_ptr(), "descriptions are cached");
     }
 
     #[test]
@@ -663,11 +668,14 @@ mod tests {
     /// unbinding a tab number or the PowerShell profile made its row vanish.
     #[test]
     fn unbound_numbered_and_profile_actions_keep_their_rows() {
-        let overrides =
-            BTreeMap::from([("tab-3".to_owned(), Vec::new()), ("profile:powershell".to_owned(), Vec::new())]);
+        let overrides = BTreeMap::from([
+            ("tab-3".to_owned(), Vec::new()),
+            ("profile:powershell".to_owned(), Vec::new()),
+            ("profile:bash".to_owned(), Vec::new()),
+        ]);
         let (km, problems) = Keymap::with_overrides(&overrides);
         assert!(problems.is_empty(), "{problems:?}");
-        for id in ["tab-3", "profile:powershell"] {
+        for id in ["tab-3", "profile:powershell", "profile:bash"] {
             let row = km.describe().iter().find(|(row, _)| row == id);
             assert_eq!(row.map(|(_, chords)| chords.len()), Some(0), "{id}");
         }

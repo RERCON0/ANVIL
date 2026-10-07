@@ -145,7 +145,7 @@ pub const SETTINGS_HOTKEYS_HINT: &str =
 // Quotas.
 pub const SETTINGS_QUOTA: &str = "Квоты";
 pub const SETTINGS_QUOTA_ENABLED: &str = "Показывать квоты";
-pub const SETTINGS_QUOTA_INTERVAL: &str = "Обновление раз в 5 минут";
+pub const SETTINGS_QUOTA_INTERVAL: &str = "Фоновое обновление раз в 30 секунд";
 pub const SETTINGS_QUOTA_REFRESH: &str = "Обновить сейчас";
 pub const SETTINGS_QUOTA_NO_LOGIN: &str = "вход не найден";
 pub const SETTINGS_QUOTA_SET_KEY: &str = "Задать ключ…";

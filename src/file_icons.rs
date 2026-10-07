@@ -502,7 +502,6 @@ mod tests {
         assert_eq!(for_file("src/WORKSPACE.RS"), for_file("src/workspace.rs"));
         assert_eq!(for_file("SRC/App.Rs"), for_file("src/app.rs"));
         assert_eq!(for_file("dockerfile"), for_file("Dockerfile"));
-        assert_eq!(for_file(".gitignore"), for_file(".gitignore"));
         assert_eq!(for_file("Makefile"), for_file("makefile"));
         assert_eq!(for_file("README.MD"), for_file("readme.md"));
         assert_eq!(for_file("no-extension-here"), DEFAULT_FILE);

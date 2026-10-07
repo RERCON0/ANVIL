@@ -14,10 +14,11 @@ class BuildPathGuard(unittest.TestCase):
     def test_rejects_executables_that_embed_the_builders_directories(self):
         home = str(Path.home())
         for leaked in (home, home.upper(), home.replace("\\", "/"), str(check_package.ROOT)):
-            with self.subTest(leaked=leaked):
-                data = b"MZ\0\0panic at " + leaked.encode() + b"\\.cargo\\registry\\src\\x\\lib.rs\0"
-                with self.assertRaises(ValueError):
-                    check_package.check_no_build_paths(data, "anvil.exe")
+            for encoding in ("utf-8", "utf-16le"):
+                with self.subTest(leaked=leaked, encoding=encoding):
+                    data = b"MZ\0\0panic at " + leaked.encode(encoding) + b"\0"
+                    with self.assertRaises(ValueError):
+                        check_package.check_no_build_paths(data, "anvil.exe")
 
     def test_accepts_remapped_paths(self):
         check_package.check_no_build_paths(b"MZ\0\0at /cargo/registry/src/x/lib.rs, /anvil/src/app.rs, /rust/library\0", "anvil.exe")

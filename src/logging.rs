@@ -31,10 +31,11 @@ impl FileLogger {
             *guard = None;
         }
         if guard.is_none() {
-            // A rotation that fails (another window holds the old file) must not
-            // cost this line: keep appending to the current file and rotate on
-            // the next reopen.
-            let _ = rotate_if_needed(&self.path, self.max_bytes);
+            // A rotation failure must not reopen a full file for appending:
+            // a locked destination would otherwise let every window grow the
+            // log without limit. A missing source after another window rotated
+            // is already treated as success by `rotate`.
+            rotate_if_needed(&self.path, self.max_bytes)?;
             if let Some(dir) = self.path.parent() {
                 fs::create_dir_all(dir)?;
             }
@@ -125,6 +126,25 @@ mod tests {
         assert!(old.exists());
         assert!(fs::metadata(&path).unwrap().len() < 128);
         assert!(fs::metadata(&old).unwrap().len() >= 64);
+    }
+
+    #[test]
+    fn failed_rotation_does_not_keep_growing_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("anvil.log");
+        let old = dir.path().join("anvil.log.1");
+        let logger = FileLogger::new(path.clone(), log::LevelFilter::Info, 64);
+        let full = vec![b'x'; 64];
+        fs::write(&path, &full).unwrap();
+        fs::create_dir(&old).unwrap();
+        for _ in 0..100 {
+            assert!(logger.write_line("another line").is_err(), "a failed rotation must refuse the append");
+        }
+        assert_eq!(fs::read(&path).unwrap(), full, "the log stays bounded while rotation is blocked");
+        fs::remove_dir(&old).unwrap();
+        logger.write_line("rotation works again").unwrap();
+        assert_eq!(fs::read(&old).unwrap(), full);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "rotation works again\n");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Provider quotas, fetched by ANVIL itself: no CLI has to run. A background
 //! thread in every window observes the shared `quota.json`; the window that
-//! holds `quota.lock` also polls the providers (every 5 minutes, or on
-//! request) with the logins it finds on disk and the keys typed into ANVIL.
+//! holds `quota.lock` also polls every enabled provider every 30 seconds (or
+//! on request) with the logins it finds on disk and the keys typed into ANVIL.
 //! The UI thread only reads the published snapshot.
 
 pub mod cache;

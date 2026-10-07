@@ -34,20 +34,47 @@ const JSON_CREDENTIAL_ENVS: [&str; 3] = ["ANVIL_AIDER_CONFIG", "OPENCODE_AUTH_CO
 /// names that actually carry a secret qualify: a model name redacted out of an
 /// error message would cost more than it protects.
 pub(super) fn command_secrets(command: &Command) -> Vec<String> {
+    command_secrets_with(command, std::env::vars_os())
+}
+
+fn command_secrets_with(
+    command: &Command,
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<String> {
     let mut secrets = Vec::new();
-    for (key, value) in command.get_envs() {
-        let Some(value) = value.map(|value| value.to_string_lossy().into_owned()) else { continue };
-        let name = key.to_string_lossy().to_ascii_uppercase();
-        if JSON_CREDENTIAL_ENVS.contains(&name.as_str()) {
-            if let Ok(document) = serde_json::from_str::<serde_json::Value>(&value) {
-                json_secrets(&document, &mut secrets);
+    // Command::get_envs contains only overrides; provider credentials normally
+    // come from the parent's environment. Removed or replaced entries must not
+    // contribute their old values.
+    for (key, value) in inherited {
+        let overridden = command.get_envs().any(|(explicit, _)| {
+            if cfg!(windows) {
+                explicit.to_string_lossy().eq_ignore_ascii_case(&key.to_string_lossy())
+            } else {
+                explicit == key
             }
-        } else if SECRET_MARKERS.iter().any(|marker| name.contains(marker)) {
-            secrets.push(value);
+        });
+        if !overridden {
+            env_secrets(&key, &value, &mut secrets);
+        }
+    }
+    for (key, value) in command.get_envs() {
+        if let Some(value) = value {
+            env_secrets(key, value, &mut secrets);
         }
     }
     secrets.retain(|secret| secret.len() >= 8);
     secrets
+}
+
+fn env_secrets(key: &std::ffi::OsStr, value: &std::ffi::OsStr, secrets: &mut Vec<String>) {
+    let name = key.to_string_lossy().to_ascii_uppercase();
+    if JSON_CREDENTIAL_ENVS.contains(&name.as_str()) {
+        if let Ok(document) = serde_json::from_str::<serde_json::Value>(&value.to_string_lossy()) {
+            json_secrets(&document, secrets);
+        }
+    } else if SECRET_MARKERS.iter().any(|marker| name.contains(marker)) {
+        secrets.push(value.to_string_lossy().into_owned());
+    }
 }
 
 /// String values stored under a credential-looking field name. Aider keeps
@@ -67,6 +94,13 @@ fn json_secrets(value: &serde_json::Value, secrets: &mut Vec<String>) {
                         secrets.push(text.to_owned());
                         if let Some((_, tail)) = text.split_once('=') {
                             secrets.push(tail.trim().to_owned());
+                        }
+                        if name.contains("AUTH") {
+                            if let Some((scheme, credential)) = text.split_once(' ') {
+                                if scheme.eq_ignore_ascii_case("bearer") {
+                                    secrets.push(credential.trim().to_owned());
+                                }
+                            }
                         }
                     }
                 }
@@ -1108,13 +1142,39 @@ mod tests {
         command.env("ANTHROPIC_AUTH_TOKEN", "sk-ant-very-secret-value");
         command.env("ANTHROPIC_MODEL", "claude-opus-5");
         command.env("HOME", "/tmp/x");
-        let secrets = command_secrets(&command);
+        let secrets = command_secrets_with(&command, std::iter::empty());
         assert_eq!(secrets, vec!["sk-ant-very-secret-value".to_owned()], "only real secrets are collected");
 
         let stderr = "request failed\nAuthorization: Bearer sk-ant-very-secret-value\nmodel=claude-opus-5\n";
         let scrubbed = redact(stderr, &secrets);
         assert!(!scrubbed.contains("sk-ant-very-secret-value"), "{scrubbed}");
         assert!(scrubbed.contains("claude-opus-5"), "diagnostics stay useful: {scrubbed}");
+    }
+
+    #[test]
+    fn inherited_provider_credentials_are_scrubbed_but_removed_values_are_not() {
+        let mut command = Command::new("echo");
+        command.env("ANTHROPIC_API_KEY", "sk-replacement-key");
+        command.env_remove("GEMINI_API_KEY");
+        let inherited = [
+            ("OPENAI_API_KEY", "sk-inherited-key"),
+            ("ANTHROPIC_API_KEY", "sk-old-key"),
+            ("GEMINI_API_KEY", "sk-removed-key"),
+            ("ANTHROPIC_MODEL", "claude-opus-5"),
+        ]
+        .map(|(key, value)| (key.into(), value.into()));
+        let secrets = command_secrets_with(&command, inherited);
+        let diagnostics = "Bearer sk-inherited-key sk-replacement-key sk-old-key sk-removed-key claude-opus-5";
+        assert_eq!(redact(diagnostics, &secrets), "Bearer … … sk-old-key sk-removed-key claude-opus-5");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn removed_environment_credentials_match_windows_names_case_insensitively() {
+        let mut command = Command::new("echo");
+        command.env_remove("openai_api_key");
+        let inherited = [("OPENAI_API_KEY".into(), "sk-removed-key".into())];
+        assert_eq!(redact("sk-removed-key", &command_secrets_with(&command, inherited)), "sk-removed-key");
     }
 
     /// One secret that is a prefix of another must not leave the longer one's
@@ -1132,7 +1192,7 @@ mod tests {
     fn short_environment_values_are_not_treated_as_secrets() {
         let mut command = Command::new("echo");
         command.env("ANTHROPIC_API_KEY", "short");
-        assert!(command_secrets(&command).is_empty());
+        assert!(command_secrets_with(&command, std::iter::empty()).is_empty());
     }
 
     /// Credential copies must not survive a crash: only our own prefix is swept.
@@ -1242,17 +1302,24 @@ mod tests {
             "OPENCODE_CONFIG_CONTENT",
             serde_json::json!({
                 "model": "zai/glm-5",
-                "provider": { "custom": { "options": { "baseURL": "https://example.com", "apiKey": "custom-secret-4" } } }
+                "provider": { "custom": { "options": {
+                    "baseURL": "https://example.com",
+                    "apiKey": "custom-secret-4",
+                    "headers": { "Authorization": "bEaReR custom-header-secret-5" }
+                } } }
             })
             .to_string(),
         );
-        let secrets = command_secrets(&command);
-        for expected in ["sk-openai-secret-1", "AIzaGeminiSecret2", "zai-secret-key-3", "custom-secret-4"] {
+        let secrets = command_secrets_with(&command, std::iter::empty());
+        for expected in
+            ["sk-openai-secret-1", "AIzaGeminiSecret2", "zai-secret-key-3", "custom-secret-4", "custom-header-secret-5"]
+        {
             assert!(secrets.iter().any(|secret| secret == expected), "{expected} is not scrubbed: {secrets:?}");
         }
         assert!(!secrets.iter().any(|secret| secret.contains("some-model") || secret.contains("example.com")));
-        let scrubbed = redact("failed: key=AIzaGeminiSecret2 url=https://example.com", &secrets);
-        assert_eq!(scrubbed, "failed: key=… url=https://example.com");
+        let scrubbed =
+            redact("failed: key=AIzaGeminiSecret2 token=custom-header-secret-5 url=https://example.com", &secrets);
+        assert_eq!(scrubbed, "failed: key=… token=… url=https://example.com");
     }
 
     /// A provider entry can pull executable code in through `npm`; only the

@@ -923,6 +923,11 @@ impl Workspace {
     }
 
     fn commit_box(&mut self, ui: &mut egui::Ui) {
+        // A commit or generation in flight owns the draft it was sent. A merely
+        // disabled text edit still consumes keystrokes while it holds focus, so
+        // the editor also stops being interactive and gives the focus up; the
+        // text otherwise typed here would be cleared with the sent draft.
+        let editable = !self.ai_generating && !self.committing;
         let editor = egui::Frame::NONE
             .fill(ui.visuals().extreme_bg_color)
             .inner_margin(egui::Margin::symmetric(4, 2))
@@ -934,27 +939,30 @@ impl Workspace {
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         ui.add_enabled(
-                            !self.ai_generating,
+                            editable,
                             egui::TextEdit::multiline(&mut self.commit_message)
                                 .frame(egui::Frame::NONE)
                                 .margin(egui::Margin::same(0))
                                 .font(theme::field_font(12.0))
                                 .desired_rows(6)
                                 .hint_text(strings::WORKSPACE_COMMIT_HINT)
-                                .desired_width(f32::INFINITY),
+                                .desired_width(f32::INFINITY)
+                                .interactive(editable),
                         )
                     })
                     .inner
             });
         let commit = editor.inner;
+        if !editable && commit.has_focus() {
+            commit.surrender_focus();
+        }
         let visuals = ui.style().interact(&commit);
         let stroke = if commit.has_focus() { ui.visuals().selection.stroke } else { visuals.bg_stroke };
         ui.painter().rect_stroke(editor.response.rect, visuals.corner_radius, stroke, egui::StrokeKind::Middle);
         let ctrl_enter = commit.has_focus() && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter));
         ui.horizontal_wrapped(|ui| {
             let has_staged = self.status.changes.iter().any(Change::staged);
-            let can_commit =
-                !self.ai_generating && !self.committing && !self.commit_message.trim().is_empty() && has_staged;
+            let can_commit = editable && !self.commit_message.trim().is_empty() && has_staged;
             if ui.add_enabled(can_commit, theme::accent_button(strings::WORKSPACE_COMMIT)).clicked()
                 || (can_commit && ctrl_enter)
             {
@@ -964,13 +972,12 @@ impl Workspace {
                 Some(command) => strings::workspace_ai(command.split_whitespace().next().unwrap_or(command)),
                 None => strings::WORKSPACE_AI.to_owned(),
             };
-            let ai = ui.add_enabled(!self.ai_generating && has_staged, theme::ghost_button(ai_label)).on_hover_text(
-                if has_staged {
+            let ai =
+                ui.add_enabled(editable && has_staged, theme::ghost_button(ai_label)).on_hover_text(if has_staged {
                     self.ai_command.as_deref().unwrap_or(strings::WORKSPACE_NO_AI_COMMAND)
                 } else {
                     strings::WORKSPACE_AI_NO_STAGE
-                },
-            );
+                });
             if ai.clicked() {
                 self.ai_generating = true;
                 self.busy = true;
@@ -4868,6 +4875,77 @@ mod tests {
         workspace.absorb();
         assert_eq!(workspace.notice, Some(("nothing to commit".to_owned(), true)));
         assert!(!workspace.committing && workspace.commit_message == "feat: next", "the draft survives a refusal");
+    }
+
+    /// A slow commit owns the submitted draft until it answers. Editing that
+    /// draft used to accept text which the success response then cleared; AI
+    /// generation queued here also ran after the staged index was committed.
+    #[test]
+    fn pending_commit_does_not_accept_draft_edits_or_ai_generation() {
+        fn frame(
+            workspace: &mut Workspace,
+            ctx: &egui::Context,
+            events: Vec<egui::Event>,
+        ) -> Vec<egui::epaint::ClippedShape> {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0))),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show_inside(ui, |ui| workspace.commit_box(ui));
+            })
+            .shapes
+        }
+        let click = |point: Pos2| {
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ]
+        };
+        let (request_tx, request_rx) = mpsc::channel();
+        let mut workspace = Workspace {
+            tx: Some(request_tx),
+            commit_message: "submitted draft".to_owned(),
+            status: Status { changes: vec![changed_file("f.txt")], ..Default::default() },
+            ..Default::default()
+        };
+        workspace.status.changes[0].index = 'M';
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        let shapes = frame(&mut workspace, &ctx, Vec::new());
+        let text_point = |shapes: &[egui::epaint::ClippedShape], value: &str| {
+            shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) if text.galley.text() == value => {
+                        Some(text.visual_bounding_rect().center())
+                    }
+                    _ => None,
+                })
+                .expect("the control is painted")
+        };
+        frame(&mut workspace, &ctx, click(text_point(&shapes, "submitted draft")));
+        assert!(ctx.memory(|memory| memory.focused().is_some()), "the editor has focus");
+        workspace.start_commit();
+        let shapes = frame(&mut workspace, &ctx, vec![egui::Event::Text("lost text".to_owned())]);
+        assert_eq!(workspace.commit_message, "submitted draft", "pending text cannot be accepted and then lost");
+        frame(&mut workspace, &ctx, click(text_point(&shapes, strings::WORKSPACE_AI)));
+        assert!(!workspace.ai_generating);
+        let requests: Vec<_> = request_rx.try_iter().collect();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(requests[0].1, Request::Commit { .. }));
     }
 
     /// What a click on a file launches is decided on the worker: it

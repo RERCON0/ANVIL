@@ -9,11 +9,7 @@ use anvil::claude_status::{format_line_with, git_branch, Payload, StatusRecord, 
 use anvil::config::Config;
 
 fn main() {
-    let mut input = String::new();
-    if std::io::stdin().take(MAX_PAYLOAD_BYTES).read_to_string(&mut input).is_err() {
-        return;
-    }
-    let Some(payload) = Payload::parse(&input) else { return };
+    let Some(payload) = read_payload(std::io::stdin()) else { return };
     // The fields chosen in ANVIL's settings; an absent or unreadable config.json
     // (never quarantined from here) means every field, as before.
     let fields = Config::load_for_reload(&Config::path()).map(|c| c.claude_status.line_fields).unwrap_or_default();
@@ -32,5 +28,31 @@ fn main() {
     if let (Some(dir), Some(pane)) = (std::env::var_os("ANVIL_STATUS_DIR"), std::env::var("ANVIL_PANE_ID").ok()) {
         let record = StatusRecord::new(&payload, branch.as_deref(), now_ms);
         let _ = record.write(&PathBuf::from(dir), &pane);
+    }
+}
+
+/// Read one complete, bounded JSON payload, never a valid-looking prefix of
+/// an oversized or malformed input.
+fn read_payload(input: impl Read) -> Option<Payload> {
+    let mut text = String::new();
+    input.take(MAX_PAYLOAD_BYTES + 1).read_to_string(&mut text).ok()?;
+    (text.len() as u64 <= MAX_PAYLOAD_BYTES).then(|| Payload::parse(&text)).flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_input_cannot_publish_a_valid_prefix() {
+        let mut input = br#"{"model":{"display_name":"Opus"}}"#.to_vec();
+        input.resize(MAX_PAYLOAD_BYTES as usize, b' ');
+        assert_eq!(read_payload(input.as_slice()).unwrap().model.as_deref(), Some("Opus"));
+        input.push(b'x');
+        assert!(read_payload(input.as_slice()).is_none());
+        input.pop();
+        input.push(b' ');
+        assert!(read_payload(input.as_slice()).is_none());
+        assert!(read_payload(b"{".as_slice()).is_none());
     }
 }

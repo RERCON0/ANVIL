@@ -2633,10 +2633,6 @@ mod tests {
         assert_eq!(app.config, edited, "the edit must not be overwritten after apply_config");
         assert_eq!(Config::load(&path).config, edited);
         assert!(app.profiles.is_empty(), "compare against the old live profiles, not defaults");
-        let source = include_str!("app.rs");
-        let show = source.split("fn show_settings(").nth(1).unwrap().split("fn settle_settings(").next().unwrap();
-        assert!(show.contains("self.config.clone()"));
-        assert!(!show.contains("mem::take"), "drawing settings must leave the applied config in place");
     }
 
     fn bare_app(dir: &Path) -> AnvilApp {

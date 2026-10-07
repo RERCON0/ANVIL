@@ -158,12 +158,9 @@ impl WinHttp {
         WinHttp::open(user_agent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, TIMEOUT_MS)
     }
 
-    /// A session for a call that may outlast the quota worker's ten seconds:
-    /// every wait of it (name lookup, connection, sending, each receive) ends
-    /// after `timeout`. [`WinHttp::post`] additionally ends the receiving phases
-    /// (the headers and every read of the body) at `timeout` after the call
-    /// began, so a slow answer cannot outlast it; the earlier phases keep their
-    /// own `timeout` each.
+    /// A session for a call that may outlast the quota worker's ten seconds.
+    /// Each native wait is bounded by `timeout`; POST also shortens those
+    /// waits to its remaining request budget.
     pub fn with_timeout(user_agent: &str, timeout: Duration) -> Result<WinHttp, HttpError> {
         let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX).max(1);
         WinHttp::open(user_agent, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, millis)
@@ -213,7 +210,7 @@ impl Http for WinHttp {
         };
         let exchange = self.exchange("GET", endpoint, &target, headers, &[], None)?;
         let retry_after = query_text(&exchange.request, WINHTTP_QUERY_RETRY_AFTER);
-        let body = read_body(&exchange.request, self.body_deadline)?;
+        let body = read_body(&exchange.request, self.body_deadline, self.body_deadline / BODY_TIMEOUTS)?;
         Ok(Response { status: exchange.status, retry_after, body })
     }
 }
@@ -264,7 +261,12 @@ impl WinHttp {
         // The limit is set before the request goes out: WinHTTP starts waiting
         // for the answer inside the send, with the values the handle has then.
         if let Some(deadline) = deadline {
-            limit_wait(&request, deadline)?;
+            let timeout = remaining(deadline)?.min(self.body_deadline / BODY_TIMEOUTS);
+            let millis = timeout_millis(timeout) as i32;
+            // SAFETY: valid request handle and positive timeout values. Resolve,
+            // connect and send are separate waits inside WinHttpSendRequest.
+            check(unsafe { WinHttpSetTimeouts(request.0, millis, millis, millis, millis) })?;
+            limit_wait(&request, deadline, timeout)?;
         }
         // SAFETY: `block` is NUL-terminated (length u32::MAX = "until NUL");
         // `data` is null or readable for `length` bytes. WinHTTP may use the
@@ -272,10 +274,13 @@ impl WinHttp {
         // `data` spans this whole function, which makes that call.
         check(unsafe { WinHttpSendRequest(request.0, block.as_ptr(), u32::MAX, data, length, length, 0) })?;
         if let Some(deadline) = deadline {
-            limit_wait(&request, deadline)?;
+            limit_wait(&request, deadline, self.body_deadline / BODY_TIMEOUTS)?;
         }
         // SAFETY: valid request handle; the reserved pointer must be null.
         check(unsafe { WinHttpReceiveResponse(request.0, null_mut()) })?;
+        if let Some(deadline) = deadline {
+            remaining(deadline)?;
+        }
         let status = query_status(&request)?;
         if (300..400).contains(&status) {
             return Err(HttpError::Redirect(status));
@@ -284,8 +289,11 @@ impl WinHttp {
     }
 
     /// POST of `body` (the caller names its content type) whose answer is read
-    /// as it arrives, for server-sent events that may run for minutes. The
-    /// whole request, answer included, is over `timeout` after it was made.
+    /// as it arrives, for server-sent events that may run for minutes. Every
+    /// wait uses the remaining `timeout`, and an answer received after it is
+    /// rejected. Native synchronous timers have coarse granularity; resolve,
+    /// connect and send within SendRequest each have their own bounded wait,
+    /// so this is not hard wall-clock cancellation of that combined call.
     pub fn post(
         &self,
         endpoint: &Endpoint,
@@ -296,7 +304,14 @@ impl WinHttp {
         let deadline = Instant::now() + timeout;
         let exchange = self.exchange("POST", endpoint, endpoint.path, headers, body, Some(deadline))?;
         let status_text = query_text(&exchange.request, WINHTTP_QUERY_STATUS_TEXT).unwrap_or_default();
-        Ok(BodyStream { exchange, status_text, deadline, finished: false, _session: PhantomData })
+        Ok(BodyStream {
+            exchange,
+            status_text,
+            deadline,
+            receive_timeout: self.body_deadline / BODY_TIMEOUTS,
+            finished: false,
+            _session: PhantomData,
+        })
     }
 }
 
@@ -307,6 +322,7 @@ pub struct BodyStream<'a> {
     exchange: Exchange,
     status_text: String,
     deadline: Instant,
+    receive_timeout: Duration,
     finished: bool,
     /// The session must outlive the handles opened on it.
     _session: PhantomData<&'a WinHttp>,
@@ -324,12 +340,13 @@ impl BodyStream<'_> {
 
     fn next(&mut self, buf: &mut [u8]) -> Result<usize, HttpError> {
         let request = &self.exchange.request;
-        limit_wait(request, self.deadline)?;
+        limit_wait(request, self.deadline, self.receive_timeout)?;
         // `WinHttpReadData` waits until its whole buffer is full, so ask what
         // has arrived first, as `read_body` does.
         let mut available: u32 = 0;
         // SAFETY: valid request handle; the DWORD is written by the call.
         check(unsafe { WinHttpQueryDataAvailable(request.0, &mut available) })?;
+        remaining(self.deadline)?;
         if available == 0 {
             return Ok(0);
         }
@@ -337,6 +354,7 @@ impl BodyStream<'_> {
         let mut read: u32 = 0;
         // SAFETY: `buf` is writable for `want <= buf.len()` bytes.
         check(unsafe { WinHttpReadData(request.0, buf.as_mut_ptr().cast(), want as u32, &mut read) })?;
+        remaining(self.deadline)?;
         Ok(read as usize)
     }
 }
@@ -388,15 +406,26 @@ fn header_block(headers: &[(&str, &str)]) -> Result<Vec<u16>, HttpError> {
     Ok(wide(&block))
 }
 
-/// Makes the next wait for the server end with `deadline`: what is left of it
-/// becomes the limit of the next receive. A zero would mean "no limit" to
-/// WinHTTP, so at least one millisecond is set; none left is a timeout.
-fn limit_wait(request: &Handle, deadline: Instant) -> Result<(), HttpError> {
+/// Checks the deadline after native waits too: their timers can complete late,
+/// and EOF must not turn a late response into a successful one.
+fn remaining(deadline: Instant) -> Result<Duration, HttpError> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
-        return Err(HttpError::Timeout);
+        Err(HttpError::Timeout)
+    } else {
+        Ok(left)
     }
-    let millis = u32::try_from(left.as_millis()).unwrap_or(i32::MAX as u32).clamp(1, i32::MAX as u32);
+}
+
+fn timeout_millis(timeout: Duration) -> u32 {
+    // Zero disables WinHTTP's timeout, so round a sub-millisecond budget up.
+    u32::try_from(timeout.as_millis()).unwrap_or(i32::MAX as u32).clamp(1, i32::MAX as u32)
+}
+
+/// Shortens the next receive to the request budget without extending the
+/// session's per-receive timeout.
+fn limit_wait(request: &Handle, deadline: Instant, receive_timeout: Duration) -> Result<(), HttpError> {
+    let millis = timeout_millis(remaining(deadline)?.min(receive_timeout));
     for option in [WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, WINHTTP_OPTION_RECEIVE_TIMEOUT] {
         // SAFETY: DWORD option on a request handle.
         check(unsafe { WinHttpSetOption(request.0, option, (&millis as *const u32).cast(), 4) })?;
@@ -441,17 +470,19 @@ fn query_text(request: &Handle, level: u32) -> Option<String> {
     String::from_utf16(&buffer).ok().map(|text| text.trim().to_owned())
 }
 
-fn read_body(request: &Handle, deadline: Duration) -> Result<Vec<u8>, HttpError> {
-    let started = Instant::now();
+fn read_body(request: &Handle, body_timeout: Duration, receive_timeout: Duration) -> Result<Vec<u8>, HttpError> {
+    let deadline = Instant::now() + body_timeout;
     let mut body = Vec::new();
     let mut chunk = vec![0u8; 16 * 1024];
     loop {
+        limit_wait(request, deadline, receive_timeout)?;
         // `WinHttpReadData` waits until its whole buffer is full, so a peer that
         // trickles bytes would hold it past any deadline; asking what has
         // arrived first keeps every wait down to one receive timeout.
         let mut available: u32 = 0;
         // SAFETY: valid request handle; the DWORD is written by the call.
         check(unsafe { WinHttpQueryDataAvailable(request.0, &mut available) })?;
+        remaining(deadline)?;
         if available == 0 {
             return Ok(body);
         }
@@ -459,6 +490,7 @@ fn read_body(request: &Handle, deadline: Duration) -> Result<Vec<u8>, HttpError>
         let want = (available as usize).min(chunk.len());
         // SAFETY: `chunk` is writable for `want <= chunk.len()` bytes.
         check(unsafe { WinHttpReadData(request.0, chunk.as_mut_ptr().cast(), want as u32, &mut read) })?;
+        remaining(deadline)?;
         if read == 0 {
             return Ok(body);
         }
@@ -466,9 +498,6 @@ fn read_body(request: &Handle, deadline: Duration) -> Result<Vec<u8>, HttpError>
             return Err(HttpError::TooLarge);
         }
         body.extend_from_slice(&chunk[..read as usize]);
-        if started.elapsed() > deadline {
-            return Err(HttpError::Timeout);
-        }
     }
 }
 
@@ -668,6 +697,24 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     }
 
+    /// The last bytes arrive before the body budget, but the close-delimited
+    /// EOF arrives after it. Completion must not bypass the deadline check.
+    #[test]
+    fn a_quota_body_that_ends_after_its_deadline_is_rejected() {
+        let (port, _seen) = loopback::serve(|stream| {
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{}");
+            for _ in 0..5 {
+                std::thread::sleep(Duration::from_millis(250));
+                if stream.write_all(b" ").is_err() {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(400));
+        });
+        let result = WinHttp::for_tests(500).get(&Endpoint::loopback(port, "/"), None, &[]);
+        assert_eq!(result, Err(HttpError::Timeout));
+    }
+
     /// A silent server times out: WinHTTP checks its timers in steps of about
     /// four seconds, so the limit is asserted against a server that stays
     /// silent for much longer.
@@ -810,5 +857,34 @@ mod tests {
         let result = http.post(&Endpoint::loopback(port, "/"), &[], b"{}", Duration::from_secs(1));
         assert_eq!(result.err(), Some(HttpError::Timeout));
         assert!(started.elapsed() < Duration::from_secs(7), "{:?}", started.elapsed());
+    }
+
+    /// WinHTTP's coarse timer can allow headers to arrive after a short
+    /// timeout. A successful native call still has to satisfy our deadline.
+    #[test]
+    fn post_headers_received_after_the_deadline_are_rejected() {
+        let (port, _seen) = loopback::serve(|stream| {
+            std::thread::sleep(Duration::from_millis(1_400));
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        let http = WinHttp::for_tests(30_000);
+        let result = http.post(&Endpoint::loopback(port, "/"), &[], b"{}", Duration::from_secs(1));
+        assert_eq!(result.err(), Some(HttpError::Timeout));
+    }
+
+    #[test]
+    fn a_post_stream_that_ends_after_the_deadline_is_rejected() {
+        let (port, _seen) = loopback::serve(|stream| {
+            let _ = stream.write_all(SSE_HEAD);
+            let _ = stream.write_all(b"5\r\nfirst\r\n");
+            std::thread::sleep(Duration::from_millis(1_400));
+            let _ = stream.write_all(b"0\r\n\r\n");
+        });
+        let http = WinHttp::for_tests(30_000);
+        let mut stream = http.post(&Endpoint::loopback(port, "/"), &[], b"{}", Duration::from_secs(1)).unwrap();
+        let mut body = Vec::new();
+        let error = stream.read_to_end(&mut body).unwrap_err();
+        assert_eq!(body, b"first");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 }

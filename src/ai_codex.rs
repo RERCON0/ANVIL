@@ -184,7 +184,7 @@ fn complete(http: &WinHttp, request: &Request, timeout: std::time::Duration) -> 
     if !(200..300).contains(&status) {
         let shown = match response.status_text() {
             "" => status.to_string(),
-            text => format!("{status} {text}"),
+            text => format!("{status} {}", text.replace(&request.token, "…")),
         };
         let mut body = String::new();
         let _ = response.take(64 * 1024).read_to_string(&mut body);
@@ -201,7 +201,7 @@ fn complete(http: &WinHttp, request: &Request, timeout: std::time::Duration) -> 
             _ => format!("Codex: HTTP {shown}. {detail}"),
         });
     }
-    read_stream(response, timeout)
+    read_stream(response, timeout).map_err(|error| error.replace(&request.token, "…"))
 }
 
 fn send<'a>(http: &'a WinHttp, request: &Request, timeout: std::time::Duration) -> Result<BodyStream<'a>, String> {
@@ -222,6 +222,7 @@ fn read_stream(reader: impl std::io::Read, timeout: std::time::Duration) -> Resu
     let deadline = std::time::Instant::now() + timeout;
     let mut text = String::new();
     let mut failure = None;
+    let mut completed = false;
     let mut reader = std::io::BufReader::new(reader);
     let mut bytes_read = 0;
     loop {
@@ -268,12 +269,16 @@ fn read_stream(reader: impl std::io::Read, timeout: std::time::Duration) -> Resu
                 );
                 break;
             }
-            Some("response.completed") => break,
+            Some("response.completed") => {
+                completed = true;
+                break;
+            }
             _ => {}
         }
     }
     match failure {
         Some(error) => Err(error),
+        None if !completed => Err("Codex: поток ответа завершился до завершения генерации".to_owned()),
         None if text.trim().is_empty() => Err("Codex: модель не вернула сообщение коммита".to_owned()),
         None => Ok(text),
     }
@@ -292,7 +297,7 @@ mod tests {
     #[test]
     fn streaming_output_obeys_a_byte_budget_and_never_returns_a_cut_message() {
         let exact = "я".repeat(OUTPUT_CAP / 2);
-        let stream = event(&exact);
+        let stream = event(&exact) + "data: {\"type\":\"response.completed\"}\n";
         assert_eq!(read_stream(stream.as_bytes(), std::time::Duration::from_secs(1)).unwrap(), exact);
         let over = event(&"я".repeat(OUTPUT_CAP / 2 + 1));
         assert!(read_stream(over.as_bytes(), std::time::Duration::from_secs(1)).is_err());
@@ -414,6 +419,36 @@ mod tests {
         );
         let error = run(reply, TOKEN, std::time::Duration::from_secs(10)).0.unwrap_err();
         assert_eq!(error, "Codex: HTTP 500 Internal Server Error. bad key … here");
+    }
+
+    #[test]
+    fn streamed_failure_details_never_echo_the_token() {
+        for event in [
+            serde_json::json!({ "type": "response.failed", "response": { "error": { "message": format!("bad key {TOKEN}") } } }),
+            serde_json::json!({ "type": "error", "message": format!("bad key {TOKEN}") }),
+            serde_json::json!({ "type": "response.incomplete", "response": { "error": { "message": format!("bad key {TOKEN}") } } }),
+        ] {
+            let reply = format!("{SSE_HEAD}data: {event}\n");
+            let error = run(reply, TOKEN, std::time::Duration::from_secs(10)).0.unwrap_err();
+            assert_eq!(error, "bad key …");
+        }
+    }
+
+    #[test]
+    fn error_reason_phrases_never_echo_the_token() {
+        let reply = format!("HTTP/1.1 500 bad key {TOKEN}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let error = run(reply, TOKEN, std::time::Duration::from_secs(10)).0.unwrap_err();
+        assert!(!error.contains(TOKEN), "{error}");
+        assert!(error.contains("500"), "{error}");
+    }
+
+    #[test]
+    fn a_closed_stream_without_completion_never_returns_a_partial_message() {
+        for suffix in ["", "data: {not-json}\n", "data: {\"type\":\"response.output_text.done\"}\n"] {
+            let reply = format!("{SSE_HEAD}{}{suffix}", event("Fix partial"));
+            let result = run(reply, TOKEN, std::time::Duration::from_secs(10)).0;
+            assert!(result.is_err(), "an unfinished message was accepted: {result:?}");
+        }
     }
 
     /// The caps of `read_stream` hold on a real connection, not only on a slice.
