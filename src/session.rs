@@ -187,22 +187,14 @@ impl SavedNode {
 }
 
 /// The saved directory if it still exists, else None (use the profile's).
-/// Only a path on a local drive counts: a UNC or device path restored from a
-/// session file would make the pane's ConPTY dial that host — and authenticate
-/// to it — while starting the shell, so it is rejected before any filesystem
-/// call (`is_dir` on a UNC path is itself the connection).
+/// Only a directory on this machine counts: a UNC or device path, or a symlink
+/// that leads to one, restored from a session file or reported by a program,
+/// would make the pane's ConPTY dial that host — and authenticate to it — while
+/// starting the shell. The path is resolved link by link and refused before the
+/// filesystem is asked about the target (`is_dir` on a UNC path, or on a link to
+/// one, is itself the connection).
 pub fn usable_cwd(saved: Option<&Path>) -> Option<PathBuf> {
-    saved.filter(|p| is_local_dir(p)).map(Path::to_path_buf)
-}
-
-fn is_local_dir(path: &Path) -> bool {
-    let mut components = path.components();
-    let local = matches!(
-        components.next(),
-        Some(std::path::Component::Prefix(prefix))
-            if matches!(prefix.kind(), std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_))
-    );
-    local && components.next().is_some() && path.is_dir()
+    saved.filter(|p| crate::git::is_local_dir(p)).map(Path::to_path_buf)
 }
 
 #[cfg(test)]

@@ -815,6 +815,31 @@ fn local_path(path: &Path) -> Result<PathBuf, String> {
     local_path_in(path, &mut Walk { remaining_bytes: 0, ..Walk::default() })
 }
 
+/// Whether `path` is an existing directory on a drive letter, decided before
+/// any request to another machine: the resolution the Git panel applies, so a
+/// UNC or device path, or a symlink or junction that leads to one, is refused
+/// before anything is asked about the target. A folder a program reported or a
+/// session file recorded has to pass this before a shell is started in it.
+///
+/// The path has to be absolute on a drive, and free of `..`: Win32 folds `..`
+/// away on the text before it meets any link, while the resolver follows a link
+/// first, so for a path that climbs out of one they name different folders and
+/// the one checked would not be the one opened. A drive letter is judged by
+/// `reject_remote_path`, and a link whose record cannot be read is taken at its
+/// word, as in the Git panel.
+pub fn is_local_dir(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    let mut components = path.components();
+    let on_a_drive = matches!(
+        (components.next(), components.next()),
+        (Some(Component::Prefix(prefix)), Some(Component::RootDir))
+            if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+    );
+    on_a_drive
+        && !path.components().any(|component| component == Component::ParentDir)
+        && local_path(path).is_ok_and(|resolved| resolved.is_dir())
+}
+
 /// Resolve one component at a time. read_link reads the LOCAL reparse entry,
 /// not its target; reject that target before inspecting the next component.
 fn local_path_in(path: &Path, walk: &mut Walk) -> Result<PathBuf, String> {
@@ -3824,6 +3849,85 @@ index 111..222 100644\n\
         // Removes the junction itself, never what it points at.
         std::fs::remove_dir(&real).unwrap();
         assert!(!current, "the swapped component has to be noticed");
+    }
+
+    #[test]
+    fn only_an_existing_directory_on_this_machine_is_a_local_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(is_local_dir(dir.path()));
+        assert!(!is_local_dir(&dir.path().join("missing")));
+        std::fs::write(dir.path().join("file"), b"x").unwrap();
+        assert!(!is_local_dir(&dir.path().join("file")), "a file cannot be a shell's folder");
+        for remote in [r"\\127.0.0.1\ANVIL-denied", "//127.0.0.1/ANVIL-denied", r"\\?\UNC\127.0.0.1\ANVIL-denied"] {
+            assert!(!is_local_dir(Path::new(remote)), "{remote}");
+        }
+        assert!(!is_local_dir(Path::new("C:")), "a drive-relative path depends on hidden state");
+    }
+
+    /// Only a path on a drive letter is a folder to start in. The old check
+    /// refused the rest, and a bare `src` or `\Windows` is resolved against
+    /// whatever folder ANVIL itself was started in.
+    #[test]
+    fn a_path_without_a_drive_is_not_a_local_directory() {
+        for path in [".", "src", r"\Windows", "Windows", r"C:Windows"] {
+            assert!(!is_local_dir(Path::new(path)), "{path}");
+        }
+    }
+
+    /// The check has to be of the folder the shell will really start in. Win32
+    /// folds `..` away on the text, before it meets any link, so
+    /// `fixture\link\..\x` is `fixture\x`; the resolver follows the link first
+    /// and would have vouched for a different folder, `sub\x`.
+    #[cfg(windows)]
+    #[test]
+    fn a_path_that_climbs_out_of_a_link_is_not_vouched_for_by_another_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let deeper = dir.path().join("sub").join("deeper");
+        std::fs::create_dir_all(&deeper).unwrap();
+        std::fs::create_dir(dir.path().join("sub").join("x")).unwrap();
+        let link = dir.path().join("link");
+        junction(&link, &deeper);
+        let climbing = link.join("..").join("x");
+        assert!(!dir.path().join("x").exists(), "the folder Win32 opens does not exist");
+        let local = is_local_dir(&climbing);
+        // Removes the junction itself, never what it points at.
+        std::fs::remove_dir(&link).unwrap();
+        assert!(!local, "the physical walk found `sub\\x`, the shell would be started in `x`");
+    }
+
+    /// Redirecting a folder is not suspicious in itself: a project folder that
+    /// is a junction to another local drive has to keep working.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_to_a_local_directory_stays_a_local_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        junction(&link, &real);
+        let local = is_local_dir(&link);
+        // Removes the junction itself, never what it points at.
+        std::fs::remove_dir(&link).unwrap();
+        assert!(local);
+    }
+
+    /// The link branch of the resolver, driven through its lookup cache so that
+    /// it needs no privilege to create a symlink (a plain run on Windows has
+    /// none): the entry stands for a reparse point whose LOCAL record names the
+    /// target. A share is refused before it is followed, a local folder is
+    /// followed to.
+    #[cfg(windows)]
+    #[test]
+    fn a_link_to_a_share_is_refused_before_it_is_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        let mut walk = Walk::default();
+        walk.entries.insert(link.clone(), Entry::Link(PathBuf::from(r"\\127.0.0.1\ANVIL-denied")));
+        assert!(local_path_in(&link, &mut walk).unwrap_err().contains("сетевые"));
+        walk.entries.insert(link.clone(), Entry::Link(real.clone()));
+        assert_eq!(local_path_in(&link, &mut walk).unwrap(), real);
     }
 
     /// An absent include can have nearly 32767 characters and thousands of

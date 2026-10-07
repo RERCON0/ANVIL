@@ -273,7 +273,10 @@ pub fn parse_cwd(payload: &[u8]) -> Option<PathBuf> {
 /// (`C:\...`). Anything a program prints can claim a directory: a UNC or
 /// device path (`\\host\share`, `\\?\UNC\...`) would make the panel's git
 /// and new tabs reach out to that host, and relative or drive-relative paths
-/// mean nothing outside the program that sent them.
+/// mean nothing outside the program that sent them. The check is on the text
+/// only: this runs on the reader thread, which must not touch the filesystem.
+/// A link or a mapped drive behind a local-looking path is refused where the
+/// folder is used (`session::usable_cwd`, the Git panel's resolver).
 fn local_drive_path(path: &str) -> Option<String> {
     let path = path.replace('/', "\\");
     let bytes = path.as_bytes();

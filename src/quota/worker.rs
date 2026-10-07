@@ -631,6 +631,30 @@ mod tests {
         assert_eq!((&kimi.state, kimi.windows.len()), (&ProviderState::UpdateFailed { reason: "timeout".into() }, 1));
     }
 
+    /// The line as the user sees it across a flaky connection: a poll that
+    /// fails between two answers keeps the last numbers (the schedule above)
+    /// and they stay coloured; only a refresh missing for long dims them.
+    #[test]
+    fn a_network_blip_between_two_answers_does_not_dim_the_line() {
+        use crate::quota::view::{segments, FAILURE_GRACE};
+        let dim_at = |snapshot: &Snapshot, now| segments(snapshot, &crate::config::QuotaConfig::default(), now)[0].dim;
+        let claude = || only(ProviderId::Claude, || login(1));
+        let blip = |_: ProviderId, _: &Credential| Err(FetchError::Network("timeout".into()));
+        let mut engine = Engine::default();
+        let good = engine.cycle(1_000, &Prefs::new(), &Snapshot::default(), claude(), |_, _| ok());
+        assert!(!dim_at(&good, 1_000));
+        let failed = engine.cycle(1_000 + INTERVAL, &Prefs::new(), &good, claude(), blip);
+        let state = &failed.get(ProviderId::Claude).unwrap().state;
+        assert_eq!(state, &ProviderState::UpdateFailed { reason: "timeout".into() });
+        assert!(!dim_at(&failed, 1_000 + INTERVAL), "one failed poll must not grey out numbers fetched 30 s ago");
+        let back = engine.cycle(1_000 + 2 * INTERVAL, &Prefs::new(), &failed, claude(), |_, _| ok());
+        assert!(!dim_at(&back, 1_000 + 2 * INTERVAL));
+        let gone = engine.cycle(1_000 + 3 * INTERVAL, &Prefs::new(), &back, claude(), blip);
+        assert!(!dim_at(&gone, 1_000 + 3 * INTERVAL));
+        let later = 1_000 + 2 * INTERVAL + FAILURE_GRACE + 1;
+        assert!(dim_at(&gone, later), "numbers whose refresh has been missing for long are dimmed");
+    }
+
     #[test]
     fn a_refused_login_is_not_retried_until_it_changes() {
         let mut engine = Engine::default();

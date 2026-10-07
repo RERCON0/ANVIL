@@ -9,6 +9,10 @@ use crate::strings;
 
 /// Data older than this is dimmed even when the last fetch succeeded.
 pub const STALE_AFTER: i64 = 1_800;
+/// After a failed attempt (a network blip, a pause after a 429, a locked
+/// store) the last numbers keep their colours for this long since they were
+/// fetched; ten polls without a fresh answer, and they dim.
+pub const FAILURE_GRACE: i64 = 300;
 /// From this share on, the reset time is written next to the value.
 pub const RESET_INLINE_FROM: f64 = 60.0;
 /// Login expired: the segment keeps its last values, dimmed, after this mark.
@@ -113,8 +117,16 @@ pub fn segments(snapshot: &Snapshot, config: &QuotaConfig, now: i64) -> Vec<Segm
             if items.is_empty() && mark.is_none() {
                 return None;
             }
-            let stale = provider.fetched_at.is_none_or(|at| now - at > STALE_AFTER);
-            let dim = stale || provider.state != ProviderState::Ok;
+            let older_than = |limit: i64| provider.fetched_at.is_none_or(|at| now - at > limit);
+            let dim = match &provider.state {
+                ProviderState::Ok => older_than(STALE_AFTER),
+                // Nothing to trust, or nothing that will refresh by itself.
+                ProviderState::Idle | ProviderState::AuthExpired | ProviderState::FormatError { .. } => true,
+                // The last attempt failed but the numbers are still the ones
+                // fetched a moment ago: they keep their colours (the hover text
+                // says what went wrong) until a refresh has been missing long.
+                _ => items.is_empty() || older_than(FAILURE_GRACE),
+            };
             Some(Segment { id, name: id.label(), items, mark, dim, tooltip: tooltip(provider, config, now) })
         })
         .collect()
@@ -359,6 +371,36 @@ mod tests {
         assert!((segments[4].items[0].pct.unwrap() - 31.0).abs() < 1e-9);
         assert!(segments[2].tooltip.ends_with("ответ провайдера: нет coding plan"), "{}", segments[2].tooltip);
         assert!(segments[1].tooltip.contains("кредиты 120 кр."), "{}", segments[1].tooltip);
+    }
+
+    /// One poll that fails (the network stalls for half a minute, a 429 starts
+    /// a pause) leaves numbers fetched moments ago on screen. They used to turn
+    /// grey at once and get their colours back with the next answer, so a
+    /// flaky connection made the line flash. They dim only once a refresh has
+    /// been missing for `FAILURE_GRACE`; a lost login or an unreadable answer
+    /// dims at once, as before.
+    #[test]
+    fn a_failed_poll_keeps_fresh_numbers_coloured_until_they_age() {
+        let dim = |state: ProviderState, fetched_ago: i64| {
+            let mut claude = provider(ProviderId::Claude, state, vec![Window::new("5h", "5ч", 88.0, None)], vec![]);
+            claude.fetched_at = Some(NOW - fetched_ago);
+            let snapshot = Snapshot { version: Snapshot::VERSION, providers: vec![claude] };
+            segments(&snapshot, &QuotaConfig::default(), NOW)[0].dim
+        };
+        for state in [
+            ProviderState::UpdateFailed { reason: "timeout".into() },
+            ProviderState::RateLimited { retry_at: NOW + 60 },
+            ProviderState::StoreUnreadable,
+        ] {
+            assert!(!dim(state.clone(), 35), "{state:?}: a blip must not blank the colours");
+            assert!(!dim(state.clone(), FAILURE_GRACE), "{state:?}: still within the grace");
+            assert!(dim(state.clone(), FAILURE_GRACE + 1), "{state:?}: a refresh missing for long dims them");
+        }
+        assert!(dim(ProviderState::AuthExpired, 35), "nothing refreshes until the login changes");
+        assert!(dim(ProviderState::FormatError { reason: "bad".into() }, 35));
+        assert!(!dim(ProviderState::Ok, 35));
+        assert!(!dim(ProviderState::Ok, STALE_AFTER));
+        assert!(dim(ProviderState::Ok, STALE_AFTER + 1), "old data dims even after a good fetch");
     }
 
     #[test]

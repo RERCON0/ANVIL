@@ -1506,6 +1506,11 @@ impl AnvilApp {
             self.builtin_profiles.push(profile.clone());
             self.profiles = self.build_profiles();
         }
+        // The folder of a split or a new tab is what the program in the pane
+        // last printed, and a restored one is what a file said: neither may
+        // send the next shell to another machine. The profile's own folder is
+        // the user's setting and stays as configured.
+        let cwd = session::usable_cwd(cwd.as_deref());
         let version = env!("CARGO_PKG_VERSION");
         let env =
             profiles::pane_env(profile, id, Some(&self.status_dir), version, self.inherited_prompt_command.as_deref());
@@ -1697,8 +1702,7 @@ impl AnvilApp {
                             .map(profiles::wsl_profile)
                     })
                     .unwrap_or_else(|| self.default_profile());
-                let cwd = session::usable_cwd(pane_state.cwd.as_deref());
-                let mut entry = self.spawn_entry(id, &profile, cwd);
+                let mut entry = self.spawn_entry(id, &profile, pane_state.cwd.clone());
                 entry.workspace.open = pane_state.workspace_open;
                 if let Some(width) = pane_state.workspace_width {
                     entry.workspace.width = crate::workspace::clamp_width(width);
@@ -1733,8 +1737,7 @@ impl AnvilApp {
                     saved.pane.profile_id.strip_prefix("wsl-").filter(|d| !d.is_empty()).map(profiles::wsl_profile)
                 })
                 .unwrap_or_else(|| self.default_profile());
-            let cwd = session::usable_cwd(saved.pane.cwd.as_deref());
-            let mut entry = self.spawn_entry(id, &profile, cwd);
+            let mut entry = self.spawn_entry(id, &profile, saved.pane.cwd.clone());
             entry.workspace.open = saved.pane.workspace_open;
             if let Some(width) = saved.pane.workspace_width {
                 entry.workspace.width = crate::workspace::clamp_width(width);
@@ -2746,6 +2749,53 @@ mod tests {
         poll(&mut app, 0);
         assert!(!path.exists(), "the agent is gone, so is its record");
         assert!(app.tabs[0].panes[&id].claude.is_none());
+    }
+
+    /// What a new pane would start in when it has no usable folder of its own.
+    fn fallback_cwd(profile: &Profile) -> Option<PathBuf> {
+        profile.cwd.clone().or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+    }
+
+    /// A pane's folder is whatever the program in it printed (OSC 7 and
+    /// friends) or a session file said, and a split or a new tab hands it
+    /// straight to the next shell's ConPTY. A network folder there makes the
+    /// start itself connect to that host and authenticate to it.
+    #[test]
+    fn a_pane_never_starts_in_a_network_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bare_app(dir.path());
+        app.repaint = Some(Arc::new(|| {}));
+        let profile = app.default_profile();
+        for remote in [r"\\127.0.0.1\ANVIL-denied", "//127.0.0.1/ANVIL-denied", r"\\?\UNC\127.0.0.1\ANVIL-denied"] {
+            let id = app.alloc_pane_id();
+            let entry = app.spawn_entry(id, &profile, Some(PathBuf::from(remote)));
+            assert_eq!(entry.start_cwd, fallback_cwd(&profile), "{remote}");
+        }
+        let id = app.alloc_pane_id();
+        let entry = app.spawn_entry(id, &profile, Some(dir.path().to_path_buf()));
+        assert_eq!(entry.start_cwd.as_deref(), Some(dir.path()), "a local folder is kept as it was reported");
+    }
+
+    /// The lexical check on the reported path sees `C:\repo\link` and nothing
+    /// else: a symlink inside a checkout that points at a share passes it, and
+    /// the shell would start on that share.
+    #[cfg(windows)]
+    #[test]
+    fn a_link_to_a_network_share_is_not_a_start_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link");
+        if let Err(error) = std::os::windows::fs::symlink_dir(r"\\127.0.0.1\ANVIL-denied", &link) {
+            assert_eq!(error.raw_os_error(), Some(1314), "create link: {error}");
+            eprintln!("symlink privilege is unavailable; skipping reparse fixture");
+            return;
+        }
+        let mut app = bare_app(dir.path());
+        app.repaint = Some(Arc::new(|| {}));
+        let profile = app.default_profile();
+        let id = app.alloc_pane_id();
+        let entry = app.spawn_entry(id, &profile, Some(link.clone()));
+        assert_eq!(entry.start_cwd, fallback_cwd(&profile));
+        assert_eq!(session::usable_cwd(Some(&link)), None);
     }
 
     fn typing(app: &mut AnvilApp, ctx: &egui::Context, text: &str) {
