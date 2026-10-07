@@ -1,8 +1,9 @@
 //! Where quota logins come from. Everything here only reads: CLI login files,
 //! the OMP and OpenCode 2 databases, environment variables, the `env` block of
 //! Claude Code's user settings and the keys typed into ANVIL. Tokens are never
-//! refreshed and refresh tokens are never read into memory. Project-level
-//! configuration from repositories is never consulted.
+//! refreshed, and a refresh token is never used or kept: a login file is parsed
+//! whole, so it passes through memory there, but no `Credential` carries it.
+//! Project-level configuration from repositories is never consulted.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -68,7 +69,7 @@ impl Source {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Credential {
     pub secret: Secret,
     pub source: Source,
@@ -82,6 +83,24 @@ pub struct Credential {
     pub expires_at: Option<i64>,
     /// Changes whenever the login does; kept in memory only.
     pub marker: u64,
+}
+
+// Written by hand: `account` and `org` are never shown (see their docs), and a
+// derived `Debug` would print them next to the masked secret.
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let hidden = |value: &Option<String>| value.as_ref().map(|_| "…");
+        f.debug_struct("Credential")
+            .field("secret", &self.secret)
+            .field("source", &self.source)
+            .field("plan", &self.plan)
+            .field("account", &hidden(&self.account))
+            .field("org", &hidden(&self.org))
+            .field("server", &self.server)
+            .field("expires_at", &self.expires_at)
+            .field("marker", &self.marker)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -279,7 +298,7 @@ struct Accept {
 /// One stored login entry, shaped like OpenCode's: `{"type": "api" | "key" |
 /// "api_key", "key"}` or `{"type": "oauth", "access", "expires", "accountId"}`.
 /// OpenCode 2 keeps extra fields under `metadata`; they are merged under the
-/// top level. `refresh` is never copied.
+/// top level. `refresh` is never read into the credential.
 fn from_entry(entry: &Value, source: Source, accept: Accept) -> Option<Credential> {
     let mut merged = entry.get("metadata").and_then(Value::as_object).cloned().unwrap_or_default();
     for (k, v) in entry.as_object()? {
@@ -580,6 +599,25 @@ mod tests {
             Detection::Found(c) => c,
             other => panic!("expected a login, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn debug_output_hides_the_secret_and_the_account_identifiers() {
+        let credential = Credential {
+            secret: Secret::new("sk-ant-oat-secret"),
+            source: Source::CodexCli,
+            plan: Some("Plus".to_owned()),
+            account: Some("acct-1234".to_owned()),
+            org: Some("org-5678".to_owned()),
+            server: Some("https://opencode.ai/console".to_owned()),
+            expires_at: None,
+            marker: 7,
+        };
+        let shown = format!("{credential:?}");
+        for hidden in ["sk-ant-oat-secret", "acct-1234", "org-5678"] {
+            assert!(!shown.contains(hidden), "Debug leaks {hidden}: {shown}");
+        }
+        assert!(shown.contains("Plus") && shown.contains("opencode.ai"), "{shown}");
     }
 
     #[test]

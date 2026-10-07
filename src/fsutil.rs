@@ -35,6 +35,12 @@ fn bounded_reads_accept_the_exact_cap_and_reject_more() {
 /// (or two writers) cannot interleave on the same temp name. Creates the
 /// parent directory. A symlinked target is resolved first, so the link itself
 /// survives the write.
+///
+/// Atomic for readers, not durable across a power cut: the temp file is
+/// flushed, but the rename itself is not written through (a write-through
+/// `MoveFileExW` cannot replace a file other readers hold open, which the
+/// standard rename can). The replacement is a new file, so it takes the ACL and
+/// attributes the directory gives new files, not those of the file it replaces.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let target = resolve_link(path);
     if let Some(dir) = target.parent() {

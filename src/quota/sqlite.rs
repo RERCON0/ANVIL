@@ -23,6 +23,8 @@ const BUSY_TIMEOUT_MS: c_int = 500;
 const MAX_ROWS: usize = 64;
 const MAX_VALUE_BYTES: usize = 64 * 1024;
 
+// `winsqlite3.h` declares the API `__stdcall` (`SQLITE_APICALL`), which is what
+// "system" means; on x64, the only target, it is the one convention either way.
 type Db = c_void;
 type Stmt = c_void;
 

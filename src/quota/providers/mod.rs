@@ -185,6 +185,12 @@ fn number(value: Option<&Value>) -> Option<f64> {
     n.is_finite().then_some(n)
 }
 
+/// `now` plus a delay the provider reported, in seconds. The delay is untrusted
+/// input: one that does not fit saturates instead of overflowing the sum.
+fn after(now: i64, secs: f64) -> i64 {
+    now.saturating_add(secs as i64)
+}
+
 /// Provider-supplied text for a message or label: one line, bounded.
 fn clean(text: &str, max: usize) -> String {
     text.chars().map(|c| if c.is_control() { ' ' } else { c }).take(max).collect::<String>().trim().to_owned()
@@ -363,6 +369,24 @@ mod tests {
         assert!(seen[0].2.iter().any(|(n, v)| n == "ChatGPT-Account-Id" && v == "acc-1"));
         assert!(!seen[1].2.iter().any(|(n, _)| n == "ChatGPT-Account-Id"));
         assert!(seen[2].2.iter().any(|(n, v)| n == "x-org-id" && v == "org-7"));
+    }
+
+    /// A delay or a window length from the provider is untrusted: one too large
+    /// to add to the clock must not overflow (a debug build panics, a release
+    /// build wraps to an instant in the past).
+    #[test]
+    fn absurd_provider_numbers_do_not_overflow_the_clock() {
+        let now = 1_791_210_000;
+        let chatgpt = br#"{"rate_limit": {"primary_window": {"used_percent": 1, "limit_window_seconds": 18000,
+            "reset_after_seconds": 1e300}}}"#;
+        assert_eq!(chatgpt::parse(chatgpt, now).unwrap().windows[0].resets_at, Some(i64::MAX));
+        let kimi = br#"{"usage": {"limit": 10, "used": 1, "reset_in": 1e300}}"#;
+        assert_eq!(kimi::parse(kimi, now).unwrap().windows[0].resets_at, Some(i64::MAX));
+        let minimax = br#"{"base_resp": {"status_code": 0}, "model_remains": [{"model_name": "general",
+            "current_interval_remaining_percent": 50, "remains_time": 1e300}]}"#;
+        let fetched = minimax::parse(minimax, now, minimax::Region::International).unwrap();
+        assert_eq!(fetched.windows[0].resets_at, Some(i64::MAX));
+        assert!(crate::quota::model::duration_window(i64::MAX).is_some());
     }
 
     #[test]

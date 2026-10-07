@@ -29,15 +29,45 @@ pub struct Payload {
     pub agent: Option<String>,
 }
 
+/// No payload Claude Code sends is anywhere near this: the helper reads stdin
+/// until EOF, so the ceiling is what a misbehaving writer can make it buffer.
+pub const MAX_PAYLOAD_BYTES: u64 = 1024 * 1024;
+
+/// A name, directory or model is a label for one status line.
+const MAX_TEXT_CHARS: usize = 256;
+
+/// The text of a payload field as a single printable label. A JSON string can
+/// carry any control character (ESC as `\u001b`), and a model or agent name
+/// comes from settings or agent definitions that a repository can supply; it is
+/// printed into the terminal, so it must not bring escape sequences of its own.
+/// The length cap keeps the status file below the size the reader accepts.
+fn label(text: &str) -> Option<String> {
+    let text: String = text.chars().filter(|ch| !ch.is_control()).take(MAX_TEXT_CHARS).collect();
+    (!text.is_empty()).then_some(text)
+}
+
+/// The longest working directory kept. A path cut short names another
+/// directory (the branch is read from it), so a longer one is dropped whole;
+/// the cap also keeps the status record below the size the reader accepts.
+const MAX_PATH_CHARS: usize = 8192;
+
+/// A working directory as a printable string: control characters removed, never
+/// truncated.
+fn path_label(text: &str) -> Option<String> {
+    let text: String = text.chars().filter(|ch| !ch.is_control()).collect();
+    (!text.is_empty() && text.chars().count() <= MAX_PATH_CHARS).then_some(text)
+}
+
 impl Payload {
     /// None when the input is not JSON (print nothing, like the script).
     pub fn parse(text: &str) -> Option<Payload> {
         let v: Value = serde_json::from_str(text).ok()?;
-        let s = |p: &str| v.pointer(p).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
+        let s = |p: &str| v.pointer(p).and_then(Value::as_str).and_then(label);
+        let d = |p: &str| v.pointer(p).and_then(Value::as_str).and_then(path_label);
         let n = |p: &str| v.pointer(p).and_then(Value::as_f64);
         Some(Payload {
             model: s("/model/display_name"),
-            dir: s("/workspace/current_dir").or_else(|| s("/cwd")),
+            dir: d("/workspace/current_dir").or_else(|| d("/cwd")),
             context_pct: n("/context_window/used_percentage"),
             five_hour_pct: n("/rate_limits/five_hour/used_percentage"),
             five_hour_resets_at: n("/rate_limits/five_hour/resets_at"),
@@ -169,7 +199,7 @@ impl StatusRecord {
         StatusRecord {
             model: p.model.clone(),
             cwd: p.dir.clone(),
-            branch: branch.map(str::to_owned),
+            branch: branch.and_then(label),
             context_pct: p.context_pct,
             five_hour_pct: p.five_hour_pct,
             five_hour_resets_at: p.five_hour_resets_at,
@@ -269,6 +299,47 @@ mod tests {
         );
         let json = r#"{"context_window":{"used_percentage":0.4},"rate_limits":{"five_hour":{"used_percentage":60}}}"#;
         assert_eq!(line(json), "\x1b[32m░░░░░░░░░░\x1b[0m \x1b[32m0%\x1b[0m\x1b[2m | \x1b[0m5h: \x1b[33m60%\x1b[0m");
+    }
+
+    /// The branch is read from this path, so a long one must reach it whole.
+    #[test]
+    fn a_working_directory_is_kept_whole_or_dropped_never_cut() {
+        let long = format!("C:/{}", "deep/".repeat(80));
+        assert!(long.chars().count() > MAX_TEXT_CHARS);
+        let parse = |dir: &str| {
+            Payload::parse(&serde_json::json!({"workspace": {"current_dir": dir}}).to_string()).unwrap().dir
+        };
+        assert_eq!(parse(&long), Some(long.clone()));
+        assert_eq!(parse("C:/pro\u{1b}j"), Some("C:/proj".to_owned()));
+        assert_eq!(parse(&"d".repeat(MAX_PATH_CHARS + 1)), None);
+    }
+
+    /// A model or agent name can come from a repository's settings or agent
+    /// definitions. It is printed into the terminal and written to the status
+    /// file, which the reader refuses above 64 KiB, so it is a bounded plain label.
+    #[test]
+    fn payload_text_is_a_printable_bounded_label() {
+        let hostile = format!("Opus\u{1b}]52;c;AAAA\u{7}\u{9b}2J{}", "x".repeat(200_000));
+        let json = serde_json::json!({
+            "model": { "display_name": hostile },
+            "agent": { "name": "\u{1b}[2J\n" },
+            "cwd": "C:/x/proj\r\n"
+        });
+        let payload = Payload::parse(&json.to_string()).unwrap();
+        let model = payload.model.as_deref().unwrap();
+        assert!(model.starts_with("Opus]52;c;AAAA2Jxxx"), "{model}");
+        assert_eq!(model.chars().count(), 256);
+        assert_eq!(payload.agent.as_deref(), Some("[2J"));
+        assert_eq!(payload.dir.as_deref(), Some("C:/x/proj"));
+        // Only ANVIL's own colour sequences remain in the printed line.
+        let printed = format_line(&payload, None, 0);
+        assert_eq!(printed.matches('\u{1b}').count(), printed.matches("\u{1b}[").count(), "{printed:?}");
+        assert!(printed.chars().all(|ch| !ch.is_control() || ch == '\u{1b}'), "{printed:?}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let record = StatusRecord::new(&payload, None, 1);
+        record.write(dir.path(), "3").unwrap();
+        assert_eq!(StatusRecord::read(&StatusRecord::file_path(dir.path(), "3")), Some(record));
     }
 
     #[test]

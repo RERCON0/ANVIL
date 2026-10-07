@@ -114,11 +114,116 @@ fn take_ready<T>(slot: &mut Option<std::sync::mpsc::Receiver<T>>) -> Option<T> {
     }
 }
 
+/// How long typing in a settings text field may rest before config.json is
+/// written. Every keystroke still applies in memory at once.
+const CONFIG_SAVE_IDLE: Duration = Duration::from_millis(700);
+/// The longest an edit may wait for the disk, however long the typing goes on.
+const CONFIG_SAVE_MAX: Duration = Duration::from_secs(3);
+/// The pause before the first automatic retry of a write that failed, doubled
+/// after each further failure up to `CONFIG_SAVE_RETRY_MAX`. A write that cannot
+/// succeed (a read-only file, another process holding it) costs the UI thread an
+/// fsync and up to half a second of sharing retries per attempt, so the attempts
+/// thin out instead of recurring every few seconds for as long as the app runs.
+const CONFIG_SAVE_RETRY: Duration = Duration::from_secs(5);
+const CONFIG_SAVE_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// An edit of the config that is applied but not yet on disk.
+#[derive(Clone, Copy, Debug)]
+struct PendingSave {
+    /// The first unsaved keystroke, and the latest.
+    first: Instant,
+    last: Instant,
+    /// Writes that failed in a row since the last new typing or forced attempt;
+    /// 0: none, the edit is just waiting for its idle moment.
+    failures: u32,
+    /// The failure has been logged: once per series, not once per attempt.
+    reported: bool,
+}
+
+impl PendingSave {
+    fn new(now: Instant) -> PendingSave {
+        PendingSave { first: now, last: now, failures: 0, reported: false }
+    }
+
+    /// More typing: a new edit, whose first write is not held back by the
+    /// failures of the earlier ones. Its three seconds start now: keeping the
+    /// failed edit's `first` would make every further keystroke due at once,
+    /// a write (and, on a file that cannot be replaced, half a second of
+    /// frozen UI) per keystroke.
+    fn touched(self, now: Instant) -> PendingSave {
+        let first = if self.failures > 0 { now } else { self.first };
+        PendingSave { first, last: now, failures: 0, ..self }
+    }
+
+    /// The state after a write failed at `now`. `forced`: the attempt was not
+    /// the timer's but the user's (a field or the page left, the window
+    /// deactivated, the app closing), which always writes; the pause starts over
+    /// from its initial length after it.
+    fn failed(previous: Option<PendingSave>, now: Instant, forced: bool) -> PendingSave {
+        PendingSave {
+            first: previous.map_or(now, |pending| pending.first),
+            last: now,
+            failures: if forced { 1 } else { previous.map_or(0, |pending| pending.failures).saturating_add(1) },
+            reported: true,
+        }
+    }
+
+    /// The pause before the retry that follows the `failures`-th failure.
+    fn retry_pause(failures: u32) -> Duration {
+        let doublings = failures.saturating_sub(1).min(16);
+        CONFIG_SAVE_RETRY.saturating_mul(1 << doublings).min(CONFIG_SAVE_RETRY_MAX)
+    }
+
+    /// `None`: write now. `Some(wait)`: ask again after `wait`. Typing is only
+    /// possible on the settings page, so leaving it settles the edit at once.
+    fn wait(&self, settings_open: bool, now: Instant) -> Option<Duration> {
+        let left =
+            |since: Instant, limit: Duration| (since + limit).checked_duration_since(now).filter(|d| !d.is_zero());
+        if self.failures > 0 {
+            return left(self.last, Self::retry_pause(self.failures));
+        }
+        if !settings_open {
+            return None;
+        }
+        let idle = left(self.last, CONFIG_SAVE_IDLE)?;
+        Some(left(self.first, CONFIG_SAVE_MAX)?.min(idle))
+    }
+}
+
+/// What `check_config` has already said about config.json, so a file that
+/// stays broken is reported once and not on every tick.
+#[derive(Default)]
+struct ReloadLog {
+    failure: Option<(Option<SystemTime>, String)>,
+}
+
+impl ReloadLog {
+    /// Whether this failure is news: the first one, or another error, or the
+    /// file changed (and is broken in a new way) since the last one reported.
+    fn failed(&mut self, mtime: Option<SystemTime>, error: &str) -> bool {
+        let news = !self.failure.as_ref().is_some_and(|(seen, text)| *seen == mtime && text == error);
+        if news {
+            self.failure = Some((mtime, error.to_owned()));
+        }
+        news
+    }
+
+    /// Whether a good load ends a failure that was reported.
+    fn recovered(&mut self) -> bool {
+        self.failure.take().is_some()
+    }
+}
+
 pub struct AnvilApp {
     config: Config,
     config_path: PathBuf,
     config_mtime: Option<SystemTime>,
     config_checked: Instant,
+    /// Typing in a settings text field waiting for the disk.
+    config_pending: Option<PendingSave>,
+    /// The settings page was open in the last frame (to notice it closing).
+    config_page_open: bool,
+    config_reload_log: ReloadLog,
     keymap: Keymap,
     palette: Palette,
     profiles: Vec<Profile>,
@@ -159,6 +264,10 @@ pub struct AnvilApp {
     /// A process enumeration in flight. The Toolhelp snapshot blocks for
     /// milliseconds, which does not belong on the frame path.
     proc_results: Option<std::sync::mpsc::Receiver<Option<Vec<crate::procs::ProcInfo>>>>,
+    /// When the enumeration in flight (or the last one adopted) was requested:
+    /// the snapshot was taken no earlier, so it cannot know about anything
+    /// that started after this instant.
+    proc_requested: Option<SystemTime>,
     last_status_poll: Instant,
     last_proc_poll: Instant,
     last_tab_area: Rect,
@@ -215,6 +324,9 @@ impl AnvilApp {
             config_path,
             config_mtime,
             config_checked: Instant::now(),
+            config_pending: None,
+            config_page_open: false,
+            config_reload_log: ReloadLog::default(),
             keymap,
             palette,
             profiles: Vec::new(),
@@ -245,6 +357,7 @@ impl AnvilApp {
             inherited_prompt_command: None,
             proc_snapshot: Vec::new(),
             proc_results: None,
+            proc_requested: None,
             last_status_poll: Instant::now(),
             last_proc_poll: Instant::now(),
             last_tab_area: Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0)),
@@ -406,6 +519,7 @@ impl AnvilApp {
         self.show_picker(&ctx);
         self.show_collapsed_list(&ctx);
         self.show_dialog(&ctx);
+        self.flush_config_if_due(&ctx);
         if let Some(at) = self.session_dirty {
             if at.elapsed() >= Duration::from_secs(1) {
                 self.save_session();
@@ -655,15 +769,78 @@ impl AnvilApp {
     }
 
     fn settle_settings(&mut self, ctx: &egui::Context, next: Config, outcome: &crate::settings_ui::SettingsOutcome) {
-        if outcome.changed {
-            self.apply_config(ctx.clone(), next, true);
+        if outcome.changed || outcome.typed {
+            // Typing applies in memory at once; its write waits for the field to
+            // be left or the typing to rest, so a keystroke is not an fsync.
+            self.apply_config(ctx.clone(), next, outcome.changed);
+            if !outcome.changed {
+                self.defer_config_save();
+            }
+        }
+        if outcome.commit {
+            self.flush_config();
         }
         if outcome.open_config {
-            if let Err(e) = self.config.save(&self.config_path) {
+            self.save_config_now();
+        }
+    }
+
+    /// Notes that the applied config is ahead of config.json by typing.
+    fn defer_config_save(&mut self) {
+        let now = Instant::now();
+        self.config_pending = Some(self.config_pending.map_or(PendingSave::new(now), |pending| pending.touched(now)));
+    }
+
+    /// Writes config.json and makes it the file's current state.
+    fn write_config(&mut self) -> std::io::Result<()> {
+        let path = self.config_path.clone();
+        self.config.save(&path)?;
+        self.config_mtime = file_mtime(&path);
+        self.config_pending = None;
+        Ok(())
+    }
+
+    /// `write_config`, logging a failure once per series. The edit stays pending
+    /// then, so it is tried again instead of living in memory only. `forced`
+    /// is the user's attempt (see `PendingSave::failed`); the timer's retries
+    /// back off.
+    fn try_save_config(&mut self, forced: bool) {
+        if let Err(e) = self.write_config() {
+            if !self.config_pending.is_some_and(|pending| pending.reported) {
                 log::warn!("cannot save {}: {e}", self.config_path.display());
-            } else {
-                self.config_mtime = file_mtime(&self.config_path);
             }
+            self.config_pending = Some(PendingSave::failed(self.config_pending, Instant::now(), forced));
+        }
+    }
+
+    /// An attempt that is always made: the edit is the user's own act.
+    fn save_config_now(&mut self) {
+        self.try_save_config(true);
+    }
+
+    /// Writes what typing left pending, now, whatever an earlier failure has
+    /// backed off. Called wherever the file has to be current: a field or the
+    /// page is left, the window is deactivated, a window starts, the app exits.
+    fn flush_config(&mut self) {
+        if self.config_pending.is_some() {
+            self.save_config_now();
+        }
+    }
+
+    /// The frame's share of the deferred write: due, or asks for a frame when it
+    /// will be. The frame that finds the settings page just closed makes the
+    /// write unconditionally, so a backed-off retry does not hold it up.
+    fn flush_config_if_due(&mut self, ctx: &egui::Context) {
+        let page_closed = self.config_page_open && !self.settings_open;
+        self.config_page_open = self.settings_open;
+        if page_closed {
+            self.flush_config();
+            return;
+        }
+        let Some(pending) = self.config_pending else { return };
+        match pending.wait(self.settings_open, Instant::now()) {
+            None => self.try_save_config(false),
+            Some(wait) => ctx.request_repaint_after(wait),
         }
     }
 
@@ -871,6 +1048,10 @@ impl AnvilApp {
     }
 
     pub fn window_focus_changed(&mut self, focused: bool) {
+        if !focused {
+            // Another window or program may read config.json next.
+            self.flush_config();
+        }
         if let Some(pane) = self.focused_pane() {
             if pane.term.lock().mode().contains(TermMode::FOCUS_IN_OUT) {
                 pane.write(if focused { b"\x1b[I".to_vec() } else { b"\x1b[O".to_vec() });
@@ -890,6 +1071,8 @@ impl AnvilApp {
                 self.new_tab_at_end(&profile, cwd);
             }
             Action::NewWindow => {
+                // The new process reads config.json at once.
+                self.flush_config();
                 if let Ok(exe) = std::env::current_exe() {
                     if let Err(e) = std::process::Command::new(exe).arg(NEW_WINDOW_ARG).spawn() {
                         log::warn!("cannot start a new window: {e}");
@@ -1022,6 +1205,7 @@ impl AnvilApp {
     }
 
     pub fn on_exit(&mut self, window: Option<&Window>) {
+        self.flush_config();
         if let Some(window) = window {
             self.window_geometry(window.inner_size(), window.outer_position().ok(), window.is_maximized());
         }
@@ -1618,6 +1802,7 @@ impl AnvilApp {
         let claude_enabled = !self.config.claude_status.enabled && config.claude_status.enabled;
         let previous_integration = claude_disabled.then(|| self.config.claude_status.clone());
         let quota_switches_changed = config.quota.providers != self.config.quota.providers;
+        let hotkeys_changed = config.hotkeys != self.config.hotkeys;
         self.config = config;
         if profiles_changed {
             self.profiles = self.build_profiles();
@@ -1633,20 +1818,20 @@ impl AnvilApp {
             self.setup_claude();
         }
         if save {
-            let path = self.config_path.clone();
-            if let Err(e) = self.config.save(&path) {
-                log::warn!("cannot save {}: {e}", path.display());
-            } else {
-                self.config_mtime = file_mtime(&path);
-            }
+            self.save_config_now();
         }
-        let (keymap, problems) = Keymap::with_overrides(&self.config.hotkeys);
-        self.keymap = keymap;
-        if !problems.is_empty() {
-            for problem in &problems {
-                log::warn!("config hotkeys: {problem}");
+        // The keymap is a function of the hotkeys alone: rebuilding it (and
+        // repeating its warnings) on every settings edit would report the same
+        // problem again for each keystroke typed in an unrelated field.
+        if hotkeys_changed {
+            let (keymap, problems) = Keymap::with_overrides(&self.config.hotkeys);
+            self.keymap = keymap;
+            if !problems.is_empty() {
+                for problem in &problems {
+                    log::warn!("config hotkeys: {problem}");
+                }
+                self.toast(strings::UNKNOWN_HOTKEYS.to_owned());
             }
-            self.toast(strings::UNKNOWN_HOTKEYS.to_owned());
         }
         if family_changed {
             let report = fonts::install(&ctx, &self.config.font.family, &self.font_entries, self.fallbacks_loaded);
@@ -1689,6 +1874,11 @@ impl AnvilApp {
     }
 
     fn check_config(&mut self, ctx: &egui::Context) {
+        // Typing that is not on disk yet is newer than any file there: it is
+        // written first, and a reload would throw it away.
+        if self.config_pending.is_some_and(|pending| pending.failures == 0) {
+            return;
+        }
         if self.config_checked.elapsed() < Duration::from_secs(1) {
             return;
         }
@@ -1700,13 +1890,21 @@ impl AnvilApp {
         }
         match Config::load_for_reload(&path) {
             Ok(config) => {
+                if self.config_reload_log.recovered() {
+                    log::info!("config.json reloaded");
+                }
                 self.config_mtime = mtime;
+                // The file wins over an edit that could not be written.
+                self.config_pending = None;
                 self.apply_config(ctx.clone(), config, false);
             }
             Err(e) => {
                 // Keep the active configuration and retry: the file may be
-                // half-written by an editor right now.
-                log::warn!("config.json not reloaded: {e}");
+                // half-written by an editor right now. Said once per state of
+                // the file, not once per tick while it stays broken.
+                if self.config_reload_log.failed(mtime, &e) {
+                    log::warn!("config.json not reloaded: {e}");
+                }
             }
         }
     }
@@ -1893,10 +2091,7 @@ impl AnvilApp {
         self.config.claude_status.installed_command = Some(ours.to_owned());
         self.config.claude_status.installed_settings_path = Some(path.to_path_buf());
         self.config.claude_status.declined_command = None;
-        let config_path = self.config_path.clone();
-        self.config.save(&config_path)?;
-        self.config_mtime = file_mtime(&config_path);
-        Ok(())
+        self.write_config()
     }
 
     fn disable_claude(&mut self) {
@@ -1931,11 +2126,7 @@ impl AnvilApp {
                 self.config.claude_status.previous_status_line = None;
                 self.config.claude_status.installed_command = None;
                 self.config.claude_status.installed_settings_path = None;
-                let config_path = self.config_path.clone();
-                if let Err(e) = self.config.save(&config_path) {
-                    log::warn!("cannot save {}: {e}", config_path.display());
-                }
-                self.config_mtime = file_mtime(&config_path);
+                self.save_config_now();
             }
             Ok(None) => {}
             Err(e) => log::warn!("{e}"),
@@ -1950,6 +2141,10 @@ impl AnvilApp {
         // A finished enumeration is adopted first, so the pane walk below reads
         // the snapshot the `polled_processes` branch then annotates.
         let adopted = self.absorb_proc_snapshot();
+        // Only a snapshot adopted in this very poll is current. The poll that
+        // merely starts the next enumeration still reads the previous one (or
+        // the empty startup one), which cannot know about an agent started since.
+        let fresh_since = if adopted { self.proc_requested } else { None };
         let polled_processes = adopted || self.last_proc_poll.elapsed() >= Duration::from_secs(3);
         if polled_processes {
             if !adopted {
@@ -1958,6 +2153,7 @@ impl AnvilApp {
                 if self.proc_results.is_none() {
                     let (tx, rx) = std::sync::mpsc::channel();
                     self.proc_results = Some(rx);
+                    self.proc_requested = Some(SystemTime::now());
                     std::thread::spawn(move || {
                         let _ = tx.send(crate::procs::snapshot());
                     });
@@ -1999,7 +2195,7 @@ impl AnvilApp {
                     }
                     _ => {}
                 }
-                if polled_processes && entry.claude.is_some() && !entry.has_claude {
+                if entry.claude.is_some() && status_outlived_agent(fresh_since, entry.has_claude, entry.claude_mtime) {
                     entry.claude = None;
                     entry.claude_mtime = None;
                     let _ = std::fs::remove_file(&path);
@@ -2039,6 +2235,10 @@ impl AnvilApp {
     }
 
     fn toast(&mut self, text: String) {
+        // One toast per message: an event that repeats every frame (a held
+        // Backspace ringing the bell at the key-repeat rate) renews it instead
+        // of stacking dozens that run off the top of the window.
+        self.ui.toasts.retain(|toast| toast.text != text);
         self.ui.toasts.push(Toast { text, at: Instant::now() });
     }
 
@@ -2065,6 +2265,9 @@ impl AnvilApp {
     }
 
     fn open_picker(&mut self, ctx: &egui::Context) {
+        // One centred list at a time: two of them stack in the same place and
+        // each answers the same Enter and Escape.
+        self.ui.collapsed_list = None;
         self.ui.picker = Some(PickerState {
             filter: String::new(),
             selected: 0,
@@ -2091,6 +2294,7 @@ impl AnvilApp {
     }
 
     fn open_collapsed_list(&mut self, ctx: &egui::Context) {
+        self.ui.picker = None;
         self.ui.collapsed_list = Some(CollapsedListState { selected: 0, opened_pass: ctx.cumulative_pass_nr() });
     }
 
@@ -2138,11 +2342,7 @@ impl AnvilApp {
             dialogs::DialogOutcome::Cancel => {
                 if let DialogState::ClaudeInstall { current, .. } = dialog {
                     self.config.claude_status.declined_command = Some(current);
-                    let path = self.config_path.clone();
-                    if let Err(e) = self.config.save(&path) {
-                        log::warn!("cannot save {}: {e}", path.display());
-                    }
-                    self.config_mtime = file_mtime(&path);
+                    self.save_config_now();
                 }
             }
             dialogs::DialogOutcome::Accept => match dialog {
@@ -2157,6 +2357,18 @@ impl AnvilApp {
                 }
             },
         }
+    }
+}
+
+/// A pane's status record outlived the agent that wrote it: a process snapshot
+/// requested after the record was written (`requested`, `None` when no fresh one
+/// was adopted) shows no agent under the pane. A record written after the
+/// request proves nothing about this snapshot, and an agent that started and
+/// wrote its first status since the previous snapshot would lose its badge.
+fn status_outlived_agent(requested: Option<SystemTime>, has_agent: bool, written: Option<SystemTime>) -> bool {
+    match (requested, written) {
+        (Some(requested), Some(written)) => !has_agent && written <= requested,
+        _ => false,
     }
 }
 
@@ -2379,14 +2591,7 @@ mod tests {
         app.settle_settings(
             &egui::Context::default(),
             next,
-            &crate::settings_ui::SettingsOutcome {
-                changed: true,
-                open_config: false,
-                refresh_fonts: false,
-                install_claude: false,
-                restore_claude: false,
-                quota_refresh: false,
-            },
+            &crate::settings_ui::SettingsOutcome { changed: true, ..Default::default() },
         );
         let restored: serde_json::Value = serde_json::from_slice(&std::fs::read(&claude_path).unwrap()).unwrap();
         assert_eq!(restored["statusLine"], previous);
@@ -2416,14 +2621,7 @@ mod tests {
             AnvilApp::from_state(config.clone(), path.clone(), None, SessionState::default(), false, dir.path().into());
         app.profiles = app.build_profiles();
         let ctx = egui::Context::default();
-        let outcome = crate::settings_ui::SettingsOutcome {
-            changed: false,
-            open_config: true,
-            refresh_fonts: false,
-            install_claude: false,
-            restore_claude: false,
-            quota_refresh: false,
-        };
+        let outcome = crate::settings_ui::SettingsOutcome { open_config: true, ..Default::default() };
         app.settle_settings(&ctx, config.clone(), &outcome);
         assert_eq!(Config::load(&path).config, config, "opening config must not save a default placeholder");
         assert_eq!(app.config, config);
@@ -2439,6 +2637,342 @@ mod tests {
         let show = source.split("fn show_settings(").nth(1).unwrap().split("fn settle_settings(").next().unwrap();
         assert!(show.contains("self.config.clone()"));
         assert!(!show.contains("mem::take"), "drawing settings must leave the applied config in place");
+    }
+
+    fn bare_app(dir: &Path) -> AnvilApp {
+        let mut config = Config::default();
+        config.quota.enabled = false; // No worker, credentials or network in this fixture.
+        AnvilApp::from_state(config, dir.join("config.json"), None, SessionState::default(), true, dir.into())
+    }
+
+    /// The profile list and the hidden-panes list share one place on screen and
+    /// both answer Enter and Escape: opening one closes the other.
+    #[test]
+    fn the_centred_lists_do_not_stack() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bare_app(dir.path());
+        let ctx = egui::Context::default();
+        app.open_picker(&ctx);
+        app.open_collapsed_list(&ctx);
+        assert!(app.ui.picker.is_none() && app.ui.collapsed_list.is_some());
+        app.open_picker(&ctx);
+        assert!(app.ui.picker.is_some() && app.ui.collapsed_list.is_none());
+    }
+
+    /// The hotkey problems are reported when the hotkeys change, not again by
+    /// every unrelated settings edit (a keystroke in a text field applies the
+    /// whole config).
+    #[test]
+    fn hotkey_problems_are_reported_when_the_hotkeys_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.quota.enabled = false;
+        config.hotkeys.insert("new-tab".to_owned(), vec!["Ctrl-Hyper-T".to_owned()]);
+        let mut app = AnvilApp::from_state(
+            config.clone(),
+            dir.path().join("config.json"),
+            None,
+            SessionState::default(),
+            true,
+            dir.path().into(),
+        );
+        let ctx = egui::Context::default();
+        let reported = |app: &AnvilApp| app.ui.toasts.iter().any(|toast| toast.text == strings::UNKNOWN_HOTKEYS);
+        assert!(reported(&app), "the problem is reported at startup");
+        app.ui.toasts.clear();
+        let mut edited = config.clone();
+        edited.terminal.word_separators.push('/');
+        app.apply_config(ctx.clone(), edited.clone(), false);
+        assert!(!reported(&app), "an unrelated edit must not repeat it");
+        edited.hotkeys.insert("close-tab".to_owned(), vec!["Ctrl-Hyper-W".to_owned()]);
+        app.apply_config(ctx, edited, false);
+        assert!(reported(&app), "a change of the hotkeys is checked again");
+    }
+
+    /// A message that repeats (a held Backspace rings the bell at the key-repeat
+    /// rate) renews its toast: the old code stacked one per frame.
+    #[test]
+    fn a_repeated_message_renews_its_toast_instead_of_stacking() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bare_app(dir.path());
+        for _ in 0..50 {
+            app.toast(strings::BELL.to_owned());
+        }
+        app.toast(strings::COPIED.to_owned());
+        app.toast(strings::BELL.to_owned());
+        let texts: Vec<_> = app.ui.toasts.iter().map(|toast| toast.text.as_str()).collect();
+        assert_eq!(texts, [strings::COPIED, strings::BELL]);
+    }
+
+    #[test]
+    fn a_status_record_is_stale_only_against_a_snapshot_requested_after_it_was_written() {
+        let at = |secs| std::time::UNIX_EPOCH + Duration::from_secs(secs);
+        assert!(status_outlived_agent(Some(at(10)), false, Some(at(9))), "the agent is gone");
+        assert!(!status_outlived_agent(Some(at(10)), true, Some(at(9))), "the agent is still there");
+        assert!(!status_outlived_agent(Some(at(10)), false, Some(at(11))), "written after the snapshot was asked for");
+        assert!(!status_outlived_agent(None, false, Some(at(9))), "no fresh snapshot, no verdict");
+        assert!(!status_outlived_agent(Some(at(10)), false, None));
+    }
+
+    /// The poll on the 3 s timer only *requests* the next enumeration and still
+    /// reads the previous snapshot (empty at startup). That snapshot cannot list
+    /// an agent started since, so the poll deleted the status record the agent
+    /// had just written and its tab lost the badge until the next update.
+    #[test]
+    fn a_status_record_survives_the_poll_that_only_requests_a_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bare_app(dir.path());
+        app.repaint = Some(Arc::new(|| {}));
+        let profile = app.default_profile();
+        let id = app.alloc_pane_id();
+        let entry = app.spawn_entry(id, &profile, Some(dir.path().to_path_buf()));
+        assert!(entry.live().is_some(), "the fixture needs a running pane");
+        app.tabs.push(Tab::new(SplitTree::new(id), HashMap::from([(id, entry)]), id));
+        let path = StatusRecord::file_path(dir.path(), &id.to_string());
+        let record = StatusRecord { model: Some("Opus".into()), ..StatusRecord::default() };
+        record.write(dir.path(), &id.to_string()).unwrap();
+        let poll = |app: &mut AnvilApp, since_process_poll: u64| {
+            app.last_status_poll = Instant::now() - Duration::from_secs(5);
+            app.last_proc_poll = Instant::now() - Duration::from_secs(since_process_poll);
+            app.poll_statuses();
+        };
+        poll(&mut app, 0);
+        assert!(app.tabs[0].panes[&id].claude.is_some(), "the record is read");
+        poll(&mut app, 10);
+        assert!(path.exists(), "a poll without a fresh snapshot must keep the record");
+        assert!(app.tabs[0].panes[&id].claude.is_some());
+        // A snapshot requested after the record was written and showing no agent:
+        // now the record really is stale.
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Some(Vec::new())).unwrap();
+        app.proc_results = Some(rx);
+        app.proc_requested = Some(SystemTime::now() + Duration::from_secs(60));
+        poll(&mut app, 0);
+        assert!(!path.exists(), "the agent is gone, so is its record");
+        assert!(app.tabs[0].panes[&id].claude.is_none());
+    }
+
+    fn typing(app: &mut AnvilApp, ctx: &egui::Context, text: &str) {
+        let mut next = app.config.clone();
+        next.terminal.word_separators = text.to_owned();
+        app.settle_settings(ctx, next, &crate::settings_ui::SettingsOutcome { typed: true, ..Default::default() });
+    }
+
+    fn separators_on_disk(path: &Path) -> String {
+        Config::load(path).config.terminal.word_separators
+    }
+
+    /// A series of keystrokes in a text field is applied at once and reaches the
+    /// disk in one write, when the field is left. Each of them used to write
+    /// (and fsync) config.json on the UI thread.
+    #[test]
+    fn typing_applies_at_once_and_is_written_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut app = bare_app(dir.path());
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        for key in "ab /cd".chars() {
+            text.push(key);
+            typing(&mut app, &ctx, &text);
+            assert_eq!(app.config.terminal.word_separators, text, "applied at once");
+        }
+        assert!(!path.exists(), "a keystroke is not a write");
+        let leave = crate::settings_ui::SettingsOutcome { commit: true, ..Default::default() };
+        app.settle_settings(&ctx, app.config.clone(), &leave);
+        assert_eq!(separators_on_disk(&path), "ab /cd", "the last value is what lands");
+        std::fs::remove_file(&path).unwrap();
+        app.flush_config();
+        assert!(!path.exists(), "nothing is pending after the write");
+    }
+
+    /// Whatever ends the typing writes it: the page closing, the typing resting
+    /// (or going on for too long), the window losing the focus, the app exiting.
+    #[test]
+    fn deferred_typing_is_written_wherever_the_file_has_to_be_current() {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut app = bare_app(dir.path());
+        app.settings_open = true;
+        typing(&mut app, &ctx, "a ");
+        app.flush_config_if_due(&ctx);
+        assert!(!path.exists(), "typing on the open page waits");
+        app.settings_open = false;
+        app.flush_config_if_due(&ctx);
+        assert_eq!(separators_on_disk(&path), "a ", "closing the page");
+
+        app.settings_open = true;
+        typing(&mut app, &ctx, "b");
+        app.config_pending.as_mut().unwrap().last -= Duration::from_secs(2);
+        app.flush_config_if_due(&ctx);
+        assert_eq!(separators_on_disk(&path), "b", "the typing rested");
+
+        typing(&mut app, &ctx, "c");
+        app.config_pending.as_mut().unwrap().first -= Duration::from_secs(10);
+        app.flush_config_if_due(&ctx);
+        assert_eq!(separators_on_disk(&path), "c", "typing that never rests is still written");
+
+        typing(&mut app, &ctx, "d");
+        app.window_focus_changed(false);
+        assert_eq!(separators_on_disk(&path), "d", "focus lost");
+
+        typing(&mut app, &ctx, "e");
+        app.on_exit(None);
+        assert_eq!(separators_on_disk(&path), "e", "exit");
+    }
+
+    /// A write that fails keeps the edit, which is tried again; a reload does
+    /// not throw typing away that is waiting for the disk.
+    #[test]
+    fn a_failed_or_waiting_write_is_not_lost_to_a_reload() {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut app = bare_app(dir.path());
+        std::fs::write(&path, "{}").unwrap();
+        app.config_mtime = file_mtime(&path);
+        typing(&mut app, &ctx, "typed");
+        // Someone else saves the file meanwhile.
+        std::fs::write(&path, r#"{"terminal":{"wordSeparators":"other"}}"#).unwrap();
+        app.config_checked = Instant::now() - Duration::from_secs(5);
+        app.check_config(&ctx);
+        assert_eq!(app.config.terminal.word_separators, "typed", "no reload over waiting typing");
+        app.flush_config();
+        assert_eq!(separators_on_disk(&path), "typed");
+
+        // A write that cannot happen (the target is a directory) stays pending.
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        app.config_path = blocked;
+        typing(&mut app, &ctx, "kept");
+        app.flush_config();
+        assert!(app.config_pending.is_some_and(|pending| pending.failures == 1), "the edit is kept for a retry");
+        app.config_path = path.clone();
+        app.config_pending.as_mut().unwrap().last -= Duration::from_secs(10);
+        app.flush_config_if_due(&ctx);
+        assert_eq!(separators_on_disk(&path), "kept");
+        assert!(app.config_pending.is_none());
+    }
+
+    #[test]
+    fn a_pending_write_asks_for_a_frame_when_it_falls_due() {
+        let now = Instant::now();
+        let at = |ms: u64| now + Duration::from_millis(ms);
+        let pending = PendingSave::new(now);
+        assert_eq!(pending.wait(true, at(100)), Some(CONFIG_SAVE_IDLE - Duration::from_millis(100)));
+        assert_eq!(pending.wait(true, at(700)), None, "rested");
+        assert_eq!(pending.wait(false, at(1)), None, "the page is closed");
+        // Typing goes on: the idle time keeps moving, the ceiling does not.
+        let typing_on = pending.touched(at(2_500));
+        assert_eq!(typing_on.wait(true, at(2_600)), Some(Duration::from_millis(400)), "the ceiling comes first");
+        assert_eq!(typing_on.wait(true, at(3_000)), None, "too long behind the keys");
+        // A failed write waits for the retry whatever the page does.
+        let failed = PendingSave::failed(Some(pending), now, false);
+        assert_eq!(failed.wait(false, at(1_000)), Some(CONFIG_SAVE_RETRY - Duration::from_secs(1)));
+        assert_eq!(failed.wait(true, at(5_000)), None);
+        assert_eq!(failed.touched(at(10)).failures, 0, "new typing is a new attempt");
+        assert!(failed.touched(at(10)).reported, "but the series was reported");
+    }
+
+    /// The timer's retries of a write that keeps failing thin out, to a ceiling,
+    /// and start over with new typing or an attempt of the user's.
+    #[test]
+    fn retries_of_a_failing_write_back_off_to_a_ceiling_and_start_over() {
+        let secs = |n: u64| Duration::from_secs(n);
+        let pauses: Vec<_> = (1..=9).map(PendingSave::retry_pause).collect();
+        assert_eq!(
+            pauses,
+            [secs(5), secs(10), secs(20), secs(40), secs(80), secs(160), secs(300), secs(300), secs(300)]
+        );
+        assert_eq!(PendingSave::retry_pause(u32::MAX), CONFIG_SAVE_RETRY_MAX, "no overflow however long it fails");
+
+        let now = Instant::now();
+        let ms = Duration::from_millis;
+        let mut pending = PendingSave::failed(None, now, false);
+        let mut at = now;
+        for pause in [5, 10, 20, 40, 80, 160, 300, 300] {
+            let pause = secs(pause);
+            assert_eq!(pending.wait(false, at + pause - ms(1)), Some(ms(1)), "not due before its pause");
+            assert_eq!(pending.wait(false, at + pause), None, "due at it");
+            at += pause;
+            pending = PendingSave::failed(Some(pending), at, false);
+        }
+        // The user's attempt (focus lost, page closed, exit) starts the pauses over.
+        let forced = PendingSave::failed(Some(pending), pending.last + secs(1), true);
+        assert_eq!(forced.failures, 1);
+        assert_eq!(forced.wait(false, forced.last), Some(CONFIG_SAVE_RETRY));
+        assert_eq!(forced.first, now, "it is still the same edit");
+        // And so does more typing, as an edit with a window of its own: the
+        // failed edit's start must not make every keystroke due at once.
+        let typed_at = pending.last + secs(10);
+        let typed = pending.touched(typed_at);
+        assert_eq!(typed.failures, 0);
+        assert_eq!(typed.wait(true, typed_at), Some(CONFIG_SAVE_IDLE), "the idle rest applies again");
+        assert_eq!(typed.wait(true, typed_at + CONFIG_SAVE_IDLE), None);
+    }
+
+    /// A write that cannot succeed is not retried on the timer before its pause,
+    /// but the page closing, the window being deactivated and the exit always
+    /// try, and a success ends the series.
+    #[test]
+    fn a_backed_off_write_is_still_made_when_the_user_leaves() {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        let mut app = bare_app(dir.path());
+        app.config_path = blocked;
+        app.settings_open = true;
+        app.flush_config_if_due(&ctx);
+        typing(&mut app, &ctx, "x");
+        app.flush_config();
+        assert_eq!(app.config_pending.map(|pending| pending.failures), Some(1));
+        // The file becomes writable, but the timer is still backing off.
+        app.config_path = path.clone();
+        app.settings_open = true;
+        app.flush_config_if_due(&ctx);
+        assert!(!path.exists(), "the timer waits out its pause");
+        // The page closes: the write is made without waiting for the pause.
+        app.settings_open = false;
+        app.flush_config_if_due(&ctx);
+        assert_eq!(separators_on_disk(&path), "x");
+        assert!(app.config_pending.is_none());
+        // Deactivation and exit do not wait either.
+        let leaves: [fn(&mut AnvilApp); 2] = [|app| app.window_focus_changed(false), |app| app.on_exit(None)];
+        for (index, leave) in leaves.into_iter().enumerate() {
+            let blocked = dir.path().join(format!("blocked-{index}"));
+            std::fs::create_dir(&blocked).unwrap();
+            app.config_path = blocked;
+            typing(&mut app, &ctx, "y");
+            app.flush_config();
+            assert_eq!(app.config_pending.map(|pending| pending.failures), Some(1));
+            app.config_path = path.clone();
+            leave(&mut app);
+            assert_eq!(separators_on_disk(&path), "y");
+            assert!(app.config_pending.is_none());
+        }
+    }
+
+    /// A config.json that stays broken is said once per state of the file, not on
+    /// every tick: the first time, again when the error or the file changes, and
+    /// the end of the failure once.
+    #[test]
+    fn a_broken_config_is_logged_when_its_state_changes() {
+        let at = |secs| Some(std::time::UNIX_EPOCH + Duration::from_secs(secs));
+        let mut log = ReloadLog::default();
+        assert!(!log.recovered(), "nothing to recover from");
+        assert!(log.failed(at(1), "expected value"), "first sight");
+        for _ in 0..100 {
+            assert!(!log.failed(at(1), "expected value"), "the same state is not news");
+        }
+        assert!(log.failed(at(1), "trailing comma"), "another error");
+        assert!(log.failed(at(2), "trailing comma"), "the file changed and is still broken");
+        assert!(log.failed(None, "no such file"), "the file vanished");
+        assert!(log.recovered(), "fixed");
+        assert!(!log.recovered(), "said once");
+        assert!(log.failed(at(2), "trailing comma"), "broken again counts as new");
     }
 
     /// A finished enumeration is taken exactly once. The old code asked the

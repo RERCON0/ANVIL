@@ -320,8 +320,12 @@ pub fn app_dir() -> PathBuf {
 const MAX_CONFIG_BYTES: usize = 2 * 1024 * 1024;
 
 fn read_config_text(path: &Path) -> io::Result<String> {
-    String::from_utf8(crate::fsutil::read_limited(path, MAX_CONFIG_BYTES)?)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    let text = String::from_utf8(crate::fsutil::read_limited(path, MAX_CONFIG_BYTES)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    // Older Notepad and Windows PowerShell 5.1 write UTF-8 with a byte order
+    // mark, which the JSON parser rejects: a hand-edited file was reported as
+    // corrupt and moved aside.
+    Ok(text.strip_prefix('\u{feff}').map(str::to_owned).unwrap_or(text))
 }
 
 impl Config {
@@ -479,6 +483,21 @@ mod tests {
         assert!(outcome.notice.is_some(), "an unreadable config is reported, not silently defaulted");
         assert!(path.exists(), "an oversized file is not quarantined as corrupt");
         assert!(Config::load_for_reload(&path).is_err());
+    }
+
+    /// Older Notepad and Windows PowerShell 5.1 save UTF-8 with a byte order
+    /// mark, which serde_json does not skip: a hand-edited config.json was
+    /// reported as corrupt and moved aside, and its settings were lost.
+    #[test]
+    fn a_byte_order_mark_is_not_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"\xEF\xBB\xBF{\"version\":1,\"font\":{\"size\":13}}").unwrap();
+        let outcome = Config::load(&path);
+        assert!(outcome.notice.is_none(), "{:?}", outcome.notice);
+        assert_eq!(outcome.config.font.size, 13.0);
+        assert!(path.exists(), "the file stays where it is");
+        assert_eq!(Config::load_for_reload(&path).unwrap().font.size, 13.0);
     }
 
     #[test]

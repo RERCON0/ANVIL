@@ -25,6 +25,11 @@ const LEAD_RETRY: i64 = 30;
 /// After a network failure (often: just woke from sleep, network not up yet)
 /// the next cycle comes this soon instead of a full interval later.
 pub const QUICK_RETRY: i64 = 60;
+/// Quick retries in a row before the normal interval takes over, each one
+/// twice as late as the one before. A cycle polls every provider, so a failure
+/// that does not go away (one blocked host, a login store that stays
+/// unreadable) must not turn into a request per minute for all of them.
+const QUICK_RETRIES: u32 = 3;
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Memory {
@@ -47,6 +52,12 @@ pub struct Engine {
     /// inside the gap waits for it to pass instead of being dropped.
     manual_pending: bool,
     retry_at: Option<i64>,
+    /// Cycles in a row that ended with a failure worth a quick retry.
+    #[serde(default)]
+    quick_retries: u32,
+    /// The running cycle met such a failure.
+    #[serde(skip)]
+    transient: bool,
     /// The snapshot built so far, so a panic part-way through a cycle still
     /// leaves the providers that answered on screen.
     #[serde(skip)]
@@ -62,7 +73,7 @@ impl Engine {
         let now = now_unix();
         engine.last_cycle = engine.last_cycle.map(|at| at.clamp(0, now));
         engine.last_manual = engine.last_manual.map(|at| at.clamp(0, now));
-        engine.retry_at = engine.retry_at.map(|at| at.clamp(0, now + QUICK_RETRY));
+        engine.retry_at = engine.retry_at.map(|at| at.clamp(0, now + INTERVAL));
         for memory in engine.memory.values_mut() {
             memory.paused_until = memory.paused_until.clamp(0, now + super::model::MAX_PAUSE);
         }
@@ -81,10 +92,22 @@ impl Engine {
     fn begin_cycle(&mut self, now: i64) {
         self.last_cycle = Some(now);
         self.retry_at = None;
+        self.transient = false;
         if self.manual_pending {
             self.manual_pending = false;
             self.last_manual = Some(now);
         }
+    }
+
+    /// Plans the quick retry the finished cycle asked for, or starts the
+    /// sequence over after a clean one.
+    fn plan_quick_retry(&mut self, now: i64) {
+        if !std::mem::take(&mut self.transient) {
+            self.quick_retries = 0;
+            return;
+        }
+        self.retry_at = (self.quick_retries < QUICK_RETRIES).then(|| now + (QUICK_RETRY << self.quick_retries));
+        self.quick_retries = self.quick_retries.saturating_add(1);
     }
 
     fn manual_deadline(&self) -> i64 {
@@ -146,6 +169,7 @@ impl Engine {
                 }
             }
         }
+        self.plan_quick_retry(now);
         self.partial.take().unwrap_or_default()
     }
 
@@ -194,9 +218,7 @@ impl Engine {
                     None
                 }
                 Detection::Unreadable => {
-                    if enabled {
-                        self.retry_at = Some(now + QUICK_RETRY);
-                    }
+                    self.transient |= enabled;
                     let state = if memory.paused_until > now {
                         ProviderState::RateLimited { retry_at: memory.paused_until }
                     } else {
@@ -239,9 +261,7 @@ impl Engine {
                                 })
                             }
                             Err(error) => {
-                                if matches!(error, FetchError::Network(_)) {
-                                    self.retry_at = Some(now + QUICK_RETRY);
-                                }
+                                self.transient |= matches!(error, FetchError::Network(_));
                                 // A provider's own error text is written to disk
                                 // and drawn in the GUI: a compromised or echoing
                                 // endpoint must not get the key onto either.
@@ -470,6 +490,32 @@ mod tests {
             |_, _| ok(),
         );
         assert!(!engine.due(1_000 + 2 * QUICK_RETRY, None, false), "back to the normal interval");
+    }
+
+    /// A failure that does not go away must not keep the whole cycle (every
+    /// provider's request) at one per minute: the quick retries back off, give
+    /// up in favour of the interval, and start over after a clean cycle.
+    #[test]
+    fn a_failure_that_persists_backs_the_quick_retries_off_and_then_stops() {
+        let mut engine = Engine::default();
+        let down = |_: ProviderId, _: &Credential| Err(FetchError::Network("blocked".into()));
+        let detect = only(ProviderId::Zai, || login(1));
+        let mut at = 1_000;
+        for gap in [QUICK_RETRY, 2 * QUICK_RETRY, 4 * QUICK_RETRY] {
+            engine.cycle(at, &Prefs::new(), &Snapshot::default(), &detect, down);
+            assert!(!engine.due(at + gap - 1, None, false), "gap {gap}");
+            assert!(engine.due(at + gap, None, false), "gap {gap}");
+            at += gap;
+        }
+        engine.cycle(at, &Prefs::new(), &Snapshot::default(), &detect, down);
+        assert!(!engine.due(at + 4 * QUICK_RETRY, None, false), "no quick retry is left");
+        assert!(!engine.due(at + INTERVAL - 1, None, false));
+        assert!(engine.due(at + INTERVAL, None, false), "the normal interval still applies");
+        at += INTERVAL;
+        engine.cycle(at, &Prefs::new(), &Snapshot::default(), &detect, |_, _| ok());
+        at += INTERVAL;
+        engine.cycle(at, &Prefs::new(), &Snapshot::default(), &detect, down);
+        assert!(engine.due(at + QUICK_RETRY, None, false), "a clean cycle starts the sequence over");
     }
 
     fn run(engine: &mut Engine, now: i64) {

@@ -11,6 +11,11 @@
 # Seti UI is MIT licensed (c) 2014 Jesse Weed - see seti-LICENSE.txt.
 #
 # The outputs are committed, so a normal build never needs this script.
+# Edit the hand-written part of src/file_icons.rs in RUST_TAIL below, not in the
+# generated file. test_gen_seti_icons.py compares a fresh generation with the
+# committed fonts/seti.ttf and src/file_icons.rs, but it needs fontTools and CI
+# does not install it: the test is skipped there, so run it locally after any
+# change to this script, vendor/seti/ or src/file_icons.rs.
 
 import re
 import shutil
@@ -24,6 +29,82 @@ DEFAULT_SOURCE = ROOT / "vendor" / "seti"
 
 ICON_ENTRY = re.compile(r'"((?:[^"\\]|\\.)*)"\s*:\s*\{\s*char:\s*"((?:[^"\\]|\\.)*)"\s*,\s*color:\s*"(#[0-9a-fA-F]{6})"')
 CONST_ICON = re.compile(r'export const (SETI_[A-Z_]+): SetiIcon = \{\s*char:\s*"((?:[^"\\]|\\.)*)"\s*,\s*color:\s*"(#[0-9a-fA-F]{6})"')
+
+
+# Hand-written part of src/file_icons.rs (everything after the generated tables).
+# Keep it identical to the committed file (checked by scripts/test_gen_seti_icons.py,
+# which runs locally with fontTools and is skipped in CI).
+RUST_TAIL = r'''/// Both tables are sorted by their lower-case key, so comparing byte by byte
+/// with ASCII case folded keeps them ordered — and lets `for_file` skip
+/// building a lower-cased copy of every name it is asked about.
+fn lookup(table: &[(&str, char, Color32)], key: &str) -> Option<(char, Color32)> {
+    let order = |left: &str, right: &str| {
+        let (left, right) = (left.as_bytes(), right.as_bytes());
+        left.iter()
+            .zip(right.iter())
+            .map(|(a, b)| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()))
+            .find(|order| *order != std::cmp::Ordering::Equal)
+            .unwrap_or_else(|| left.len().cmp(&right.len()))
+    };
+    table.binary_search_by(|(name, _, _)| order(name, key)).ok().map(|index| (table[index].1, table[index].2))
+}
+
+/// Icon and colour of one file, by full name first, then by extension.
+///
+/// Runs once per visible row per frame, so it must not allocate: the table is
+/// already sorted in lower case, which lets `eq_ignore_ascii_case` stand in
+/// for a lower-cased copy of the name.
+pub fn for_file(name: &str) -> (char, Color32) {
+    let file_name = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    if let Some(icon) = lookup(BY_FILE_NAME, file_name) {
+        return icon;
+    }
+    if let Some((_, extension)) = file_name.rsplit_once('.') {
+        if !extension.is_empty() && extension.len() != file_name.len() {
+            if let Some(icon) = lookup(BY_EXTENSION, extension) {
+                return icon;
+            }
+        }
+    }
+    DEFAULT_FILE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rust_and_docker_files_have_icons() {
+        let (rust, rust_color) = for_file("src/workspace.rs");
+        assert_eq!(rust, for_file("main.rs").0, "extension lookup");
+        assert_eq!(rust_color, for_file("a/b/other.rs").1, "same extension, same icon");
+        let (docker, _) = for_file("Dockerfile");
+        assert_ne!(docker, DEFAULT_FILE.0, "by-name lookup");
+        let (unknown, colour) = for_file("notes.unknownext");
+        assert_eq!((unknown, colour), DEFAULT_FILE);
+    }
+
+    /// The lookup no longer builds a lower-cased copy of the name, so mixed
+    /// case has to be resolved by the comparison itself.
+    #[test]
+    fn lookup_ignores_case_without_rewriting_the_name() {
+        assert_eq!(for_file("src/WORKSPACE.RS"), for_file("src/workspace.rs"));
+        assert_eq!(for_file("SRC/App.Rs"), for_file("src/app.rs"));
+        assert_eq!(for_file("dockerfile"), for_file("Dockerfile"));
+        assert_eq!(for_file(".gitignore"), for_file(".gitignore"));
+        assert_eq!(for_file("Makefile"), for_file("makefile"));
+        assert_eq!(for_file("README.MD"), for_file("readme.md"));
+        assert_eq!(for_file("no-extension-here"), DEFAULT_FILE);
+        assert_eq!(for_file("trailing."), DEFAULT_FILE);
+    }
+
+    #[test]
+    fn tables_are_sorted_for_binary_search() {
+        assert!(BY_FILE_NAME.windows(2).all(|w| w[0].0 < w[1].0));
+        assert!(BY_EXTENSION.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+}
+'''
 
 
 def unescape(value: str) -> str:
@@ -58,13 +139,11 @@ def main() -> int:
 
     fonts = ROOT / "fonts"
     fonts.mkdir(exist_ok=True)
-    font = TTFont(source / "seti.woff")
+    # recalcTimestamp=False keeps the source font's head created/modified times
+    # instead of stamping "now" on save, so the output is byte-reproducible.
+    font = TTFont(source / "seti.woff", recalcTimestamp=False)
     font.flavor = None
-    # fontTools stamps the head table with "now" on save; freeze it so the
-    # committed font is byte-reproducible.
-    font["head"].created = 0
-    font["head"].modified = 0
-    font.save(fonts / "seti.ttf", recalcTimestamp=False)
+    font.save(fonts / "seti.ttf")
     shutil.copyfile(source / "seti-LICENSE.txt", fonts / "seti-LICENSE.txt")
 
     by_name = parse_map(ts, "setiIconByFileName", "setiIconByExtension")
@@ -84,50 +163,8 @@ def main() -> int:
         "",
         f"pub const DEFAULT_FILE: (char, Color32) = ({rust_char(default_file[0])}, {rust_color(default_file[1])});",
         "",
-        "fn lookup(table: &[(&str, char, Color32)], key: &str) -> Option<(char, Color32)> {",
-        "    table.binary_search_by(|(name, _, _)| name.cmp(&key)).ok().map(|index| (table[index].1, table[index].2))",
-        "}",
-        "",
-        "/// Icon and colour of one file, by full name first, then by extension.",
-        "pub fn for_file(name: &str) -> (char, Color32) {",
-        "    let lower = name.to_ascii_lowercase();",
-        "    let file_name = lower.rsplit(['/', '\\\\']).next().unwrap_or(&lower);",
-        "    if let Some(icon) = lookup(BY_FILE_NAME, file_name) {",
-        "        return icon;",
-        "    }",
-        "    let extension = file_name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or(\"\");",
-        "    if !extension.is_empty() && extension != file_name {",
-        "        if let Some(icon) = lookup(BY_EXTENSION, extension) {",
-        "            return icon;",
-        "        }",
-        "    }",
-        "    DEFAULT_FILE",
-        "}",
-        "",
-        "#[cfg(test)]",
-        "mod tests {",
-        "    use super::*;",
-        "",
-        "    #[test]",
-        "    fn rust_and_docker_files_have_icons() {",
-        "        let (rust, rust_color) = for_file(\"src/workspace.rs\");",
-        "        assert_eq!(rust, for_file(\"main.rs\").0, \"extension lookup\");",
-        "        assert_eq!(rust_color, for_file(\"a/b/other.rs\").1, \"same extension, same icon\");",
-        "        let (docker, _) = for_file(\"Dockerfile\");",
-        "        assert_ne!(docker, DEFAULT_FILE.0, \"by-name lookup\");",
-        "        let (unknown, colour) = for_file(\"notes.unknownext\");",
-        "        assert_eq!((unknown, colour), DEFAULT_FILE);",
-        "    }",
-        "",
-        "    #[test]",
-        "    fn tables_are_sorted_for_binary_search() {",
-        "        assert!(BY_FILE_NAME.windows(2).all(|w| w[0].0 < w[1].0));",
-        "        assert!(BY_EXTENSION.windows(2).all(|w| w[0].0 < w[1].0));",
-        "    }",
-        "}",
-        "",
     ]
-    (ROOT / "src" / "file_icons.rs").write_text("\n".join(out), encoding="utf-8")
+    (ROOT / "src" / "file_icons.rs").write_text("\n".join(out) + "\n" + RUST_TAIL, encoding="utf-8", newline="\n")
     print(f"seti: {len(by_name)} file names, {len(by_ext)} extensions, font {fonts / 'seti.ttf'}")
     return 0
 

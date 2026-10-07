@@ -2,9 +2,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// The request-shape regression test (src/git.rs) exercises this module even
-// when the optional HTTP client is not part of the build.
-#[cfg(any(feature = "codex", test))]
 #[path = "ai_codex.rs"]
 mod ai_codex;
 
@@ -25,27 +22,70 @@ pub(super) struct Invocation {
     pub model: Option<String>,
 }
 
+const SECRET_MARKERS: [&str; 4] = ["KEY", "TOKEN", "SECRET", "PASSWORD"];
+
+/// Environment entries that carry their credentials inside one JSON document
+/// (aider's projected config, OpenCode's auth and provider data): the entry's
+/// name says nothing about the secrets in it.
+const JSON_CREDENTIAL_ENVS: [&str; 3] = ["ANVIL_AIDER_CONFIG", "OPENCODE_AUTH_CONTENT", "OPENCODE_CONFIG_CONTENT"];
+
 /// The credential values this invocation hands the child, so a caller that
 /// surfaces the child's diagnostics can scrub them first. Only environment
 /// names that actually carry a secret qualify: a model name redacted out of an
 /// error message would cost more than it protects.
 pub(super) fn command_secrets(command: &Command) -> Vec<String> {
-    command
-        .get_envs()
-        .filter_map(|(key, value)| {
-            let name = key.to_string_lossy().to_ascii_uppercase();
-            let is_secret = ["KEY", "TOKEN", "SECRET", "PASSWORD"].iter().any(|marker| name.contains(marker));
-            is_secret
-                .then(|| value.map(|value| value.to_string_lossy().into_owned()))
-                .flatten()
-                .filter(|value| value.len() >= 8)
-        })
-        .collect()
+    let mut secrets = Vec::new();
+    for (key, value) in command.get_envs() {
+        let Some(value) = value.map(|value| value.to_string_lossy().into_owned()) else { continue };
+        let name = key.to_string_lossy().to_ascii_uppercase();
+        if JSON_CREDENTIAL_ENVS.contains(&name.as_str()) {
+            if let Ok(document) = serde_json::from_str::<serde_json::Value>(&value) {
+                json_secrets(&document, &mut secrets);
+            }
+        } else if SECRET_MARKERS.iter().any(|marker| name.contains(marker)) {
+            secrets.push(value);
+        }
+    }
+    secrets.retain(|secret| secret.len() >= 8);
+    secrets
 }
 
-/// Replaces every known secret in `text` with an ellipsis.
+/// String values stored under a credential-looking field name. Aider keeps
+/// `provider=key` pairs in its `api-key` list, so the part after `=` counts too.
+fn json_secrets(value: &serde_json::Value, secrets: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (name, value) in fields {
+                let name = name.to_ascii_uppercase();
+                if SECRET_MARKERS.iter().chain(&["AUTH"]).any(|marker| name.contains(marker)) {
+                    let texts = match value {
+                        serde_json::Value::String(text) => vec![text.as_str()],
+                        serde_json::Value::Array(items) => items.iter().filter_map(serde_json::Value::as_str).collect(),
+                        _ => Vec::new(),
+                    };
+                    for text in texts {
+                        secrets.push(text.to_owned());
+                        if let Some((_, tail)) = text.split_once('=') {
+                            secrets.push(tail.trim().to_owned());
+                        }
+                    }
+                }
+                json_secrets(value, secrets);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter().for_each(|item| json_secrets(item, secrets)),
+        _ => {}
+    }
+}
+
+/// Replaces every known secret in `text` with an ellipsis. Longer secrets go
+/// first: one that is a prefix of another would otherwise leave the rest of
+/// the longer one behind. An empty secret matches between every character, so
+/// it is skipped.
 pub(super) fn redact(text: &str, secrets: &[String]) -> String {
-    secrets.iter().fold(text.to_owned(), |text, secret| text.replace(secret.as_str(), "…"))
+    let mut ordered: Vec<&str> = secrets.iter().map(String::as_str).filter(|secret| !secret.is_empty()).collect();
+    ordered.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    ordered.into_iter().fold(text.to_owned(), |text, secret| text.replace(secret, "…"))
 }
 
 pub(super) fn words(spec: &str) -> Result<Vec<String>, String> {
@@ -116,10 +156,16 @@ fn home() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from)
 }
 
+/// The cap is applied to the read itself and a briefly denied open is retried:
+/// Claude Code rewrites `settings.json` and `.credentials.json` while a pane is
+/// running, and a size check followed by a plain read fails on that window.
 fn read_config(path: &Path) -> Result<Option<String>, String> {
-    match std::fs::metadata(path) {
-        Ok(meta) if meta.len() > 2 * 1024 * 1024 => Err(format!("AI: конфигурация слишком велика: {}", path.display())),
-        Ok(_) => std::fs::read_to_string(path).map(Some).map_err(|e| format!("{}: {e}", path.display())),
+    match crate::fsutil::read_limited(path, 2 * 1024 * 1024) {
+        Ok(bytes) => String::from_utf8(bytes).map(Some).map_err(|e| format!("{}: {e}", path.display())),
+        // `read_limited` reports only an exceeded cap as `InvalidData`.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            Err(format!("AI: конфигурация слишком велика: {}", path.display()))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
@@ -131,9 +177,20 @@ fn project(value: &serde_json::Value, keys: &[&str]) -> serde_json::Value {
     )
 }
 
+/// Where a JSON5 document stopped parsing, without the text around it: the
+/// parser's own message quotes the offending source line, and these files hold
+/// credentials (`.credentials.json` is a single line holding the OAuth tokens).
+fn syntax_error(error: &json5::Error) -> String {
+    let json5::Error::Message { location, .. } = error;
+    match location {
+        Some(at) => format!("неверный JSON (строка {}, столбец {})", at.line, at.column),
+        None => "неверный JSON".to_owned(),
+    }
+}
+
 fn json_config(path: &Path) -> Result<serde_json::Value, String> {
     read_config(path)?.map_or(Ok(serde_json::json!({})), |text| {
-        json5::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+        json5::from_str(&text).map_err(|e| format!("{}: {}", path.display(), syntax_error(&e)))
     })
 }
 
@@ -246,29 +303,14 @@ pub(super) fn prepare(spec: &str) -> Result<Invocation, String> {
     Ok(Invocation { program: Some(command), directory, backend, model: None })
 }
 
-#[cfg(feature = "codex")]
-fn codex_generate_impl(model: Option<&str>, prompt: &str, timeout: std::time::Duration) -> Result<String, String> {
-    let home = config_home().ok_or_else(|| "Codex: не найден каталог ~/.codex".to_owned())?;
-    ai_codex::generate(&home, model, prompt, timeout)
-}
-
 /// Native Codex inference: the official Responses request, never its agent.
-/// Without the `codex` feature the HTTP client is not linked, so the backend
-/// reports how to get it instead of silently degrading to the CLI's agent.
 pub(super) fn codex_generate(
     model: Option<&str>,
     prompt: &str,
     timeout: std::time::Duration,
 ) -> Result<String, String> {
-    #[cfg(feature = "codex")]
-    {
-        codex_generate_impl(model, prompt, timeout)
-    }
-    #[cfg(not(feature = "codex"))]
-    {
-        let _ = (model, prompt, timeout);
-        Err("Codex: эта сборка ANVIL без бэкенда Codex (меньше размер и зависимости). Соберите с `--features codex` или выберите другой AI-бэкенд".to_owned())
-    }
+    let home = config_home().ok_or_else(|| "Codex: не найден каталог ~/.codex".to_owned())?;
+    ai_codex::generate(&home, model, prompt, timeout).map(|text| plain_message(&text))
 }
 
 /// The shape a Codex request has: URL, headers, body, and the token carried in
@@ -280,14 +322,13 @@ pub(super) type CodexRequest = (String, Vec<(String, String)>, serde_json::Value
 pub(super) fn codex_request_for_tests(home: &Path, model: Option<&str>, prompt: &str) -> Result<CodexRequest, String> {
     let request = ai_codex::request(home, model, prompt)?;
     Ok((
-        request.url,
+        request.url(),
         request.headers.into_iter().map(|(name, value)| (name.to_owned(), value)).collect(),
         request.body,
         request.token,
     ))
 }
 
-#[cfg(feature = "codex")]
 fn config_home() -> Option<PathBuf> {
     std::env::var_os("CODEX_HOME").map(PathBuf::from).or_else(|| home().map(|home| home.join(".codex")))
 }
@@ -481,7 +522,7 @@ fn opencode(command: &mut Command, dir: &Path, models: bool) -> Result<(), Strin
         merge(&mut config, opencode_provider_config(&json_config(Path::new(&path))?)?);
     }
     if let Ok(text) = std::env::var("OPENCODE_CONFIG_CONTENT") {
-        let value = json5::from_str(&text).map_err(|e| format!("OPENCODE_CONFIG_CONTENT: {e}"))?;
+        let value = json5::from_str(&text).map_err(|e| format!("OPENCODE_CONFIG_CONTENT: {}", syntax_error(&e)))?;
         merge(&mut config, opencode_provider_config(&value)?);
     }
     let config = super::opencode_commit_config(Some(&config.to_string()))?;
@@ -741,7 +782,33 @@ pub(super) fn prepare_models() -> Result<Invocation, String> {
     Ok(Invocation { program: Some(command), directory, backend: Backend::OpenCode, model: None })
 }
 
+/// Model output is untrusted text (a staged file can steer it) that ends up in
+/// commit metadata. A control character is not something the reviewer sees in
+/// the message box, yet the terminal of whoever later runs `git log` interprets
+/// it, so only printable text, line breaks and tabs pass; bidirectional
+/// overrides cannot reorder what a reviewer reads either.
+fn plain_message(text: &str) -> String {
+    text.chars()
+        .filter(|ch| {
+            matches!(ch, '\n' | '\t')
+                || !(ch.is_control() || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+        })
+        .collect()
+}
+
 pub(super) fn response(backend: Backend, output: &str) -> Result<String, String> {
+    reply(backend, output).map(|text| plain_message(&text))
+}
+
+/// A JSON string is shown as its text, not as JSON with quotes and escapes.
+fn error_text(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+        .map_or_else(|| value.to_string(), str::to_owned)
+}
+
+fn reply(backend: Backend, output: &str) -> Result<String, String> {
     match backend {
         Backend::OpenCode => super::opencode_message(output),
         Backend::Claude | Backend::Gemini | Backend::Aider => {
@@ -751,7 +818,7 @@ pub(super) fn response(backend: Backend, output: &str) -> Result<String, String>
                 return Err(value
                     .get("error")
                     .or_else(|| value.get("result"))
-                    .map(ToString::to_string)
+                    .map(error_text)
                     .unwrap_or_else(|| output.to_owned()));
             }
             value
@@ -1050,6 +1117,15 @@ mod tests {
         assert!(scrubbed.contains("claude-opus-5"), "diagnostics stay useful: {scrubbed}");
     }
 
+    /// One secret that is a prefix of another must not leave the longer one's
+    /// tail in the text, and an empty value must not shred the text.
+    #[test]
+    fn redaction_removes_the_longest_secret_first_and_ignores_empty_ones() {
+        let secrets = vec!["sk-live".to_owned(), String::new(), "sk-live-tail-of-the-longer-key".to_owned()];
+        let scrubbed = redact("echo sk-live-tail-of-the-longer-key and sk-live", &secrets);
+        assert_eq!(scrubbed, "echo … and …");
+    }
+
     /// A short value is far more likely to be an ordinary setting that happens
     /// to sit in a secret-sounding name than a credential.
     #[test]
@@ -1071,6 +1147,112 @@ mod tests {
         sweep_stale_directories_in(root.path(), std::time::Duration::ZERO);
         assert!(!stale.exists(), "an abandoned generation directory keeps credentials");
         assert!(foreign.exists(), "directories that are not ours are untouched");
+    }
+
+    /// The parser's own message quotes the source line it stopped on. A one-line
+    /// `.credentials.json` cut short by a concurrent writer would put the OAuth
+    /// tokens into the notice, so only the position is reported.
+    #[test]
+    fn syntax_errors_never_quote_the_credentials_they_were_found_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        std::fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-SECRETVALUE","refreshToken":"sk-ant-ort0"#,
+        )
+        .unwrap();
+        let error = json_config(&path).unwrap_err();
+        assert!(!error.contains("SECRETVALUE") && !error.contains("sk-ant"), "the document leaked: {error}");
+        assert!(error.contains("строка 1"), "the position is still reported: {error}");
+        let error = json5::from_str::<serde_json::Value>(r#"{"key": "sk-ant-oat01-SECRETVALUE" "#)
+            .map_err(|e| syntax_error(&e))
+            .unwrap_err();
+        assert!(!error.contains("SECRETVALUE"), "{error}");
+
+        std::fs::write(&path, vec![b' '; 2 * 1024 * 1024 + 1]).unwrap();
+        assert!(read_config(&path).unwrap_err().contains("слишком велика"));
+    }
+
+    /// Claude Code rewrites its settings and credentials while a pane runs. A
+    /// denied open for a moment is not a failed generation.
+    #[cfg(windows)]
+    #[test]
+    fn config_read_waits_out_a_writer_that_briefly_denies_sharing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            drop(held);
+        });
+        assert_eq!(read_config(&path).unwrap().as_deref(), Some("{}"));
+        release.join().unwrap();
+    }
+
+    /// The model's text lands in a commit message the user reviews in a box, then
+    /// in `git log` on someone's terminal.
+    #[test]
+    fn model_output_reaches_the_message_box_as_plain_text() {
+        let hostile = "feat: add parser\u{1b}]52;c;AAAA\u{7}\r\n\r\nbody\u{0}\u{9b}31m\u{202e}\ttail";
+        for output in [hostile.to_owned(), serde_json::json!({ "result": hostile }).to_string()] {
+            let backend = if output.starts_with('{') { Backend::Claude } else { Backend::Custom };
+            assert_eq!(
+                response(backend, &output).unwrap(),
+                "feat: add parser]52;c;AAAA\n\nbody31m\ttail",
+                "{backend:?}"
+            );
+        }
+        let cyrillic = "feat: поддержка кириллицы\n\n- пункт";
+        assert_eq!(response(Backend::Custom, cyrillic).unwrap(), cyrillic);
+    }
+
+    /// An error carried in a JSON string is shown as text, not as quoted JSON.
+    #[test]
+    fn cli_errors_are_shown_as_text() {
+        let claude = r#"{"is_error":true,"result":"API Error: 401 \"Invalid key\""}"#;
+        assert_eq!(response(Backend::Claude, claude).unwrap_err(), "API Error: 401 \"Invalid key\"");
+        let nested = r#"{"error":{"message":"quota exceeded","code":429}}"#;
+        assert_eq!(response(Backend::Gemini, nested).unwrap_err(), "quota exceeded");
+        assert_eq!(response(Backend::Aider, r#"{"error":"no model"}"#).unwrap_err(), "no model");
+    }
+
+    /// Aider's projected config and OpenCode's auth/provider data travel as JSON
+    /// in one environment entry, so the entry's name does not mark the secrets:
+    /// the ones inside it still have to be scrubbed from the child's diagnostics.
+    #[test]
+    fn secrets_inside_json_environment_entries_are_collected() {
+        let mut command = Command::new("echo");
+        command.env(
+            "ANVIL_AIDER_CONFIG",
+            serde_json::json!({
+                "model": "openrouter/some-model",
+                "openai-api-key": "sk-openai-secret-1",
+                "api-key": ["gemini=AIzaGeminiSecret2", "short=k"],
+                "timeout": "60"
+            })
+            .to_string(),
+        );
+        command.env(
+            "OPENCODE_AUTH_CONTENT",
+            serde_json::json!({ "zai": { "type": "api", "key": "zai-secret-key-3" } }).to_string(),
+        );
+        command.env(
+            "OPENCODE_CONFIG_CONTENT",
+            serde_json::json!({
+                "model": "zai/glm-5",
+                "provider": { "custom": { "options": { "baseURL": "https://example.com", "apiKey": "custom-secret-4" } } }
+            })
+            .to_string(),
+        );
+        let secrets = command_secrets(&command);
+        for expected in ["sk-openai-secret-1", "AIzaGeminiSecret2", "zai-secret-key-3", "custom-secret-4"] {
+            assert!(secrets.iter().any(|secret| secret == expected), "{expected} is not scrubbed: {secrets:?}");
+        }
+        assert!(!secrets.iter().any(|secret| secret.contains("some-model") || secret.contains("example.com")));
+        let scrubbed = redact("failed: key=AIzaGeminiSecret2 url=https://example.com", &secrets);
+        assert_eq!(scrubbed, "failed: key=… url=https://example.com");
     }
 
     /// A provider entry can pull executable code in through `npm`; only the

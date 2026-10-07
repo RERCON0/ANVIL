@@ -24,12 +24,6 @@ name = "anvil-probe"
 path = "src/bin/anvil-probe.rs"
 test = false
 
-[features]
-default = ["codex"]
-# Native Codex inference is included in normal builds and portable packages.
-# --no-default-features is available for development of the CLI-only backends.
-codex = ["dep:reqwest"]
-
 [dependencies]
 egui = { version = "0.34.3", default-features = false, features = ["default_fonts"] }
 egui_glow = { version = "0.34.3", features = ["winit", "clipboard", "links"] }
@@ -44,8 +38,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml_ng = "0.10"
 json5 = "0.4"
-toml = "0.9"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
+toml = "1"
 log = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 tempfile = "3"
@@ -90,18 +83,15 @@ embed-resource = "3"
 
 [profile.release]
 strip = true
-# `lto = true` is already fat. The per-package overrides below only cover
-# dependencies: the whole frame path (render, view, style, app, workspace) is the
-# root crate, so `opt-level = "z"` compiled it at -Oz for a 1.94x slower frame
-# and a longer build. -O2 measured the same as -O3 on the frame path.
+# `lto = true` is already fat. The per-package overrides below only raise the
+# terminal engine to -O3: the whole frame path (render, view, style, app,
+# workspace) is the root crate, so `opt-level = "z"` compiled it at -Oz for a
+# 1.94x slower frame and a longer build. -O2 measured the same as -O3 on the
+# frame path.
 lto = true
 opt-level = 2
 codegen-units = 1
 
-[profile.release.package.epaint]
-opt-level = 2
-[profile.release.package.egui]
-opt-level = 2
 [profile.release.package.alacritty_terminal]
 opt-level = 3
 [profile.release.package.vte]

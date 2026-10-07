@@ -13,6 +13,39 @@ def split_entry(item, separator):
     return (name, value) if name and value else None
 
 
+def known_secrets(config):
+    """Credential values this process holds: a provider's error text can echo one."""
+    found = set()
+    for name, value in os.environ.items():
+        if any(marker in name.upper() for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
+            found.add(value)
+    if isinstance(config, dict):
+        for name, value in config.items():
+            if "key" not in str(name).lower():
+                continue
+            for item in value if isinstance(value, list) else [value]:
+                if isinstance(item, str):
+                    found.add(item)
+                    entry = split_entry(item, "=")
+                    if entry is not None:
+                        found.add(entry[1])
+    return sorted((secret for secret in found if len(secret) >= 8), key=len, reverse=True)
+
+
+def scrub(text, secrets):
+    for secret in secrets:
+        text = text.replace(secret, "…")
+    return text
+
+
+def emit(document):
+    # ASCII only. The process runs isolated (-I), so PYTHONUTF8/PYTHONIOENCODING
+    # are ignored and a pipe is written in the ANSI code page (cp1251, cp1252),
+    # which the reader does not decode: any non-ASCII text would arrive as
+    # replacement characters, or fail to encode at all.
+    print(json.dumps(document))
+
+
 def generate(config, prompt, model_override=None):
     # No aider.main/Coder: those discover repo config and can execute /commands.
     from aider.models import Model, MODEL_ALIASES
@@ -78,6 +111,7 @@ def main():
     parser.add_argument("--model")
     parser.add_argument("--message", required=True)
     args = parser.parse_args()
+    config = {}
     try:
         # The projected config carries API keys, so it arrives in the
         # environment rather than as a file on disk.
@@ -86,9 +120,9 @@ def main():
         # Imported provider libraries may print diagnostics; keep protocol stdout clean.
         with contextlib.redirect_stdout(sys.stderr):
             message = generate(config, args.message, args.model)
-        print(json.dumps({"result": message}, ensure_ascii=False))
+        emit({"result": message})
     except Exception as error:
-        print(json.dumps({"error": str(error)}, ensure_ascii=False))
+        emit({"error": scrub(str(error), known_secrets(config))})
         return 1
     return 0
 

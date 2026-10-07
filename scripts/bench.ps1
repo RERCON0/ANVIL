@@ -7,11 +7,21 @@ Set-Location $root
 
 $log = Join-Path $env:APPDATA 'anvil\anvil.log'
 $exe = Join-Path $root 'target\release\anvil.exe'
-if (-not (Test-Path $exe)) { throw "build the release binary first: cargo build --release" }
+if (-not (Test-Path -LiteralPath $exe)) { throw "build the release binary first: cargo build --release" }
 
 function Get-AnvilProcesses { @(Get-Process anvil -ErrorAction SilentlyContinue) }
 
+# The log is appended to across runs and every line starts with its epoch
+# milliseconds, so only a first-frame line written after this launch counts.
+function Get-FirstFrameMs([long]$SinceMs) {
+    if (-not (Test-Path -LiteralPath $log)) { return $null }
+    $hit = Select-String -LiteralPath $log -Pattern '^(\d+) INFO +anvil::app: first frame in (\d+) ms' |
+        Where-Object { [long]$_.Matches[0].Groups[1].Value -ge $SinceMs } | Select-Object -Last 1
+    if ($hit) { [int]$hit.Matches[0].Groups[2].Value }
+}
+
 $before = Get-AnvilProcesses
+$launchedAtMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $start = Get-Date
 Start-Process -FilePath $exe
 $deadline = $start.AddSeconds(15)
@@ -24,9 +34,14 @@ while ((Get-Date) -lt $deadline) {
 if (-not $windowAt) { throw 'the ANVIL window did not appear within 15 s' }
 $startupMs = [int]($windowAt - $start).TotalMilliseconds
 
-# The first frame mark from the log (main -> first rendered frame).
-$firstFrame = Select-String -Path $log -Pattern 'first frame in (\d+) ms' | Select-Object -Last 1
-$firstFrameMs = if ($firstFrame) { [int]$firstFrame.Matches[0].Groups[1].Value } else { $null }
+# The first frame mark from the log (main -> first rendered frame). It can land
+# a moment after the window handle appears.
+$firstFrameMs = Get-FirstFrameMs $launchedAtMs
+$frameDeadline = (Get-Date).AddSeconds(10)
+while ($null -eq $firstFrameMs -and (Get-Date) -lt $frameDeadline) {
+    Start-Sleep -Milliseconds 100
+    $firstFrameMs = Get-FirstFrameMs $launchedAtMs
+}
 
 $proc = Get-Process -Id $pid_
 $workingSetMb = [math]::Round($proc.WorkingSet64 / 1MB, 1)

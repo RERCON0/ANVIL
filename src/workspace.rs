@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use egui::{Align, Align2, Layout, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, Vec2};
 
-use crate::git::{self, Change, CommitLog, FileDiff, Status};
+use crate::git::{self, Change, CommitLog, Status};
 use crate::graph;
 use crate::strings;
 use crate::theme;
@@ -76,13 +76,23 @@ pub enum Request {
     ReadFile {
         path: String,
     },
-    /// `header` is the `@@ … @@` line the user saw; the worker refuses to apply
-    /// when the freshly generated diff no longer has it at `index`.
+    /// `seen` is hunk `index` exactly as the user was shown it (the `@@ … @@`
+    /// line, the context and the changes, byte for byte); the worker refuses to
+    /// apply unless the freshly generated diff has the same bytes at `index`.
     ApplyHunks {
         path: String,
         index: usize,
-        header: String,
+        seen: Vec<u8>,
         from_index: bool,
+    },
+    /// The file named by a context-menu click, looked at on the worker: the UI
+    /// thread must not canonicalize it or read its first bytes (a cloud
+    /// placeholder makes that wait for a download).
+    OpenExternal {
+        path: String,
+    },
+    Reveal {
+        path: String,
     },
     Fetch,
     Push,
@@ -120,15 +130,19 @@ enum Response {
     Trusted(git::RepositoryIdentity),
     Diff {
         path: String,
-        files: Vec<FileDiff>,
         text: String,
         rows: Vec<TextRow>,
+        /// Every hunk of `text` as git printed it, indexed like the `@@` rows.
+        hunks: Vec<Vec<u8>>,
         staged: bool,
         side: Option<bool>,
     },
     DiffChecked(DiffStamp),
     Refreshed,
-    Committed(String),
+    /// The short hash, or why git refused. Exactly one answer per commit request.
+    Committed(Result<String, String>),
+    /// What the UI thread starts now (None: nothing to start).
+    Launch(Option<Launch>),
     AiMessage(Result<String, String>),
     Log(CommitLog),
     CommitDetail {
@@ -155,6 +169,14 @@ enum Response {
     Fetched(String),
     Pushed(String),
     Error(String),
+}
+
+/// What the UI thread starts for a file of the repository once the worker has
+/// looked at it: the program that views it, or Explorer with it selected.
+#[derive(Debug, PartialEq, Eq)]
+enum Launch {
+    Open(PathBuf),
+    Reveal(PathBuf),
 }
 
 /// A row of the commit list: either a section header or a commit by index.
@@ -237,7 +259,9 @@ pub struct Workspace {
     pub collapsed: HashSet<String>,
     pub diff_path: Option<String>,
     pub diff_text: String,
-    pub diff_files: Vec<FileDiff>,
+    /// The hunks of `diff_text` byte for byte, as the worker read them: what a
+    /// click on a hunk header asks the worker to apply.
+    diff_hunks: Vec<Vec<u8>>,
     pub diff_from_index: bool,
     /// The side the user picked with the index/worktree button (None: auto).
     pub diff_side: Option<bool>,
@@ -271,6 +295,9 @@ pub struct Workspace {
     markdown: MarkdownCache,
     ai_command: Option<String>,
     ai_generating: bool,
+    /// A commit request is on its way and has not been answered: the button is
+    /// off, so a second click cannot send a second `git commit`.
+    committing: bool,
     trust_required: bool,
     trust_approval_pending: bool,
     pending_identity: Option<git::RepositoryIdentity>,
@@ -298,7 +325,7 @@ impl Default for Workspace {
             collapsed: HashSet::new(),
             diff_path: None,
             diff_text: String::new(),
-            diff_files: Vec::new(),
+            diff_hunks: Vec::new(),
             diff_from_index: false,
             diff_side: None,
             commit_message: String::new(),
@@ -329,6 +356,7 @@ impl Default for Workspace {
             markdown: MarkdownCache::default(),
             ai_command: None,
             ai_generating: false,
+            committing: false,
             trust_required: false,
             trust_approval_pending: false,
             pending_identity: None,
@@ -392,12 +420,13 @@ impl Workspace {
         self.busy = false;
         self.trust_approval_pending = false;
         self.ai_generating = false;
+        self.committing = false;
         self.status = Status::default();
         self.selected.clear();
         self.collapsed.clear();
         self.diff_path = None;
         self.diff_text.clear();
-        self.diff_files.clear();
+        self.diff_hunks.clear();
         self.diff_rows.clear();
         self.diff_wrapped = WrappedRows::default();
         self.diff_stamp = None;
@@ -424,6 +453,20 @@ impl Workspace {
         self.log_status_seen = false;
     }
 
+    /// Sends the commit message, once: until the worker answers, a second call
+    /// (a double click, a held Ctrl+Enter) sends nothing, so no second
+    /// `git commit` can fail with "nothing to commit" over the first one's notice.
+    fn start_commit(&mut self) {
+        // Without a worker nothing would answer, and the button would stay off.
+        if self.committing || self.tx.is_none() {
+            return;
+        }
+        self.committing = true;
+        self.busy = true;
+        self.notice = None;
+        self.request(Request::Commit { message: self.commit_message.clone() });
+    }
+
     fn trust_view(&mut self, ui: &mut egui::Ui) {
         ui.label(
             RichText::new(strings::WORKSPACE_TRUST_TITLE).color(theme::colors().status_yellow).font(theme::font(13.0)),
@@ -444,7 +487,7 @@ impl Workspace {
                 );
                 for hazard in hazards {
                     ui.label(
-                        RichText::new(format!("· {hazard}"))
+                        RichText::new(format!("· {}", display(hazard, 120)))
                             .color(theme::colors().status_yellow)
                             .font(theme::field_font(11.0)),
                     );
@@ -452,7 +495,7 @@ impl Workspace {
             }
         }
         if let Some((notice, _)) = &self.notice {
-            ui.label(RichText::new(notice).color(theme::colors().status_red).font(theme::font(11.5)));
+            notice_label(ui, notice, theme::colors().status_red);
         }
         if ui
             .add_enabled(
@@ -488,18 +531,6 @@ impl Workspace {
                 }
             }
         }
-        if lost {
-            self.tx = None;
-            self.rx = None;
-            self.busy = false;
-            self.ai_generating = false;
-            self.trust_approval_pending = false;
-            self.inflight = 0;
-            if self.notice.is_none() {
-                self.notice = Some((strings::WORKSPACE_WORKER_LOST.to_owned(), true));
-            }
-            return true;
-        }
         // Every response retires one queued request. `saturating_sub` because
         // `Approve` is answered twice (Trusted, then the status it unlocked):
         // the count may reach zero early, which costs one extra poll, never a
@@ -515,7 +546,7 @@ impl Workspace {
                     self.trust_required = true;
                     self.busy = false;
                     self.ai_generating = false;
-                    self.notice = error.map(|message| (message, true));
+                    self.notice = error.map(|message| (notice_text(&message), true));
                 }
                 Response::Trusted(identity) => {
                     self.root = Some(identity.root);
@@ -558,7 +589,7 @@ impl Workspace {
                         if !self.status.changes.iter().any(|change| change.path == path) {
                             self.diff_path = None;
                             self.diff_text.clear();
-                            self.diff_files.clear();
+                            self.diff_hunks.clear();
                             self.diff_rows.clear();
                             self.diff_wrapped = WrappedRows::default();
                             self.diff_stamp = None;
@@ -585,9 +616,12 @@ impl Workspace {
                         self.diff_stamp = Some(stamp);
                     }
                 }
-                Response::Diff { path, files, text, rows, staged, side } => {
+                Response::Diff { path, text, rows, hunks, staged, side } => {
                     self.busy = false;
                     if self.diff_path.as_deref() == Some(path.as_str()) && self.diff_side == side {
+                        // Even for an unchanged text: two diffs can read the same
+                        // after the lossy decoding and still differ in their bytes.
+                        self.diff_hunks = hunks;
                         if self.diff_text != text {
                             // The rows were indexed on the worker thread: an
                             // 8 MiB diff would otherwise build a row per line
@@ -595,7 +629,6 @@ impl Workspace {
                             self.diff_rows = rows;
                             self.diff_wrapped = WrappedRows::default();
                             self.diff_text = text;
-                            self.diff_files = files;
                         }
                         self.diff_from_index = staged;
                     }
@@ -609,19 +642,30 @@ impl Workspace {
                         self.request(Request::Files);
                     }
                 }
-                Response::Committed(hash) => {
+                Response::Committed(result) => {
                     self.busy = false;
-                    self.commit_message.clear();
-                    self.notice = Some((strings::workspace_committed(&hash), false));
-                    self.request(Request::Log);
-                    self.last_poll = Instant::now() - POLL_INTERVAL;
+                    self.committing = false;
+                    match result {
+                        Ok(hash) => {
+                            self.commit_message.clear();
+                            self.notice = Some((notice_text(&strings::workspace_committed(&hash)), false));
+                            self.request(Request::Log);
+                            self.last_poll = Instant::now() - POLL_INTERVAL;
+                        }
+                        Err(message) => self.notice = Some((notice_text(&message), true)),
+                    }
                 }
+                Response::Launch(launch) => match launch {
+                    Some(Launch::Open(full)) => crate::settings_ui::open_path(&full),
+                    Some(Launch::Reveal(full)) => reveal_resolved(&full),
+                    None => {}
+                },
                 Response::AiMessage(result) => {
                     self.busy = false;
                     self.ai_generating = false;
                     match result {
                         Ok(message) => self.commit_message = message,
-                        Err(message) => self.notice = Some((message, true)),
+                        Err(message) => self.notice = Some((notice_text(&message), true)),
                     }
                 }
                 Response::Log(log) => {
@@ -679,21 +723,36 @@ impl Workspace {
                 }
                 Response::Fetched(what) => {
                     self.busy = false;
-                    self.notice = Some((strings::workspace_fetch_done(&what), false));
+                    self.notice = Some((notice_text(&strings::workspace_fetch_done(&what)), false));
                     self.last_poll = Instant::now() - POLL_INTERVAL;
                     self.request(Request::Log);
                 }
                 Response::Pushed(branch) => {
                     self.busy = false;
-                    self.notice = Some((strings::workspace_pushed(&branch), false));
+                    self.notice = Some((notice_text(&strings::workspace_pushed(&branch)), false));
                     self.last_poll = Instant::now() - POLL_INTERVAL;
                     self.request(Request::Log);
                 }
                 Response::Error(message) => {
                     self.busy = false;
-                    self.notice = Some((message, true));
+                    self.notice = Some((notice_text(&message), true));
                 }
             }
+        }
+        // After the answers: `Disconnected` is reported only once the channel is
+        // drained, so everything the worker sent before it died is applied above.
+        if lost {
+            self.tx = None;
+            self.rx = None;
+            self.busy = false;
+            self.ai_generating = false;
+            self.committing = false;
+            self.trust_approval_pending = false;
+            self.inflight = 0;
+            if self.notice.is_none() {
+                self.notice = Some((strings::WORKSPACE_WORKER_LOST.to_owned(), true));
+            }
+            repaint = true;
         }
         self.busy |= self.ai_generating;
         repaint
@@ -858,7 +917,7 @@ impl Workspace {
         });
         if let Some((notice, error)) = &self.notice {
             let colour = if *error { theme::colors().status_red } else { theme::colors().status_green };
-            ui.label(RichText::new(notice).color(colour).font(theme::font(11.5)));
+            notice_label(ui, notice, colour);
         }
         theme::hairline(ui);
     }
@@ -894,13 +953,12 @@ impl Workspace {
         let ctrl_enter = commit.has_focus() && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter));
         ui.horizontal_wrapped(|ui| {
             let has_staged = self.status.changes.iter().any(Change::staged);
-            let can_commit = !self.ai_generating && !self.commit_message.trim().is_empty() && has_staged;
+            let can_commit =
+                !self.ai_generating && !self.committing && !self.commit_message.trim().is_empty() && has_staged;
             if ui.add_enabled(can_commit, theme::accent_button(strings::WORKSPACE_COMMIT)).clicked()
                 || (can_commit && ctrl_enter)
             {
-                self.busy = true;
-                self.notice = None;
-                self.request(Request::Commit { message: self.commit_message.clone() });
+                self.start_commit();
             }
             let ai_label = match &self.ai_command {
                 Some(command) => strings::workspace_ai(command.split_whitespace().next().unwrap_or(command)),
@@ -1013,8 +1071,9 @@ impl Workspace {
         const ROW_HEIGHT: f32 = 22.0;
         let commit = &self.log.commits[index];
         {
-            let row =
-                self.graph.get(index).cloned().unwrap_or(graph::Row { lane: 0, lane_count: 1, segments: Vec::new() });
+            // Borrowed: a clone allocated the segment list of every visible row on every frame.
+            let blank = graph::Row { lane: 0, lane_count: 1, segments: Vec::new() };
+            let row = self.graph.get(index).unwrap_or(&blank);
             let (rect, response) = ui.allocate_exact_size(Vec2::new(width, ROW_HEIGHT), Sense::click());
             let painter = ui.painter_at(rect);
             if response.hovered() {
@@ -1121,7 +1180,13 @@ impl Workspace {
                 );
             }
             if response.hovered() {
-                let tooltip = format!("{}\n{} · {}\n{}", commit.subject, commit.author, commit.short, time_text);
+                let tooltip = format!(
+                    "{}\n{} · {}\n{}",
+                    display(&commit.subject, 500),
+                    display(&commit.author, 80),
+                    commit.short,
+                    time_text
+                );
                 let _ = response.clone().on_hover_text(tooltip);
             }
             if response.clicked() {
@@ -1135,8 +1200,8 @@ impl Workspace {
         let label = match &prompt.kind {
             PromptKind::NewFile => strings::WORKSPACE_NEW_FILE.to_owned(),
             PromptKind::NewFolder => strings::WORKSPACE_NEW_FOLDER.to_owned(),
-            PromptKind::Rename(path) => format!("{}: {path}", strings::WORKSPACE_RENAME),
-            PromptKind::Delete { path, .. } => format!("{}: {path}", strings::WORKSPACE_DELETE),
+            PromptKind::Rename(path) => format!("{}: {}", strings::WORKSPACE_RENAME, display(path, 240)),
+            PromptKind::Delete { path, .. } => format!("{}: {}", strings::WORKSPACE_DELETE, display(path, 240)),
         };
         ui.label(RichText::new(label).color(theme::colors().dim).font(theme::font(11.5)));
         if let PromptKind::Delete { folder, .. } = prompt.kind {
@@ -1171,6 +1236,8 @@ impl Workspace {
         if commit {
             let Some(prompt) = self.prompt.take() else { return };
             let text = prompt.text.trim().to_owned();
+            // The previous answer is about the previous operation.
+            self.notice = None;
             match prompt.kind {
                 PromptKind::NewFile if !text.is_empty() => {
                     self.busy = true;
@@ -1207,7 +1274,7 @@ impl Workspace {
                 self.request(Request::Stage { paths, staged: true });
             }
             if ui.add_enabled(has_selection, theme::ghost_button(strings::WORKSPACE_UNSTAGE)).clicked() {
-                let paths: Vec<String> = self.selected.iter().cloned().collect();
+                let paths = unstage_paths(self.status.changes.iter().filter(|c| self.selected.contains(&c.path)));
                 self.busy = true;
                 self.request(Request::Stage { paths, staged: false });
             }
@@ -1218,8 +1285,7 @@ impl Workspace {
                 self.request(Request::Stage { paths, staged: true });
             }
             if ui.add(theme::ghost_button(strings::WORKSPACE_UNSTAGE_ALL)).clicked() {
-                let paths: Vec<String> =
-                    self.status.changes.iter().filter(|c| c.staged()).map(|c| c.path.clone()).collect();
+                let paths = unstage_paths(self.status.changes.iter().filter(|c| c.staged()));
                 self.busy = true;
                 self.request(Request::Stage { paths, staged: false });
             }
@@ -1345,7 +1411,7 @@ impl Workspace {
                                 } else {
                                     self.diff_path = Some(path.clone());
                                     self.diff_text.clear();
-                                    self.diff_files.clear();
+                                    self.diff_hunks.clear();
                                     self.diff_rows.clear();
                                     self.diff_stamp = None;
                                     self.diff_wrapped = WrappedRows::default();
@@ -1378,7 +1444,7 @@ impl Workspace {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.add(theme::ghost_button(strings::WORKSPACE_DIFF_STAGED)).clicked() {
                     self.diff_text.clear();
-                    self.diff_files.clear();
+                    self.diff_hunks.clear();
                     self.diff_rows.clear();
                     self.diff_wrapped = WrappedRows::default();
                     self.diff_stamp = None;
@@ -1388,7 +1454,7 @@ impl Workspace {
                 }
             });
         });
-        let mut hunks_to_apply: Option<(usize, String, bool)> = None;
+        let mut hunks_to_apply: Option<(usize, bool)> = None;
         let height = (ui.available_height() * 0.55).clamp(24.0, 300.0);
         self.diff_wrapped.prepare(ui, &self.diff_text, &self.diff_rows);
         let spacing = ui.spacing().item_spacing.y;
@@ -1415,13 +1481,7 @@ impl Workspace {
                         );
                         paint_text_row(ui, rect, line, None, theme::colors().diff_hunk);
                         if response.clicked() {
-                            if let Some(header) = self.diff_rows.iter().find(|row| row.hunk == Some(hunk_index)) {
-                                hunks_to_apply = Some((
-                                    hunk_index,
-                                    self.diff_text[header.bytes.clone()].to_owned(),
-                                    self.diff_from_index,
-                                ));
-                            }
+                            hunks_to_apply = Some((hunk_index, self.diff_from_index));
                         }
                     } else {
                         patch_line(ui, line, row.number, row.kind);
@@ -1429,9 +1489,12 @@ impl Workspace {
                 }
             });
         ui.spacing_mut().item_spacing.y = spacing;
-        if let Some((index, header, from_index)) = hunks_to_apply {
-            self.busy = true;
-            self.request(Request::ApplyHunks { path, index, header, from_index });
+        if let Some((index, from_index)) = hunks_to_apply {
+            // The hunk as it was shown: the worker applies it only if the file still has it.
+            if let Some(seen) = self.diff_hunks.get(index).cloned() {
+                self.busy = true;
+                self.request(Request::ApplyHunks { path, index, seen, from_index });
+            }
         }
     }
 
@@ -1552,7 +1615,7 @@ fn commit_detail_view(
                         false,
                         RichText::new(display(path, 120)).color(theme::colors().text).font(theme::font(11.5)),
                     )
-                    .on_hover_text(path)
+                    .on_hover_text(display(path, 240))
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
                 {
@@ -1592,7 +1655,7 @@ impl Workspace {
                 if !hidden {
                     rows.push(FileRow {
                         depth: index,
-                        name: (*segment).to_owned(),
+                        name: display(segment, 120),
                         dir: None,
                         path: folder.clone(),
                         folder: true,
@@ -1605,7 +1668,7 @@ impl Workspace {
             if !hidden && !name.is_empty() {
                 rows.push(FileRow {
                     depth: dirs.len(),
-                    name: name[0].to_owned(),
+                    name: display(name[0], 120),
                     dir: None,
                     path: path.clone(),
                     folder: false,
@@ -1737,11 +1800,11 @@ impl Workspace {
         let path = row.path.clone();
         response.context_menu(|ui| {
             if ui.button(strings::WORKSPACE_OPEN_EXTERNAL).clicked() {
-                open_external(&self.root, &path);
+                self.request(Request::OpenExternal { path: path.clone() });
                 ui.close();
             }
             if ui.button(strings::WORKSPACE_REVEAL).clicked() {
-                reveal_in_explorer(&self.root, &path);
+                self.request(Request::Reveal { path: path.clone() });
                 ui.close();
             }
             if ui.button(strings::WORKSPACE_RENAME).clicked() {
@@ -1784,6 +1847,11 @@ impl Workspace {
                 );
             }
         });
+        // The answer of a refused create, rename or delete: only the Changes tab
+        // drew the notice, so here the prompt closed and nothing said why.
+        if let Some((notice, true)) = &self.notice {
+            notice_label(ui, notice, theme::colors().status_red);
+        }
         ui.add(
             egui::TextEdit::singleline(&mut self.file_filter)
                 .font(theme::field_font(12.0))
@@ -1823,7 +1891,7 @@ impl Workspace {
         if let Some((path, text, truncated)) = self.file_preview.as_ref() {
             ui.add_space(2.0);
             theme::hairline(ui);
-            ui.label(RichText::new(path).color(theme::colors().dim).font(theme::field_font(11.0)));
+            ui.label(RichText::new(display(path, 240)).color(theme::colors().dim).font(theme::field_font(11.0)));
             // The preview ends on a whole line and takes the space the list
             // leaves: a height that is not a multiple of the line height cut
             // the last line in half, and the old half-of-the-rest cap left the
@@ -2054,7 +2122,9 @@ fn text_rows(text: &str, patch: bool) -> Vec<TextRow> {
             let start = offset;
             offset += raw.len();
             let number = if patch { numbers.line(line) } else { Some(index as u64 + 1) };
-            let hunk_index = if patch && line.starts_with("@@") {
+            // `diff --cc` (a conflicted file) heads its hunks `@@@`: `parse_diff` has no
+            // hunk behind those, so they are not offered as clickable hunks either.
+            let hunk_index = if patch && line.starts_with("@@ ") {
                 let index = hunk;
                 hunk += 1;
                 Some(index)
@@ -2401,25 +2471,38 @@ fn inline_job(text: &str, size: f32, colour: egui::Color32, width: f32) -> egui:
     };
     let mut job = LayoutJob::default();
     job.wrap.max_width = width;
-    let mut rest = text;
-    while !rest.is_empty() {
-        let bold_at = rest.find("**").map(|at| (at, "**", &bold));
-        let code_at = rest.find('`').map(|at| (at, "`", &code));
-        let Some((at, marker, format)) = [bold_at, code_at].into_iter().flatten().min_by_key(|(at, _, _)| *at) else {
-            job.append(rest, 0.0, plain);
+    let mut cursor = 0;
+    // The next marker of each kind, as an offset into `text`. One is searched for
+    // again only once the cursor has passed it: searching both from the cursor at
+    // every step rescans the whole remainder for the kind that never occurs, which
+    // is quadratic on a long line of one kind (an 8 MiB Markdown line).
+    let mut bold_at = text.find("**");
+    let mut code_at = text.find('`');
+    while cursor < text.len() {
+        if bold_at.is_some_and(|at| at < cursor) {
+            bold_at = text[cursor..].find("**").map(|at| at + cursor);
+        }
+        if code_at.is_some_and(|at| at < cursor) {
+            code_at = text[cursor..].find('`').map(|at| at + cursor);
+        }
+        let bold_next = bold_at.map(|at| (at, "**", &bold));
+        let code_next = code_at.map(|at| (at, "`", &code));
+        let Some((at, marker, format)) = [bold_next, code_next].into_iter().flatten().min_by_key(|(at, _, _)| *at)
+        else {
+            job.append(&text[cursor..], 0.0, plain);
             break;
         };
-        if at > 0 {
-            job.append(&rest[..at], 0.0, plain.clone());
+        if at > cursor {
+            job.append(&text[cursor..at], 0.0, plain.clone());
         }
-        let after = &rest[at + marker.len()..];
-        match after.find(marker) {
+        let opened = at + marker.len();
+        match text[opened..].find(marker) {
             Some(end) => {
-                job.append(&after[..end], 0.0, format.clone());
-                rest = &after[end + marker.len()..];
+                job.append(&text[opened..opened + end], 0.0, format.clone());
+                cursor = opened + end + marker.len();
             }
             None => {
-                job.append(&rest[at..], 0.0, plain);
+                job.append(&text[at..], 0.0, plain);
                 break;
             }
         }
@@ -2604,6 +2687,26 @@ fn display_multiline(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// A notice as the panel keeps and paints it. It is untrusted: git answers a
+/// refused commit with its whole `git status` (names from the repository, up to
+/// 8 MiB, unescaped bidi overrides), so control and bidi characters are dropped
+/// and the size is bounded to a few lines of a few hundred characters. Applying
+/// it twice changes nothing.
+pub(crate) fn notice_text(text: &str) -> String {
+    const LINES: usize = 6;
+    const CHARS: usize = 300;
+    let mut lines = text.lines();
+    let mut kept: Vec<String> = lines.by_ref().take(LINES).map(|line| display(line, CHARS)).collect();
+    if lines.next().is_some() {
+        kept.push("…".to_owned());
+    }
+    kept.join("\n")
+}
+
+fn notice_label(ui: &mut egui::Ui, notice: &str, colour: egui::Color32) {
+    ui.label(RichText::new(notice_text(notice)).color(colour).font(theme::font(11.5)));
+}
+
 fn is_format_control(ch: char) -> bool {
     matches!(ch, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
 }
@@ -2709,20 +2812,24 @@ fn viewable_content(extension: &str, prefix: &[u8]) -> bool {
     }
 }
 
-fn open_external(root: &Option<PathBuf>, path: &str) {
-    let Some(root) = root else { return };
-    let Ok((full, safe)) = external_open_target(root, path) else { return };
-    if safe {
-        crate::settings_ui::open_path(&full);
-    } else {
-        reveal_resolved(&full);
+/// Which launch a click on a repository file means. The worker runs this (it
+/// canonicalizes the path and reads the first bytes of the file); the UI thread
+/// only starts the result. A viewer format with matching content opens;
+/// everything else, scripts and programs included, is revealed in Explorer.
+fn external_launch(root: &Path, path: &str, reveal_only: bool) -> Result<Launch, String> {
+    if reveal_only {
+        return git::resolve_path(root, path).map(Launch::Reveal);
     }
+    let (full, safe) = external_open_target(root, path)?;
+    Ok(if safe { Launch::Open(full) } else { Launch::Reveal(full) })
 }
 
-fn reveal_in_explorer(root: &Option<PathBuf>, path: &str) {
-    let Some(root) = root else { return };
-    let Ok(full) = git::resolve_path(root, path) else { return };
-    reveal_resolved(&full);
+/// Every hunk of a diff in the order of its `@@` rows, each as `git::hunk_bytes`
+/// reads it. One pass over the diff: every hunk is copied once, from its own
+/// lines (rebuilding a whole patch per hunk was quadratic in the hunk count).
+fn diff_hunk_bytes(diff: &[u8], staged: bool) -> Vec<Vec<u8>> {
+    let files = git::parse_diff(diff, staged);
+    files.iter().flat_map(|file| (0..file.hunks.len()).filter_map(|index| git::hunk_bytes(file, index))).collect()
 }
 
 fn reveal_resolved(full: &Path) {
@@ -2762,10 +2869,11 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
             };
             if request.requires_current_repository() && expected_root != root {
                 let error = strings::WORKSPACE_REPO_CHANGED.to_owned();
-                send(if matches!(request, Request::AiMessage { .. }) {
-                    Response::AiMessage(Err(error))
-                } else {
-                    Response::Error(error)
+                send(match request {
+                    Request::AiMessage { .. } => Response::AiMessage(Err(error)),
+                    Request::Commit { .. } => Response::Committed(Err(error)),
+                    Request::OpenExternal { .. } | Request::Reveal { .. } => Response::Launch(None),
+                    _ => Response::Error(error),
                 });
                 continue;
             }
@@ -2853,10 +2961,10 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                                 }
                             },
                         };
-                        let files = git::parse_diff(&bytes, from_index);
                         let text = String::from_utf8_lossy(&bytes).into_owned();
                         let rows = text_rows(&text, true);
-                        send(Response::Diff { path, files, text, rows, staged: from_index, side });
+                        let hunks = diff_hunk_bytes(&bytes, from_index);
+                        send(Response::Diff { path, text, rows, hunks, staged: from_index, side });
                     }
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
                 },
@@ -2875,11 +2983,8 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
                 },
                 Request::Commit { message } => match &root {
-                    Some(root) => match git::commit(root, message) {
-                        Ok(hash) => send(Response::Committed(hash)),
-                        Err(e) => send(Response::Error(e)),
-                    },
-                    None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
+                    Some(root) => send(Response::Committed(git::commit(root, message))),
+                    None => send(Response::Committed(Err(strings::WORKSPACE_NO_REPO.to_owned()))),
                 },
                 Request::AiMessage { command } => {
                     if root.is_none() {
@@ -2983,7 +3088,7 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                     },
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
                 },
-                Request::ApplyHunks { path, index, header, from_index } => match &root {
+                Request::ApplyHunks { path, index, seen, from_index } => match &root {
                     Some(root) => {
                         let result = git::diff_bytes(root, &path, from_index).and_then(|bytes| {
                             let files = git::parse_diff(&bytes, from_index);
@@ -2991,14 +3096,14 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                                 .iter()
                                 .find(|file| file.path == path)
                                 .ok_or_else(|| strings::WORKSPACE_NO_CHANGES_FOR_FILE.to_owned())
-                                .and_then(|file| match file.hunks.get(index) {
-                                    // The file may have changed since it was shown:
-                                    // apply only the hunk the user actually saw.
-                                    Some(hunk) if hunk.header == header => {
+                                .and_then(|file| match git::hunk_bytes(file, index) {
+                                    // The file may have changed since it was shown: apply
+                                    // only the hunk the user actually saw, whole. The `@@`
+                                    // line alone repeats when a line is replaced by another.
+                                    Some(current) if current == seen => {
                                         git::apply_hunks(root, file, &[index], from_index)
                                     }
-                                    Some(_) => Err(strings::WORKSPACE_DIFF_STALE.to_owned()),
-                                    None => Err(strings::WORKSPACE_DIFF_STALE.to_owned()),
+                                    _ => Err(strings::WORKSPACE_DIFF_STALE.to_owned()),
                                 })
                         });
                         match result {
@@ -3008,6 +3113,12 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                     }
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
                 },
+                Request::OpenExternal { path } => {
+                    send(Response::Launch(root.as_deref().and_then(|root| external_launch(root, &path, false).ok())));
+                }
+                Request::Reveal { path } => {
+                    send(Response::Launch(root.as_deref().and_then(|root| external_launch(root, &path, true).ok())));
+                }
                 Request::Fetch => match &root {
                     Some(root) => match git::fetch(root) {
                         Ok(what) => send(Response::Fetched(what)),
@@ -3101,12 +3212,30 @@ fn rename_path_checked(root: &Path, from: &str, to: &str, before_move: impl FnOn
         Ok(())
     }
     #[cfg(not(windows))]
-    std::fs::rename(&from, &to).map_err(|e| e.to_string())
+    {
+        // `std::fs::rename` replaces an existing target, which the check above
+        // cannot rule out atomically; only the Windows move above is safe.
+        Err("Renaming is only supported on Windows".to_owned())
+    }
 }
 
 fn delete_path(root: &Path, path: &str) -> Result<(), String> {
     let full = git::resolve_path(root, path)?;
     crate::fsutil::recycle_path(&full)
+}
+
+/// What to hand to `git restore --staged` for these changes. A staged rename is
+/// two index entries, the new name added and the old one deleted: restoring only
+/// the new name leaves `D  old` staged next to an untracked new file.
+fn unstage_paths<'a>(changes: impl Iterator<Item = &'a Change>) -> Vec<String> {
+    let mut paths = Vec::new();
+    for change in changes {
+        paths.push(change.path.clone());
+        if change.index == 'R' {
+            paths.extend(change.original_path.clone());
+        }
+    }
+    paths
 }
 
 /// Width clamped to the panel bounds.
@@ -3250,9 +3379,9 @@ mod tests {
         response_tx
             .send(Response::Diff {
                 path: "f.txt".to_owned(),
-                files: Vec::new(),
                 text: diff.to_owned(),
                 rows: text_rows(diff, true),
+                hunks: Vec::new(),
                 staged: false,
                 side: None,
             })
@@ -3283,9 +3412,9 @@ mod tests {
         response_tx
             .send(Response::Diff {
                 path: "f.txt".to_owned(),
-                files: Vec::new(),
                 text: "stale worktree".to_owned(),
                 rows: Vec::new(),
+                hunks: Vec::new(),
                 staged: false,
                 side: Some(false),
             })
@@ -3751,6 +3880,17 @@ mod tests {
             egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
             egui::Shape::Vec(shapes) => shapes.iter().find_map(shape_text),
             _ => None,
+        }
+    }
+
+    /// Every text the shapes paint, in order.
+    fn collect_text(shapes: &[egui::Shape], out: &mut Vec<String>) {
+        for shape in shapes {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(inner) => collect_text(inner, out),
+                _ => {}
+            }
         }
     }
 
@@ -4499,6 +4639,301 @@ mod tests {
         workspace.absorb();
         assert!(!workspace.busy);
         assert!(workspace.detail_file.as_ref().unwrap().patch.is_none());
+    }
+
+    /// The worker answered and then died on the next request. The channel
+    /// reports `Disconnected` only once it is drained, so the answers already
+    /// in it were collected and then thrown away together with the reset.
+    #[test]
+    fn answers_a_dying_worker_already_sent_are_still_applied() {
+        let (tx, rx) = mpsc::channel();
+        let mut workspace =
+            Workspace { rx: Some(rx), busy: true, commit_message: "feat: draft".to_owned(), ..Default::default() };
+        tx.send(Response::Committed(Ok("0123456789".to_owned()))).unwrap();
+        drop(tx);
+        assert!(workspace.absorb());
+        assert!(workspace.commit_message.is_empty(), "the commit that finished is acknowledged");
+        assert!(workspace.notice.as_ref().is_some_and(|(text, error)| text.contains("0123456789") && !error));
+        assert!(workspace.rx.is_none() && workspace.tx.is_none() && !workspace.busy, "the lost worker is still reset");
+    }
+
+    /// Both marker kinds were searched for again from the cursor at every step,
+    /// so a line of code spans (no `**` anywhere) rescanned the whole remainder
+    /// for `**` once per span: quadratic, and a Markdown file may be one 8 MiB
+    /// line that stalls the UI thread for minutes.
+    #[test]
+    fn inline_markup_is_linear_in_the_length_of_the_line() {
+        let spans = "`a`".repeat(100_000);
+        let started = Instant::now();
+        let job = inline_job(&spans, 11.5, egui::Color32::WHITE, 300.0);
+        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+        assert_eq!(job.text.len(), 100_000);
+
+        let job = inline_job("x **bold** `code` **open", 11.5, egui::Color32::WHITE, 300.0);
+        let pieces: Vec<&str> = job.sections.iter().map(|section| &job.text[section.byte_range.clone()]).collect();
+        assert_eq!(pieces, ["x ", "bold", " ", "code", " ", "**open"]);
+        assert!(job.sections[1].format.extra_letter_spacing > 0.0, "bold keeps its format");
+        assert_eq!(job.sections[3].format.background, theme::colors().tab_active_bg, "code keeps its chip");
+    }
+
+    /// Names in a repository are untrusted: a bidi override spoofs the
+    /// extension and a line break splits a fixed-height row. The change list
+    /// and the history already strip them; the file tree, the delete/rename
+    /// confirmation and the preview header painted the raw path.
+    #[test]
+    fn paths_from_the_repository_are_painted_without_bidi_or_control_characters() {
+        let hostile = "dir/evil\u{202e}gpj.exe\nsecond line";
+        let mut workspace = Workspace {
+            files: vec![hostile.to_owned()],
+            file_expanded: HashSet::from(["dir".to_owned()]),
+            file_preview: Some((hostile.to_owned(), "text".to_owned(), false)),
+            prompt: Some(Prompt {
+                kind: PromptKind::Delete { path: hostile.to_owned(), folder: false },
+                text: String::new(),
+                focus: false,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(workspace.file_tree()[1].name, "evilgpj.exesecond line");
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 600.0));
+        let shapes = panel_frame(&mut workspace, PanelTab::Files, 1, rect);
+        let mut painted = Vec::new();
+        collect_text(&shapes, &mut painted);
+        assert!(painted.iter().any(|text| text.contains("evilgpj.exe")), "the name is still shown: {painted:?}");
+        let raw: Vec<_> = painted.iter().filter(|text| text.contains('\u{202e}') || text.contains('\n')).collect();
+        assert!(raw.is_empty(), "unsanitised text reached the screen: {raw:?}");
+    }
+
+    /// A failed create, rename or delete answers with `Response::Error`, which
+    /// is stored as the notice. Only the Changes tab and the trust screen drew
+    /// it, so in the Files tab the prompt closed and nothing said why the file
+    /// was not renamed.
+    #[test]
+    fn a_failed_file_operation_is_reported_in_the_files_tab() {
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 600.0));
+        let mut workspace = Workspace {
+            notice: Some((strings::WORKSPACE_FILE_EXISTS.to_owned(), true)),
+            files: vec!["a.txt".to_owned()],
+            ..Default::default()
+        };
+        let mut painted = Vec::new();
+        collect_text(&panel_frame(&mut workspace, PanelTab::Files, 1, rect), &mut painted);
+        assert!(painted.iter().any(|text| text == strings::WORKSPACE_FILE_EXISTS), "{painted:?}");
+        // A success notice belongs to the Changes tab and stays out of this one.
+        workspace.notice = Some((strings::workspace_committed("abc"), false));
+        let mut painted = Vec::new();
+        collect_text(&panel_frame(&mut workspace, PanelTab::Files, 1, rect), &mut painted);
+        assert!(!painted.iter().any(|text| text.contains("abc")), "{painted:?}");
+    }
+
+    /// The `@@` line repeats when a line is replaced by another one, so the
+    /// worker used to apply whatever hunk now sat at the index: a file changed
+    /// between the diff on screen and the click staged lines nobody had seen.
+    #[test]
+    fn a_hunk_is_applied_only_if_it_is_still_the_one_that_was_shown() {
+        // Bytes git printed, not their lossy text: two invalid bytes read the same.
+        let diff = |byte: &[u8]| {
+            [b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-x\n+".as_slice(), byte, b"\n"].concat()
+        };
+        assert_ne!(diff_hunk_bytes(&diff(b"\xC0"), false), diff_hunk_bytes(&diff(b"\xC1"), false));
+        assert_eq!(diff_hunk_bytes(&diff(b"a"), false).len(), 1);
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        if !git(root, &["init", "--quiet"]) {
+            return;
+        }
+        assert!(
+            git(root, &["config", "user.email", "anvil@test"]) && git(root, &["config", "user.name", "ANVIL test"])
+        );
+        std::fs::write(root.join("f.txt"), "one\n").unwrap();
+        assert!(git(root, &["add", "f.txt"]) && git(root, &["commit", "--quiet", "-m", "init"]));
+        std::fs::write(root.join("f.txt"), "two\n").unwrap();
+        let seen = diff_hunk_bytes(&git::diff_bytes(root, "f.txt", false).unwrap(), false);
+        assert_eq!(seen.len(), 1);
+        // The file changes under the open diff: the same `@@ -1 +1 @@`, another line.
+        std::fs::write(root.join("f.txt"), "three\n").unwrap();
+
+        let (tx, rx) = spawn_worker();
+        tx.send((None, Request::Refresh { cwd: root.to_owned() })).unwrap();
+        let shown = approve_worker(&tx, &rx);
+        let apply = |seen: Vec<u8>| {
+            let request = Request::ApplyHunks { path: "f.txt".to_owned(), index: 0, seen, from_index: false };
+            tx.send((shown.clone(), request)).unwrap();
+            rx.recv_timeout(Duration::from_secs(20)).expect("a worker response")
+        };
+        match apply(seen[0].clone()) {
+            Response::Error(message) => assert_eq!(message, strings::WORKSPACE_DIFF_STALE),
+            _ => panic!("a hunk that is no longer the one shown must be refused"),
+        }
+        assert!(git(root, &["diff", "--cached", "--quiet"]), "nothing was staged");
+        let fresh = diff_hunk_bytes(&git::diff_bytes(root, "f.txt", false).unwrap(), false);
+        assert!(matches!(apply(fresh[0].clone()), Response::Applied), "the hunk that is shown still applies");
+        assert!(!git(root, &["diff", "--cached", "--quiet"]), "the shown hunk was staged");
+    }
+
+    /// 50 000 hunks (a 1.5 MB diff, far under the 8 MiB cap) cost seconds on the
+    /// worker at every refresh: the bytes of each hunk were cut out of a patch
+    /// rebuilt from every hunk of the file.
+    #[test]
+    fn collecting_the_hunks_of_a_diff_is_linear_in_their_number() {
+        let mut diff = b"diff --git a/f b/f\n--- a/f\n+++ b/f\n".to_vec();
+        for line in 0..50_000 {
+            diff.extend_from_slice(format!("@@ -{line},1 +{line},1 @@\n-a\n+b\n").as_bytes());
+        }
+        let started = Instant::now();
+        let hunks = diff_hunk_bytes(&diff, false);
+        assert!(started.elapsed() < Duration::from_secs(3), "took {:?}", started.elapsed());
+        assert_eq!(hunks.len(), 50_000);
+        assert_eq!(hunks[49_999], b"@@ -49999,1 +49999,1 @@\n-a\n+b\n");
+    }
+
+    /// `git commit` answers "nothing to commit" with the whole `git status` on
+    /// stdout, names from the repository included: the notice is untrusted
+    /// text, kept and painted without control or bidi characters and bounded.
+    #[test]
+    fn a_notice_is_painted_without_control_characters_and_within_a_limit() {
+        let hostile = format!(
+            "On branch main\n\tmodified: evil\u{202e}gpj.exe\u{7}\n{}\n{}",
+            "x".repeat(5_000),
+            "untracked: file\n".repeat(200)
+        );
+        let (tx, rx) = mpsc::channel();
+        let mut workspace = Workspace {
+            rx: Some(rx),
+            status: Status { branch: "main".to_owned(), ..Default::default() },
+            ..Default::default()
+        };
+        tx.send(Response::Committed(Err(hostile.clone()))).unwrap();
+        workspace.absorb();
+        let stored = workspace.notice.clone().expect("the refusal is reported").0;
+        assert_eq!(stored, notice_text(&stored), "storing it again changes nothing");
+        assert!(stored.lines().count() <= 7 && stored.chars().count() < 2_200, "{} chars", stored.chars().count());
+        assert!(!stored.contains('\u{202e}') && !stored.contains('\u{7}'), "{stored:?}");
+        assert!(stored.starts_with("On branch main\n"), "the first lines are what explains it");
+
+        // Painted bounded and clean whatever is in the field, in every place it is drawn.
+        workspace.notice = Some((hostile, true));
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 600.0));
+        for tab in [PanelTab::Changes, PanelTab::Files] {
+            let mut painted = Vec::new();
+            collect_text(&panel_frame(&mut workspace, tab, 1, rect), &mut painted);
+            let notice = painted.iter().find(|text| text.starts_with("On branch main")).expect("the notice is drawn");
+            assert!(!notice.contains('\u{202e}') && !notice.contains('\u{7}'), "{tab:?}: {notice:?}");
+            assert!(notice.lines().count() <= 7 && notice.chars().count() < 2_200, "{tab:?}");
+        }
+        workspace.trust_required = true;
+        let mut painted = Vec::new();
+        collect_text(&panel_frame(&mut workspace, PanelTab::Changes, 1, rect), &mut painted);
+        let notice = painted.iter().find(|text| text.starts_with("On branch main")).expect("drawn on the trust screen");
+        assert!(!notice.contains('\u{202e}') && notice.chars().count() < 2_200);
+    }
+
+    /// A conflicted file is shown as `diff --cc` with `@@@` hunk lines. There is
+    /// no hunk behind them (`parse_diff` reads only `diff --git`), so they are
+    /// plain rows: a click used to do nothing at all.
+    #[test]
+    fn combined_diff_hunk_lines_are_not_clickable_hunks() {
+        let text = "diff --cc f\n@@@ -1,2 -1,2 +1,4 @@@\n  a\n++b\n";
+        assert!(text_rows(text, true).iter().all(|row| row.hunk.is_none()));
+        assert!(diff_hunk_bytes(text.as_bytes(), false).is_empty());
+        let plain = "diff --git a/f b/f\n@@ -1 +1 @@\n-a\n+b\n";
+        assert_eq!(text_rows(plain, true).iter().filter(|row| row.hunk.is_some()).count(), 1);
+    }
+
+    /// A double click used to send two `git commit`s: the second failed with
+    /// "nothing to commit" and its red answer replaced the first one's notice.
+    #[test]
+    fn a_second_commit_click_while_the_first_is_pending_sends_nothing() {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+        let mut workspace = Workspace {
+            tx: Some(request_tx),
+            rx: Some(response_rx),
+            commit_message: "feat: change".to_owned(),
+            ..Default::default()
+        };
+        workspace.start_commit();
+        workspace.start_commit();
+        let commits = request_rx.try_iter().filter(|(_, request)| matches!(request, Request::Commit { .. })).count();
+        assert_eq!(commits, 1, "one request for two clicks");
+        response_tx.send(Response::Committed(Ok("abc1234".to_owned()))).unwrap();
+        workspace.absorb();
+        assert_eq!(workspace.notice, Some((strings::workspace_committed("abc1234"), false)));
+        assert!(!workspace.committing, "the button is back once the answer arrived");
+        // Its own failure is reported, and only for the request that failed.
+        workspace.commit_message = "feat: next".to_owned();
+        workspace.start_commit();
+        response_tx.send(Response::Committed(Err("nothing to commit".to_owned()))).unwrap();
+        workspace.absorb();
+        assert_eq!(workspace.notice, Some(("nothing to commit".to_owned(), true)));
+        assert!(!workspace.committing && workspace.commit_message == "feat: next", "the draft survives a refusal");
+    }
+
+    /// What a click on a file launches is decided on the worker: it
+    /// canonicalizes the path and reads the file's first bytes, which on a
+    /// cloud placeholder waits for a download. The UI thread starts the result.
+    #[test]
+    fn the_worker_chooses_what_a_click_on_a_file_launches() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("notes.txt"), "read me\n").unwrap();
+        std::fs::write(root.join("run.bat"), "echo hi\r\n").unwrap();
+        let full = |path: &str| git::resolve_path(root, path).unwrap();
+        assert_eq!(external_launch(root, "notes.txt", false), Ok(Launch::Open(full("notes.txt"))));
+        assert_eq!(external_launch(root, "run.bat", false), Ok(Launch::Reveal(full("run.bat"))), "scripts are shown");
+        assert_eq!(external_launch(root, "notes.txt", true), Ok(Launch::Reveal(full("notes.txt"))));
+        assert!(external_launch(root, "../outside.txt", false).is_err());
+
+        if !git(root, &["init", "--quiet"]) {
+            return;
+        }
+        let (tx, rx) = spawn_worker();
+        tx.send((None, Request::Refresh { cwd: root.to_owned() })).unwrap();
+        let shown = approve_worker(&tx, &rx);
+        let ask = |request: Request| {
+            tx.send((shown.clone(), request)).unwrap();
+            match rx.recv_timeout(Duration::from_secs(20)).expect("a worker response") {
+                Response::Launch(launch) => launch,
+                _ => panic!("a launch answer"),
+            }
+        };
+        assert_eq!(ask(Request::OpenExternal { path: "notes.txt".to_owned() }), Some(Launch::Open(full("notes.txt"))));
+        assert_eq!(ask(Request::OpenExternal { path: "run.bat".to_owned() }), Some(Launch::Reveal(full("run.bat"))));
+        assert_eq!(ask(Request::Reveal { path: "notes.txt".to_owned() }), Some(Launch::Reveal(full("notes.txt"))));
+        assert_eq!(ask(Request::OpenExternal { path: "../outside.txt".to_owned() }), None);
+    }
+
+    /// A staged rename is two index entries. Unstaging only the new name left
+    /// the deletion of the old one staged: `D  old` next to an untracked `new`.
+    #[test]
+    fn unstaging_a_rename_restores_both_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        if !git(root, &["init", "--quiet"]) {
+            return;
+        }
+        assert!(
+            git(root, &["config", "user.email", "anvil@test"]) && git(root, &["config", "user.name", "ANVIL test"])
+        );
+        std::fs::write(root.join("old.txt"), "content\n").unwrap();
+        assert!(git(root, &["add", "old.txt"]) && git(root, &["commit", "--quiet", "-m", "init"]));
+        assert!(git(root, &["mv", "old.txt", "new.txt"]));
+        let status = git::status(root).unwrap();
+        let renamed = status.changes.iter().find(|change| change.path == "new.txt").expect("the rename is listed");
+        assert_eq!((renamed.index, renamed.original_path.as_deref()), ('R', Some("old.txt")));
+
+        // What the buttons used to send: the cause, shown with the real git.
+        git::stage(root, &["new.txt".to_owned()], false).unwrap();
+        let half = git::status(root).unwrap();
+        assert!(half.changes.iter().any(|change| change.path == "old.txt" && change.staged()), "{:?}", half.changes);
+
+        assert!(git(root, &["add", "-A"]));
+        let status = git::status(root).unwrap();
+        git::stage(root, &unstage_paths(status.changes.iter()), false).unwrap();
+        let after = git::status(root).unwrap();
+        assert!(after.changes.iter().all(|change| !change.staged()), "nothing stays staged: {:?}", after.changes);
+        assert_eq!(after.changes.len(), 2, "the old name is deleted and the new one untracked: {:?}", after.changes);
     }
 
     #[test]

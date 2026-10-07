@@ -105,7 +105,8 @@ cargo build --locked --release --bin anvil --bin anvil-claude-status
 .\target\release\anvil.exe
 ```
 
-Портативный пакет с ConPTY, лицензиями и сведениями о сборке:
+Портативный пакет с ConPTY, лицензиями и сведениями о сборке (нужен Python
+в `PATH`: `package.ps1` собирает лицензии Rust-крейтов):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\package.ps1
@@ -117,8 +118,8 @@ powershell -ExecutionPolicy Bypass -File scripts\package.ps1
 | `anvil.exe` | Терминал, GUI, Git, AI-коммиты и фоновые квоты |
 | `anvil-claude-status.exe` | Консольный helper для statusLine Claude Code |
 | `conpty.dll`, `OpenConsole.exe` | Runtime псевдоконсоли Windows |
-| `LICENSE`, `LICENSES/` | Лицензии приложения и встроенных ресурсов |
-| `SOURCE.txt`, `BUILD.json` | Версия, исходный коммит, включённый Codex и хеши файлов |
+| `LICENSE`, `LICENSES/` | Лицензии приложения, встроенных ресурсов и Rust-зависимостей (`LICENSES/THIRD-PARTY-RUST.txt`) |
+| `SOURCE.txt`, `BUILD.json` | Версия, исходный коммит и хеши файлов |
 
 > [!NOTE]
 > Пакеты разработки и артефакты CI пока не подписаны. SHA-256 и `BUILD.json` проверяют целостность; они не подтверждают издателя. Публикация релизов выполняется отдельно.
@@ -130,6 +131,7 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
 python -B -m unittest discover -s tests -p 'test_*.py' -v
+python -B -m unittest discover -s scripts -p 'test_*.py' -v
 python -B scripts/check_conpty.py
 python -B scripts/check_docs.py
 ```

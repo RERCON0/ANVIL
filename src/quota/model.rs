@@ -181,7 +181,7 @@ pub fn duration_window(secs: i64) -> Option<(String, String)> {
         let hours = secs / 3_600;
         return Some((format!("{hours}h"), format!("{hours}{}", strings::QUOTA_UNIT_HOUR)));
     }
-    let minutes = (secs + 30) / 60;
+    let minutes = secs.saturating_add(30) / 60;
     (minutes > 0).then(|| (format!("{minutes}m"), format!("{minutes}{}", strings::QUOTA_UNIT_MINUTE)))
 }
 

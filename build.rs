@@ -37,9 +37,13 @@ fn copy_conpty() {
         for name in ["conpty.dll", "OpenConsole.exe"] {
             let src = Path::new("vendor/conpty/x64").join(name);
             let dst = dir.join(name);
+            // A missing or unreadable vendored runtime must stop the build: with
+            // no copy next to the binaries yet, both reads would fail, compare
+            // equal and leave ANVIL on the system ConPTY without a word.
+            let wanted = std::fs::read(&src).unwrap_or_else(|e| panic!("cannot read {}: {e}", src.display()));
             // Compare the contents, not just the sizes: a same-length update of
             // the vendored runtime must be re-copied.
-            if std::fs::read(&src).ok() == std::fs::read(&dst).ok() {
+            if std::fs::read(&dst).is_ok_and(|current| current == wanted) {
                 continue;
             }
             match std::fs::copy(&src, &dst) {

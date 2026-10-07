@@ -437,10 +437,15 @@ fn collapse(node: &mut Node) {
 
 fn normalize(node: &mut Node) {
     if let Node::Split { children, .. } = node {
-        let sum: f32 = children.iter().map(|(f, _)| f.max(0.0)).sum();
+        // A share that is not a finite number (`1e39` parses as infinity) makes
+        // every fraction of the split NaN once divided by the sum: none of the
+        // file's shares is trusted then, and the split is even, as `sane_fraction`
+        // does for one restored pane.
+        let finite = children.iter().all(|(f, _)| f.is_finite());
+        let sum: f32 = if finite { children.iter().map(|(f, _)| f.max(0.0)).sum() } else { 0.0 };
         let n = children.len() as f32;
         for (f, c) in children.iter_mut() {
-            *f = if sum > 0.0 { f.max(0.0) / sum } else { 1.0 / n };
+            *f = if sum.is_finite() && sum > 0.0 { f.max(0.0) / sum } else { 1.0 / n };
             normalize(c);
         }
     }
@@ -665,6 +670,22 @@ mod tests {
         let anchor = t.remove(1).expect("pane 1 is removed");
         assert_eq!(anchor.neighbor, 2, "its neighbour is a real pane, not an empty split");
         assert_eq!(t.panes(), vec![2]);
+    }
+
+    /// A share of `1e39` parses into an f32 as infinity, which turned the
+    /// normalised fractions into NaN (inf / inf) and gave every pane of the
+    /// split a NaN rectangle. A hand-edited share must end up finite.
+    #[test]
+    fn non_finite_shares_from_a_session_are_repaired() {
+        let json = r#"{"Split":{"dir":"Row","children":[[1e39,{"Leaf":1}],[1.0,{"Leaf":2}],[-1e39,{"Leaf":3}]]}}"#;
+        let node: Node = serde_json::from_str(json).expect("a huge share still parses");
+        let t = SplitTree::from_root(node);
+        assert_relocation_invariants(&t, &[1, 2, 3]);
+        for (_, rect) in t.layout(AREA, GAP) {
+            assert!(rect.w.is_finite() && rect.h.is_finite(), "{rect:?}");
+        }
+        let nan = SplitTree::from_root(row(vec![(f32::NAN, leaf(1)), (f32::INFINITY, leaf(2))]));
+        assert_eq!(nan.root(), &row(vec![(0.5, leaf(1)), (0.5, leaf(2))]), "nothing usable: an even split");
     }
 
     #[test]

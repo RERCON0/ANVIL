@@ -12,6 +12,12 @@ const MAX_PAYLOAD: usize = 4096;
 /// title/link/clipboard request. This leaves ordinary screen output untouched.
 pub const MAX_OSC_BYTES: usize = 1024 * 1024;
 
+/// Longest title OSC (0 and 2) let through. The display clips a title to a few
+/// hundred characters, but alacritty keeps every title it is given and each
+/// `CSI 22 t` clones it onto a 4096-entry stack: a megabyte title and a few
+/// kilobytes of pushes would cost gigabytes of memory.
+pub const MAX_TITLE_OSC_BYTES: usize = 4096;
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum GuardState {
     #[default]
@@ -22,9 +28,45 @@ enum GuardState {
     Discard,
 }
 
+/// What the OSC being held is, as far as its size limit is concerned.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum OscKind {
+    /// Nothing but the `]` seen yet.
+    #[default]
+    Start,
+    /// A first parameter of `0` or `2`, no `;` yet.
+    TitleNumber,
+    /// `0;` or `2;`: the window title.
+    Title,
+    Other,
+}
+
+impl OscKind {
+    /// Advances over one OSC byte, ignoring the controls VTE ignores inside
+    /// a string so the kind is the one VTE will dispatch.
+    fn next(self, b: u8) -> OscKind {
+        match (self, b) {
+            (kind, 0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1c..=0x1f) => kind,
+            (OscKind::Start, b'0' | b'2') => OscKind::TitleNumber,
+            (OscKind::TitleNumber, b';') => OscKind::Title,
+            (OscKind::Start | OscKind::TitleNumber, _) => OscKind::Other,
+            (kind, _) => kind,
+        }
+    }
+
+    fn limit(self) -> usize {
+        if self == OscKind::Title {
+            MAX_TITLE_OSC_BYTES
+        } else {
+            MAX_OSC_BYTES
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct OscGuard {
     state: GuardState,
+    kind: OscKind,
     osc: Vec<u8>,
     ready: Vec<u8>,
     offset: usize,
@@ -73,8 +115,9 @@ impl OscGuard {
                             self.osc = Vec::new();
                         }
                         self.state = if b == 0x1b { GuardState::Escape } else { GuardState::Ground };
-                    } else if self.osc.len() < MAX_OSC_BYTES {
+                    } else if self.osc.len() < self.kind.next(b).limit() {
                         self.osc.push(b);
+                        self.kind = self.kind.next(b);
                     } else {
                         self.osc = Vec::new();
                         // Only the initial ESC was forwarded. CAN resets that
@@ -93,6 +136,7 @@ impl OscGuard {
                 },
                 GuardState::Escape if b == b']' => {
                     self.osc.push(b);
+                    self.kind = OscKind::Start;
                     self.state = GuardState::Osc;
                 }
                 state => {
@@ -108,13 +152,14 @@ impl OscGuard {
 // Mirror VTE's escape entry, including ignored controls and intermediates.
 // ESC anywhere ends OSC/DCS/APC/PM and begins an escape in VTE; a literal
 // ESC ] therefore starts an OSC even when it follows one of those strings.
+// Bytes >= 0x80 are ignored inside an escape too, so `ESC 0x80 ]` is an OSC.
 fn escape_state(state: GuardState, b: u8) -> GuardState {
     if b == 0x1b {
         return GuardState::Escape;
     }
     match state {
         GuardState::Escape | GuardState::EscapeIntermediate => match b {
-            0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f => state,
+            0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f..=0xff => state,
             0x20..=0x2f => GuardState::EscapeIntermediate,
             _ => GuardState::Ground,
         },
@@ -195,7 +240,7 @@ impl OscScanner {
                 self.overflow = false;
             }
             0x1b => self.state = State::Escape,
-            0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f => {}
+            0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f..=0xff => {}
             _ => self.state = State::Ground,
         }
     }
@@ -296,6 +341,9 @@ mod tests {
             b"\x1b]1337;CurrentDir=C:\\test\x1b[31m",
             b"\x1b]1337;CurrentDir=C:\\te\x00st\x07",
             b"\x1b\x00]1337;CurrentDir=C:\\test\x07",
+            // VTE ignores bytes >= 0x80 inside an escape and stays in it.
+            b"\x1b\x80]1337;CurrentDir=C:\\test\x07",
+            b"\x1b\xff\x9d]1337;CurrentDir=C:\\test\x07",
         ] {
             let mut observer = Observer::default();
             alacritty_terminal::vte::Parser::new().advance(&mut observer, sequence);
@@ -440,9 +488,92 @@ mod tests {
         }
     }
 
+    /// VTE leaves an escape only on a final byte, CAN/SUB or ESC: bytes >= 0x80
+    /// are ignored there, so `ESC 0x80 ]` still opens an OSC string. A guard that
+    /// went back to ground on them let such an OSC grow VTE's unbounded buffer.
+    #[test]
+    fn osc_guard_stays_in_escape_through_high_bytes() {
+        #[derive(Default)]
+        struct Observer(usize);
+        impl alacritty_terminal::vte::Perform for Observer {
+            fn osc_dispatch(&mut self, _: &[&[u8]], _: bool) {
+                self.0 += 1;
+            }
+        }
+        let mut observer = Observer::default();
+        alacritty_terminal::vte::Parser::new().advance(&mut observer, b"\x1b\x80\xff]0;title\x07");
+        assert_eq!(observer.0, 1, "VTE must really open an OSC after ESC 0x80 0xFF");
+
+        let mut hostile = b"\x1b\x80\xff]0;".to_vec();
+        hostile.resize(MAX_OSC_BYTES + 8, b'a');
+        for cut in [0, 1, 2, 3, 4, hostile.len() / 2, hostile.len()] {
+            assert_eq!(
+                guarded(&[&hostile[..cut], &hostile[cut..], b"\x07"]),
+                b"\x1b\x80\xff\x18",
+                "an overlong OSC behind high bytes is discarded, cut at {cut}"
+            );
+        }
+        let short = b"\x1b\x80\xff]0;title\x07";
+        assert_eq!(guarded(&[short]), short, "a short one is forwarded untouched");
+    }
+
+    /// Every `CSI 22 t` makes alacritty clone the current title onto a stack of
+    /// 4096: with the 1 MiB OSC limit that is 4 GiB for about a megabyte of
+    /// output. Titles get a far smaller limit, however VTE comes to read them.
+    #[test]
+    fn osc_guard_limits_titles_far_below_other_strings() {
+        use alacritty_terminal::event::{Event, EventListener};
+        use alacritty_terminal::term::{Config, Term};
+        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+        #[derive(Clone)]
+        struct Titles(std::sync::mpsc::Sender<String>);
+        impl EventListener for Titles {
+            fn send_event(&self, event: Event) {
+                if let Event::Title(title) = event {
+                    let _ = self.0.send(title);
+                }
+            }
+        }
+        // VTE ignores the control in `ESC ] 0x01 2 ;` and still sets the title.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let size = crate::term::pane::GridSize { columns: 20, lines: 3 };
+        let mut term = Term::new(Config::default(), &size, Titles(tx));
+        Processor::<StdSyncHandler>::new().advance(&mut term, b"\x1b]\x012;shown\x07");
+        assert_eq!(rx.try_recv().as_deref(), Ok("shown"));
+        let mut huge = b"\x1b]0;".to_vec();
+        huge.resize(MAX_OSC_BYTES, b'a');
+        huge.push(0x07);
+        let mut parser = Processor::<StdSyncHandler>::new();
+        parser.advance(&mut term, &huge);
+        assert!(rx.try_recv().is_ok_and(|title| title.len() > MAX_OSC_BYTES / 2), "VTE takes a title of any size");
+        parser.advance(&mut term, &guarded(&[&huge]));
+        assert!(rx.try_recv().is_err(), "the guard keeps it from the terminal");
+
+        for prefix in [&b"\x1b]0;"[..], b"\x1b]2;", b"\x1b]\x012;", b"\x1b]0\x02;", b"\x1b\x80]\x0c0;"] {
+            // Bytes before the `]` are forwarded; the OSC itself is held.
+            let held = prefix.iter().position(|&b| b == b']').unwrap();
+            let mut exact = prefix.to_vec();
+            exact.resize(held + MAX_TITLE_OSC_BYTES, b'a');
+            let mut valid = exact.clone();
+            valid.push(0x07);
+            assert_eq!(guarded(&[&valid]), valid, "{prefix:?}");
+            let mut too_long = exact.clone();
+            too_long.extend_from_slice(b"b\x07x");
+            let expected = [&prefix[..held], b"\x18", b"x"].concat();
+            assert_eq!(guarded(&[&too_long]), expected, "{prefix:?}");
+        }
+        // Other strings keep the larger limit, and so do titles-by-name that are not titles.
+        for prefix in [&b"\x1b]52;c;"[..], b"\x1b]00;", b"\x1b]20;", b"\x1b]0x;"] {
+            let mut long = prefix.to_vec();
+            long.resize(prefix.len() + MAX_TITLE_OSC_BYTES * 2, b'a');
+            long.push(0x07);
+            assert_eq!(guarded(&[&long]), long, "{prefix:?}");
+        }
+    }
+
     #[test]
     fn osc_guard_discards_overflow_and_recovers_without_payload_leak() {
-        let mut exact = b"\x1b]0;".to_vec();
+        let mut exact = b"\x1b]52;c;".to_vec();
         exact.resize(MAX_OSC_BYTES + 1, b'a'); // ESC plus the allowed OSC bytes.
         for end in [&b"\x07"[..], b"\x1b\\", b"\x18", b"\x1a"] {
             let mut valid = exact.clone();

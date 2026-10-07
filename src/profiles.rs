@@ -88,12 +88,12 @@ fn run_bounded(command: &mut std::process::Command, timeout: std::time::Duration
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
+                reap(&mut child);
                 return None;
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
             Err(_) => {
-                let _ = child.kill();
+                reap(&mut child);
                 return None;
             }
         }
@@ -103,6 +103,15 @@ fn run_bounded(command: &mut std::process::Command, timeout: std::time::Duration
     output.by_ref().take(1024 * 1024).read_to_end(&mut stdout).ok()?;
     drop(output);
     Some(std::process::Output { status, stdout, stderr: Vec::new() })
+}
+
+/// Kills a child and waits for it, so the process is gone before its output file
+/// is released. Waits only after a successful kill: a child that cannot be
+/// killed would otherwise block the caller for as long as it runs.
+fn reap(child: &mut std::process::Child) {
+    if child.kill().is_ok() {
+        let _ = child.wait();
+    }
 }
 
 /// Subsequence match, case-insensitive. Higher is better; None = no match.
@@ -221,18 +230,23 @@ pub fn detect_builtin() -> Vec<Profile> {
     out
 }
 
+/// `wsl.exe -l -q` prints UTF-16LE, which `parse_wsl_list` reads. `WSL_UTF8=1`, a
+/// documented switch many users set globally, makes it print UTF-8 instead, and
+/// every distribution name would then decode as garbage, so the child never sees it.
+#[cfg(windows)]
+fn wsl_list_command() -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+    let mut command = std::process::Command::new("wsl.exe");
+    command.args(["-l", "-q"]).env_remove("WSL_UTF8").creation_flags(CREATE_NO_WINDOW);
+    command.stdin(std::process::Stdio::null());
+    command
+}
+
 /// WSL profiles are probed only on the application worker.
 #[cfg(windows)]
 pub fn detect_wsl() -> Vec<Profile> {
-    use std::os::windows::process::CommandExt;
-    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
-    let output = run_bounded(
-        std::process::Command::new("wsl.exe")
-            .args(["-l", "-q"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(std::process::Stdio::null()),
-        std::time::Duration::from_secs(2),
-    );
+    let output = run_bounded(&mut wsl_list_command(), std::time::Duration::from_secs(2));
     output
         .filter(|output| output.status.success())
         .map(|output| parse_wsl_list(&output.stdout).into_iter().map(|distro| wsl_profile(&distro)).collect())
@@ -331,6 +345,17 @@ mod tests {
         let bytes: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
         assert_eq!(parse_wsl_list(&bytes), vec!["Ubuntu".to_owned(), "Debian".to_owned()]);
         assert!(parse_wsl_list(&[]).is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_listing_never_inherits_the_utf8_output_switch() {
+        let command = wsl_list_command();
+        let envs: Vec<_> = command.get_envs().collect();
+        assert!(
+            envs.contains(&(std::ffi::OsStr::new("WSL_UTF8"), None)),
+            "WSL_UTF8=1 would switch wsl.exe to UTF-8 and break the UTF-16 parser: {envs:?}"
+        );
     }
 
     #[test]

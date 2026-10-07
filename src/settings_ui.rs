@@ -87,6 +87,14 @@ enum ModelCatalog {
 }
 
 impl SettingsState {
+    /// Opens `section`. Leaving one ends whatever was typed in it.
+    fn select(&mut self, section: SettingsSection, outcome: &mut SettingsOutcome) {
+        if self.section != section {
+            self.section = section;
+            outcome.commit = true;
+        }
+    }
+
     fn load_models(&mut self, ctx: &egui::Context) {
         let (tx, rx) = std::sync::mpsc::channel();
         self.model_catalog = ModelCatalog::Loading(rx);
@@ -119,8 +127,16 @@ pub struct SettingsContext<'a> {
     pub quota: Option<&'a crate::quota::Snapshot>,
 }
 
+#[derive(Default)]
 pub struct SettingsOutcome {
+    /// Edits that apply and are written to config.json at once.
     pub changed: bool,
+    /// Keystrokes in a text field: applied in memory at once, written once the
+    /// field is left or the typing rests (see `commit`).
+    pub typed: bool,
+    /// A text field lost the focus or the section changed: whatever typing is
+    /// still waiting for the disk has to be written now.
+    pub commit: bool,
     pub open_config: bool,
     pub refresh_fonts: bool,
     pub install_claude: bool,
@@ -140,14 +156,7 @@ fn draft_profile() -> ProfileConfig {
 }
 
 pub fn show(ui: &mut egui::Ui, rect: Rect, cx: &mut SettingsContext, state: &mut SettingsState) -> SettingsOutcome {
-    let mut outcome = SettingsOutcome {
-        changed: false,
-        open_config: false,
-        refresh_fonts: false,
-        install_claude: false,
-        restore_claude: false,
-        quota_refresh: false,
-    };
+    let mut outcome = SettingsOutcome::default();
     ui.painter_at(rect).rect_filled(rect, 0.0, theme::colors().chrome_bg);
     ui.scope_builder(
         egui::UiBuilder::new().max_rect(rect.shrink2(Vec2::new(18.0, 12.0))).id_salt("settings-page"),
@@ -184,7 +193,7 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, cx: &mut SettingsContext, state: &mut
                         color,
                     );
                     if response.clicked() {
-                        state.section = section;
+                        state.select(section, &mut outcome);
                     }
                 }
             });
@@ -213,6 +222,12 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, cx: &mut SettingsContext, state: &mut
 /// leaves, if it differs from `current`. Applying every keystroke reinstalled
 /// the fonts (100 MB of fallbacks once loaded) and rewrote config.json.
 fn font_family_field(ui: &mut egui::Ui, id: egui::Id, current: &str) -> Option<String> {
+    // A draft belongs to the editing session that wrote it. One left behind by
+    // a page that was closed mid-edit is dropped, not shown (and applied) later.
+    let editing = ui.memory(|memory| memory.had_focus_last_frame(id));
+    if !editing {
+        ui.data_mut(|data| data.remove::<String>(id));
+    }
     let mut family = ui.data_mut(|data| data.get_temp::<String>(id)).unwrap_or_else(|| current.to_owned());
     let response =
         ui.add(egui::TextEdit::singleline(&mut family).id(id).font(theme::field_font(13.0)).desired_width(180.0));
@@ -347,16 +362,52 @@ fn section_terminal(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut S
         outcome.changed = true;
     }
     theme::tag(ui, strings::SETTINGS_WORD_SEPARATORS);
-    if ui
-        .add(
-            egui::TextEdit::singleline(&mut cx.config.terminal.word_separators)
-                .font(theme::field_font(13.0))
-                .desired_width(260.0),
-        )
-        .changed()
-    {
-        outcome.changed = true;
+    let field = egui::TextEdit::singleline(&mut cx.config.terminal.word_separators)
+        .id(egui::Id::new("settings-word-separators"))
+        .font(theme::field_font(13.0))
+        .desired_width(260.0);
+    note_typing(&ui.add(field), outcome);
+}
+
+/// The text of a field whose value the config keeps in a normalised form (the
+/// AI command is trimmed, the arguments are re-quoted). While the field has the
+/// focus its raw text is kept here, so a trailing space or a quote still open
+/// survives the next frame; rebuilt from the config each frame, a space typed
+/// between two words was gone before the second word, and such a field could
+/// only be pasted into. Out of focus it follows the config again.
+fn edit_buffer(ui: &mut egui::Ui, id: egui::Id, from_config: impl FnOnce() -> String) -> String {
+    let editing = ui.memory(|memory| memory.had_focus_last_frame(id));
+    let kept = ui.data_mut(|data| {
+        if editing {
+            data.get_temp::<String>(id)
+        } else {
+            data.remove::<String>(id);
+            None
+        }
+    });
+    kept.unwrap_or_else(from_config)
+}
+
+/// Keeps what `edit_buffer` hands out for the next frame while the field has
+/// the focus.
+fn keep_buffer(ui: &mut egui::Ui, id: egui::Id, response: &egui::Response, text: String) {
+    if response.has_focus() {
+        ui.data_mut(|data| data.insert_temp(id, text));
     }
+}
+
+/// A text field of the settings: each keystroke applies in memory at once, but
+/// config.json is written when the typing rests or the field is left (see
+/// `SettingsOutcome::typed` and `commit`), not on every key. True when the text
+/// changed.
+fn note_typing(response: &egui::Response, outcome: &mut SettingsOutcome) -> bool {
+    if response.changed() {
+        outcome.typed = true;
+    }
+    if response.lost_focus() {
+        outcome.commit = true;
+    }
+    response.changed()
 }
 
 fn section_profiles(
@@ -371,13 +422,8 @@ fn section_profiles(
         .width(260.0)
         .selected_text(RichText::new(cx.config.default_profile.clone()).font(theme::field_font(13.0)))
         .show_ui(ui, |ui| {
+            // `cx.profiles` already holds the custom profiles next to the detected ones.
             for profile in cx.profiles {
-                if ui.selectable_label(profile.id == cx.config.default_profile, &profile.name).clicked() {
-                    cx.config.default_profile = profile.id.clone();
-                    outcome.changed = true;
-                }
-            }
-            for profile in cx.config.profiles.iter() {
                 if ui.selectable_label(profile.id == cx.config.default_profile, &profile.name).clicked() {
                     cx.config.default_profile = profile.id.clone();
                     outcome.changed = true;
@@ -435,12 +481,15 @@ fn section_profiles(
 fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut SettingsState, outcome: &mut SettingsOutcome) {
     theme::section(ui, strings::SETTINGS_WORKSPACE);
     theme::tag(ui, strings::SETTINGS_AI_COMMAND);
-    let mut ai = cx.config.workspace.ai_commit_command.clone().unwrap_or_default();
-    if ui.add(egui::TextEdit::singleline(&mut ai).font(theme::field_font(13.0)).desired_width(320.0)).changed() {
+    let id = egui::Id::new("settings-ai-command");
+    let mut ai = edit_buffer(ui, id, || cx.config.workspace.ai_commit_command.clone().unwrap_or_default());
+    let field = egui::TextEdit::singleline(&mut ai).id(id).font(theme::field_font(13.0)).desired_width(320.0);
+    let response = ui.add(field);
+    if note_typing(&response, outcome) {
         let trimmed = ai.trim().to_owned();
         cx.config.workspace.ai_commit_command = (!trimmed.is_empty()).then_some(trimmed);
-        outcome.changed = true;
     }
+    keep_buffer(ui, id, &response, ai);
     ui.label(RichText::new(strings::SETTINGS_AI_HINT).color(theme::colors().faint).font(theme::font(11.5)));
     ui.add_space(14.0);
     theme::tag(ui, strings::SETTINGS_AI_MODEL);
@@ -474,7 +523,11 @@ fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Settings
             });
         }
         ModelCatalog::Ready(Err(error)) => {
-            ui.label(RichText::new(error).color(theme::colors().status_red).font(theme::font(11.5)));
+            ui.label(
+                RichText::new(crate::workspace::notice_text(error))
+                    .color(theme::colors().status_red)
+                    .font(theme::font(11.5)),
+            );
         }
         ModelCatalog::Ready(Ok(models)) => {
             let query = state.model_filter.trim();
@@ -868,15 +921,24 @@ fn profile_editor(
     theme::tag(ui, strings::SETTINGS_COMMAND);
     ui.add(egui::TextEdit::singleline(&mut draft.command).font(theme::field_font(13.0)).desired_width(520.0));
     theme::tag(ui, strings::SETTINGS_ARGS);
-    let mut args = join_args(&draft.args);
-    if ui.add(egui::TextEdit::singleline(&mut args).font(theme::field_font(13.0)).desired_width(420.0)).changed() {
+    let id = egui::Id::new("profile-args");
+    let mut args = edit_buffer(ui, id, || join_args(&draft.args));
+    let field = egui::TextEdit::singleline(&mut args).id(id).font(theme::field_font(13.0)).desired_width(420.0);
+    let response = ui.add(field);
+    if response.changed() {
         draft.args = split_args(&args);
     }
+    keep_buffer(ui, id, &response, args);
     theme::tag(ui, strings::SETTINGS_CWD);
-    let mut cwd = draft.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-    if ui.add(egui::TextEdit::singleline(&mut cwd).font(theme::field_font(13.0)).desired_width(520.0)).changed() {
+    let id = egui::Id::new("profile-cwd");
+    let mut cwd =
+        edit_buffer(ui, id, || draft.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default());
+    let field = egui::TextEdit::singleline(&mut cwd).id(id).font(theme::field_font(13.0)).desired_width(520.0);
+    let response = ui.add(field);
+    if response.changed() {
         draft.cwd = (!cwd.trim().is_empty()).then(|| PathBuf::from(cwd.trim()));
     }
+    keep_buffer(ui, id, &response, cwd);
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         if ui.add(theme::accent_button(strings::SETTINGS_SAVE)).clicked() && !draft.command.trim().is_empty() {
@@ -884,7 +946,7 @@ fn profile_editor(
                 draft.name = draft.command.clone();
             }
             if draft.id.is_empty() {
-                draft.id = unique_profile_id(cx.config, &draft.name);
+                draft.id = unique_profile_id(cx.config, cx.profiles, &draft.name);
             }
             match state.editing.and_then(|index| cx.config.profiles.get_mut(index)) {
                 Some(slot) => *slot = draft.clone(),
@@ -902,50 +964,113 @@ fn profile_editor(
     ui.add_space(4.0);
 }
 
-/// Quotes arguments that contain spaces, so the text field round-trips an
-/// argument list instead of silently splitting `-File "C:\My Scripts\x.ps1"`.
+/// The argument list as one line of text, in the Windows command-line grammar
+/// that `split_args` reads back (and that a child process sees): an empty
+/// argument is `""`, one with white space is wrapped in quotes, a `"` inside
+/// is `\"`, and the backslashes in front of a quote (or of the closing one)
+/// are doubled. `split_args(&join_args(args)) == args` for any list.
 fn join_args(args: &[String]) -> String {
-    args.iter()
-        .map(|arg| {
-            if arg.contains(' ') || arg.contains('"') {
-                format!("\"{}\"", arg.replace('"', "'"))
+    let mut line = String::new();
+    for arg in args {
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        let quote = arg.is_empty() || arg.chars().any(char::is_whitespace);
+        if quote {
+            line.push('"');
+        }
+        let mut backslashes = 0;
+        for ch in arg.chars() {
+            if ch == '\\' {
+                backslashes += 1;
             } else {
-                arg.clone()
+                if ch == '"' {
+                    // 2n+1 backslashes make an escaped quote out of n.
+                    line.extend(std::iter::repeat_n('\\', backslashes + 1));
+                }
+                backslashes = 0;
             }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+            line.push(ch);
+        }
+        if quote {
+            // 2n before the closing quote, so it still closes.
+            line.extend(std::iter::repeat_n('\\', backslashes));
+            line.push('"');
+        }
+    }
+    line
 }
 
-/// Splits on whitespace, keeping quoted runs together (quotes are dropped).
+/// Splits a line into arguments by the rules of the Microsoft C runtime's
+/// command-line parser (2008 and later), which differ from the shell's
+/// `CommandLineToArgvW` in one point, noted below: white space outside quotes
+/// separates, `"` opens or closes a quoted run (and is dropped), 2n backslashes
+/// before a quote are n and the quote keeps its meaning, 2n+1 are n and a
+/// literal quote, backslashes anywhere else are literal. `""` inside a run is a
+/// literal quote and the run stays open (`CommandLineToArgvW` closes the run
+/// there); `join_args` never writes `""` inside a run, so the pair reads back
+/// the same under either rule. An argument that was quoted stays even when
+/// empty (`""`), and a quote left open runs to the end of the line.
 fn split_args(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
+    let mut started = false;
     let mut quoted = false;
-    for ch in text.chars() {
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
-            '"' => quoted = !quoted,
+            '\\' => {
+                let mut backslashes = 1;
+                while chars.next_if_eq(&'\\').is_some() {
+                    backslashes += 1;
+                }
+                if chars.peek() == Some(&'"') {
+                    current.extend(std::iter::repeat_n('\\', backslashes / 2));
+                    if backslashes % 2 == 1 {
+                        chars.next();
+                        current.push('"');
+                    }
+                } else {
+                    current.extend(std::iter::repeat_n('\\', backslashes));
+                }
+                started = true;
+            }
+            '"' => {
+                if quoted && chars.next_if_eq(&'"').is_some() {
+                    current.push('"');
+                } else {
+                    quoted = !quoted;
+                }
+                started = true;
+            }
             c if c.is_whitespace() && !quoted => {
-                if !current.is_empty() {
+                if started {
                     out.push(std::mem::take(&mut current));
+                    started = false;
                 }
             }
-            c => current.push(c),
+            c => {
+                current.push(c);
+                started = true;
+            }
         }
     }
-    if !current.is_empty() {
+    if started {
         out.push(current);
     }
     out
 }
 
-fn unique_profile_id(config: &Config, name: &str) -> String {
+/// An id no profile uses yet. The built-in ones count too: a custom profile
+/// with their id replaces them in the list, so a profile named "PowerShell"
+/// would make the detected PowerShell vanish.
+fn unique_profile_id(config: &Config, profiles: &[crate::profiles::Profile], name: &str) -> String {
     let slug: String = name.trim().to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
     let slug = slug.trim_matches('-').to_owned();
     let base = if slug.is_empty() { "custom".to_owned() } else { slug };
     let mut id = base.clone();
     let mut n = 2;
-    while config.profiles.iter().any(|p| p.id == id) {
+    while config.profiles.iter().any(|p| p.id == id) || profiles.iter().any(|p| p.id == id) {
         id = format!("{base}-{n}");
         n += 1;
     }
@@ -1034,6 +1159,249 @@ mod tests {
         assert_eq!(frame(vec![enter]), Some("Consolas X".to_owned()), "Enter applies the name");
     }
 
+    /// A draft that nobody read back (the page was left mid-edit, so the field
+    /// never saw the focus go) must not reappear in a later visit and be applied
+    /// by the first focus and blur.
+    #[test]
+    fn an_abandoned_family_draft_does_not_come_back() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        let _ = ctx.run_ui(Default::default(), |_| {});
+        let id = egui::Id::new("family-abandoned");
+        let frame = |events: Vec<egui::Event>, draw: bool| {
+            let mut committed = None;
+            let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    if draw {
+                        committed = font_family_field(ui, id, "Consolas");
+                    }
+                });
+            });
+            committed
+        };
+        assert_eq!(frame(Vec::new(), true), None);
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        assert_eq!(frame(Vec::new(), true), None);
+        assert_eq!(frame(vec![egui::Event::Text(" X".to_owned())], true), None);
+        // The page is left (a click on a tab) while the field still holds its draft.
+        assert_eq!(frame(Vec::new(), false), None);
+        // Back on the page: focusing and leaving the field changes nothing.
+        assert_eq!(frame(Vec::new(), true), None);
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        assert_eq!(frame(Vec::new(), true), None);
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        assert_eq!(frame(vec![enter], true), None, "the old draft must not be applied");
+    }
+
+    fn built_in(id: &str, name: &str) -> crate::profiles::Profile {
+        crate::profiles::Profile {
+            id: id.into(),
+            name: name.into(),
+            command: "sh".into(),
+            args: Vec::new(),
+            cwd: None,
+            env: Default::default(),
+            kind: crate::profiles::ProfileKind::Cmd,
+        }
+    }
+
+    /// A custom profile with a built-in's id replaces it in the list, so a new
+    /// profile named like a detected one must get a different id.
+    #[test]
+    fn a_new_profile_never_takes_a_built_in_id() {
+        let config = Config::default();
+        let detected = [built_in("powershell", "PowerShell"), built_in("git-bash", "Git Bash")];
+        assert_eq!(unique_profile_id(&config, &detected, "PowerShell"), "powershell-2");
+        assert_eq!(unique_profile_id(&config, &detected, "Git Bash"), "git-bash-2");
+        assert_eq!(unique_profile_id(&config, &[], "PowerShell"), "powershell");
+    }
+
+    /// The profile list the app hands over already holds the custom profiles, so
+    /// listing the config's ones again offered each of them twice.
+    #[test]
+    fn the_default_profile_list_names_every_profile_once() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        let _ = ctx.run_ui(Default::default(), |_| {});
+        let mut config = Config::default();
+        config.profiles.push(ProfileConfig {
+            id: "mine".into(),
+            name: "Zeta shell".into(),
+            command: "sh".into(),
+            args: Vec::new(),
+            cwd: None,
+            env: Default::default(),
+        });
+        let profiles = [built_in("cmd", "cmd"), built_in("mine", "Zeta shell")];
+        let mut state = SettingsState::default();
+        let rect = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 700.0));
+        let mut frame = |open: bool| {
+            let output = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    if open {
+                        let combo = ui.make_persistent_id(egui::Id::new("default-profile"));
+                        egui::Popup::open_id(ui.ctx(), combo.with("popup"));
+                    }
+                    let mut cx = SettingsContext {
+                        config: &mut config,
+                        keymap_rows: &[],
+                        profiles: &profiles,
+                        fonts: &[],
+                        claude_line: &crate::claude_setup::LineState::Missing,
+                        quota: None,
+                    };
+                    let mut outcome = SettingsOutcome::default();
+                    section_profiles(ui, &mut cx, &mut state, &mut outcome);
+                });
+            });
+            output
+                .shapes
+                .iter()
+                .filter(
+                    |clipped| matches!(&clipped.shape, egui::Shape::Text(text) if text.galley.text() == "Zeta shell"),
+                )
+                .count()
+        };
+        let closed = frame(false);
+        assert_eq!(closed, 1, "the profile's own row");
+        let _ = frame(true);
+        let _ = frame(false);
+        let open = frame(false);
+        assert_eq!(open - closed, 1, "one entry in the opened list");
+    }
+
+    /// Draws the profile editor for one frame with `events`.
+    fn editor_frame(ctx: &egui::Context, state: &mut SettingsState, events: Vec<egui::Event>) {
+        let mut config = Config::default();
+        let rect = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 700.0));
+        let raw = egui::RawInput { screen_rect: Some(rect), events, ..Default::default() };
+        let _ = ctx.run_ui(raw, |ui| {
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                let mut cx = SettingsContext {
+                    config: &mut config,
+                    keymap_rows: &[],
+                    profiles: &[],
+                    fonts: &[],
+                    claude_line: &crate::claude_setup::LineState::Missing,
+                    quota: None,
+                };
+                profile_editor(ui, state, &mut cx, &mut SettingsOutcome::default());
+            });
+        });
+    }
+
+    /// The args field is typed into one key at a time: what is typed stays in
+    /// the field. It used to be rebuilt from the parsed list every frame, which
+    /// dropped a trailing space (and a quote still open), so a second argument
+    /// or a quoted one could only be pasted, never typed.
+    #[test]
+    fn arguments_can_be_typed_one_key_at_a_time() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        let _ = ctx.run_ui(Default::default(), |_| {});
+        let mut state = SettingsState { adding: true, ..SettingsState::default() };
+        editor_frame(&ctx, &mut state, Vec::new());
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("profile-args")));
+        editor_frame(&ctx, &mut state, Vec::new());
+        for key in ["-a", " ", "-b", " ", "\"", "c", " ", "d", "\""] {
+            editor_frame(&ctx, &mut state, vec![egui::Event::Text(key.to_owned())]);
+        }
+        assert_eq!(state.draft.args, ["-a", "-b", "c d"]);
+    }
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }
+    }
+
+    /// Draws a settings section for one frame with `events`.
+    fn page_frame(
+        ctx: &egui::Context,
+        config: &mut Config,
+        state: &mut SettingsState,
+        git: bool,
+        events: Vec<egui::Event>,
+    ) -> SettingsOutcome {
+        let mut outcome = SettingsOutcome::default();
+        let rect = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 700.0));
+        let raw = egui::RawInput { screen_rect: Some(rect), events, ..Default::default() };
+        let _ = ctx.run_ui(raw, |ui| {
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                let mut cx = SettingsContext {
+                    config,
+                    keymap_rows: &[],
+                    profiles: &[],
+                    fonts: &[],
+                    claude_line: &crate::claude_setup::LineState::Missing,
+                    quota: None,
+                };
+                if git {
+                    section_git(ui, &mut cx, state, &mut outcome);
+                } else {
+                    section_terminal(ui, &mut cx, &mut outcome);
+                }
+            });
+        });
+        outcome
+    }
+
+    /// Typing in a text field is reported as typing, not as a change to write:
+    /// the page applies it at once and the write waits for `commit`, which the
+    /// field raises when it is left.
+    #[test]
+    fn a_text_field_reports_typing_and_then_its_end() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        let _ = ctx.run_ui(Default::default(), |_| {});
+        let mut config = Config::default();
+        let mut state = SettingsState::default();
+        let before = config.terminal.word_separators.clone();
+        page_frame(&ctx, &mut config, &mut state, false, Vec::new());
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("settings-word-separators")));
+        let idle = page_frame(&ctx, &mut config, &mut state, false, Vec::new());
+        assert!(!idle.changed && !idle.typed && !idle.commit);
+        let outcome = page_frame(&ctx, &mut config, &mut state, false, vec![egui::Event::Text("x".to_owned())]);
+        assert!(outcome.typed && !outcome.changed && !outcome.commit, "a keystroke is typing");
+        assert_eq!(config.terminal.word_separators, format!("{before}x"), "and is in the edited config");
+        let outcome = page_frame(&ctx, &mut config, &mut state, false, vec![key(egui::Key::Escape)]);
+        assert!(outcome.commit && !outcome.typed, "leaving the field ends the typing");
+    }
+
+    /// The AI command is kept trimmed in the config, and used to be rebuilt from
+    /// it every frame: the space typed after the first word vanished before the
+    /// second word, so a command with an argument could only be pasted.
+    #[test]
+    fn the_ai_command_can_be_typed_with_spaces() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        let _ = ctx.run_ui(Default::default(), |_| {});
+        let mut config = Config::default();
+        // A loaded catalogue: the page does not start the real `opencode models`.
+        let mut state = SettingsState { model_catalog: ModelCatalog::Ready(Ok(Vec::new())), ..Default::default() };
+        page_frame(&ctx, &mut config, &mut state, true, Vec::new());
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("settings-ai-command")));
+        page_frame(&ctx, &mut config, &mut state, true, Vec::new());
+        for text in ["opencode", " ", "run", " ", "--pure", " "] {
+            page_frame(&ctx, &mut config, &mut state, true, vec![egui::Event::Text(text.to_owned())]);
+        }
+        assert_eq!(config.workspace.ai_commit_command.as_deref(), Some("opencode run --pure"));
+    }
+
+    #[test]
+    fn leaving_a_section_ends_its_typing() {
+        let mut state = SettingsState::default();
+        let mut outcome = SettingsOutcome::default();
+        state.select(SettingsSection::Appearance, &mut outcome);
+        assert!(!outcome.commit, "the same section is not leaving");
+        state.select(SettingsSection::Terminal, &mut outcome);
+        assert!(outcome.commit && state.section == SettingsSection::Terminal);
+    }
+
     #[test]
     fn arguments_round_trip_through_the_text_field() {
         let args = vec!["-NoLogo".to_owned(), "-File".to_owned(), r"C:\My Scripts\start.ps1".to_owned()];
@@ -1042,5 +1410,83 @@ mod tests {
         assert_eq!(split_args(&text), args);
         assert_eq!(split_args("  -a   -b  "), vec!["-a".to_owned(), "-b".to_owned()]);
         assert_eq!(split_args(""), Vec::<String>::new());
+    }
+
+    fn owned(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    /// Whatever the editor shows for a list reads back as the same list: the
+    /// old pair turned a `"` into `'` and dropped an empty argument, so editing
+    /// the field rewrote the profile's arguments.
+    #[test]
+    fn arguments_survive_the_text_field_whatever_they_hold() {
+        let hard: &[&[&str]] = &[
+            &[],
+            &[""],
+            &["", "a", ""],
+            &["a b"],
+            &["a\"b"],
+            &["\""],
+            &["\"\""],
+            &["a b\"c d"],
+            &["a\\"],
+            &["a b\\"],
+            &["a\\\\"],
+            &["a b\\\\"],
+            &["a\\\"b"],
+            &["a b\\\\\"c"],
+            &["\\"],
+            &["\\\\", "\\ "],
+            &[" "],
+            &["\t"],
+            &["a\tb", "c"],
+            &["C:\\My Scripts\\start.ps1", "-Command", "Write-Host \"hi there\""],
+            &["'", "a'b c", "\"'\""],
+            &["привет мир", "ж"],
+            &["x\"\"y z", "\"", ""],
+        ];
+        for args in hard {
+            let args = owned(args);
+            let text = join_args(&args);
+            assert_eq!(split_args(&text), args, "through `{text}`");
+        }
+        // Every short string over the characters that matter, alone and in pairs.
+        let mut strings = vec![String::new()];
+        let mut layer = vec![String::new()];
+        for _ in 0..4 {
+            layer = layer.iter().flat_map(|s| ['a', ' ', '\t', '"', '\\'].map(|c| format!("{s}{c}"))).collect();
+            strings.extend(layer.iter().cloned());
+        }
+        for one in &strings {
+            let args = vec![one.clone()];
+            assert_eq!(split_args(&join_args(&args)), args, "{one:?}");
+        }
+        for first in strings.iter().filter(|s| s.len() <= 3) {
+            for second in strings.iter().filter(|s| s.len() <= 3) {
+                let args = vec![first.clone(), second.clone()];
+                assert_eq!(split_args(&join_args(&args)), args, "{first:?} {second:?}");
+            }
+        }
+    }
+
+    /// Text typed in the format the field has always taken reads as before, and
+    /// the Windows rules cover what it could not say.
+    #[test]
+    fn typed_arguments_keep_their_old_meaning() {
+        assert_eq!(
+            split_args(r#"-NoLogo -File "C:\My Scripts\start.ps1""#),
+            owned(&["-NoLogo", "-File", r"C:\My Scripts\start.ps1"])
+        );
+        assert_eq!(split_args(r#"a "b c" d"#), owned(&["a", "b c", "d"]));
+        assert_eq!(split_args(r#"a"b c"d"#), owned(&["ab cd"]), "a quote can start inside a word");
+        assert_eq!(split_args(r"C:\dir\file.txt"), owned(&[r"C:\dir\file.txt"]), "backslashes are literal");
+        assert_eq!(split_args("a\tb\u{a0}c"), owned(&["a", "b", "c"]), "any white space separates");
+        assert_eq!(split_args(r#"-m "open"#), owned(&["-m", "open"]), "an open quote runs to the end");
+        // What the old reader could not express.
+        assert_eq!(split_args(r#"a "" b"#), owned(&["a", "", "b"]), "an empty argument");
+        assert_eq!(split_args(r#"say \"hi\""#), owned(&["say", "\"hi\""]), "an escaped quote");
+        assert_eq!(split_args(r#""a ""b"" c""#), owned(&["a \"b\" c"]), "a doubled quote inside a quoted run");
+        assert_eq!(split_args(r#""C:\dir\\" x"#), owned(&[r"C:\dir\", "x"]), "2n backslashes before a closing quote");
     }
 }

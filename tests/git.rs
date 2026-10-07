@@ -644,6 +644,54 @@ fn hunks_of_a_cyrillic_file_name_can_be_staged() {
     assert_eq!(output(dir.path(), &["show", ":файл.txt"]), b"one\ntwo\n");
 }
 
+/// Git ends the `---`/`+++` line of a name that contains a space with a TAB,
+/// which used to stay in the parsed path: the worker finds the file by its
+/// status path, so the hunks of such a file could never be staged.
+#[test]
+fn hunks_of_a_file_name_with_a_space_can_be_staged() {
+    let Some(dir) = repo() else { return };
+    let root = git::find_root(dir.path()).expect("root");
+    std::fs::write(dir.path().join("two words.txt"), "one\n").unwrap();
+    run(dir.path(), &["add", "two words.txt"]);
+    run(dir.path(), &["commit", "--quiet", "-m", "add two words.txt"]);
+    std::fs::write(dir.path().join("two words.txt"), "one\ntwo\n").unwrap();
+
+    let files = git::parse_diff(git::diff_bytes(&root, "two words.txt", false).unwrap(), false);
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].path, "two words.txt");
+    git::apply_hunks(&root, &files[0], &[0], false).expect("stage the hunk");
+    assert_eq!(output(dir.path(), &["show", ":two words.txt"]), b"one\ntwo\n");
+}
+
+/// Git explains "nothing to commit" on stdout and leaves stderr empty, so the
+/// error used to be an empty string.
+#[test]
+fn a_commit_with_nothing_staged_says_why() {
+    let Some(dir) = repo() else { return };
+    let error = git::commit(dir.path(), "nothing to record".to_owned()).unwrap_err();
+    assert!(!error.trim().is_empty(), "the error carries git's own explanation");
+}
+
+/// `commit_detail` reads `show --numstat -z`, which lists a rename as
+/// `add<TAB>del<TAB>`, NUL, old path, NUL, new path: its counts were dropped.
+#[test]
+fn commit_detail_counts_the_lines_of_a_renamed_file() {
+    let Some(dir) = repo() else { return };
+    let root = git::find_root(dir.path()).expect("root");
+    let body: String = (1..=30).map(|index| format!("line {index}\n")).collect();
+    std::fs::write(dir.path().join("before.txt"), &body).unwrap();
+    run(dir.path(), &["add", "before.txt"]);
+    run(dir.path(), &["commit", "--quiet", "-m", "add before.txt"]);
+    run(dir.path(), &["mv", "before.txt", "after.txt"]);
+    std::fs::write(dir.path().join("after.txt"), body + "one more\n").unwrap();
+    run(dir.path(), &["add", "after.txt"]);
+    run(dir.path(), &["commit", "--quiet", "-m", "rename and extend"]);
+
+    let head = git::log(&root).expect("log").commits.first().expect("a commit").hash.clone();
+    let detail = git::commit_detail(&root, &head).expect("commit detail");
+    assert_eq!(detail.files, [('R', "after.txt".to_owned(), 1, 0)], "files: {:?}", detail.files);
+}
+
 /// Regression: the branch's remote was looked up as `config --get branch
 /// <b>.remote` (key "branch"), which always failed, so fetch went to origin.
 #[test]

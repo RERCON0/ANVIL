@@ -136,7 +136,8 @@ impl SessionState {
             Some(text) => text,
             None => return SessionState::default(),
         };
-        serde_json::from_str(&text).unwrap_or_else(|e| {
+        // An editor may have added a byte order mark, which the parser rejects.
+        serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(&text)).unwrap_or_else(|e| {
             log::warn!("ignoring broken {}: {e}", path.display());
             SessionState::default()
         })
@@ -148,7 +149,12 @@ impl SessionState {
     /// session (and started a second copy of every shell).
     pub fn for_extra_window(self) -> SessionState {
         const CASCADE: i32 = 32;
-        let window = self.window.map(|w| WindowState { x: w.x + CASCADE, y: w.y + CASCADE, maximized: false, ..w });
+        let window = self.window.map(|w| WindowState {
+            x: w.x.saturating_add(CASCADE),
+            y: w.y.saturating_add(CASCADE),
+            maximized: false,
+            ..w
+        });
         SessionState { window, active_tab: 0, tabs: Vec::new() }
     }
 
@@ -253,6 +259,19 @@ mod tests {
         assert_eq!(extra.window, Some(WindowState { x: 132, y: 82, width: 1200, height: 800, maximized: false }));
     }
 
+    /// Coordinates are hand-editable and `on_screens` already treats them as
+    /// untrusted, but the cascade offset ran first and overflowed an i32 at the
+    /// edge, which aborts a debug build when the second window starts.
+    #[test]
+    fn an_extra_window_cascade_saturates_at_the_edge_of_the_coordinate_range() {
+        let session = SessionState {
+            window: Some(WindowState { x: i32::MAX - 8, y: i32::MAX, width: 1200, height: 800, maximized: false }),
+            ..SessionState::default()
+        };
+        let window = session.for_extra_window().window.expect("the window is kept");
+        assert_eq!((window.x, window.y), (i32::MAX, i32::MAX));
+    }
+
     fn pane(profile: &str, cwd: Option<&str>) -> PaneState {
         PaneState {
             profile_id: profile.into(),
@@ -316,6 +335,18 @@ mod tests {
         let loaded: SessionState = serde_json::from_str(older).unwrap();
         assert_eq!(loaded.tabs.len(), 1);
         assert_eq!(loaded.tabs[0].color, None, "an older session must still load");
+    }
+
+    /// A session saved by an editor with a byte order mark is still the user's
+    /// session, not a broken file that the next save overwrites.
+    #[test]
+    fn a_byte_order_mark_does_not_discard_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let mut bytes = b"\xEF\xBB\xBF".to_vec();
+        bytes.extend_from_slice(serde_json::to_string(&sample()).unwrap().as_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(SessionState::load(&path), sample());
     }
 
     #[test]

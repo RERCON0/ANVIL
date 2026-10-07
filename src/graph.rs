@@ -37,8 +37,10 @@ const MAX_PARENTS: usize = 8;
 /// Lane geometry for every commit, in the order they are displayed.
 pub fn compute(commits: &[Commit]) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::with_capacity(commits.len());
-    // lanes[i] is the hash lane i is currently heading towards.
-    let mut lanes: Vec<Option<String>> = Vec::new();
+    // lanes[i] is the hash lane i is currently heading towards. The hashes are
+    // borrowed from `commits`, so the per-row snapshots below copy pointers,
+    // not strings.
+    let mut lanes: Vec<Option<&str>> = Vec::new();
 
     for commit in commits {
         // A lane for the commit's own hash, under the same cap as the parent
@@ -47,17 +49,17 @@ pub fn compute(commits: &[Commit]) -> Vec<Row> {
         // hashes that never meet. A free lane is reused before one is opened;
         // past the cap the commit shares the last lane, the approximation the
         // doc comment already allows for a deep graph.
-        let lane = match lanes.iter().position(|hash| hash.as_deref() == Some(commit.hash.as_str())) {
+        let lane = match lanes.iter().position(|hash| *hash == Some(commit.hash.as_str())) {
             Some(lane) => lane,
             None => match lanes.iter().position(Option::is_none) {
                 Some(free) => {
-                    lanes[free] = Some(commit.hash.clone());
+                    lanes[free] = Some(commit.hash.as_str());
                     free
                 }
                 // `lanes` is empty only here, and an empty vec is under the cap,
                 // so this arm always leaves at least one lane to index.
                 None if lanes.len() < MAX_LANES => {
-                    lanes.push(Some(commit.hash.clone()));
+                    lanes.push(Some(commit.hash.as_str()));
                     lanes.len() - 1
                 }
                 None => lanes.len() - 1,
@@ -67,13 +69,13 @@ pub fn compute(commits: &[Commit]) -> Vec<Row> {
         let incoming = lanes.clone();
         // The node lane continues towards the first parent (or ends).
         let (first_parent, other_parents) = match commit.parents.split_first() {
-            Some((first, rest)) => (Some(first.clone()), rest),
+            Some((first, rest)) => (Some(first.as_str()), rest),
             None => (None, &[][..]),
         };
         match first_parent {
             None => lanes[lane] = None,
             Some(parent) => {
-                let merged = lanes.iter().position(|hash| hash.as_deref() == Some(parent.as_str()));
+                let merged = lanes.iter().position(|hash| *hash == Some(parent));
                 lanes[lane] = if merged == Some(lane) || merged.is_none() { Some(parent) } else { None };
             }
         }
@@ -83,10 +85,10 @@ pub fn compute(commits: &[Commit]) -> Vec<Row> {
             if lanes.len() >= MAX_LANES {
                 break;
             }
-            if !lanes.iter().any(|hash| hash.as_deref() == Some(parent.as_str())) {
+            if !lanes.contains(&Some(parent.as_str())) {
                 match lanes.iter().position(Option::is_none) {
-                    Some(free) => lanes[free] = Some(parent.clone()),
-                    None => lanes.push(Some(parent.clone())),
+                    Some(free) => lanes[free] = Some(parent.as_str()),
+                    None => lanes.push(Some(parent.as_str())),
                 }
             }
         }
@@ -106,8 +108,8 @@ pub fn compute(commits: &[Commit]) -> Vec<Row> {
         };
         let width = incoming.len().max(outgoing.len()).max(lane + 1);
         for index in 0..width {
-            let above = incoming.get(index).and_then(|hash| hash.as_ref());
-            let below = outgoing.get(index).and_then(|hash| hash.as_ref());
+            let above = incoming.get(index).copied().flatten();
+            let below = outgoing.get(index).copied().flatten();
             if index == lane {
                 if above.is_some() {
                     push(&mut segments, Segment { from_lane: index, to_lane: index, kind: Kind::Up });
@@ -119,15 +121,14 @@ pub fn compute(commits: &[Commit]) -> Vec<Row> {
                     push(&mut segments, Segment { from_lane: index, to_lane: index, kind: Kind::Through });
                 }
                 (Some(above), None) => {
-                    let target =
-                        outgoing.iter().position(|hash| hash.as_deref() == Some(above.as_str())).unwrap_or(lane);
+                    let target = outgoing.iter().position(|hash| *hash == Some(above)).unwrap_or(lane);
                     push(&mut segments, Segment { from_lane: index, to_lane: target, kind: Kind::Up });
                 }
                 _ => {}
             }
         }
         for parent in &commit.parents {
-            if let Some(target) = outgoing.iter().position(|hash| hash.as_deref() == Some(parent.as_str())) {
+            if let Some(target) = outgoing.iter().position(|hash| *hash == Some(parent.as_str())) {
                 push(&mut segments, Segment { from_lane: lane, to_lane: target, kind: Kind::Down });
             }
         }

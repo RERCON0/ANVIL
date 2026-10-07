@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use super::{json, number};
+use super::{after, json, number};
 use crate::quota::http::Endpoint;
 use crate::quota::model::{duration_window, FetchError, Fetched, Window};
 use crate::quota::time::epoch_from_json;
@@ -27,7 +27,7 @@ fn reset(record: &Value, now: i64) -> Option<i64> {
     ["reset_in", "resetIn", "ttl"]
         .iter()
         .find_map(|key| number(record.get(*key)).filter(|s| *s > 0.0))
-        .map(|secs| now + secs as i64)
+        .map(|secs| after(now, secs))
 }
 
 fn window_secs(window: &Value) -> Option<i64> {

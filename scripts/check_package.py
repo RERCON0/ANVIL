@@ -1,14 +1,16 @@
 """Check the unsigned CI package without extracting or running its payload."""
+import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import struct
 import subprocess
-import sys
 import zipfile
 
 from check_conpty import ROOT, verify as verify_conpty
+from collect_licenses import render as render_licenses
 
 ASSETS = {
     "conpty.dll": "vendor/conpty/x64/conpty.dll",
@@ -21,7 +23,9 @@ ASSETS = {
 }
 for name in ("Hack-Regular.txt", "Ubuntu-Light-UFL.txt", "NotoEmoji-OFL.txt", "emoji-icon-font-MIT.txt"):
     ASSETS[f"LICENSES/egui-default-fonts/{name}"] = f"LICENSES/egui-default-fonts/{name}"
-EXPECTED = set(ASSETS) | {"anvil.exe", "anvil-claude-status.exe", "SOURCE.txt", "BUILD.json"}
+EXPECTED = set(ASSETS) | {
+    "anvil.exe", "anvil-claude-status.exe", "SOURCE.txt", "BUILD.json", "LICENSES/THIRD-PARTY-RUST.txt",
+}
 
 
 def check_pe(data, subsystem, name):
@@ -39,6 +43,24 @@ def check_pe(data, subsystem, name):
         raise ValueError(f"ASLR, high-entropy ASLR or DEP missing: {name}")
 
 
+def check_no_build_paths(data, name):
+    """package.ps1 remaps the builder's directories; none may survive in the executables."""
+    haystack = data.lower()
+    builder = {Path.home(), ROOT}
+    builder |= {Path(os.environ[key]) for key in ("CARGO_HOME", "RUSTUP_HOME") if os.environ.get(key)}
+    for path in builder:
+        if len(path.parts) < 2:  # a drive or filesystem root would match every path
+            continue
+        for text in {str(path), path.as_posix()}:
+            if text.encode().lower() in haystack:
+                raise ValueError(f"Builder directory {text} is embedded in {name}")
+
+
+def tree_is_clean(root=ROOT):
+    """The question package.ps1 asks: no tracked change and no untracked file that is not ignored."""
+    return not subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=normal"], cwd=root, text=True)
+
+
 def check(package):
     verify_conpty()
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
@@ -52,9 +74,10 @@ def check(package):
     metadata = json.loads(payload["BUILD.json"].decode("utf-8-sig"))
     version = re.search(r'^version\s*=\s*"([^"]+)"', (ROOT / "Cargo.toml").read_text(encoding="utf-8"), re.M)[1]
     if (metadata.get("schema") != 1 or metadata.get("version") != version
-            or metadata.get("source_commit") != commit or metadata.get("features") != ["codex"]
-            or metadata.get("target") != "x86_64-pc-windows-msvc"):
-        raise ValueError("Build metadata differs from the Codex-enabled CI revision")
+            or metadata.get("source_commit") != commit or metadata.get("target") != "x86_64-pc-windows-msvc"):
+        raise ValueError("Build metadata differs from the CI revision")
+    if metadata.get("source_dirty") is not False or not tree_is_clean():
+        raise ValueError("The package was built from a working tree with uncommitted changes")
     if set(metadata["files"]) != EXPECTED - {"BUILD.json"}:
         raise ValueError("Incomplete payload hashes")
     for name, expected in metadata["files"].items():
@@ -63,20 +86,26 @@ def check(package):
     for name, source in ASSETS.items():
         if payload[name] != (ROOT / source).read_bytes():
             raise ValueError(f"Bundled runtime or licence differs from reviewed source: {name}")
+    if payload["LICENSES/THIRD-PARTY-RUST.txt"].decode("utf-8") != render_licenses(metadata["target"]):
+        raise ValueError("Rust crate licences differ from the locked dependency graph")
     source = payload["SOURCE.txt"].decode("utf-8-sig").splitlines()
-    if f"Commit: {commit}" not in source or "Features: codex" not in source:
+    if f"Commit: {commit}" not in source:
         raise ValueError("Source notice differs from CI revision")
     check_pe(payload["anvil.exe"], 2, "anvil.exe")
     check_pe(payload["anvil-claude-status.exe"], 3, "anvil-claude-status.exe")
+    for name in ("anvil.exe", "anvil-claude-status.exe"):
+        check_no_build_paths(payload[name], name)
     checksum = hashlib.sha256(package.read_bytes()).hexdigest()
     declared = (package.parent / "SHA256SUMS.txt").read_text(encoding="ascii").strip()
     if declared != f"{checksum}  {package.name}":
         raise ValueError("Archive SHA-256 mismatch")
-    print(f"Verified unsigned ANVIL {version} / {commit} / Codex enabled")
+    print(f"Verified unsigned ANVIL {version} / {commit}")
 
 
 if __name__ == "__main__":
-    path = Path(sys.argv[1])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("package", type=Path, help="the package .zip, or the directory that holds exactly one")
+    path = parser.parse_args().package
     if path.is_dir():
         candidates = list(path.glob("anvil-*-x64.zip"))
         if len(candidates) != 1:

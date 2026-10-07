@@ -11,7 +11,7 @@ use std::time::SystemTime;
 use super::model::Snapshot;
 use crate::fsutil::atomic_write;
 
-const MAX_CACHE: u64 = 1024 * 1024;
+const MAX_CACHE: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Paths {
@@ -38,11 +38,10 @@ impl Paths {
 }
 
 pub fn read(path: &Path) -> Option<Snapshot> {
-    let meta = std::fs::metadata(path).ok()?;
-    if meta.len() > MAX_CACHE {
-        return None;
-    }
-    let snapshot: Snapshot = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    // Another window's rename or a scanner can hold the file for a moment, and
+    // an observer that gives up then keeps the stale snapshot until the next
+    // cycle: the read bounds itself on the handle and retries those errors.
+    let snapshot: Snapshot = serde_json::from_slice(&crate::fsutil::read_limited(path, MAX_CACHE).ok()?).ok()?;
     (snapshot.version == Snapshot::VERSION).then_some(snapshot)
 }
 
@@ -122,6 +121,21 @@ mod tests {
         assert!(read(&paths.snapshot).is_none(), "unknown versions are ignored");
         std::fs::write(&paths.snapshot, "garbage").unwrap();
         assert!(read(&paths.snapshot).is_none());
+    }
+
+    #[test]
+    fn a_snapshot_held_for_a_moment_is_still_read() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        write(&paths.snapshot, &Snapshot::default()).unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&paths.snapshot).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(held);
+        });
+        assert_eq!(read(&paths.snapshot), Some(Snapshot::default()));
+        release.join().unwrap();
     }
 
     #[test]

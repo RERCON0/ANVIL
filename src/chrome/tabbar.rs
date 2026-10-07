@@ -258,6 +258,7 @@ fn tab_row(
             Pos2::new(row.min.x + 30.0, row.min.y + 4.0),
             Vec2::new(row.width() - 40.0, row.height() - 8.0),
         );
+        let mut cancelled = false;
         ui.scope_builder(egui::UiBuilder::new().max_rect(field_rect), |ui| {
             let field = ui.add(egui::TextEdit::singleline(&mut rename.text).desired_width(field_rect.width()));
             if rename.focus {
@@ -265,15 +266,14 @@ fn tab_row(
                 rename.focus = false;
             }
             let commit = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
             if commit {
                 actions.push(TabbarAction::Rename(index, rename.text.trim().to_owned()));
             }
-            if escape {
-                actions.push(TabbarAction::Rename(index, tab.title.to_string()));
-            }
+            // Escape only ends the edit. Renaming to the title on screen would
+            // turn a title that follows the shell into a fixed custom one.
+            cancelled = ui.input(|i| i.key_pressed(egui::Key::Escape));
         });
-        if !actions.is_empty() {
+        if cancelled || !actions.is_empty() {
             state.rename = None;
         }
         return;
@@ -760,6 +760,39 @@ mod tests {
         };
         assert_eq!(bars(Some(theme::TabColor::Red)), 1, "one bar in the colour");
         assert_eq!(bars(None), 0, "no colour, no bar");
+    }
+
+    /// Escape ends the rename and changes nothing. It used to "rename" the tab to
+    /// the title on screen, which froze a title that follows the shell into a
+    /// custom one; Enter still commits what was typed.
+    #[test]
+    fn escape_cancels_a_rename_without_pinning_the_shown_title() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Test", &[], false);
+        let tab = TabInfo { title: "pwsh".into(), active: true, activity: false, claude: None, color: None };
+        let rect = Rect::from_min_size(Pos2::new(0.0, 30.0), Vec2::new(180.0, 200.0));
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        let run = |text: &str, event: egui::Event| {
+            let mut state = TabbarState {
+                rename: Some(RenameEdit { tab: 0, text: text.to_owned(), focus: true }),
+                ..TabbarState::default()
+            };
+            let _ = list_frame(&ctx, &mut state, std::slice::from_ref(&tab), rect, Vec::new());
+            let (_, actions) = list_frame(&ctx, &mut state, std::slice::from_ref(&tab), rect, vec![event]);
+            (actions, state.rename.is_none())
+        };
+        let (actions, ended) = run("pwsh", key(egui::Key::Escape));
+        assert!(actions.is_empty(), "Escape must not rename: {actions:?}");
+        assert!(ended, "Escape ends the edit");
+        let (actions, ended) = run("  build  ", key(egui::Key::Enter));
+        assert_eq!(actions, [TabbarAction::Rename(0, "build".to_owned())]);
+        assert!(ended);
     }
 
     /// A rename or drag in progress names a tab by index: when an earlier tab

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
+use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::{Term, TermMode};
@@ -174,6 +174,22 @@ impl TerminalView {
         Some(bytes)
     }
 
+    /// A held-button move for a tracking application. Like xterm it is reported
+    /// when the pointer enters another cell, not on every frame it stays in one:
+    /// an application that redraws on each report would keep the pane drawing
+    /// (and answering) for as long as the button is held.
+    fn drag_motion(&mut self, cell: (usize, usize), mods: Mods, modes: MouseModes) -> Option<Vec<u8>> {
+        if !self.press_reported || !mouse::wants_report(MouseAction::Motion, true, modes) {
+            return None;
+        }
+        if self.last_reported_cell == Some(cell) {
+            return None;
+        }
+        let bytes = mouse::encode_report(MouseButton::Left, MouseAction::Motion, cell.0, cell.1, mods, modes)?;
+        self.last_reported_cell = Some(cell);
+        Some(bytes)
+    }
+
     pub fn show(&mut self, ui: &mut egui::Ui, rect: Rect, pane: &mut Pane, input: &ViewInput) -> ViewOutput {
         let ctx = ui.ctx().clone();
         let fonts = TermFonts::new(self.font_size);
@@ -274,13 +290,8 @@ impl TerminalView {
             if let Some(pos) = pointer {
                 let (col, row) = clamp_cell(pos);
                 if app_mouse {
-                    if self.press_reported && mouse::wants_report(MouseAction::Motion, true, modes) {
-                        if let Some(bytes) =
-                            mouse::encode_report(MouseButton::Left, MouseAction::Motion, col, row, mods, modes)
-                        {
-                            pane.write(bytes);
-                            self.last_reported_cell = Some((col, row));
-                        }
+                    if let Some(bytes) = self.drag_motion((col, row), mods, modes) {
+                        pane.write(bytes);
                     }
                 } else if self.selecting {
                     let point = viewport_to_point(display_offset, Point::new(row, Column(col)));
@@ -667,27 +678,7 @@ impl TerminalView {
         let total_columns = term.columns().max(1);
         let history = term.grid().history_size() as i32;
         let last_line = lines as i32 - 1;
-        let origin = match self.search.current {
-            Some((row, _, end)) if forward => {
-                let line = (row as i32 - display_offset as i32).clamp(-history, last_line);
-                Point::new(Line(line), Column(end.min(total_columns - 1)))
-            }
-            Some((row, start, _)) => {
-                // Step one cell back so the current match is not returned again.
-                let line = (row as i32 - display_offset as i32).clamp(-history, last_line);
-                match start.checked_sub(1) {
-                    Some(col) => Point::new(Line(line), Column(col)),
-                    None => Point::new(Line((line - 1).max(-history)), Column(total_columns - 1)),
-                }
-            }
-            None => {
-                let cursor = term.grid().cursor.point;
-                Point::new(
-                    Line(cursor.line.0.clamp(-history, last_line)),
-                    Column(cursor.column.0.min(total_columns - 1)),
-                )
-            }
-        };
+        let origin = step_origin(&term, self.search.current, forward, display_offset);
         let direction = if forward { Direction::Right } else { Direction::Left };
         let found = term.search_next(regex, origin, direction, Side::Left, None).or_else(|| {
             let wrap = if forward {
@@ -805,6 +796,44 @@ impl TerminalView {
     }
 }
 
+/// Where the search for the next match starts: from the match on screen if
+/// there is one, else from the cursor.
+fn step_origin<L: EventListener>(
+    term: &Term<L>,
+    current: Option<(usize, usize, usize)>,
+    forward: bool,
+    display_offset: usize,
+) -> Point {
+    let lines = term.screen_lines();
+    let total_columns = term.columns().max(1);
+    let history = term.grid().history_size() as i32;
+    let last_line = lines as i32 - 1;
+    match current {
+        Some((row, _, end)) if forward => {
+            let line = (row as i32 - display_offset as i32).clamp(-history, last_line);
+            // `end` is exclusive: past the last column the next cell is the first
+            // one of the next line (wrapping from the bottom to the top).
+            if end >= total_columns {
+                Point::new(Line(line), Column(total_columns - 1)).add(term, Boundary::None, 1)
+            } else {
+                Point::new(Line(line), Column(end))
+            }
+        }
+        Some((row, start, _)) => {
+            // Step one cell back so the current match is not returned again.
+            let line = (row as i32 - display_offset as i32).clamp(-history, last_line);
+            match start.checked_sub(1) {
+                Some(col) => Point::new(Line(line), Column(col)),
+                None => Point::new(Line((line - 1).max(-history)), Column(total_columns - 1)),
+            }
+        }
+        None => {
+            let cursor = term.grid().cursor.point;
+            Point::new(Line(cursor.line.0.clamp(-history, last_line)), Column(cursor.column.0.min(total_columns - 1)))
+        }
+    }
+}
+
 fn find_scheme(text: &str, from: usize) -> Option<usize> {
     ["https://", "http://", "ftp://", "mailto:"].iter().filter_map(|s| text[from..].find(s).map(|i| i + from)).min()
 }
@@ -915,6 +944,46 @@ mod tests {
         assert_eq!(view.last_reported_cell, Some((3, 4)), "hover state cannot erase a pending release");
         view.hover_cell = Some((3, 4));
         assert_eq!(view.hover_motion(true, false, Mods::default(), modes), Some(expected));
+    }
+
+    /// `end` of a match is exclusive: for one in the last column the step has to
+    /// start on the next line, not on the match's own cell, or Enter finds it
+    /// again forever.
+    #[test]
+    fn next_match_steps_past_one_in_the_last_column() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::Config;
+        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+        let size = crate::term::pane::GridSize { columns: 20, lines: 3 };
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        Processor::<StdSyncHandler>::new().advance(&mut term, b"\x1b[1;20Hx\x1b[2;3Hx");
+        let mut regex = RegexSearch::new("x").unwrap();
+        let next = |term: &Term<VoidListener>, regex: &mut RegexSearch, current, forward| {
+            let origin = step_origin(term, current, forward, 0);
+            let direction = if forward { Direction::Right } else { Direction::Left };
+            let found = term.search_next(regex, origin, direction, Side::Left, None).expect("a match");
+            (found.start().line.0, found.start().column.0)
+        };
+        assert_eq!(next(&term, &mut regex, Some((0, 19, 20)), true), (1, 2), "forward from the last column");
+        assert_eq!(next(&term, &mut regex, Some((1, 2, 3)), true), (0, 19), "forward wraps to the top");
+        assert_eq!(next(&term, &mut regex, Some((1, 2, 3)), false), (0, 19), "backward");
+        assert_eq!(next(&term, &mut regex, Some((0, 19, 20)), false), (1, 2), "backward wraps to the bottom");
+    }
+
+    #[test]
+    fn a_held_button_reports_motion_only_when_the_cell_changes() {
+        let mut view = TerminalView::new(15.0);
+        let modes = MouseModes { drag: true, sgr: true, ..Default::default() };
+        assert!(view.drag_motion((3, 4), Mods::default(), modes).is_none(), "no press was reported to this pane");
+        view.press_reported = true;
+        view.last_reported_cell = Some((3, 4));
+        assert!(view.drag_motion((3, 4), Mods::default(), modes).is_none(), "the pointer stayed in the cell");
+        let moved = view.drag_motion((4, 4), Mods::default(), modes).expect("a new cell");
+        assert_eq!(moved, b"\x1b[<32;5;5M".to_vec());
+        assert!(view.drag_motion((4, 4), Mods::default(), modes).is_none(), "once per cell");
+        assert!(view.drag_motion((3, 4), Mods::default(), modes).is_some(), "moving back is a move");
+        let clicks_only = MouseModes { click: true, sgr: true, ..Default::default() };
+        assert!(view.drag_motion((9, 9), Mods::default(), clicks_only).is_none(), "1000 does not report drags");
     }
 
     fn cell(ch: char, hyperlink: Option<Hyperlink>) -> RenderCell {

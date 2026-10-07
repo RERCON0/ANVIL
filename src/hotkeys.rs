@@ -480,6 +480,13 @@ impl Keymap {
     fn describe_rows(&self) -> Vec<(String, Vec<String>)> {
         let mut out: Vec<(String, Vec<String>)> =
             SIMPLE_ACTIONS.iter().map(|(_, action)| (action.id(), Vec::new())).collect();
+        // The numbered and profile actions are not in that table: their rows
+        // must survive an unbinding too.
+        for (id, _) in DEFAULT_BINDINGS {
+            if !out.iter().any(|(row, _)| row == id) {
+                out.push(((*id).to_owned(), Vec::new()));
+            }
+        }
         for (chord, action) in &self.bindings {
             let id = action.id();
             let text = format_chord(chord);
@@ -649,6 +656,23 @@ mod tests {
         assert!(Action::ZoomIn.is_terminal());
         assert!(!Action::NewTab.is_terminal());
         assert!(!Action::ToggleFullscreen.is_terminal());
+    }
+
+    /// The settings page lists an unbound action with no chords instead of
+    /// dropping its row; that held only for the actions of the simple table, so
+    /// unbinding a tab number or the PowerShell profile made its row vanish.
+    #[test]
+    fn unbound_numbered_and_profile_actions_keep_their_rows() {
+        let overrides =
+            BTreeMap::from([("tab-3".to_owned(), Vec::new()), ("profile:powershell".to_owned(), Vec::new())]);
+        let (km, problems) = Keymap::with_overrides(&overrides);
+        assert!(problems.is_empty(), "{problems:?}");
+        for id in ["tab-3", "profile:powershell"] {
+            let row = km.describe().iter().find(|(row, _)| row == id);
+            assert_eq!(row.map(|(_, chords)| chords.len()), Some(0), "{id}");
+        }
+        let ids: Vec<_> = km.describe().iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids.iter().filter(|id| **id == "tab-1").count(), 1, "bound rows are not doubled");
     }
 
     #[test]

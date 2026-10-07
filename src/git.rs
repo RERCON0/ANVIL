@@ -224,7 +224,7 @@ fn resolve_inside(root: &Path, canonical_root: &Path, path: &str) -> Result<Path
     let inside = crate::strings::WORKSPACE_PATH_INSIDE_REPO;
     local_path(root)?;
     let clean = path.replace('\\', "/");
-    if clean.is_empty() || clean.starts_with('/') || clean.contains(':') || clean.contains('~') {
+    if clean.is_empty() || clean.starts_with('/') || clean.contains(':') {
         return Err(inside.to_owned());
     }
     let mut full = root.to_path_buf();
@@ -239,11 +239,7 @@ fn resolve_inside(root: &Path, canonical_root: &Path, path: &str) -> Result<Path
         if part.contains(['<', '>', '"', '|', '?', '*']) || part.chars().any(char::is_control) {
             return Err(inside.to_owned());
         }
-        let stem = part.split('.').next().unwrap_or(part).to_ascii_uppercase();
-        if matches!(
-            stem.as_str(),
-            "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "LPT1" | "LPT2" | "LPT3"
-        ) {
+        if is_reserved_device_name(part) || is_short_name_alias(part) {
             return Err(inside.to_owned());
         }
         full.push(part);
@@ -272,6 +268,32 @@ fn resolve_inside(root: &Path, canonical_root: &Path, path: &str) -> Result<Path
             }
         }
     }
+}
+
+/// Whether one path component names a Windows device, wherever it sits in the
+/// path: CON, PRN, AUX, NUL, COM1-COM9 and LPT1-LPT9 (also with the superscript
+/// digits Windows reads as digits), plus the console handles CONIN$ and CONOUT$.
+/// The name counts in any case, with any extension (`NUL.tar.gz`), with trailing
+/// dots or spaces that Win32 drops (`LPT7 .`) and with an alternate-stream
+/// suffix (`CON:stream`). COM0, LPT0, CLOCK$ and longer names (COM10, COMX) are
+/// ordinary files on every Windows version probed, and the documentation does
+/// not list them.
+fn is_reserved_device_name(component: &str) -> bool {
+    let name = component.split(':').next().unwrap_or(component).trim_end_matches(['.', ' ']);
+    // Spaces left in front of an extension are conservatively dropped too.
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ').to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") {
+        return true;
+    }
+    let Some(number) = stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT")) else { return false };
+    let mut digits = number.chars();
+    matches!((digits.next(), digits.next()), (Some('1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None))
+}
+
+/// An 8.3 alias (`PROGRA~1`, `FILE~12.TXT`) always carries `~` before digits, so
+/// it is the only use of a tilde that can address a file under another name.
+fn is_short_name_alias(component: &str) -> bool {
+    component.as_bytes().windows(2).any(|pair| pair[0] == b'~' && pair[1].is_ascii_digit())
 }
 
 /// The repository root containing `cwd`, if any.
@@ -311,12 +333,23 @@ impl ConfigSource {
         ConfigSource { path: resolved, aliases: std::collections::HashSet::from([path.to_path_buf()]), state }
     }
 
-    fn is_current(&self) -> bool {
+    fn is_current(&self, walk: &mut Walk) -> bool {
         // Never follow a redirect installed since the previous snapshot, and
         // never let a differently cased spelling of the same file look stale.
-        self.aliases.iter().all(|alias| local_path(alias).is_ok_and(|resolved| same_path(&resolved, &self.path)))
+        self.aliases
+            .iter()
+            .all(|alias| local_path_in(alias, walk).is_ok_and(|resolved| same_path(&resolved, &self.path)))
             && std::fs::metadata(&self.path).ok().map(|meta| (meta.len(), meta.modified().ok())) == self.state
     }
+}
+
+/// Whether every file in `sources` still looks as it did. The sources of one
+/// repository share long prefixes (every loose-object directory sits under the
+/// same `.git/objects`), so one `Walk` lets each path component be inspected
+/// once per sweep instead of once per source.
+fn all_current(sources: &[ConfigSource]) -> bool {
+    let mut walk = Walk::default();
+    sources.iter().all(|source| source.is_current(&mut walk))
 }
 
 /// Windows paths compare case-insensitively, exactly as the filesystem does.
@@ -413,7 +446,7 @@ impl RepositoryStamp {
 
     /// Whether the files behind this digest still look untouched.
     fn is_current(&self) -> bool {
-        self.sources.iter().all(ConfigSource::is_current)
+        all_current(&self.sources)
     }
 }
 
@@ -499,7 +532,7 @@ fn read_stamp(root: &Path) -> Result<RepositoryStamp, String> {
             }
             snapshots.push((repository, config));
         }
-        if !sources.iter().all(ConfigSource::is_current) {
+        if !all_current(&sources) {
             continue;
         }
         // An origin discovered only from Git needs a second read under its
@@ -519,7 +552,7 @@ fn read_stamp(root: &Path) -> Result<RepositoryStamp, String> {
                     break;
                 }
             }
-            if changed || !sources.iter().all(ConfigSource::is_current) {
+            if changed || !all_current(&sources) {
                 continue;
             }
         }
@@ -726,16 +759,8 @@ fn reject_remote_path(path: &Path) -> Result<(), String> {
         return Err(network_refusal());
     }
     #[cfg(windows)]
-    for part in text.split('/') {
-        let stem = part.trim_end_matches(['.', ' ']).split('.').next().unwrap_or("");
-        let numbered = stem.len() == 4
-            && stem.get(..3).is_some_and(|head| head.eq_ignore_ascii_case("COM") || head.eq_ignore_ascii_case("LPT"))
-            && matches!(stem.as_bytes()[3], b'1'..=b'9');
-        if numbered
-            || ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].iter().any(|name| stem.eq_ignore_ascii_case(name))
-        {
-            return Err(network_refusal());
-        }
+    if text.split('/').any(is_reserved_device_name) {
+        return Err(network_refusal());
     }
     #[cfg(windows)]
     {
@@ -758,9 +783,27 @@ fn reject_remote_path(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// What `symlink_metadata` said about one path prefix, remembered by a `Walk`.
+#[derive(Clone)]
+enum Entry {
+    Absent,
+    Plain,
+    /// A reparse point whose local entry could be read: where it points.
+    Link(PathBuf),
+}
+
+/// Prefix lookups of one pass over many paths (a freshness sweep, a scan).
+/// Never kept between passes: a later pass must see the filesystem as it is.
+#[derive(Default)]
+struct Walk(HashMap<PathBuf, Entry>);
+
+fn local_path(path: &Path) -> Result<PathBuf, String> {
+    local_path_in(path, &mut Walk::default())
+}
+
 /// Resolve one component at a time. read_link reads the LOCAL reparse entry,
 /// not its target; reject that target before inspecting the next component.
-fn local_path(path: &Path) -> Result<PathBuf, String> {
+fn local_path_in(path: &Path, walk: &mut Walk) -> Result<PathBuf, String> {
     reject_remote_path(path)?;
     let mut path = path.to_path_buf();
     #[cfg(windows)]
@@ -791,39 +834,48 @@ fn local_path(path: &Path) -> Result<PathBuf, String> {
                 }
                 _ => probe.push(component.as_os_str()),
             }
-            match std::fs::symlink_metadata(&probe) {
-                Ok(meta) => {
-                    #[cfg(windows)]
-                    let reparse = {
-                        use std::os::windows::fs::MetadataExt;
-                        meta.file_attributes() & 0x400 != 0
-                    };
-                    #[cfg(not(windows))]
-                    let reparse = meta.file_type().is_symlink();
-                    if reparse {
-                        // Junctions and symlinks are inspectable, and their
-                        // targets are rejected before anything follows them.
-                        // A vendor filter (OneDrive, WCI, app aliases) cannot be
-                        // given an attacker-chosen target by unprivileged code,
-                        // so an unreadable link keeps resolving lexically
-                        // instead of refusing the whole folder.
-                        if let Ok(target) = std::fs::read_link(&probe) {
-                            reject_remote_path(&target)?;
-                            let mut target = if target.is_absolute() {
-                                target
-                            } else {
-                                probe.parent().ok_or_else(network_refusal)?.join(target)
+            let entry = match walk.0.get(&probe) {
+                Some(entry) => entry.clone(),
+                None => {
+                    let entry = match std::fs::symlink_metadata(&probe) {
+                        Ok(meta) => {
+                            #[cfg(windows)]
+                            let reparse = {
+                                use std::os::windows::fs::MetadataExt;
+                                meta.file_attributes() & 0x400 != 0
                             };
-                            for rest in components {
-                                target.push(rest.as_os_str());
+                            #[cfg(not(windows))]
+                            let reparse = meta.file_type().is_symlink();
+                            // Junctions and symlinks are inspectable, and their
+                            // targets are rejected before anything follows them.
+                            // A vendor filter (OneDrive, WCI, app aliases) cannot be
+                            // given an attacker-chosen target by unprivileged code,
+                            // so an unreadable link keeps resolving lexically
+                            // instead of refusing the whole folder.
+                            match reparse.then(|| std::fs::read_link(&probe)) {
+                                Some(Ok(target)) => Entry::Link(target),
+                                _ => Entry::Plain,
                             }
-                            redirected = Some(target);
-                            break;
                         }
-                    }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Entry::Absent,
+                        Err(error) => return Err(error.to_string()),
+                    };
+                    walk.0.insert(probe.clone(), entry.clone());
+                    entry
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.to_string()),
+            };
+            if let Entry::Link(target) = entry {
+                reject_remote_path(&target)?;
+                let mut target = if target.is_absolute() {
+                    target
+                } else {
+                    probe.parent().ok_or_else(network_refusal)?.join(target)
+                };
+                for rest in components {
+                    target.push(rest.as_os_str());
+                }
+                redirected = Some(target);
+                break;
             }
         }
         match redirected {
@@ -872,6 +924,7 @@ struct ConfigScan {
     active: std::collections::HashSet<PathBuf>,
     worktree_override: bool,
     git_dir: PathBuf,
+    walk: Walk,
 }
 
 impl ConfigScan {
@@ -892,6 +945,7 @@ impl ConfigScan {
             alternate_stores: Default::default(),
             metadata_entries: 0,
             global_paths: Default::default(),
+            walk: Walk::default(),
         }
     }
 
@@ -902,7 +956,7 @@ impl ConfigScan {
         if self.alias_index.len() >= MAX_SOURCE_ALIASES {
             return Err(config_refusal());
         }
-        let resolved = local_path(path)?;
+        let resolved = local_path_in(path, &mut self.walk)?;
         let index = if let Some(&index) = self.source_index.get(&resolved) {
             self.sources[index].aliases.insert(path.to_path_buf());
             index
@@ -1618,7 +1672,7 @@ fn head_is_unborn(root: &Path) -> Result<bool, String> {
     }
     let packed = scan.read(&repository.common_dir.join("packed-refs"))?.unwrap_or_default();
     let packed_has_head = packed.lines().any(|line| line.split_once(' ').is_some_and(|(_, name)| name == reference));
-    if !scan.sources.iter().all(ConfigSource::is_current) {
+    if !all_current(&scan.sources) {
         return Err(config_refusal());
     }
     Ok(!packed_has_head)
@@ -1647,7 +1701,7 @@ fn preflight(cwd: &Path) -> Result<std::sync::Arc<Preflight>, String> {
     let cached =
         PREFLIGHT_CACHE.lock().ok().and_then(|cache| cache.as_ref().and_then(|cache| cache.get(&cwd)).cloned());
     if let Some((previous, checked)) = cached {
-        if previous == environment && checked.sources.iter().all(ConfigSource::is_current) {
+        if previous == environment && all_current(&checked.sources) {
             return Ok(checked);
         }
     }
@@ -1675,7 +1729,7 @@ fn preflight(cwd: &Path) -> Result<std::sync::Arc<Preflight>, String> {
         if let Some(repository) = &repository {
             inspect_metadata(repository, &mut scan, 0)?;
         }
-        if !scan.sources.iter().all(ConfigSource::is_current) {
+        if !all_current(&scan.sources) {
             continue;
         }
         if scan.worktree_override {
@@ -1693,7 +1747,7 @@ fn preflight(cwd: &Path) -> Result<std::sync::Arc<Preflight>, String> {
                 }
             }
         }
-        if scan.sources.iter().all(ConfigSource::is_current) {
+        if all_current(&scan.sources) {
             let checked = std::sync::Arc::new(Preflight {
                 repository,
                 repositories: scan.repositories,
@@ -1916,7 +1970,8 @@ fn plain_change(fields: &[&str]) -> Option<Change> {
 /// Parses `diff --numstat -z` into path -> (additions, deletions).
 pub fn parse_numstat(bytes: &[u8]) -> HashMap<String, (u32, u32)> {
     let mut out = HashMap::new();
-    for record in bytes.split(|b| *b == 0) {
+    let mut records = bytes.split(|b| *b == 0);
+    while let Some(record) = records.next() {
         if record.is_empty() {
             continue;
         }
@@ -1924,7 +1979,19 @@ pub fn parse_numstat(bytes: &[u8]) -> HashMap<String, (u32, u32)> {
         let mut parts = text.splitn(3, '\t');
         let (Some(add), Some(del), Some(path)) = (parts.next(), parts.next(), parts.next()) else { continue };
         let count = |value: &str| value.parse::<u32>().unwrap_or(0);
-        out.insert(path.to_owned(), (count(add), count(del)));
+        // A rename or copy has no path in its own record: the old and the new
+        // path follow as two more NUL-separated records, and the counts belong
+        // to the new one.
+        let path = if path.is_empty() {
+            let _old = records.next();
+            match records.next() {
+                Some(new) => String::from_utf8_lossy(new).into_owned(),
+                None => continue,
+            }
+        } else {
+            path.to_owned()
+        };
+        out.insert(path, (count(add), count(del)));
     }
     out
 }
@@ -2272,12 +2339,30 @@ pub fn commit(root: &Path, message: String) -> Result<String, String> {
     // index.lock behind. Stdin also avoids Windows' command-line size limit.
     let mut command = git_command(root)?;
     command.args(["commit", "-F", "-"]);
-    let (success, _, stderr) =
+    let (success, stdout, stderr) =
         run_bounded(command, "git commit", GIT_TIMEOUT_COMMIT, GIT_MAX_OUTPUT, Some(message.into_bytes()))?;
     if !success {
-        return Err(String::from_utf8_lossy(&stderr).trim().to_owned());
+        return Err(commit_failure(&stdout, &stderr));
     }
     run_git(root, &["rev-parse", "--short", "HEAD"]).map(|hash| hash.trim().to_owned())
+}
+
+/// Longest explanation of a failed commit kept from stdout.
+const COMMIT_REASON_CHARS: usize = 300;
+
+/// Why `git commit` failed. "Nothing to commit" (a change reverted since the
+/// panel last looked) is explained on stdout, where git prints the whole status
+/// listing (every changed and untracked path, names the user did not choose)
+/// before its closing sentence; only that sentence is the reason. An empty
+/// error would say nothing at all, so stderr wins only when it has text.
+fn commit_failure(stdout: &[u8], stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    if !stderr.trim().is_empty() {
+        return stderr.trim().to_owned();
+    }
+    let stdout = String::from_utf8_lossy(stdout);
+    let closing = stdout.lines().rev().map(str::trim).find(|line| !line.is_empty()).unwrap_or_default();
+    closing.chars().take(COMMIT_REASON_CHARS).collect()
 }
 
 /// The last `count` commit subjects (AI prompt context).
@@ -2565,10 +2650,13 @@ pub fn opencode_models() -> Result<Vec<String>, String> {
     let Some(command) = program else {
         return Err("OpenCode: нет команды".to_owned());
     };
+    // The CLI gets its credentials through the environment and may echo them
+    // in its error, which the settings page then shows.
+    let secrets = ai_commit::command_secrets(&command);
     let (success, stdout, stderr) =
         run_bounded(command, "opencode models", std::time::Duration::from_secs(30), 512 * 1024, None)?;
     if !success {
-        return Err(String::from_utf8_lossy(&stderr).trim().to_owned());
+        return Err(ai_commit::redact(String::from_utf8_lossy(&stderr).trim(), &secrets));
     }
     let models = parse_opencode_models(&String::from_utf8_lossy(&stdout));
     if models.is_empty() {
@@ -2695,14 +2783,16 @@ pub fn ai_commit_message(command: Option<&str>, prompt: &str, timeout: std::time
         let (success, stdout, stderr) = run_bounded(process, &label, timeout, 64 * 1024, None)?;
         let output = String::from_utf8_lossy(&stdout);
         if !success {
-            let stderr = ai_commit::redact(&String::from_utf8_lossy(&stderr), &secrets);
-            return Err(if !stderr.trim().is_empty() {
+            let stderr = String::from_utf8_lossy(&stderr);
+            // Both streams can carry what the CLI echoed of its credentials.
+            let reason = if !stderr.trim().is_empty() {
                 stderr.trim().to_owned()
             } else {
                 ai_commit::response(backend, &output).err().unwrap_or_else(|| format!("{label}: {}", output.trim()))
-            });
+            };
+            return Err(ai_commit::redact(&reason, &secrets));
         }
-        ai_commit::response(backend, &output)?
+        ai_commit::response(backend, &output).map_err(|error| ai_commit::redact(&error, &secrets))?
     } else {
         ai_commit::codex_generate(model.as_deref(), prompt, timeout)?
     };
@@ -2826,8 +2916,10 @@ pub fn parse_diff(diff: impl AsRef<[u8]>, staged: bool) -> Vec<FileDiff> {
         } else {
             // The b-side of the +++ line is authoritative for the file name
             // (the diff --git line is ambiguous when a path contains " b/").
+            // Git ends that line with a TAB when the path contains a space, so
+            // GNU patch can find where the name stops: it is not part of it.
             if let Some(path) = line.strip_prefix("+++ b/") {
-                file.path = path.to_owned();
+                file.path = path.strip_suffix('\t').unwrap_or(path).to_owned();
             }
             file.header.push(line);
             file.raw_header.push(raw.to_vec());
@@ -2847,6 +2939,20 @@ fn path_from_diff_header(line: &str) -> String {
         return rest[index + 3..].to_owned();
     }
     rest.split_whitespace().last().unwrap_or("").trim_start_matches("a/").to_owned()
+}
+
+/// Hunk `index` of `file` exactly as git printed it: the `@@` line, the context
+/// and the changes, CRs included, each line ended by `\n`, without the file
+/// header (whose `index` line changes with any edit of the file). Cost is the
+/// size of that one hunk, so a caller walking every hunk stays linear.
+pub fn hunk_bytes(file: &FileDiff, index: usize) -> Option<Vec<u8>> {
+    let hunk = file.hunks.get(index)?;
+    let mut out = Vec::with_capacity(hunk.raw.iter().map(|line| line.len() + 1).sum());
+    for line in &hunk.raw {
+        out.extend_from_slice(line);
+        out.push(b'\n');
+    }
+    Some(out)
 }
 
 /// Rebuilds a patch containing only the selected hunks (all when empty), from
@@ -3076,6 +3182,16 @@ mod tests {
         assert_eq!((both[0].additions, both[0].deletions), (24, 6));
     }
 
+    #[test]
+    fn numstat_attributes_a_rename_to_its_new_path() {
+        // `-z` prints a rename as `add<TAB>del<TAB>`, NUL, old path, NUL, new path.
+        let stats = parse_numstat(b"2\t3\ta.rs\x001\t0\t\x00old name.txt\x00new name.txt\x00-\t-\timage.png\x00");
+        assert_eq!(stats.get("a.rs"), Some(&(2, 3)));
+        assert_eq!(stats.get("new name.txt"), Some(&(1, 0)));
+        assert_eq!(stats.get("image.png"), Some(&(0, 0)), "records after a rename stay aligned");
+        assert_eq!(stats.len(), 3, "neither the old path nor an empty one is a key: {stats:?}");
+    }
+
     const SAMPLE_DIFF: &str = "diff --git a/src/main.rs b/src/main.rs\n\
 index 111..222 100644\n\
 --- a/src/main.rs\n\
@@ -3206,6 +3322,15 @@ index 111..222 100644\n\
     }
 
     #[test]
+    fn a_tab_after_a_name_with_a_space_is_not_part_of_the_path() {
+        let files = parse_diff(
+            "diff --git a/two words.txt b/two words.txt\n--- a/two words.txt\t\n+++ b/two words.txt\t\n@@ -1 +1 @@\n-a\n+b\n",
+            false,
+        );
+        assert_eq!(files[0].path, "two words.txt");
+    }
+
+    #[test]
     fn path_with_b_slash_uses_the_plus_line() {
         let files = parse_diff("diff --git a/foo b/bar.txt b/foo b/bar.txt\n--- a/foo b/bar.txt\n+++ b/foo b/bar.txt\n@@ -1 +1 @@\n-a\n+b\n", false);
         assert_eq!(files[0].path, "foo b/bar.txt");
@@ -3250,6 +3375,79 @@ index 111..222 100644\n\
         // the root itself.
         assert_eq!(resolve_path(root, "new.txt"), Ok(root.join("new.txt")));
         assert_eq!(resolve_path(root, "new/deeper.txt"), Ok(root.join("new").join("deeper.txt")));
+    }
+
+    /// Windows devices are reserved in every component, in any case and with any
+    /// extension, trailing dots or spaces; the digits ¹²³ count like 1-3. COM0,
+    /// LPT0, CLOCK$ and longer names are ordinary files (probed on Windows 11
+    /// 26200; Microsoft's "Naming Files" page lists COM1-9 and LPT1-9 only).
+    #[test]
+    fn every_windows_device_name_is_rejected_in_every_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for reserved in [
+            "COM5",
+            "com9.txt",
+            "LPT7 .",
+            "LPT9",
+            "COM\u{b9}",
+            "lpt\u{b2}.log",
+            "COM\u{b3} ",
+            "CONIN$",
+            "CONOUT$.log",
+            "conin$",
+            "NUL.tar.gz",
+            "Prn.",
+            "aux",
+            "COM1 .txt",
+            "dir\\COM6\\a",
+            "dir/ok/LPT\u{b9}.d/a",
+            "COM1.d/a",
+        ] {
+            assert!(resolve_path(root, reserved).is_err(), "{reserved:?} must be rejected");
+        }
+        for ordinary in [
+            "COM10",
+            "COMX",
+            "com.txt",
+            "COM0",
+            "LPT0",
+            "LPT10",
+            "COM\u{2074}",
+            "COM\u{ff11}",
+            "CLOCK$",
+            "CONFIG",
+            "CONSOLE",
+            "CONIN",
+            "AUX1",
+            "NULL",
+            "PRN2",
+            " CON",
+            "xCON.txt",
+            "dir\\COM10\\a",
+        ] {
+            assert!(resolve_path(root, ordinary).is_ok(), "{ordinary:?} is an ordinary name");
+        }
+        // The rule itself ignores an alternate-stream suffix and Win32's trailing
+        // dots and spaces; `resolve_inside` refuses a colon or such an ending
+        // before it gets there.
+        for spelling in ["CON:stream", "COM1:x:$DATA", "nul.txt:s", "LPT7 .", "Prn.", "COM\u{b3} "] {
+            assert!(is_reserved_device_name(spelling), "{spelling:?}");
+        }
+    }
+
+    /// Only an 8.3 alias (`~` before digits) is refused; Office lock files and
+    /// editor backups carry a tilde and are ordinary names.
+    #[test]
+    fn only_short_name_aliases_are_refused_for_their_tilde() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for ordinary in ["~$Doc.docx", "file.txt~", "a~b", "~", "sub/~$lock.xlsx", "notes~.md"] {
+            assert!(resolve_path(root, ordinary).is_ok(), "{ordinary:?} is an ordinary name");
+        }
+        for alias in ["PROGRA~1", "GIT~1/hooks", "sub/FILE~12.TXT", "a~1", "x/~1"] {
+            assert!(resolve_path(root, alias).is_err(), "{alias:?} may name another file");
+        }
     }
 
     #[test]
@@ -3546,6 +3744,62 @@ index 111..222 100644\n\
         assert_eq!(scan.alternate_stores.len(), MAX_ALTERNATE_STORES);
     }
 
+    /// Git prints the whole status listing on stdout before it says nothing was
+    /// committed: the names in it are not the user's to see in an error line.
+    #[test]
+    fn a_failed_commit_is_explained_by_git_s_closing_sentence_only() {
+        let listing = "On branch main\nChanges not staged for commit:\n\n\tmodified:   secret\u{202e}txt.rs\n\nno changes added to commit (use \"git add\" and/or \"git commit -a\")\n";
+        assert_eq!(
+            commit_failure(listing.as_bytes(), b""),
+            "no changes added to commit (use \"git add\" and/or \"git commit -a\")"
+        );
+        assert_eq!(commit_failure(b"", b"fatal: hook failed\n"), "fatal: hook failed");
+        assert_eq!(commit_failure(b"stdout text", b"  \n"), "stdout text", "a blank stderr says nothing");
+        assert_eq!(commit_failure(b"", b""), "");
+        let long = "x".repeat(COMMIT_REASON_CHARS * 3);
+        assert_eq!(commit_failure(long.as_bytes(), b"").chars().count(), COMMIT_REASON_CHARS);
+    }
+
+    /// A directory junction needs no privilege, unlike the symlinks below.
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) {
+        let status = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("run cmd");
+        assert!(status.success(), "mklink /J failed");
+    }
+
+    /// The final check of a scan has to see a path component that was swapped
+    /// for a junction after the scan, not trust what the scan walked.
+    #[cfg(windows)]
+    #[test]
+    fn a_component_swapped_for_a_junction_after_the_scan_is_noticed() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let elsewhere = dir.path().join("elsewhere");
+        // Same size and time: only the path itself tells the two files apart.
+        let stamp = std::time::SystemTime::now();
+        for base in [&real, &elsewhere] {
+            std::fs::create_dir_all(base.join("sub")).unwrap();
+            std::fs::write(base.join("sub/config"), b"x").unwrap();
+            let file = std::fs::File::options().write(true).open(base.join("sub/config")).unwrap();
+            file.set_modified(stamp).unwrap();
+        }
+        let mut scan = ConfigScan::new(dir.path());
+        scan.source(&real.join("sub/config")).unwrap();
+        assert!(all_current(&scan.sources), "nothing has changed yet");
+        std::fs::rename(&real, dir.path().join("moved")).unwrap();
+        junction(&real, &elsewhere);
+        let current = all_current(&scan.sources);
+        // Removes the junction itself, never what it points at.
+        std::fs::remove_dir(&real).unwrap();
+        assert!(!current, "the swapped component has to be noticed");
+    }
+
     #[test]
     fn source_and_alias_budgets_cover_missing_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -3652,7 +3906,7 @@ index 111..222 100644\n\
         inspect_symbolic_head(&repository, &mut scan).unwrap();
         assert!(scan.source_index.contains_key(&dir.path().join("refs/heads/next")));
         std::fs::write(dir.path().join("refs/heads/next"), "ref: refs/../outside\n").unwrap();
-        assert!(!scan.sources.iter().all(ConfigSource::is_current));
+        assert!(!all_current(&scan.sources));
         assert!(inspect_symbolic_head(&repository, &mut ConfigScan::new(dir.path())).is_err());
     }
 

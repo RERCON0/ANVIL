@@ -5,12 +5,12 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anvil::claude_status::{format_line_with, git_branch, Payload, StatusRecord};
+use anvil::claude_status::{format_line_with, git_branch, Payload, StatusRecord, MAX_PAYLOAD_BYTES};
 use anvil::config::Config;
 
 fn main() {
     let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
+    if std::io::stdin().take(MAX_PAYLOAD_BYTES).read_to_string(&mut input).is_err() {
         return;
     }
     let Some(payload) = Payload::parse(&input) else { return };

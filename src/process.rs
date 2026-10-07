@@ -33,9 +33,6 @@ mod windows {
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING, PIPE_ACCESS_OUTBOUND,
     };
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
-    };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -44,12 +41,14 @@ mod windows {
         CreateNamedPipeW, GetNamedPipeClientProcessId, PeekNamedPipe, PIPE_NOWAIT, PIPE_REJECT_REMOTE_CLIENTS,
         PIPE_TYPE_BYTE,
     };
-    use windows_sys::Win32::System::Threading::{
-        OpenThread, ResumeThread, CREATE_NO_WINDOW, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME,
-    };
+    use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
 
     const CHUNK: usize = 64 * 1024;
+    /// Idle pause between polls; it doubles while nothing moves (up to `POLL_STEPS`
+    /// doublings) and falls back to this the moment a pipe moves, so a long quiet
+    /// command costs a quarter of the wake-ups and a busy one is not slowed.
     const POLL: Duration = Duration::from_millis(2);
+    const POLL_STEPS: u32 = 2;
 
     fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
@@ -94,24 +93,21 @@ mod windows {
         }
     }
 
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtResumeProcess(process: HANDLE) -> i32;
+    }
+
     fn resume(child: &Child) -> io::Result<()> {
-        // std::Child retains the process handle, not the primary thread handle.
-        // Before its first execution the child has only its primary thread.
-        let snapshot = owned(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) })?;
-        let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
-        entry.dwSize = std::mem::size_of_val(&entry) as u32;
-        let mut found = None;
-        let mut more = unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) };
-        while more != 0 {
-            if entry.th32OwnerProcessID == child.id() && found.replace(entry.th32ThreadID).is_some() {
-                return Err(io::Error::other("suspended child has multiple threads"));
-            }
-            more = unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) };
-        }
-        let id = found.ok_or_else(|| io::Error::other("suspended primary thread not found"))?;
-        let thread = owned(unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, id) })?;
-        if unsafe { ResumeThread(thread.as_raw_handle()) } != 1 {
-            return Err(io::Error::other("could not resume suspended primary thread"));
+        // std::Child retains the process handle, not the primary thread handle,
+        // and the only documented way to find that thread (a Toolhelp snapshot)
+        // walks every thread on the machine for each spawn. Before its first
+        // execution the child has only the suspended primary thread, so
+        // resuming the process resumes exactly that thread.
+        // SAFETY: the handle is the live, full-access process handle std owns.
+        let status = unsafe { NtResumeProcess(child.as_raw_handle()) };
+        if status < 0 {
+            return Err(io::Error::other(format!("could not resume suspended child (NTSTATUS {status:#010x})")));
         }
         Ok(())
     }
@@ -237,6 +233,7 @@ mod windows {
         let mut chunk = [0u8; CHUNK];
         let mut sent = 0;
         let mut status = None;
+        let mut idle = 0u32;
         loop {
             if started.elapsed() >= timeout {
                 return Err(expired());
@@ -283,7 +280,11 @@ mod windows {
                 } // EOF, including empty input
             }
             if read_out == 0 && read_err == 0 && written == 0 {
-                std::thread::sleep(POLL.min(timeout.saturating_sub(started.elapsed())));
+                let pause = POLL.saturating_mul(1 << idle.min(POLL_STEPS));
+                idle = idle.saturating_add(1);
+                std::thread::sleep(pause.min(timeout.saturating_sub(started.elapsed())));
+            } else {
+                idle = 0;
             }
         }
     }
