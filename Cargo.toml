@@ -25,24 +25,24 @@ path = "src/bin/anvil-probe.rs"
 test = false
 
 [dependencies]
-egui = { version = "0.34.3", default-features = false, features = ["default_fonts"] }
-egui_glow = { version = "0.34.3", features = ["winit", "clipboard", "links"] }
+egui = { version = "0.36.2", default-features = false, features = ["default_fonts"] }
+egui_glow = { version = "0.36.2", features = ["winit", "clipboard", "links"] }
 winit = { version = "0.30.5", default-features = false, features = ["rwh_06"] }
 glutin = "0.32"
 glutin-winit = "0.5"
-glow = "0.17"
+glow = "0.18"
 alacritty_terminal = "0.26"
 polling = "3.8"
 arboard = { version = "3", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml_ng = "0.10"
-json5 = "0.4"
+json5 = "1.3"
 toml = "1"
 log = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
 tempfile = "3"
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Networking_WinHttp",
     "Win32_Security",
@@ -72,7 +72,7 @@ windows = { version = "0.58", features = [
     "Win32_UI_Shell",
 ] }
 # The implement macro emits references to windows_core.
-windows-core = "0.58"
+windows-core = "0.100"
 
 [dev-dependencies]
 # Examples only: the icon generator writes PNG and ICO files.
