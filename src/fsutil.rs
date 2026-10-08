@@ -219,7 +219,9 @@ mod shell_reveal {
     #[cfg(test)]
     #[test]
     fn shell_identity_preserves_commas_spaces_and_unicode_without_opening_a_window() {
+        use std::os::windows::io::AsRawHandle;
         use windows::Win32::UI::Shell::{SHGetPathFromIDListEx, GPFIDL_DEFAULT};
+        use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("one, two — файл.txt");
         std::fs::write(&path, b"text").unwrap();
@@ -228,7 +230,20 @@ mod shell_reveal {
         let mut wide = vec![0u16; 32768];
         assert!(unsafe { SHGetPathFromIDListEx(item.0, &mut wide, GPFIDL_DEFAULT) }.as_bool());
         let end = wide.iter().position(|unit| *unit == 0).unwrap();
-        assert_eq!(std::path::PathBuf::from(String::from_utf16(&wide[..end]).unwrap()), path);
+        let resolved = std::path::PathBuf::from(String::from_utf16(&wide[..end]).unwrap());
+        assert_eq!(resolved.file_name(), path.file_name());
+        // The Shell expands 8.3 directory aliases (e.g. CI's RUNNER~1).
+        // Compare the selected file, rather than its spelling in the temp path.
+        let identity = |path: &Path| {
+            let file = std::fs::File::open(path).unwrap();
+            let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+            // SAFETY: the open file handle stays live and the output has the correct size.
+            assert_ne!(unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), info.as_mut_ptr()) }, 0);
+            // SAFETY: the successful call initialized every field of this POD structure.
+            let info = unsafe { info.assume_init() };
+            (info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow)
+        };
+        assert_eq!(identity(&resolved), identity(&path));
     }
 }
 

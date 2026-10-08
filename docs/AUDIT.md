@@ -71,6 +71,7 @@ and limits on what the idle CPU measurements demonstrate.
 - Fresh RustSec database: 1,295 advisories checked against 337 dependencies; no findings with yanked/unsound denied.
 - Gitleaks over all history and the current non-ignored source tree; the existing exact synthetic-token exception remains narrow.
 - Real graphics startup/framebuffer capture and recorded drag verification with unchanged CLI process IDs.
+- Shell selection compares file identity as well as the exact filename, so Windows CI's 8.3 temporary-directory aliases do not cause a false path mismatch.
 - Release-memory stress run: 20 live panes in four tabs, 18 writers completing 2.16 million Unicode/truecolor lines; history reduction released roughly 1 GiB. Counter definitions, separate agent RAM and measured baseline are in [PERFORMANCE](PERFORMANCE.md).
 
 Signed release preparation additionally requires a clean committed source tree,
