@@ -60,10 +60,10 @@ pub fn show(ctx: &egui::Context, list: &mut CollapsedListState, rows: &[Collapse
                 }
             }
             if rows.is_empty() {
-                ui.label(strings::COLLAPSED_EMPTY);
+                ui.label(strings::COLLAPSED_EMPTY());
             } else {
                 ui.label(
-                    egui::RichText::new(strings::COLLAPSED_HINT)
+                    egui::RichText::new(strings::COLLAPSED_HINT())
                         .color(crate::theme::colors().faint)
                         .font(crate::theme::font(11.5)),
                 );

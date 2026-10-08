@@ -14,11 +14,17 @@ enum Button {
     Close,
 }
 
-pub fn title_bar(ui: &mut egui::Ui, rect: Rect, maximized: bool, window_edge: bool, commands: &mut Vec<WindowCommand>) {
+pub fn title_bar(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    maximized: bool,
+    window_edge: bool,
+    commands: &mut Vec<WindowCommand>,
+) -> bool {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme::colors().chrome_bg);
     let buttons_width = theme::WINDOW_BUTTON_WIDTH * 3.0;
-    let drag_rect = Rect::from_min_max(rect.min, Pos2::new(rect.max.x - buttons_width, rect.max.y));
+    let drag_rect = Rect::from_min_max(rect.min, Pos2::new(rect.max.x - buttons_width - 42.0, rect.max.y));
     let drag = ui.interact(drag_rect, ui.id().with("titlebar-drag"), Sense::click_and_drag());
     if drag.double_clicked() {
         commands.push(WindowCommand::ToggleMaximize);
@@ -35,6 +41,19 @@ pub fn title_bar(ui: &mut egui::Ui, rect: Rect, maximized: bool, window_edge: bo
     );
     painter.hline(rect.x_range(), rect.max.y - 0.5, Stroke::new(1.0, theme::colors().border));
 
+    let language_rect = Rect::from_min_max(
+        Pos2::new(rect.max.x - buttons_width - 42.0, rect.min.y),
+        Pos2::new(rect.max.x - buttons_width, rect.max.y),
+    );
+    let language = ui.interact(language_rect, ui.id().with("language-toggle"), Sense::click());
+    painter.text(
+        language_rect.center(),
+        Align2::CENTER_CENTER,
+        strings::pick("RU", "EN"),
+        theme::font(12.0),
+        if language.hovered() { theme::colors().title_text } else { theme::colors().window_icon },
+    );
+    let _ = language.clone().on_hover_text(strings::pick("Switch to Russian", "Switch to English"));
     let mut x = rect.max.x - buttons_width;
     for kind in [Button::Minimize, Button::Maximize, Button::Close] {
         let r = Rect::from_min_size(Pos2::new(x, rect.min.y), Vec2::new(theme::WINDOW_BUTTON_WIDTH, rect.height()));
@@ -51,10 +70,10 @@ pub fn title_bar(ui: &mut egui::Ui, rect: Rect, maximized: bool, window_edge: bo
         let color = if hovered && kind == Button::Close { Color32::WHITE } else { theme::colors().window_icon };
         // Plain glyphs, as in the owner's other apps: they need no icon font.
         let (label, tooltip) = match kind {
-            Button::Minimize => ("─", strings::WINDOW_MINIMIZE),
-            Button::Maximize if maximized => ("❐", strings::WINDOW_MAXIMIZE),
-            Button::Maximize => ("□", strings::WINDOW_MAXIMIZE),
-            Button::Close => ("×", strings::WINDOW_CLOSE),
+            Button::Minimize => ("─", strings::WINDOW_MINIMIZE()),
+            Button::Maximize if maximized => ("❐", strings::WINDOW_MAXIMIZE()),
+            Button::Maximize => ("□", strings::WINDOW_MAXIMIZE()),
+            Button::Close => ("×", strings::WINDOW_CLOSE()),
         };
         painter.text(r.center(), Align2::CENTER_CENTER, label, theme::font(14.0), color);
         let _ = response.clone().on_hover_text(tooltip);
@@ -66,6 +85,7 @@ pub fn title_bar(ui: &mut egui::Ui, rect: Rect, maximized: bool, window_edge: bo
             });
         }
     }
+    language.clicked()
 }
 
 /// Resize cursors and drags on the window edges. Returns true while the

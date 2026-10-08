@@ -37,9 +37,9 @@ pub fn parse(body: &[u8], envelope: Envelope) -> Result<Fetched, FetchError> {
     for limit in limits {
         let kind = limit.get("type").and_then(Value::as_str).unwrap_or("");
         let (key, label) = match (kind, limit.get("unit").and_then(Value::as_i64)) {
-            ("TOKENS_LIMIT" | "CREDIT_LIMIT", Some(3)) => ("5h", format!("5{}", strings::QUOTA_UNIT_HOUR)),
-            ("TOKENS_LIMIT" | "CREDIT_LIMIT", Some(6)) => ("7d", format!("7{}", strings::QUOTA_UNIT_DAY)),
-            ("TIME_LIMIT", _) => ("mcp", strings::QUOTA_MCP.to_owned()),
+            ("TOKENS_LIMIT" | "CREDIT_LIMIT", Some(3)) => ("5h", format!("5{}", strings::QUOTA_UNIT_HOUR())),
+            ("TOKENS_LIMIT" | "CREDIT_LIMIT", Some(6)) => ("7d", format!("7{}", strings::QUOTA_UNIT_DAY())),
+            ("TIME_LIMIT", _) => ("mcp", strings::QUOTA_MCP().to_owned()),
             _ => continue,
         };
         let credit = match (kind, number(limit.get("usage")), number(limit.get("currentValue"))) {

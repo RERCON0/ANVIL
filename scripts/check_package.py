@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 import re
-import struct
 import subprocess
 import zipfile
 
@@ -29,18 +28,8 @@ EXPECTED = set(ASSETS) | {
 
 
 def check_pe(data, subsystem, name):
-    if len(data) < 64 or data[:2] != b"MZ":
-        raise ValueError(f"Invalid executable: {name}")
-    offset = struct.unpack_from("<I", data, 0x3C)[0]
-    if offset + 96 > len(data) or data[offset:offset + 4] != b"PE\0\0":
-        raise ValueError(f"Invalid PE header: {name}")
-    machine = struct.unpack_from("<H", data, offset + 4)[0]
-    magic = struct.unpack_from("<H", data, offset + 24)[0]
-    actual_subsystem, flags = struct.unpack_from("<HH", data, offset + 24 + 68)
-    if machine != 0x8664 or magic != 0x20B or actual_subsystem != subsystem:
-        raise ValueError(f"Wrong x64 architecture or subsystem: {name}")
-    if flags & 0x160 != 0x160:
-        raise ValueError(f"ASLR, high-entropy ASLR or DEP missing: {name}")
+    from pe import pe_info
+    pe_info(data, subsystem)
 
 
 def check_no_build_paths(data, name):

@@ -36,7 +36,7 @@ $sysroot = "$(rustc --print sysroot)".Trim()
 if ($LASTEXITCODE -ne 0 -or -not $sysroot) { throw 'Cannot determine the Rust sysroot' }
 $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.cargo' }
 $previousRustflags = $env:CARGO_ENCODED_RUSTFLAGS
-$env:CARGO_ENCODED_RUSTFLAGS = @("--remap-path-prefix=$root=/anvil", "--remap-path-prefix=$cargoHome=/cargo", "--remap-path-prefix=$sysroot=/rust", '-Clink-arg=/Brepro') -join [char]0x1f
+$env:CARGO_ENCODED_RUSTFLAGS = @("--remap-path-prefix=$root=/anvil", "--remap-path-prefix=$cargoHome=/cargo", "--remap-path-prefix=$sysroot=/rust", '-Clink-arg=/Brepro', '-Ctarget-feature=+crt-static') -join [char]0x1f
 try {
     cargo build --locked --release --bin anvil --bin anvil-claude-status --target $targetTriple --target-dir $targetDir
 } finally {

@@ -64,13 +64,13 @@ pub fn balance_text(balance: &Balance) -> String {
         None => format_amount(balance.amount, balance.unit),
     };
     match balance.kind {
-        BalanceKind::Spent => format!("{} {value}", balance.label),
+        BalanceKind::Spent => format!("{} {value}", strings::localize(&balance.label)),
         BalanceKind::Remaining => value,
     }
 }
 
 fn hint(pct: Option<f64>, resets_at: Option<i64>, now: i64) -> Option<String> {
-    pct.filter(|p| *p >= RESET_INLINE_FROM).and(resets_at).map(|at| format_left(at - now))
+    pct.filter(|p| *p >= RESET_INLINE_FROM).and(resets_at).map(|at| format_left(at.saturating_sub(now)))
 }
 
 pub fn segments(snapshot: &Snapshot, config: &QuotaConfig, now: i64) -> Vec<Segment> {
@@ -87,7 +87,7 @@ pub fn segments(snapshot: &Snapshot, config: &QuotaConfig, now: i64) -> Vec<Segm
                 .iter()
                 .filter(|w| visible(&w.key))
                 .map(|w| Item {
-                    text: format!("{} {}", w.label, percent(w.used_pct)),
+                    text: format!("{} {}", strings::quota_window_label(&w.label), percent(w.used_pct)),
                     pct: Some(w.used_pct),
                     exhausted: false,
                     reset_hint: hint(Some(w.used_pct), w.resets_at, now),
@@ -117,7 +117,7 @@ pub fn segments(snapshot: &Snapshot, config: &QuotaConfig, now: i64) -> Vec<Segm
             if items.is_empty() && mark.is_none() {
                 return None;
             }
-            let older_than = |limit: i64| provider.fetched_at.is_none_or(|at| now - at > limit);
+            let older_than = |limit: i64| provider.fetched_at.is_none_or(|at| now.saturating_sub(at) > limit);
             let dim = match &provider.state {
                 ProviderState::Ok => older_than(STALE_AFTER),
                 // Nothing to trust, or nothing that will refresh by itself.
@@ -137,19 +137,19 @@ pub fn segments(snapshot: &Snapshot, config: &QuotaConfig, now: i64) -> Vec<Segm
 pub fn state_note(state: &ProviderState, now: i64) -> Option<String> {
     match state {
         ProviderState::Idle | ProviderState::Ok => None,
-        ProviderState::UpdateFailed { reason } => Some(format!("{} {reason}", strings::QUOTA_PROVIDER_SAID)),
-        ProviderState::AuthExpired => Some(strings::QUOTA_AUTH_EXPIRED.to_owned()),
-        ProviderState::StoreUnreadable => Some(strings::QUOTA_STORE_UNREADABLE.to_owned()),
+        ProviderState::UpdateFailed { reason } => Some(format!("{} {reason}", strings::QUOTA_PROVIDER_SAID())),
+        ProviderState::AuthExpired => Some(strings::QUOTA_AUTH_EXPIRED().to_owned()),
+        ProviderState::StoreUnreadable => Some(strings::QUOTA_STORE_UNREADABLE().to_owned()),
         ProviderState::RateLimited { retry_at } => {
-            Some(format!("{} {}", strings::QUOTA_RATE_LIMITED, format_clock(*retry_at, now).unwrap_or_default()))
+            Some(format!("{} {}", strings::QUOTA_RATE_LIMITED(), format_clock(*retry_at, now).unwrap_or_default()))
         }
-        ProviderState::FormatError { reason } => Some(format!("{}: {reason}", strings::QUOTA_FORMAT_ERROR)),
+        ProviderState::FormatError { reason } => Some(format!("{}: {reason}", strings::QUOTA_FORMAT_ERROR())),
     }
 }
 
 fn reset_suffix(resets_at: Option<i64>, now: i64) -> String {
     let Some(at) = resets_at else { return String::new() };
-    let mut text = format!(" — {} {}", strings::QUOTA_RESET_IN, format_left(at - now));
+    let mut text = format!(" — {} {}", strings::QUOTA_RESET_IN(), format_left(at.saturating_sub(now)));
     if let Some(clock) = format_clock(at, now) {
         text.push_str(&format!(" ({clock})"));
     }
@@ -162,19 +162,29 @@ fn tooltip(provider: &ProviderSnapshot, config: &QuotaConfig, now: i64) -> Strin
         None => provider.id.label().to_owned(),
     };
     let visible = |key: &str| config.window_visible(provider.id.key(), key);
-    let mut out = vec![format!("{name} · {} {}", strings::QUOTA_LOGIN, provider.source)];
+    let mut out = vec![format!("{name} · {} {}", strings::QUOTA_LOGIN(), strings::localize(&provider.source))];
     for window in provider.windows.iter().filter(|w| visible(&w.key)) {
-        out.push(format!("{} {}{}", window.label, percent(window.used_pct), reset_suffix(window.resets_at, now)));
+        out.push(format!(
+            "{} {}{}",
+            strings::quota_window_label(&window.label),
+            percent(window.used_pct),
+            reset_suffix(window.resets_at, now)
+        ));
     }
     for balance in provider.balances.iter().filter(|b| visible(&b.key)) {
-        let mut line = format!("{} {}{}", balance.label, balance_text(balance), reset_suffix(balance.resets_at, now));
+        let mut line = format!(
+            "{} {}{}",
+            strings::localize(&balance.label),
+            balance_text(balance),
+            reset_suffix(balance.resets_at, now)
+        );
         if let Some(detail) = &balance.detail {
             line.push_str(&format!(" · {detail}"));
         }
         out.push(line);
     }
     if let Some(clock) = provider.fetched_at.and_then(|at| format_clock(at, now)) {
-        out.push(format!("{} {clock}", strings::QUOTA_DATA_AT));
+        out.push(format!("{} {clock}", strings::QUOTA_DATA_AT()));
     }
     out.extend(state_note(&provider.state, now));
     out.join("\n")

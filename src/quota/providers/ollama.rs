@@ -25,9 +25,9 @@ pub fn parse(body: &[u8]) -> Result<Fetched, FetchError> {
     let limits = value.get("limits").ok_or_else(|| FetchError::Format("no limits".into()))?;
     let mut windows = Vec::new();
     let spans = [
-        ("session", "session", strings::QUOTA_SESSION.to_owned()),
-        ("weekly", "7d", format!("7{}", strings::QUOTA_UNIT_DAY)),
-        ("monthly", "month", strings::QUOTA_MONTH.to_owned()),
+        ("session", "session", strings::QUOTA_SESSION().to_owned()),
+        ("weekly", "7d", format!("7{}", strings::QUOTA_UNIT_DAY())),
+        ("monthly", "month", strings::QUOTA_MONTH().to_owned()),
     ];
     for (field, key, label) in spans {
         if let Some((used, resets_at)) = window(limits.get(field)) {

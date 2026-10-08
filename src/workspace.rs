@@ -75,6 +75,7 @@ pub enum Request {
     CountLines,
     ReadFile {
         path: String,
+        generation: u64,
     },
     /// `seen` is hunk `index` exactly as the user was shown it (the `@@ … @@`
     /// line, the context and the changes, byte for byte); the worker refuses to
@@ -160,6 +161,7 @@ enum Response {
         lines: u64,
     },
     FileText {
+        generation: u64,
         path: String,
         text: String,
         rows: Vec<TextRow>,
@@ -194,9 +196,9 @@ fn commit_rows_of(log: &CommitLog) -> Vec<CommitRow> {
         if section != Some(commit.section) {
             section = Some(commit.section);
             let label = match commit.section {
-                git::Section::Outgoing => strings::WORKSPACE_SECTION_OUTGOING,
-                git::Section::Incoming => strings::WORKSPACE_SECTION_INCOMING,
-                git::Section::History => strings::WORKSPACE_SECTION_HISTORY,
+                git::Section::Outgoing => strings::WORKSPACE_SECTION_OUTGOING(),
+                git::Section::Incoming => strings::WORKSPACE_SECTION_INCOMING(),
+                git::Section::History => strings::WORKSPACE_SECTION_HISTORY(),
             };
             rows.push(CommitRow::Header { label });
         }
@@ -280,6 +282,8 @@ pub struct Workspace {
     pub line_count: Option<(usize, u64)>,
     pub file_filter: String,
     pub file_preview: Option<(String, String, bool)>,
+    /// Invalidates a read when the preview is closed or another file is selected.
+    preview_generation: u64,
     pub prompt: Option<Prompt>,
     diff_rows: Vec<TextRow>,
     diff_wrapped: WrappedRows,
@@ -341,6 +345,7 @@ impl Default for Workspace {
             line_count: None,
             file_filter: String::new(),
             file_preview: None,
+            preview_generation: 0,
             prompt: None,
             diff_rows: Vec::new(),
             diff_wrapped: WrappedRows::default(),
@@ -416,6 +421,30 @@ impl Workspace {
             self.send(request);
         }
     }
+    fn close_diff(&mut self) {
+        self.diff_path = None;
+        self.diff_text = String::new();
+        self.diff_hunks = Vec::new();
+        self.diff_rows = Vec::new();
+        self.diff_wrapped = WrappedRows::default();
+        self.diff_stamp = None;
+        self.diff_side = None;
+    }
+
+    fn close_file_preview(&mut self) {
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        self.file_preview = None;
+        self.preview_rows = Vec::new();
+        self.preview_wrapped = WrappedRows::default();
+        self.markdown = MarkdownCache::default();
+    }
+
+    fn open_file_preview(&mut self, path: String) {
+        self.close_file_preview();
+        self.busy = true;
+        self.request(Request::ReadFile { path, generation: self.preview_generation });
+    }
+
     fn clear_repository_view(&mut self) {
         self.busy = false;
         self.trust_approval_pending = false;
@@ -424,20 +453,14 @@ impl Workspace {
         self.status = Status::default();
         self.selected.clear();
         self.collapsed.clear();
-        self.diff_path = None;
-        self.diff_text.clear();
-        self.diff_hunks.clear();
-        self.diff_rows.clear();
-        self.diff_wrapped = WrappedRows::default();
-        self.diff_stamp = None;
-        self.diff_side = None;
+        self.close_diff();
         self.detail = None;
         self.detail_file = None;
         self.files.clear();
         self.files_loaded = false;
         self.file_expanded.clear();
         self.line_count = None;
-        self.file_preview = None;
+        self.close_file_preview();
         self.file_rows.clear();
         self.file_rows_dirty = true;
         self.change_rows_cache.clear();
@@ -469,7 +492,9 @@ impl Workspace {
 
     fn trust_view(&mut self, ui: &mut egui::Ui) {
         ui.label(
-            RichText::new(strings::WORKSPACE_TRUST_TITLE).color(theme::colors().status_yellow).font(theme::font(13.0)),
+            RichText::new(strings::WORKSPACE_TRUST_TITLE())
+                .color(theme::colors().status_yellow)
+                .font(theme::font(13.0)),
         );
         if let Some(identity) = &self.pending_identity {
             ui.label(
@@ -478,12 +503,14 @@ impl Workspace {
                     .font(theme::field_font(11.5)),
             );
         }
-        ui.label(RichText::new(strings::WORKSPACE_TRUST_HINT).color(theme::colors().dim).font(theme::font(12.0)));
+        ui.label(RichText::new(strings::WORKSPACE_TRUST_HINT()).color(theme::colors().dim).font(theme::font(12.0)));
         if let Some(identity) = &self.pending_identity {
             let hazards = identity.stamp.hazards();
             if !hazards.is_empty() {
                 ui.label(
-                    RichText::new(strings::WORKSPACE_TRUST_HAZARDS).color(theme::colors().text).font(theme::font(11.5)),
+                    RichText::new(strings::WORKSPACE_TRUST_HAZARDS())
+                        .color(theme::colors().text)
+                        .font(theme::font(11.5)),
                 );
                 for hazard in hazards {
                     ui.label(
@@ -500,7 +527,7 @@ impl Workspace {
         if ui
             .add_enabled(
                 self.pending_identity.is_some() && !self.trust_approval_pending,
-                theme::accent_button(strings::WORKSPACE_TRUST_APPROVE),
+                theme::accent_button(strings::WORKSPACE_TRUST_APPROVE()),
             )
             .clicked()
         {
@@ -708,8 +735,11 @@ impl Workspace {
                     self.busy = false;
                     self.line_count = Some((files, lines));
                 }
-                Response::FileText { path, text, rows, truncated } => {
+                Response::FileText { generation, path, text, rows, truncated } => {
                     self.busy = false;
+                    if generation != self.preview_generation {
+                        continue;
+                    }
                     if !self
                         .file_preview
                         .as_ref()
@@ -750,7 +780,7 @@ impl Workspace {
             self.trust_approval_pending = false;
             self.inflight = 0;
             if self.notice.is_none() {
-                self.notice = Some((strings::WORKSPACE_WORKER_LOST.to_owned(), true));
+                self.notice = Some((strings::WORKSPACE_WORKER_LOST().to_owned(), true));
             }
             repaint = true;
         }
@@ -784,7 +814,7 @@ impl Workspace {
             // Two modes only: changes with a separate history viewport, or files.
             ui.horizontal(|ui| {
                 for (tab, label) in [
-                    (PanelTab::Files, strings::WORKSPACE_TAB_FILES.to_owned()),
+                    (PanelTab::Files, strings::WORKSPACE_TAB_FILES().to_owned()),
                     (PanelTab::Changes, strings::workspace_changes_tab(self.status.changes.len())),
                 ] {
                     // Framed like the other panel chips, with the selection dot
@@ -805,10 +835,10 @@ impl Workspace {
                     }
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(theme::ghost_button("×")).on_hover_text(strings::WORKSPACE_CLOSE).clicked() {
+                    if ui.add(theme::ghost_button("×")).on_hover_text(strings::WORKSPACE_CLOSE()).clicked() {
                         actions.push(WorkspaceAction::Close);
                     }
-                    if ui.add(theme::ghost_button("⟳")).on_hover_text(strings::WORKSPACE_REFRESH).clicked() {
+                    if ui.add(theme::ghost_button("⟳")).on_hover_text(strings::WORKSPACE_REFRESH()).clicked() {
                         self.refresh_soon();
                         self.request(Request::Log);
                         self.request(Request::Files);
@@ -836,7 +866,7 @@ impl Workspace {
         if self.status.changes.is_empty() && self.status.branch.is_empty() {
             ui.add_space(4.0);
             ui.label(
-                RichText::new(strings::WORKSPACE_NO_REPO_HINT).color(theme::colors().faint).font(theme::font(12.0)),
+                RichText::new(strings::WORKSPACE_NO_REPO_HINT()).color(theme::colors().faint).font(theme::font(12.0)),
             );
             return;
         }
@@ -884,14 +914,14 @@ impl Workspace {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if !self.status.branch.is_empty() {
                     if ui
-                        .add(theme::animated_accent_button(strings::WORKSPACE_PUBLISH))
-                        .on_hover_text(strings::WORKSPACE_PUSH_HINT)
+                        .add(theme::animated_accent_button(strings::WORKSPACE_PUBLISH()))
+                        .on_hover_text(strings::WORKSPACE_PUSH_HINT())
                         .clicked()
                     {
                         self.busy = true;
                         self.request(Request::Push);
                     }
-                    if ui.add(theme::ghost_button("fetch")).on_hover_text(strings::WORKSPACE_FETCH_HINT).clicked() {
+                    if ui.add(theme::ghost_button("fetch")).on_hover_text(strings::WORKSPACE_FETCH_HINT()).clicked() {
                         self.busy = true;
                         self.request(Request::Fetch);
                     }
@@ -945,7 +975,7 @@ impl Workspace {
                                 .margin(egui::Margin::same(0))
                                 .font(theme::field_font(12.0))
                                 .desired_rows(6)
-                                .hint_text(strings::WORKSPACE_COMMIT_HINT)
+                                .hint_text(strings::WORKSPACE_COMMIT_HINT())
                                 .desired_width(f32::INFINITY)
                                 .interactive(editable),
                         )
@@ -963,20 +993,20 @@ impl Workspace {
         ui.horizontal_wrapped(|ui| {
             let has_staged = self.status.changes.iter().any(Change::staged);
             let can_commit = editable && !self.commit_message.trim().is_empty() && has_staged;
-            if ui.add_enabled(can_commit, theme::accent_button(strings::WORKSPACE_COMMIT)).clicked()
+            if ui.add_enabled(can_commit, theme::accent_button(strings::WORKSPACE_COMMIT())).clicked()
                 || (can_commit && ctrl_enter)
             {
                 self.start_commit();
             }
             let ai_label = match &self.ai_command {
                 Some(command) => strings::workspace_ai(command.split_whitespace().next().unwrap_or(command)),
-                None => strings::WORKSPACE_AI.to_owned(),
+                None => strings::WORKSPACE_AI().to_owned(),
             };
             let ai =
                 ui.add_enabled(editable && has_staged, theme::ghost_button(ai_label)).on_hover_text(if has_staged {
-                    self.ai_command.as_deref().unwrap_or(strings::WORKSPACE_NO_AI_COMMAND)
+                    self.ai_command.as_deref().unwrap_or(strings::WORKSPACE_NO_AI_COMMAND())
                 } else {
-                    strings::WORKSPACE_AI_NO_STAGE
+                    strings::WORKSPACE_AI_NO_STAGE()
                 });
             if ai.clicked() {
                 self.ai_generating = true;
@@ -990,7 +1020,7 @@ impl Workspace {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(14.0).color(theme::colors().accent));
                 ui.label(
-                    RichText::new(strings::WORKSPACE_AI_GENERATING)
+                    RichText::new(strings::WORKSPACE_AI_GENERATING())
                         .color(theme::colors().accent)
                         .font(theme::font(11.5)),
                 );
@@ -1005,7 +1035,7 @@ impl Workspace {
         let ahead = self.status.ahead;
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(format!("[ {} ]", strings::WORKSPACE_COMMITS_TITLE))
+                RichText::new(format!("[ {} ]", strings::WORKSPACE_COMMITS_TITLE()))
                     .color(theme::colors().faint)
                     .font(theme::font(11.5)),
             );
@@ -1016,13 +1046,15 @@ impl Workspace {
             }
             if self.log.truncated {
                 ui.label(
-                    RichText::new(strings::WORKSPACE_TRUNCATED).color(theme::colors().faint).font(theme::font(10.5)),
+                    RichText::new(strings::WORKSPACE_TRUNCATED()).color(theme::colors().faint).font(theme::font(10.5)),
                 );
             }
         });
         theme::hairline(ui);
         if self.log.commits.is_empty() {
-            ui.label(RichText::new(strings::WORKSPACE_NO_COMMITS).color(theme::colors().faint).font(theme::font(11.5)));
+            ui.label(
+                RichText::new(strings::WORKSPACE_NO_COMMITS()).color(theme::colors().faint).font(theme::font(11.5)),
+            );
             return;
         }
         self.commit_rows(ui);
@@ -1205,14 +1237,14 @@ impl Workspace {
     fn prompt_row(&mut self, ui: &mut egui::Ui) {
         let Some(prompt) = self.prompt.as_mut() else { return };
         let label = match &prompt.kind {
-            PromptKind::NewFile => strings::WORKSPACE_NEW_FILE.to_owned(),
-            PromptKind::NewFolder => strings::WORKSPACE_NEW_FOLDER.to_owned(),
-            PromptKind::Rename(path) => format!("{}: {}", strings::WORKSPACE_RENAME, display(path, 240)),
-            PromptKind::Delete { path, .. } => format!("{}: {}", strings::WORKSPACE_DELETE, display(path, 240)),
+            PromptKind::NewFile => strings::WORKSPACE_NEW_FILE().to_owned(),
+            PromptKind::NewFolder => strings::WORKSPACE_NEW_FOLDER().to_owned(),
+            PromptKind::Rename(path) => format!("{}: {}", strings::WORKSPACE_RENAME(), display(path, 240)),
+            PromptKind::Delete { path, .. } => format!("{}: {}", strings::WORKSPACE_DELETE(), display(path, 240)),
         };
         ui.label(RichText::new(label).color(theme::colors().dim).font(theme::font(11.5)));
         if let PromptKind::Delete { folder, .. } = prompt.kind {
-            let hint = if folder { strings::WORKSPACE_DELETE_HINT } else { strings::WORKSPACE_DELETE_FILE_HINT };
+            let hint = if folder { strings::WORKSPACE_DELETE_HINT() } else { strings::WORKSPACE_DELETE_FILE_HINT() };
             ui.label(RichText::new(hint).color(theme::colors().faint).font(theme::font(11.5)));
         }
         let mut commit = false;
@@ -1229,11 +1261,11 @@ impl Workspace {
                 }
                 commit = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             }
-            let action = if deleting { strings::WORKSPACE_DELETE } else { strings::SETTINGS_SAVE };
+            let action = if deleting { strings::WORKSPACE_DELETE() } else { strings::SETTINGS_SAVE() };
             if ui.add(theme::ghost_button(action)).clicked() {
                 commit = true;
             }
-            if ui.add(theme::ghost_button(strings::SETTINGS_CANCEL)).clicked() {
+            if ui.add(theme::ghost_button(strings::SETTINGS_CANCEL())).clicked() {
                 cancel = true;
             }
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -1275,23 +1307,23 @@ impl Workspace {
     fn change_rows(&mut self, ui: &mut egui::Ui) {
         let has_selection = !self.selected.is_empty();
         ui.horizontal_wrapped(|ui| {
-            if ui.add_enabled(has_selection, theme::ghost_button(strings::WORKSPACE_STAGE)).clicked() {
+            if ui.add_enabled(has_selection, theme::ghost_button(strings::WORKSPACE_STAGE())).clicked() {
                 let paths: Vec<String> = self.selected.iter().cloned().collect();
                 self.busy = true;
                 self.request(Request::Stage { paths, staged: true });
             }
-            if ui.add_enabled(has_selection, theme::ghost_button(strings::WORKSPACE_UNSTAGE)).clicked() {
+            if ui.add_enabled(has_selection, theme::ghost_button(strings::WORKSPACE_UNSTAGE())).clicked() {
                 let paths = unstage_paths(self.status.changes.iter().filter(|c| self.selected.contains(&c.path)));
                 self.busy = true;
                 self.request(Request::Stage { paths, staged: false });
             }
-            if ui.add(theme::ghost_button(strings::WORKSPACE_STAGE_ALL)).clicked() {
+            if ui.add(theme::ghost_button(strings::WORKSPACE_STAGE_ALL())).clicked() {
                 let paths: Vec<String> =
                     self.status.changes.iter().filter(|c| c.unstaged()).map(|c| c.path.clone()).collect();
                 self.busy = true;
                 self.request(Request::Stage { paths, staged: true });
             }
-            if ui.add(theme::ghost_button(strings::WORKSPACE_UNSTAGE_ALL)).clicked() {
+            if ui.add(theme::ghost_button(strings::WORKSPACE_UNSTAGE_ALL())).clicked() {
                 let paths = unstage_paths(self.status.changes.iter().filter(|c| c.staged()));
                 self.busy = true;
                 self.request(Request::Stage { paths, staged: false });
@@ -1446,10 +1478,19 @@ impl Workspace {
         let Some(path) = self.diff_path.clone() else { return };
         ui.add_space(4.0);
         theme::hairline(ui);
+        let mut close = false;
         ui.horizontal(|ui| {
-            ui.label(RichText::new(display(&path, 120)).color(theme::colors().dim).font(theme::field_font(11.5)));
+            let label_width = (ui.available_width() - 165.0).max(20.0);
+            ui.add_sized(
+                [label_width, 22.0],
+                egui::Label::new(
+                    RichText::new(display(&path, 240)).color(theme::colors().dim).font(theme::field_font(11.5)),
+                )
+                .truncate(),
+            );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add(theme::ghost_button(strings::WORKSPACE_DIFF_STAGED)).clicked() {
+                close = ui.add(theme::ghost_button("×")).on_hover_text(strings::WORKSPACE_PREVIEW_CLOSE()).clicked();
+                if !close && ui.add(theme::ghost_button(strings::WORKSPACE_DIFF_STAGED())).clicked() {
                     self.diff_text.clear();
                     self.diff_hunks.clear();
                     self.diff_rows.clear();
@@ -1461,6 +1502,10 @@ impl Workspace {
                 }
             });
         });
+        if close {
+            self.close_diff();
+            return;
+        }
         let mut hunks_to_apply: Option<(usize, bool)> = None;
         let height = (ui.available_height() * 0.55).clamp(24.0, 300.0);
         self.diff_wrapped.prepare(ui, &self.diff_text, &self.diff_rows);
@@ -1545,15 +1590,15 @@ fn commit_detail_view(
 ) -> Option<CommitDetailAction> {
     let mut action = None;
     ui.horizontal(|ui| {
-        if ui.add(theme::ghost_button(strings::WORKSPACE_BACK)).clicked() {
+        if ui.add(theme::ghost_button(strings::WORKSPACE_BACK())).clicked() {
             action = Some(CommitDetailAction::Back);
         }
-        if ui.add(theme::ghost_button(strings::WORKSPACE_COPY_HASH)).clicked() {
+        if ui.add(theme::ghost_button(strings::WORKSPACE_COPY_HASH())).clicked() {
             copy_to_clipboard(hash);
         }
         if let Some(file) = file.as_ref() {
             let patch = file.patch.as_ref().and_then(|result| result.as_ref().ok());
-            if ui.add_enabled(patch.is_some(), theme::ghost_button(strings::WORKSPACE_COPY_PATCH)).clicked() {
+            if ui.add_enabled(patch.is_some(), theme::ghost_button(strings::WORKSPACE_COPY_PATCH())).clicked() {
                 if let Some(patch) = patch {
                     copy_to_clipboard(patch);
                 }
@@ -1568,7 +1613,7 @@ fn commit_detail_view(
             None => {
                 ui.horizontal(|ui| {
                     ui.add(egui::Spinner::new().size(14.0).color(theme::colors().accent));
-                    ui.label(strings::WORKSPACE_DIFF_LOADING);
+                    ui.label(strings::WORKSPACE_DIFF_LOADING());
                 });
             }
             Some(Err(error)) => {
@@ -1806,19 +1851,19 @@ impl Workspace {
         }
         let path = row.path.clone();
         response.context_menu(|ui| {
-            if ui.button(strings::WORKSPACE_OPEN_EXTERNAL).clicked() {
+            if ui.button(strings::WORKSPACE_OPEN_EXTERNAL()).clicked() {
                 self.request(Request::OpenExternal { path: path.clone() });
                 ui.close();
             }
-            if ui.button(strings::WORKSPACE_REVEAL).clicked() {
+            if ui.button(strings::WORKSPACE_REVEAL()).clicked() {
                 self.request(Request::Reveal { path: path.clone() });
                 ui.close();
             }
-            if ui.button(strings::WORKSPACE_RENAME).clicked() {
+            if ui.button(strings::WORKSPACE_RENAME()).clicked() {
                 self.prompt = Some(Prompt { kind: PromptKind::Rename(path.clone()), text: path.clone(), focus: true });
                 ui.close();
             }
-            if ui.button(strings::WORKSPACE_DELETE).clicked() {
+            if ui.button(strings::WORKSPACE_DELETE()).clicked() {
                 self.prompt = Some(Prompt {
                     kind: PromptKind::Delete { path: path.clone(), folder: row.folder },
                     text: String::new(),
@@ -1832,17 +1877,17 @@ impl Workspace {
 
     fn files_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            if ui.add(theme::ghost_button(strings::WORKSPACE_NEW_FILE)).clicked() {
+            if ui.add(theme::ghost_button(strings::WORKSPACE_NEW_FILE())).clicked() {
                 self.prompt = Some(Prompt { kind: PromptKind::NewFile, text: String::new(), focus: true });
             }
-            if ui.add(theme::ghost_button(strings::WORKSPACE_NEW_FOLDER)).clicked() {
+            if ui.add(theme::ghost_button(strings::WORKSPACE_NEW_FOLDER())).clicked() {
                 self.prompt = Some(Prompt { kind: PromptKind::NewFolder, text: String::new(), focus: true });
             }
-            if ui.add(theme::ghost_button(strings::WORKSPACE_REFRESH)).clicked() {
+            if ui.add(theme::ghost_button(strings::WORKSPACE_REFRESH())).clicked() {
                 self.busy = true;
                 self.request(Request::Files);
             }
-            if ui.add(theme::ghost_button(strings::WORKSPACE_COUNT_LINES)).clicked() {
+            if ui.add(theme::ghost_button(strings::WORKSPACE_COUNT_LINES())).clicked() {
                 self.busy = true;
                 self.request(Request::CountLines);
             }
@@ -1862,7 +1907,7 @@ impl Workspace {
         ui.add(
             egui::TextEdit::singleline(&mut self.file_filter)
                 .font(theme::field_font(12.0))
-                .hint_text(strings::WORKSPACE_FILE_FILTER)
+                .hint_text(strings::WORKSPACE_FILE_FILTER())
                 .desired_width(f32::INFINITY),
         );
         self.update_file_rows();
@@ -1892,13 +1937,30 @@ impl Workspace {
         ui.spacing_mut().item_spacing.y = spacing;
         self.file_rows = rows;
         if let Some(path) = open_file {
-            self.busy = true;
-            self.request(Request::ReadFile { path });
+            self.open_file_preview(path);
         }
+        let mut close = false;
         if let Some((path, text, truncated)) = self.file_preview.as_ref() {
             ui.add_space(2.0);
             theme::hairline(ui);
-            ui.label(RichText::new(display(path, 240)).color(theme::colors().dim).font(theme::field_font(11.0)));
+            ui.horizontal(|ui| {
+                let label_width = (ui.available_width() - 28.0).max(20.0);
+                ui.add_sized(
+                    [label_width, 22.0],
+                    egui::Label::new(
+                        RichText::new(display(path, 240)).color(theme::colors().dim).font(theme::field_font(11.0)),
+                    )
+                    .truncate(),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    close =
+                        ui.add(theme::ghost_button("×")).on_hover_text(strings::WORKSPACE_PREVIEW_CLOSE()).clicked();
+                });
+            });
+            if close {
+                self.close_file_preview();
+                return;
+            }
             // The preview ends on a whole line and takes the space the list
             // leaves: a height that is not a multiple of the line height cut
             // the last line in half, and the old half-of-the-rest cap left the
@@ -1931,11 +1993,14 @@ impl Workspace {
             }
             if *truncated {
                 ui.label(
-                    RichText::new(strings::WORKSPACE_FILE_TRUNCATED)
+                    RichText::new(strings::WORKSPACE_FILE_TRUNCATED())
                         .color(theme::colors().status_yellow)
                         .font(theme::font(11.0)),
                 );
             }
+        }
+        if close {
+            self.close_file_preview();
         }
     }
 
@@ -2856,7 +2921,7 @@ fn staged_ai_prompt(root: &Path) -> Result<String, String> {
     let status =
         git::run_git(root, &["diff", "--cached", "--name-status", "--no-ext-diff", "--no-textconv", "--no-color"])?;
     if status.trim().is_empty() {
-        return Err(strings::WORKSPACE_AI_NO_STAGE.to_owned());
+        return Err(strings::WORKSPACE_AI_NO_STAGE().to_owned());
     }
     let staged =
         git::run_git(root, &["diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color", "--unified=1"])?;
@@ -2875,7 +2940,7 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                 let _ = response_tx.send(response);
             };
             if request.requires_current_repository() && expected_root != root {
-                let error = strings::WORKSPACE_REPO_CHANGED.to_owned();
+                let error = strings::WORKSPACE_REPO_CHANGED().to_owned();
                 send(match request {
                     Request::AiMessage { .. } => Response::AiMessage(Err(error)),
                     Request::Commit { .. } => Response::Committed(Err(error)),
@@ -2915,7 +2980,10 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                 });
                 if !current_matches {
                     root = identity.as_ref().map(|identity| identity.root.clone());
-                    send(Response::TrustRequired { identity, error: Some(strings::WORKSPACE_TRUST_STALE.to_owned()) });
+                    send(Response::TrustRequired {
+                        identity,
+                        error: Some(strings::WORKSPACE_TRUST_STALE().to_owned()),
+                    });
                     continue;
                 }
                 if let Some(current) = &identity {
@@ -2973,11 +3041,11 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                         let hunks = diff_hunk_bytes(&bytes, from_index);
                         send(Response::Diff { path, text, rows, hunks, staged: from_index, side });
                     }
-                    None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
+                    None => send(Response::Error(strings::WORKSPACE_NO_REPO().to_owned())),
                 },
                 Request::CheckDiff { stamp } => {
                     if stamp.root != root {
-                        send(Response::Error(strings::WORKSPACE_REPO_CHANGED.to_owned()));
+                        send(Response::Error(strings::WORKSPACE_REPO_CHANGED().to_owned()));
                     } else {
                         send(Response::DiffChecked(stamp.with_metadata()));
                     }
@@ -2987,26 +3055,29 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                         Ok(()) => send(Response::Refreshed),
                         Err(e) => send(Response::Error(e)),
                     },
-                    None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
+                    None => send(Response::Error(strings::WORKSPACE_NO_REPO().to_owned())),
                 },
                 Request::Commit { message } => match &root {
                     Some(root) => send(Response::Committed(git::commit(root, message))),
-                    None => send(Response::Committed(Err(strings::WORKSPACE_NO_REPO.to_owned()))),
+                    None => send(Response::Committed(Err(strings::WORKSPACE_NO_REPO().to_owned()))),
                 },
                 Request::AiMessage { command } => {
                     if root.is_none() {
-                        send(Response::AiMessage(Err(strings::WORKSPACE_NO_REPO.to_owned())));
+                        send(Response::AiMessage(Err(strings::WORKSPACE_NO_REPO().to_owned())));
                         continue;
                     }
-                    let result = root.as_ref().ok_or_else(|| strings::WORKSPACE_NO_REPO.to_owned()).and_then(|root| {
-                        let prompt = staged_ai_prompt(root)?;
-                        git::ai_commit_message(command.as_deref(), &prompt, git::AI_TIMEOUT)
-                    });
+                    let result =
+                        root.as_ref().ok_or_else(|| strings::WORKSPACE_NO_REPO().to_owned()).and_then(|root| {
+                            let prompt = staged_ai_prompt(root)?;
+                            git::ai_commit_message(command.as_deref(), &prompt, git::AI_TIMEOUT)
+                        });
                     // An AI subprocess can outlive a configuration change; never
                     // publish its result using approval for the old digest.
-                    let current = root.as_ref().ok_or_else(|| strings::WORKSPACE_NO_REPO.to_owned()).and_then(|root| {
-                        git::repository_stamp(root).map(|stamp| git::RepositoryIdentity { root: root.clone(), stamp })
-                    });
+                    let current =
+                        root.as_ref().ok_or_else(|| strings::WORKSPACE_NO_REPO().to_owned()).and_then(|root| {
+                            git::repository_stamp(root)
+                                .map(|stamp| git::RepositoryIdentity { root: root.clone(), stamp })
+                        });
                     match current {
                         Ok(identity) if git::trust_approved(&identity.root, &identity.stamp) => {
                             send(Response::AiMessage(result));
@@ -3014,7 +3085,7 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                         Ok(identity) => {
                             send(Response::TrustRequired {
                                 identity: Some(identity),
-                                error: Some(strings::WORKSPACE_TRUST_STALE.to_owned()),
+                                error: Some(strings::WORKSPACE_TRUST_STALE().to_owned()),
                             });
                         }
                         Err(error) => {
@@ -3034,14 +3105,14 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                         Ok(detail) => send(Response::CommitDetail { hash, detail }),
                         Err(e) => send(Response::Error(e)),
                     },
-                    None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
+                    None => send(Response::Error(strings::WORKSPACE_NO_REPO().to_owned())),
                 },
                 Request::CommitDiff { hash, path } => {
                     let patch = if expected_root != root {
-                        Err(strings::WORKSPACE_REPO_CHANGED.to_owned())
+                        Err(strings::WORKSPACE_REPO_CHANGED().to_owned())
                     } else {
                         root.as_ref()
-                            .ok_or_else(|| strings::WORKSPACE_NO_REPO.to_owned())
+                            .ok_or_else(|| strings::WORKSPACE_NO_REPO().to_owned())
                             .and_then(|root| git::commit_file_diff(root, &hash, &path))
                             .map(|patch| {
                                 let rows = text_rows(&patch, true);
@@ -3081,19 +3152,19 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                         }
                         Err(e) => send(Response::Error(e)),
                     },
-                    None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
+                    None => send(Response::Error(strings::WORKSPACE_NO_REPO().to_owned())),
                 },
-                Request::ReadFile { path } => match &root {
+                Request::ReadFile { path, generation } => match &root {
                     Some(root) => match git::read_file(root, &path, MAX_PREVIEW_BYTES) {
                         Ok((text, truncated)) => {
                             // Markdown is laid out by `MarkdownCache`, which
                             // needs the text but no per-line rows.
                             let rows = if is_markdown(&path) { Vec::new() } else { text_rows(&text, false) };
-                            send(Response::FileText { path, text, rows, truncated });
+                            send(Response::FileText { generation, path, text, rows, truncated });
                         }
                         Err(e) => send(Response::Error(e)),
                     },
-                    None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
+                    None => send(Response::Error(strings::WORKSPACE_NO_REPO().to_owned())),
                 },
                 Request::ApplyHunks { path, index, seen, from_index } => match &root {
                     Some(root) => {
@@ -3102,7 +3173,7 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                             files
                                 .iter()
                                 .find(|file| file.path == path)
-                                .ok_or_else(|| strings::WORKSPACE_NO_CHANGES_FOR_FILE.to_owned())
+                                .ok_or_else(|| strings::WORKSPACE_NO_CHANGES_FOR_FILE().to_owned())
                                 .and_then(|file| match git::hunk_bytes(file, index) {
                                     // The file may have changed since it was shown: apply
                                     // only the hunk the user actually saw, whole. The `@@`
@@ -3110,7 +3181,7 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                                     Some(current) if current == seen => {
                                         git::apply_hunks(root, file, &[index], from_index)
                                     }
-                                    _ => Err(strings::WORKSPACE_DIFF_STALE.to_owned()),
+                                    _ => Err(strings::WORKSPACE_DIFF_STALE().to_owned()),
                                 })
                         });
                         match result {
@@ -3118,7 +3189,7 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                             Err(e) => send(Response::Error(e)),
                         }
                     }
-                    None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
+                    None => send(Response::Error(strings::WORKSPACE_NO_REPO().to_owned())),
                 },
                 Request::OpenExternal { path } => {
                     send(Response::Launch(root.as_deref().and_then(|root| external_launch(root, &path, false).ok())));
@@ -3131,35 +3202,35 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                         Ok(what) => send(Response::Fetched(what)),
                         Err(e) => send(Response::Error(e)),
                     },
-                    None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
+                    None => send(Response::Error(strings::WORKSPACE_NO_REPO().to_owned())),
                 },
                 Request::Push => match &root {
                     Some(root) => match git::push(root) {
                         Ok(branch) => send(Response::Pushed(branch)),
                         Err(e) => send(Response::Error(e)),
                     },
-                    None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
+                    None => send(Response::Error(strings::WORKSPACE_NO_REPO().to_owned())),
                 },
                 Request::WritePath { path, folder } => match &root {
                     Some(root) => match write_path(root, &path, folder) {
                         Ok(()) => send(Response::Applied),
                         Err(e) => send(Response::Error(e)),
                     },
-                    None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
+                    None => send(Response::Error(strings::WORKSPACE_NO_REPO().to_owned())),
                 },
                 Request::RenamePath { from, to } => match &root {
                     Some(root) => match rename_path(root, &from, &to) {
                         Ok(()) => send(Response::Applied),
                         Err(e) => send(Response::Error(e)),
                     },
-                    None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
+                    None => send(Response::Error(strings::WORKSPACE_NO_REPO().to_owned())),
                 },
                 Request::DeletePath { path } => match &root {
                     Some(root) => match delete_path(root, &path) {
                         Ok(()) => send(Response::Applied),
                         Err(e) => send(Response::Error(e)),
                     },
-                    None => send(Response::Error(strings::WORKSPACE_NO_REPO.to_owned())),
+                    None => send(Response::Error(strings::WORKSPACE_NO_REPO().to_owned())),
                 },
             }
         }
@@ -3180,7 +3251,7 @@ fn write_path(root: &Path, path: &str, folder: bool) -> Result<(), String> {
         // being silently truncated to zero bytes.
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&full) {
             Ok(_) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(strings::WORKSPACE_FILE_EXISTS.to_owned()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(strings::WORKSPACE_FILE_EXISTS().to_owned()),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -3194,14 +3265,14 @@ fn rename_path_checked(root: &Path, from: &str, to: &str, before_move: impl FnOn
     let from = git::resolve_path(root, from)?;
     let to = git::resolve_path(root, to)?;
     if !from.exists() {
-        return Err(strings::WORKSPACE_NO_SUCH_FILE.to_owned());
+        return Err(strings::WORKSPACE_NO_SUCH_FILE().to_owned());
     }
     // std::fs::rename replaces an existing target on Windows. A target that
     // resolves to the source itself is a case-only rename and is allowed.
     if to.symlink_metadata().is_ok() {
         let same = matches!((from.canonicalize(), to.canonicalize()), (Ok(a), Ok(b)) if a == b);
         if !same {
-            return Err(strings::WORKSPACE_FILE_EXISTS.to_owned());
+            return Err(strings::WORKSPACE_FILE_EXISTS().to_owned());
         }
     }
     before_move();
@@ -3445,7 +3516,7 @@ mod tests {
         let (tx, rx) = spawn_worker();
         tx.send((None, Request::Refresh { cwd: repository.path().to_owned() })).unwrap();
         let shown = approve_worker(&tx, &rx);
-        tx.send((shown.clone(), Request::ReadFile { path: "large.txt".to_owned() })).unwrap();
+        tx.send((shown.clone(), Request::ReadFile { path: "large.txt".to_owned(), generation: 0 })).unwrap();
         let response = rx.recv_timeout(Duration::from_secs(20)).unwrap();
         let Response::FileText { text: loaded, truncated, .. } = &response else {
             panic!("real preview response expected")
@@ -3460,7 +3531,7 @@ mod tests {
         assert_eq!(&loaded[last.bytes.clone()], "tail marker");
         assert_eq!(last.number, Some(120_001));
         std::fs::write(repository.path().join("large.txt"), vec![b'x'; MAX_PREVIEW_BYTES + 1]).unwrap();
-        tx.send((shown, Request::ReadFile { path: "large.txt".to_owned() })).unwrap();
+        tx.send((shown, Request::ReadFile { path: "large.txt".to_owned(), generation: 0 })).unwrap();
         let Response::FileText { text, truncated, .. } = rx.recv_timeout(Duration::from_secs(20)).unwrap() else {
             panic!("real capped response expected")
         };
@@ -3781,7 +3852,7 @@ mod tests {
         let elsewhere = Some(PathBuf::from("C:/some/other/repo"));
         tx.send((elsewhere, Request::DeletePath { path: "keep.txt".to_owned() })).unwrap();
         match wait() {
-            Response::Error(message) => assert_eq!(message, strings::WORKSPACE_REPO_CHANGED),
+            Response::Error(message) => assert_eq!(message, strings::WORKSPACE_REPO_CHANGED()),
             _ => panic!("the delete must be refused"),
         }
         assert!(dir.path().join("keep.txt").exists(), "nothing was deleted");
@@ -4019,7 +4090,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(600.0, 700.0));
-        let commit_button = strings::WORKSPACE_COMMIT.to_owned();
+        let commit_button = strings::WORKSPACE_COMMIT().to_owned();
         let mut frame = |events: Vec<egui::Event>, time: f64| {
             let input = egui::RawInput { screen_rect: Some(rect), time: Some(time), events, ..Default::default() };
             let output = ctx.run_ui(input, |ui| {
@@ -4178,7 +4249,7 @@ mod tests {
 
         // Stand in for the race: the file exists by the time we ask.
         let result = write_path(root, "new.txt", false);
-        assert_eq!(result, Err(strings::WORKSPACE_FILE_EXISTS.to_owned()));
+        assert_eq!(result, Err(strings::WORKSPACE_FILE_EXISTS().to_owned()));
         assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "", "an existing file is left as it was");
 
         std::fs::write(root.join("taken.txt"), "someone else's work").unwrap();
@@ -4192,7 +4263,7 @@ mod tests {
         let root = dir.path();
         std::fs::write(root.join("a.txt"), "a").unwrap();
         std::fs::write(root.join("b.txt"), "b").unwrap();
-        assert_eq!(rename_path(root, "a.txt", "b.txt"), Err(strings::WORKSPACE_FILE_EXISTS.to_owned()));
+        assert_eq!(rename_path(root, "a.txt", "b.txt"), Err(strings::WORKSPACE_FILE_EXISTS().to_owned()));
         assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "b", "the target is untouched");
         assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "a");
         rename_path(root, "a.txt", "A.txt").expect("a case-only rename");
@@ -4604,7 +4675,7 @@ mod tests {
             assert!(!prompt.contains(excluded), "unstaged data leaked: {excluded}");
         }
         assert!(git(root, &["reset", "--quiet", "HEAD"]));
-        assert_eq!(staged_ai_prompt(root), Err(strings::WORKSPACE_AI_NO_STAGE.to_owned()));
+        assert_eq!(staged_ai_prompt(root), Err(strings::WORKSPACE_AI_NO_STAGE().to_owned()));
         let (tx, rx) = spawn_worker();
         tx.send((None, Request::Refresh { cwd: root.to_owned() })).unwrap();
         let shown = approve_worker(&tx, &rx);
@@ -4612,7 +4683,7 @@ mod tests {
         let Response::AiMessage(Err(message)) = rx.recv_timeout(Duration::from_secs(20)).unwrap() else {
             panic!("empty index must reject generation")
         };
-        assert_eq!(message, strings::WORKSPACE_AI_NO_STAGE, "the CLI must not start for an empty index");
+        assert_eq!(message, strings::WORKSPACE_AI_NO_STAGE(), "the CLI must not start for an empty index");
         let missing = root.join("missing");
         assert!(staged_ai_prompt(&missing).is_err(), "index read errors cannot start generation");
     }
@@ -4719,13 +4790,13 @@ mod tests {
     fn a_failed_file_operation_is_reported_in_the_files_tab() {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 600.0));
         let mut workspace = Workspace {
-            notice: Some((strings::WORKSPACE_FILE_EXISTS.to_owned(), true)),
+            notice: Some((strings::WORKSPACE_FILE_EXISTS().to_owned(), true)),
             files: vec!["a.txt".to_owned()],
             ..Default::default()
         };
         let mut painted = Vec::new();
         collect_text(&panel_frame(&mut workspace, PanelTab::Files, 1, rect), &mut painted);
-        assert!(painted.iter().any(|text| text == strings::WORKSPACE_FILE_EXISTS), "{painted:?}");
+        assert!(painted.iter().any(|text| text == strings::WORKSPACE_FILE_EXISTS()), "{painted:?}");
         // A success notice belongs to the Changes tab and stays out of this one.
         workspace.notice = Some((strings::workspace_committed("abc"), false));
         let mut painted = Vec::new();
@@ -4770,7 +4841,7 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(20)).expect("a worker response")
         };
         match apply(seen[0].clone()) {
-            Response::Error(message) => assert_eq!(message, strings::WORKSPACE_DIFF_STALE),
+            Response::Error(message) => assert_eq!(message, strings::WORKSPACE_DIFF_STALE()),
             _ => panic!("a hunk that is no longer the one shown must be refused"),
         }
         assert!(git(root, &["diff", "--cached", "--quiet"]), "nothing was staged");
@@ -4941,7 +5012,7 @@ mod tests {
         workspace.start_commit();
         let shapes = frame(&mut workspace, &ctx, vec![egui::Event::Text("lost text".to_owned())]);
         assert_eq!(workspace.commit_message, "submitted draft", "pending text cannot be accepted and then lost");
-        frame(&mut workspace, &ctx, click(text_point(&shapes, strings::WORKSPACE_AI)));
+        frame(&mut workspace, &ctx, click(text_point(&shapes, strings::WORKSPACE_AI())));
         assert!(!workspace.ai_generating);
         let requests: Vec<_> = request_rx.try_iter().collect();
         assert_eq!(requests.len(), 1);
@@ -5083,5 +5154,77 @@ mod tests {
         assert!(git(root, &["update-ref", remote, "HEAD~1"]));
         assert_eq!(apply_status(&mut workspace), 1, "external upstream changes invalidate history");
         assert_eq!(apply_status(&mut workspace), 0);
+    }
+}
+
+#[cfg(test)]
+mod preview_close_tests {
+    use super::*;
+    #[test]
+    fn closing_preview_keeps_panel_and_draft_but_rejects_late_reads() {
+        let (tx, rx) = mpsc::channel();
+        let mut workspace = Workspace {
+            open: true,
+            tab: PanelTab::Files,
+            commit_message: "Keep this draft".to_owned(),
+            file_preview: Some(("file.txt".to_owned(), "old".to_owned(), false)),
+            preview_rows: text_rows("old", false),
+            rx: Some(rx),
+            ..Default::default()
+        };
+        workspace.close_file_preview();
+        assert!(workspace.open && workspace.file_preview.is_none());
+        assert_eq!(workspace.commit_message, "Keep this draft");
+        assert_eq!(workspace.preview_rows.capacity(), 0);
+        let respond = |generation, text: &str| {
+            tx.send(Response::FileText {
+                generation,
+                path: "file.txt".to_owned(),
+                text: text.to_owned(),
+                rows: text_rows(text, false),
+                truncated: false,
+            })
+            .unwrap()
+        };
+        respond(0, "late old read");
+        workspace.absorb();
+        assert!(workspace.file_preview.is_none());
+        workspace.open_file_preview("file.txt".to_owned());
+        respond(0, "late read of the same file");
+        workspace.absorb();
+        assert!(workspace.file_preview.is_none());
+        respond(workspace.preview_generation, "new read");
+        workspace.absorb();
+        assert_eq!(workspace.file_preview.as_ref().unwrap().1, "new read");
+    }
+    #[test]
+    fn closing_diff_frees_data_and_a_late_response_does_not_reopen_it() {
+        let (tx, rx) = mpsc::channel();
+        let mut workspace = Workspace {
+            open: true,
+            diff_path: Some("file.txt".to_owned()),
+            diff_text: "@@ -1 +1 @@\n-x\n+y".to_owned(),
+            diff_rows: text_rows("@@ -1 +1 @@\n-x\n+y", true),
+            diff_hunks: vec![vec![0; 1024]],
+            commit_message: "Keep draft".to_owned(),
+            rx: Some(rx),
+            ..Default::default()
+        };
+        workspace.close_diff();
+        tx.send(Response::Diff {
+            path: "file.txt".to_owned(),
+            text: "late".to_owned(),
+            rows: text_rows("late", true),
+            hunks: vec![],
+            staged: false,
+            side: None,
+        })
+        .unwrap();
+        workspace.absorb();
+        assert!(workspace.open && workspace.diff_path.is_none() && workspace.diff_text.is_empty());
+        assert_eq!(workspace.commit_message, "Keep draft");
+        assert_eq!(workspace.diff_rows.capacity(), 0);
+        assert_eq!(workspace.diff_text.capacity(), 0);
+        assert_eq!(workspace.diff_hunks.capacity(), 0);
     }
 }

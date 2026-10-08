@@ -2,6 +2,8 @@
 /dist
 /docs/*
 !/docs/REFERENCE.md
+!/docs/RELEASING.md
+!/docs/AUDIT.md
 __pycache__/
 *.py[cod]
 .env

@@ -194,7 +194,9 @@ mod windows {
         input: Option<Vec<u8>>,
     ) -> Result<(bool, Vec<u8>, Vec<u8>), String> {
         let started = Instant::now();
-        let expired = || format!("{label} не ответил за {} с", timeout.as_secs());
+        let expired = || {
+            crate::tr_format!("{label} did not respond within {} s", "{label} не ответил за {} с", timeout.as_secs())
+        };
         let error = |e: io::Error| format!("{label}: {e}");
         let job = job().map_err(error)?;
         let mut writer = if input.is_some() {

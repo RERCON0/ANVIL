@@ -26,33 +26,33 @@ pub fn show(ctx: &egui::Context, dialog: &DialogState) -> DialogOutcome {
         .show(ctx, |ui| {
             let accept = match dialog {
                 DialogState::ClaudeInstall { path, current, ours, .. } => {
-                    ui.label(strings::CLAUDE_INSTALL_QUESTION);
-                    ui.label(strings::CLAUDE_INSTALL_GLOBAL);
+                    ui.label(strings::CLAUDE_INSTALL_QUESTION());
+                    ui.label(strings::CLAUDE_INSTALL_GLOBAL());
                     ui.monospace(path.display().to_string());
                     if !current.is_empty() {
-                        ui.label(strings::CLAUDE_CURRENT_COMMAND);
+                        ui.label(strings::CLAUDE_CURRENT_COMMAND());
                         ui.monospace(current);
                     }
-                    ui.label(strings::CLAUDE_NEW_COMMAND);
+                    ui.label(strings::CLAUDE_NEW_COMMAND());
                     ui.monospace(ours);
-                    ui.label(strings::CLAUDE_INSTALL_WARNING);
-                    strings::CLAUDE_INSTALL_ACCEPT
+                    ui.label(strings::CLAUDE_INSTALL_WARNING());
+                    strings::CLAUDE_INSTALL_ACCEPT()
                 }
                 DialogState::Paste { text, .. } => {
-                    ui.label(strings::PASTE_WARNING);
-                    ui.label(strings::PASTE_PREVIEW_HINT);
+                    ui.label(strings::PASTE_WARNING());
+                    ui.label(strings::PASTE_PREVIEW_HINT());
                     egui::ScrollArea::vertical().max_height(230.0).show(ui, |ui| {
                         let preview = crate::term::paste::prepare_paste(text, false);
                         let preview = String::from_utf8_lossy(&preview).replace('\r', "\n");
                         // The preview is not editable: consent applies to these exact bytes.
                         ui.monospace(preview);
                     });
-                    strings::PASTE_ACCEPT
+                    strings::PASTE_ACCEPT()
                 }
             };
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                let cancel = ui.add(crate::theme::ghost_button(strings::SETTINGS_CANCEL));
+                let cancel = ui.add(crate::theme::ghost_button(strings::SETTINGS_CANCEL()));
                 if cancel.clicked() {
                     outcome = DialogOutcome::Cancel;
                 }

@@ -175,14 +175,14 @@ pub fn duration_window(secs: i64) -> Option<(String, String)> {
     }
     if secs % 86_400 == 0 {
         let days = secs / 86_400;
-        return Some((format!("{days}d"), format!("{days}{}", strings::QUOTA_UNIT_DAY)));
+        return Some((format!("{days}d"), format!("{days}{}", strings::QUOTA_UNIT_DAY())));
     }
     if secs % 3_600 == 0 {
         let hours = secs / 3_600;
-        return Some((format!("{hours}h"), format!("{hours}{}", strings::QUOTA_UNIT_HOUR)));
+        return Some((format!("{hours}h"), format!("{hours}{}", strings::QUOTA_UNIT_HOUR())));
     }
     let minutes = secs.saturating_add(30) / 60;
-    (minutes > 0).then(|| (format!("{minutes}m"), format!("{minutes}{}", strings::QUOTA_UNIT_MINUTE)))
+    (minutes > 0).then(|| (format!("{minutes}m"), format!("{minutes}{}", strings::QUOTA_UNIT_MINUTE())))
 }
 
 /// What an amount is counted in.
@@ -274,8 +274,8 @@ pub fn format_amount(amount: f64, unit: Unit) -> String {
     match unit {
         Unit::Usd => format!("{sign}${abs:.2}"),
         Unit::Cny => format!("{sign}¥{abs:.2}"),
-        Unit::Credits if abs >= 10.0 => format!("{sign}{} {}", abs.round() as i64, strings::QUOTA_CREDITS_SHORT),
-        Unit::Credits => format!("{sign}{abs:.1} {}", strings::QUOTA_CREDITS_SHORT),
+        Unit::Credits if abs >= 10.0 => format!("{sign}{} {}", abs.round() as i64, strings::QUOTA_CREDITS_SHORT()),
+        Unit::Credits => format!("{sign}{abs:.1} {}", strings::QUOTA_CREDITS_SHORT()),
     }
 }
 

@@ -94,13 +94,13 @@ pub fn parse(body: &[u8], now: i64, region: Region) -> Result<Fetched, FetchErro
             (Some(start), Some(end)) if end > start => duration_window(end - start),
             _ => None,
         };
-        let (key, label) = span.unwrap_or_else(|| ("5h".to_owned(), format!("5{}", strings::QUOTA_UNIT_HOUR)));
+        let (key, label) = span.unwrap_or_else(|| ("5h".to_owned(), format!("5{}", strings::QUOTA_UNIT_HOUR())));
         windows.push(Window::new(key, label, used, reset(bucket, "end_time", "remains_time", now)));
     }
     if let Some(used) = used(bucket, "current_weekly", region) {
         if !windows.iter().any(|w: &Window| w.key == "7d") {
             let resets_at = reset(bucket, "weekly_end_time", "weekly_remains_time", now);
-            windows.push(Window::new("7d", format!("7{}", strings::QUOTA_UNIT_DAY), used, resets_at));
+            windows.push(Window::new("7d", format!("7{}", strings::QUOTA_UNIT_DAY()), used, resets_at));
         }
     }
     if windows.is_empty() {

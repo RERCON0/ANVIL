@@ -10,7 +10,7 @@ pub const ENDPOINT: Endpoint = Endpoint::https("hyper.charm.land", "/v1/credits"
 pub fn parse(body: &[u8]) -> Result<Fetched, FetchError> {
     let value = json(body)?;
     let balance = number(value.get("balance")).ok_or_else(|| FetchError::Format("no balance".into()))?;
-    let credits = Balance::new("credits", strings::QUOTA_CREDITS, balance, Unit::Credits, BalanceKind::Remaining);
+    let credits = Balance::new("credits", strings::QUOTA_CREDITS(), balance, Unit::Credits, BalanceKind::Remaining);
     Ok(Fetched { plan: None, windows: Vec::new(), balances: vec![credits] })
 }
 

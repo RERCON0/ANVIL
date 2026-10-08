@@ -27,8 +27,8 @@ pub fn parse(body: &[u8]) -> Result<Fetched, FetchError> {
             continue;
         };
         let mut windows = vec![
-            Window::new("5h", format!("5{}", strings::QUOTA_UNIT_HOUR), five.0, five.1),
-            Window::new("7d", format!("7{}", strings::QUOTA_UNIT_DAY), seven.0, seven.1),
+            Window::new("5h", format!("5{}", strings::QUOTA_UNIT_HOUR()), five.0, five.1),
+            Window::new("7d", format!("7{}", strings::QUOTA_UNIT_DAY()), seven.0, seven.1),
         ];
         let limits = root.get("limits").or_else(|| value.get("limits")).and_then(Value::as_array);
         for limit in limits.into_iter().flatten() {
@@ -44,7 +44,7 @@ pub fn parse(body: &[u8]) -> Result<Fetched, FetchError> {
             if name.is_empty() || windows.iter().any(|w| w.key == key) {
                 continue;
             }
-            let label = format!("{name}·7{}", strings::QUOTA_UNIT_DAY);
+            let label = format!("{name}·7{}", strings::QUOTA_UNIT_DAY());
             windows.push(Window::new(key, label, used, limit.get("resets_at").and_then(epoch_from_json)));
         }
         return Ok(Fetched::windows(None, windows));

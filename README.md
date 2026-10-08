@@ -1,130 +1,110 @@
-<p align="center">
-  <img src="icons/anvil-256.png" width="112" alt="Логотип ANVIL">
-</p>
+<p align="center"><img src="icons/anvil-256.png" width="112" alt="ANVIL logo"></p>
 
 <h1 align="center">ANVIL</h1>
 
-<p align="center">
-  <strong>Лёгкий терминал для Windows с богатым набором инструментов.<br>Вкладки, сплиты, Git и AI-сессии в одном рабочем пространстве.</strong>
-</p>
+<p align="center"><strong>A lightweight Windows terminal for multiple CLI agents.<br>Project tabs, movable split panes, Git and AI quotas in one workspace.</strong></p>
 
 <p align="center">
   <a href="https://github.com/RERCON0/ANVIL/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/RERCON0/ANVIL/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="https://github.com/RERCON0/ANVIL/actions/workflows/security.yml"><img alt="Security" src="https://github.com/RERCON0/ANVIL/actions/workflows/security.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/RERCON0/ANVIL/blob/main/Cargo.toml"><img alt="Windows x64" src="https://img.shields.io/badge/Windows-x64-0078D4?logo=windows&logoColor=white"></a>
-  <a href="LICENSE"><img alt="GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-2f855a"></a>
+  <a href="https://github.com/RERCON0/ANVIL/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/RERCON0/ANVIL?color=49b675"></a>
+  <a href="https://github.com/RERCON0/ANVIL/releases"><img alt="Windows x64" src="https://img.shields.io/badge/Windows-x64-0078D4?logo=windows&logoColor=white"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/RERCON0/ANVIL?color=2f855a"></a>
   <a href="https://t.me/rercon"><img alt="Telegram" src="https://img.shields.io/badge/Telegram-@rercon-26A5E4?logo=telegram&logoColor=white"></a>
 </p>
 
-<p align="center">
-  <a href="#возможности">Возможности</a> ·
-  <a href="#запуск">Запуск</a> ·
-  <a href="#сборка">Сборка</a> ·
-  <a href="#горячие-клавиши">Горячие клавиши</a> ·
-  <a href="#документация">Документация</a>
-</p>
+<p align="center"><a href="README.ru.md">Русский</a> · <a href="https://github.com/RERCON0/ANVIL/releases">Download</a> · <a href="#features">Features</a> · <a href="#build">Build</a> · <a href="#keyboard-shortcuts">Shortcuts</a> · <a href="docs/RELEASING.md">Release verification</a></p>
 
-> [!NOTE]
-> ANVIL находится в активной разработке. Пока основной способ запуска — сборка из исходников; CI проверяет текущую ветку и сохраняет тестовый пакет.
+![ANVIL with Codex, Claude Code, OpenCode, OMP, project tabs, Git history and AI quotas](assets/workspace.png)
 
-## Возможности
+<p align="center"><sub>Real CLI sessions in a sample workspace. Git history, staging and commit controls stay next to the agents.</sub></p>
 
-ANVIL написан на Rust: интерфейс рисуется через egui/OpenGL, а оболочки работают
-через ConPTY из проекта Windows Terminal. Claude Code, Codex, OpenCode, OMP
-и обычные shell-сессии живут в одном окне рядом с инструментами проекта.
+## Why ANVIL
 
-### Рабочее пространство под несколько задач
+Keep each project in its own tab, then open Codex, Claude Code, OpenCode, OMP
+or a shell in separate panes. Split, move, collapse or close panes as you work;
+each keeps its running process and working directory. Review changes and commit
+from the adjacent Git panel, without switching to a separate IDE.
 
-- **Вертикальные вкладки:** названия, цвета, активность, перетаскивание и быстрый выбор профиля.
-- **Сплиты вправо и вниз:** навигация с клавиатуры, максимизация и сворачивание пейнов.
-- **Перестановка пейнов:** `Ctrl+Shift` и перетаскивание с подсветкой места вставки; запущенные процессы продолжают работу.
-- **Восстановление раскладки:** вкладки, каталоги, сплиты и состояние панелей сохраняются между запусками.
+ANVIL focuses on a small native application, rich terminal functionality and
+quick access to the work. The interface uses Rust, egui and OpenGL; shells run
+through ConPTY from Windows Terminal.
+
+## Features
+
+| Workspace | What you can do |
+|---|---|
+| Project tabs | Name, colour, reorder and switch between projects |
+| Split panes | Split right/down, move running sessions, navigate with the keyboard, maximise or collapse |
+| Git panel | Inspect changes and history, stage files or individual hunks, edit AI-assisted commit messages, commit, fetch and push |
+| File browser | Filter files, preview text and Markdown, create, rename and send files to the Recycle Bin |
+| AI quotas | View usage windows, reset times, balances or spending for 19 providers; windows share one polling worker |
+| Claude Code | Optional statusLine and tab badge with model, context usage, limits and agent |
+| Terminal | Truecolor, OSC 8 links, search, mouse modes, bracketed paste, font fallback, grid-aligned block/Braille graphics |
+| Saved workspace | Restore tabs, folders, splits and panel state; choose English or Russian in the title bar |
 
 > [!IMPORTANT]
-> Восстанавливается рабочее пространство. Оболочки запускаются заново; живые процессы AI-CLI и скроллбек между запусками не сохраняются.
+> Layouts are restored; shells start again. Live CLI processes and terminal scrollback are not saved between application launches.
 
-### Git рядом с терминалом
-
-У каждого пейна своя панель проекта: статус файлов, стейджинг целиком или по
-отдельным ханкам, diff, история коммитов, push и fetch. Рядом — дерево файлов,
-поиск и предпросмотр текста с рендером Markdown.
-
-Для сообщения коммита можно вызвать AI: ANVIL передаёт staged-diff, предлагает
-текст и оставляет его на редактирование. Доступны Codex, Claude, OpenCode,
-Gemini и Aider; для внешних бэкендов нужны установленные CLI.
+AI commit messages support Codex, Claude, OpenCode, Gemini and Aider. External
+backends require their CLI installations. The generated message remains editable.
 
 > [!CAUTION]
-> При генерации сообщения staged-diff отправляется AI-провайдеру. Проверьте индекс перед вызовом: ключи, токены и другие секреты не должны попасть в запрос.
+> Generating a commit message sends the staged diff to your AI provider. Check the index for credentials and other private data before using it.
 
-### Контекст и лимиты AI-сессий
+## Get started
 
-| Интеграция | Что показывает |
-|---|---|
-| Claude Code | Модель, заполнение контекста, лимиты и агент — в statusLine и бейдже вкладки |
-| Квоты 19 провайдеров | Проценты по временным окнам, сброс лимитов, баланс или расходы |
-| Несколько окон | Общий кэш квот; API опрашивает одно окно |
+Requires **Windows 10/11 x64**, an OpenGL 2.1-capable graphics driver and a shell.
+Install Git for Windows for the Git panel, and your preferred external AI CLIs
+separately. Codex commit messages can use an existing Codex login or an API key.
 
-Claude statusLine и строка квот включаются отдельно в настройках. ANVIL
-использует существующий вход поддерживаемых CLI; отдельные ключи квот
-хранятся в Диспетчере учётных данных Windows.
+1. Download the ZIP from [Releases](https://github.com/RERCON0/ANVIL/releases).
+2. Extract the whole archive and run `anvil.exe`. Keep the runtime and helper files beside it.
+3. Open a project folder, then split the tab to run several agents or shells.
+4. Enable the quotas and Claude statusLine you want in Settings. Click **RU/EN** in the title bar to switch language.
 
-### Терминал для ежедневной работы
-
-Truecolor, поиск по буферу, OSC 8-ссылки, режимы мыши, bracketed paste,
-масштабирование текста и системные шрифты с fallback-глифами. Блочная графика
-и Braille рисуются по сетке, чтобы ASCII-арт и спиннеры сохраняли форму.
-
-Многострочная вставка получает предпросмотр, когда приложение не включило
-bracketed paste. Копирование при выделении настраивается, OSC 52 выключен
-по умолчанию. Подробности поведения — в [справочнике](docs/REFERENCE.md).
-
-## Запуск
-
-Нужны **Windows 10/11 x64** и установленная оболочка. Git for Windows
-используется панелью Git; AI-CLI устанавливаются отдельно и обнаруживаются
-через профили. Для встроенного Codex используется вход Codex CLI или API-ключ.
-
-1. Соберите приложение по инструкции ниже.
-2. Запустите `target\release\anvil.exe`, оставив `conpty.dll` и `OpenConsole.exe` рядом.
-3. Выберите профиль оболочки и откройте каталог проекта.
-4. В настройках включите нужные AI-интеграции и квоты.
+> [!NOTE]
+> Releases carry an Ed25519 signature covering the package files. This is separate from Windows Authenticode, so SmartScreen may still warn. If you trust the download source, choose **More info → Run anyway**. Verification instructions and the trusted key fingerprint are in [RELEASING](docs/RELEASING.md).
 
 > [!TIP]
-> Claude statusLine подключается через **Настройки → Claude Code → Строка статуса от ANVIL**. Диалог покажет изменение файла настроек. После переноса программы обновите путь к helper; перед удалением отключите интеграцию.
+> Enable **Settings → Claude Code → ANVIL status line** to see session context. The confirmation shows the settings change. Update the helper path after moving ANVIL, and disable the integration before removing it.
 
-## Сборка
+## Security built into the workflow
 
-Для сборки нужны Git, rustup и **Visual Studio Build Tools** с инструментами
-C++ и Windows SDK. Rust **1.92.0**, rustfmt и Clippy закреплены в
-[rust-toolchain.toml](rust-toolchain.toml); rustup выбирает их автоматически.
+Git settings that can execute programs require explicit trust; that approval
+expires when the relevant configuration changes. Git and AI jobs in the panel
+have deadlines, bounded output and process-tree cleanup. Credential reads,
+file previews and metadata traversal are bounded; AI diagnostics redact known
+secrets. Quota keys use Windows Credential Manager, and DLL lookup is restricted
+to the application directory and system locations.
 
-Из корня репозитория в PowerShell:
+CI checks real ConPTY sessions, Git integration, package contents and PE
+mitigations. Security checks the locked dependency graph, complete Git history
+for secrets and the workflows themselves. See [SECURITY](SECURITY.md) for the
+enforcement details and remaining limits.
+
+## Build
+
+Install Git, rustup and **Visual Studio Build Tools** with C++ tools and the
+Windows SDK. [rust-toolchain.toml](rust-toolchain.toml) pins Rust 1.92.0,
+rustfmt and Clippy. PowerShell, from the repository root:
 
 ```powershell
 cargo build --locked --release --bin anvil --bin anvil-claude-status
 .\target\release\anvil.exe
 ```
 
-Портативный пакет с ConPTY, лицензиями и сведениями о сборке (нужен Python
-в `PATH`: `package.ps1` собирает лицензии Rust-крейтов):
+For an unsigned development package with runtime files, licences and build
+provenance, install Python 3.13 and run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\package.ps1
-# dist\anvil-<версия>-x64.zip и dist\SHA256SUMS.txt
+# dist\anvil-<version>-x64.zip
 ```
 
-| Файл | Назначение |
-|---|---|
-| `anvil.exe` | Терминал, GUI, Git, AI-коммиты и фоновые квоты |
-| `anvil-claude-status.exe` | Консольный helper для statusLine Claude Code |
-| `conpty.dll`, `OpenConsole.exe` | Runtime псевдоконсоли Windows |
-| `LICENSE`, `LICENSES/` | Лицензии приложения, встроенных ресурсов и Rust-зависимостей (`LICENSES/THIRD-PARTY-RUST.txt`) |
-| `SOURCE.txt`, `BUILD.json` | Версия, исходный коммит и хеши файлов |
-
-> [!NOTE]
-> Пакеты разработки и артефакты CI пока не подписаны. SHA-256 и `BUILD.json` проверяют целостность; они не подтверждают издателя. Публикация релизов выполняется отдельно.
-
-### Проверки перед коммитом
+Publisher signing uses a separate clean-build procedure in
+[RELEASING](docs/RELEASING.md). The CI artifacts remain explicitly unsigned.
+Python is needed for development scripts and release verification, not to run ANVIL.
 
 ```powershell
 cargo fmt --all -- --check
@@ -136,49 +116,38 @@ python -B scripts/check_conpty.py
 python -B scripts/check_docs.py
 ```
 
-Python 3.13 используется для тестов Aider-helper и проверок CI. Иконки
-пересобираются через `cargo run --locked --example gen_icons`;
-исходник и правила экспорта — в [icons/README.md](icons/README.md).
+## Keyboard shortcuts
 
-## Горячие клавиши
-
-| Действие | Клавиши |
+| Action | Keys |
 |---|---|
-| Новая вкладка / новое окно | `Ctrl+Shift+T` / `Ctrl+Shift+N` |
-| Закрыть / вернуть вкладку | `Ctrl+Shift+W` / `Ctrl+Shift+Z` |
-| Следующая / предыдущая вкладка | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
-| Сплит вправо / вниз | `Ctrl+Shift+S` / `Ctrl+Shift+D` |
-| Перейти в соседний пейн | `Ctrl+Alt+Стрелки` |
-| Переставить пейн | `Ctrl+Shift` и перетаскивание ярлыка мышью |
-| Максимизировать пейн | `Ctrl+Alt+Enter` |
-| Свернуть / вернуть пейн | `Ctrl+Alt+C` / `Ctrl+Alt+R` |
-| Список свёрнутых пейнов | `Ctrl+Alt+L` |
-| Панель Git / поиск | `Ctrl+Shift+G` / `Ctrl+Shift+F` |
-| Копировать / вставить | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
-| Настройки / полный экран | `Ctrl+,` / `F11` |
+| New tab / window | `Ctrl+Shift+T` / `Ctrl+Shift+N` |
+| Close / restore tab | `Ctrl+Shift+W` / `Ctrl+Shift+Z` |
+| Next / previous tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
+| Split right / down | `Ctrl+Shift+S` / `Ctrl+Shift+D` |
+| Navigate panes | `Ctrl+Alt+Arrow keys` |
+| Move a pane | `Ctrl+Shift` + drag its label |
+| Maximise a pane | `Ctrl+Alt+Enter` |
+| Collapse / restore pane | `Ctrl+Alt+C` / `Ctrl+Alt+R` |
+| Collapsed pane list | `Ctrl+Alt+L` |
+| Git panel / search | `Ctrl+Shift+G` / `Ctrl+Shift+F` |
+| Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
+| Settings / fullscreen | `Ctrl+,` / `F11` |
 
-Полный список и переопределение — в настройках и
-[справочнике](docs/REFERENCE.md#горячие-клавиши). Сочетания привязаны к
-физическим клавишам и работают независимо от раскладки.
+Shortcuts use physical keys and work across keyboard layouts. Rebind them in Settings.
 
-## Настройки и данные
+## Data and documentation
 
-| Каталог | Содержимое |
+| Location | Data |
 |---|---|
-| `%APPDATA%\anvil` | `config.json`, сохранённая раскладка `session.json`, журнал `anvil.log` |
-| `%LOCALAPPDATA%\anvil` | Общий кэш и расписание квот, блокировка опроса и временные статусы Claude |
-| Диспетчер учётных данных Windows | Отдельные ключи квот `anvil/quota/<провайдер>` |
+| `%APPDATA%\anvil` | `config.json`, saved `session.json`, `anvil.log` |
+| `%LOCALAPPDATA%\anvil` | Shared quota cache, polling schedule and temporary Claude statuses |
+| Windows Credential Manager | Quota API keys: `anvil/quota/<provider>` |
 
-Настройки сохраняются при применении; `config.json` можно редактировать на
-ходу. Схема, примеры квот и подробный список файлов — в
-[справочнике](docs/REFERENCE.md#настройки-и-файлы).
+- [Detailed feature and configuration reference (Russian)](docs/REFERENCE.md)
+- [Security policy and limitations](SECURITY.md)
+- [Release signing and verification](docs/RELEASING.md)
+- [Audit findings and checks](docs/AUDIT.md)
+- [Third-party resources and licences](THIRD-PARTY.md)
+- [ConPTY provenance](vendor/conpty/README.md)
 
-## Документация
-
-- [Справочник возможностей и настроек](docs/REFERENCE.md)
-- [Безопасность и границы защиты](SECURITY.md)
-- [Сторонние ресурсы и лицензии](THIRD-PARTY.md)
-- [Происхождение ConPTY](vendor/conpty/README.md)
-- [CI](https://github.com/RERCON0/ANVIL/actions/workflows/ci.yml) и [Security](https://github.com/RERCON0/ANVIL/actions/workflows/security.yml)
-
-ANVIL распространяется под [GPL-3.0-or-later](LICENSE). Автор — rercon prod.
+Licensed under [GPL-3.0-or-later](LICENSE). By rercon prod.

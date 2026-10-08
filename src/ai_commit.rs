@@ -159,7 +159,9 @@ pub(super) fn words(spec: &str) -> Result<Vec<String>, String> {
         }
     }
     if quote.is_some() {
-        return Err("AI: незакрытая кавычка в команде".to_owned());
+        return Err(
+            crate::strings::pick("AI: unmatched quote in command", "AI: незакрытая кавычка в команде").to_owned()
+        );
     }
     if started {
         words.push(word);
@@ -197,9 +199,11 @@ fn read_config(path: &Path) -> Result<Option<String>, String> {
     match crate::fsutil::read_limited(path, 2 * 1024 * 1024) {
         Ok(bytes) => String::from_utf8(bytes).map(Some).map_err(|e| format!("{}: {e}", path.display())),
         // `read_limited` reports only an exceeded cap as `InvalidData`.
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-            Err(format!("AI: конфигурация слишком велика: {}", path.display()))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(crate::tr_format!(
+            "AI: configuration is too large: {}",
+            "AI: конфигурация слишком велика: {}",
+            path.display()
+        )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
@@ -217,8 +221,13 @@ fn project(value: &serde_json::Value, keys: &[&str]) -> serde_json::Value {
 fn syntax_error(error: &json5::Error) -> String {
     let json5::Error::Message { location, .. } = error;
     match location {
-        Some(at) => format!("неверный JSON (строка {}, столбец {})", at.line, at.column),
-        None => "неверный JSON".to_owned(),
+        Some(at) => crate::tr_format!(
+            "invalid JSON (line {}, column {})",
+            "неверный JSON (строка {}, столбец {})",
+            at.line,
+            at.column
+        ),
+        None => crate::strings::pick("invalid JSON", "неверный JSON").to_owned(),
     }
 }
 
@@ -251,7 +260,7 @@ fn strip_runtime_injection(command: &mut Command) {
 pub(super) fn prepare(spec: &str) -> Result<Invocation, String> {
     let mut parts = words(spec)?.into_iter();
     let program =
-        parts.next().filter(|s| !s.is_empty()).ok_or_else(|| crate::strings::WORKSPACE_NO_AI_COMMAND.to_owned())?;
+        parts.next().filter(|s| !s.is_empty()).ok_or_else(|| crate::strings::WORKSPACE_NO_AI_COMMAND().to_owned())?;
     let backend = classify_backend(&program);
     let args: Vec<String> = parts.collect();
     #[cfg(windows)]
@@ -283,7 +292,11 @@ pub(super) fn prepare(spec: &str) -> Result<Invocation, String> {
     };
     // A shell/node wrapper around a known agent is not an escape hatch from its safe profile.
     if backend == Backend::Custom && args.iter().any(|arg| wrapper_hides_agent(arg)) {
-        return Err("AI: укажите исполняемый файл AI напрямую, без shell/node-обёртки".to_owned());
+        return Err(crate::strings::pick(
+            "AI: specify the AI executable directly, without a shell/node wrapper",
+            "AI: укажите исполняемый файл AI напрямую, без shell/node-обёртки",
+        )
+        .to_owned());
     }
     let directory = {
         sweep_stale_ai_state();
@@ -303,13 +316,20 @@ pub(super) fn prepare(spec: &str) -> Result<Invocation, String> {
                 continue;
             }
             match arg.as_str() {
-                "-m" | "--model" => model = Some(args.next().ok_or_else(|| "AI: не указана модель".to_owned())?),
+                "-m" | "--model" => {
+                    model = Some(args.next().ok_or_else(|| {
+                        crate::strings::pick("AI: model is missing", "AI: не указана модель").to_owned()
+                    })?)
+                }
                 "--variant" if backend == Backend::OpenCode => {
-                    variant = Some(args.next().ok_or_else(|| "AI: не указан вариант модели".to_owned())?)
+                    variant = Some(args.next().ok_or_else(|| {
+                        crate::strings::pick("AI: model variant is missing", "AI: не указан вариант модели").to_owned()
+                    })?)
                 }
                 _ if arg.starts_with("--model=") => model = Some(arg[8..].to_owned()),
                 _ => {
-                    return Err(format!(
+                    return Err(crate::tr_format!(
+                        "AI: parameter {arg} is not allowed in safe generation mode; --model is allowed",
                         "AI: параметр {arg} не разрешён в безопасном режиме генерации; разрешён --model"
                     ))
                 }
@@ -343,7 +363,9 @@ pub(super) fn codex_generate(
     prompt: &str,
     timeout: std::time::Duration,
 ) -> Result<String, String> {
-    let home = config_home().ok_or_else(|| "Codex: не найден каталог ~/.codex".to_owned())?;
+    let home = config_home().ok_or_else(|| {
+        crate::strings::pick("Codex: ~/.codex directory not found", "Codex: не найден каталог ~/.codex").to_owned()
+    })?;
     ai_codex::generate(&home, model, prompt, timeout).map(|text| plain_message(&text))
 }
 
@@ -527,14 +549,17 @@ fn claude(command: &mut Command) -> Result<(), String> {
         }
         command.arg("--bare");
     } else {
-        let root = root.as_deref().ok_or_else(|| "AI: невозможно проверить политику Claude".to_owned())?;
+        let root = root.as_deref().ok_or_else(|| {
+            crate::strings::pick("AI: cannot verify Claude policy", "AI: невозможно проверить политику Claude")
+                .to_owned()
+        })?;
         check_claude_managed_policy(root, true)?;
         // Personal pro/max accounts do not fetch organization-managed hooks.
         // Enterprise/token-only accounts cannot prove this contract before launch.
         let credentials = json_config(&root.join(".credentials.json"))?;
         let subscription = credentials.pointer("/claudeAiOauth/subscriptionType").and_then(serde_json::Value::as_str);
         if !matches!(subscription, Some("pro" | "max")) {
-            return Err("AI: административные hooks Claude не позволяют гарантировать генерацию без выполнения команд. Используйте API-ключ (режим --bare), другого AI-бэкенда или личную подписку pro/max".to_owned());
+            return Err(crate::strings::pick("AI: administrative Claude hooks prevent generation without executing commands. Use an API key (--bare), another AI backend or a personal pro/max subscription", "AI: административные hooks Claude не позволяют гарантировать генерацию без выполнения команд. Используйте API-ключ (режим --bare), другого AI-бэкенда или личную подписку pro/max").to_owned());
         }
         command.arg("--safe-mode");
     }
@@ -662,7 +687,13 @@ fn check_bundled_sdks(value: &serde_json::Value, provider: &str) -> Result<(), S
         serde_json::Value::Object(fields) => {
             for (key, value) in fields {
                 if key == "npm" {
-                    let npm = value.as_str().ok_or_else(|| "AI: OpenCode npm должен быть строкой".to_owned())?;
+                    let npm = value.as_str().ok_or_else(|| {
+                        crate::strings::pick(
+                            "AI: OpenCode npm must be a string",
+                            "AI: OpenCode npm должен быть строкой",
+                        )
+                        .to_owned()
+                    })?;
                     if !matches!(
                         npm,
                         "@ai-sdk/openai"
@@ -690,7 +721,7 @@ fn check_bundled_sdks(value: &serde_json::Value, provider: &str) -> Result<(), S
                             | "@ai-sdk/github-copilot"
                             | "venice-ai-sdk-provider"
                     ) {
-                        return Err(format!("AI: OpenCode provider {provider} использует исполняемый SDK {npm}, запрещённый для генерации коммита"));
+                        return Err(crate::tr_format!("AI: OpenCode provider {provider} uses executable SDK {npm}, which is not allowed for commit generation", "AI: OpenCode provider {provider} использует исполняемый SDK {npm}, запрещённый для генерации коммита"));
                     }
                 } else {
                     check_bundled_sdks(value, provider)?;
@@ -777,7 +808,9 @@ fn aider_python(command: &Command) -> Result<PathBuf, String> {
                 .and_then(|path| std::env::split_paths(&path).map(|dir| dir.join(&program)).find(|p| p.is_file()))
         }
     }
-    .ok_or_else(|| "AI: не найден установленный Aider".to_owned())?;
+    .ok_or_else(|| {
+        crate::strings::pick("AI: installed Aider not found", "AI: не найден установленный Aider").to_owned()
+    })?;
     use std::io::Read;
     let mut bytes = Vec::new();
     std::fs::File::open(&executable)
@@ -804,7 +837,11 @@ fn aider_python(command: &Command) -> Result<PathBuf, String> {
     if adjacent.is_file() {
         return Ok(adjacent);
     }
-    Err("AI: не найден Python установленного Aider; требуется pip/uv установка с доступным интерпретатором".to_owned())
+    Err(crate::strings::pick(
+        "AI: Aider Python not found; a pip/uv installation with an accessible interpreter is required",
+        "AI: не найден Python установленного Aider; требуется pip/uv установка с доступным интерпретатором",
+    )
+    .to_owned())
 }
 
 pub(super) fn prepare_models() -> Result<Invocation, String> {
@@ -859,17 +896,22 @@ fn reply(backend: Backend, output: &str) -> Result<String, String> {
                 .get(if backend == Backend::Gemini { "response" } else { "result" })
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
-                .ok_or_else(|| format!("{backend:?}: ответ не содержит текст сообщения"))
+                .ok_or_else(|| {
+                    crate::tr_format!(
+                        "{backend:?}: response contains no message text",
+                        "{backend:?}: ответ не содержит текст сообщения"
+                    )
+                })
         }
         Backend::Codex | Backend::Custom => Ok(output.to_owned()),
     }
 }
 
 fn gemini(command: &mut Command, dir: &Path) -> Result<(), String> {
-    let original_home = std::env::var_os("GEMINI_CLI_HOME")
-        .map(PathBuf::from)
-        .or_else(home)
-        .ok_or_else(|| "AI: не найден каталог авторизации Gemini".to_owned())?;
+    let original_home = std::env::var_os("GEMINI_CLI_HOME").map(PathBuf::from).or_else(home).ok_or_else(|| {
+        crate::strings::pick("AI: Gemini login directory not found", "AI: не найден каталог авторизации Gemini")
+            .to_owned()
+    })?;
     let original = original_home.join(".gemini");
     let source = json_config(&original.join("settings.json"))?;
     let mut settings = serde_json::json!({
@@ -954,7 +996,7 @@ pub(super) fn policy_is_executable(value: &serde_json::Value, hooks_active: bool
 }
 
 fn check_claude_managed_policy(root: &Path, hooks_active: bool) -> Result<(), String> {
-    let error = "AI: управляемая политика Claude содержит hooks/MCP/исполняемые настройки; генерация без выполнения команд невозможна. Используйте API-ключ (--bare), другого AI-бэкенда или обратитесь к администратору";
+    let error = crate::strings::pick("AI: managed Claude policy contains hooks/MCP/executable settings; generation without executing commands is unavailable. Use an API key (--bare), another AI backend or contact your administrator", "AI: управляемая политика Claude содержит hooks/MCP/исполняемые настройки; генерация без выполнения команд невозможна. Используйте API-ключ (--bare), другого AI-бэкенда или обратитесь к администратору");
     let mut paths = vec![root.join("remote-settings.json")];
     for key in ["CLAUDE_CODE_MANAGED_SETTINGS_PATH", "CLAUDE_CODE_REMOTE_SETTINGS_PATH"] {
         if let Some(path) = std::env::var_os(key) {
@@ -970,7 +1012,12 @@ fn check_claude_managed_policy(root: &Path, hooks_active: bool) -> Result<(), St
     match std::fs::read_dir(system.join("managed-settings.d")) {
         Ok(entries) => {
             for entry in entries {
-                let entry = entry.map_err(|e| format!("AI: не удалось проверить managed settings: {e}"))?;
+                let entry = entry.map_err(|e| {
+                    crate::tr_format!(
+                        "AI: could not inspect managed settings: {e}",
+                        "AI: не удалось проверить managed settings: {e}"
+                    )
+                })?;
                 let name = entry.file_name();
                 if !name.to_string_lossy().starts_with('.') && entry.path().extension().is_some_and(|e| e == "json") {
                     paths.push(entry.path());
@@ -978,7 +1025,12 @@ fn check_claude_managed_policy(root: &Path, hooks_active: bool) -> Result<(), St
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("AI: не удалось проверить managed settings: {e}")),
+        Err(e) => {
+            return Err(crate::tr_format!(
+                "AI: could not inspect managed settings: {e}",
+                "AI: не удалось проверить managed settings: {e}"
+            ))
+        }
     }
     for path in paths {
         let is_mcp = path.file_name().is_some_and(|n| n == "managed-mcp.json");
@@ -1015,7 +1067,10 @@ fn claude_registry_policies() -> Result<Vec<serde_json::Value>, String> {
                 continue;
             }
             if status != ERROR_SUCCESS {
-                return Err(format!("AI: не удалось проверить registry policy Claude ({status})"));
+                return Err(crate::tr_format!(
+                    "AI: could not inspect Claude registry policy ({status})",
+                    "AI: не удалось проверить registry policy Claude ({status})"
+                ));
             }
             let result = (|| {
                 let mut kind = 0;
@@ -1039,7 +1094,10 @@ fn claude_registry_policies() -> Result<Vec<serde_json::Value>, String> {
                     || bytes > 2 * 1024 * 1024
                     || bytes % 2 != 0
                 {
-                    return Err(format!("AI: не удалось прочитать registry policy Claude ({status})"));
+                    return Err(crate::tr_format!(
+                        "AI: could not read Claude registry policy ({status})",
+                        "AI: не удалось прочитать registry policy Claude ({status})"
+                    ));
                 }
                 let mut utf16 = vec![0u16; bytes as usize / 2];
                 // SAFETY: allocated buffer is bytes long, returned size is bounded again below.
@@ -1054,7 +1112,10 @@ fn claude_registry_policies() -> Result<Vec<serde_json::Value>, String> {
                     )
                 };
                 if status != ERROR_SUCCESS {
-                    return Err(format!("AI: не удалось прочитать registry policy Claude ({status})"));
+                    return Err(crate::tr_format!(
+                        "AI: could not read Claude registry policy ({status})",
+                        "AI: не удалось прочитать registry policy Claude ({status})"
+                    ));
                 }
                 let text = String::from_utf16(&utf16).map_err(|e| e.to_string())?;
                 let value = serde_json::from_str(text.trim_end_matches('\0'))

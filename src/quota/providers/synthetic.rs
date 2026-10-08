@@ -28,7 +28,7 @@ pub fn parse(body: &[u8]) -> Result<Fetched, FetchError> {
             let used = (max - remaining) / max * 100.0;
             windows.push(Window::new(
                 "5h",
-                format!("5{}", strings::QUOTA_UNIT_HOUR),
+                format!("5{}", strings::QUOTA_UNIT_HOUR()),
                 used,
                 rolling.get("nextTickAt").and_then(epoch_from_json),
             ));
@@ -44,7 +44,7 @@ pub fn parse(body: &[u8]) -> Result<Fetched, FetchError> {
         if let Some(used) = reported.or(computed) {
             windows.push(Window::new(
                 "7d",
-                format!("7{}", strings::QUOTA_UNIT_DAY),
+                format!("7{}", strings::QUOTA_UNIT_DAY()),
                 used,
                 weekly.get("nextRegenAt").and_then(epoch_from_json),
             ));

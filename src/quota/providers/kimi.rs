@@ -46,7 +46,7 @@ pub fn parse(body: &[u8], now: i64) -> Result<Fetched, FetchError> {
     let mut windows: Vec<Window> = Vec::new();
     if let Some(usage) = data.get("usage").filter(|u| u.is_object()) {
         if let Some(used) = used_pct(usage) {
-            windows.push(Window::new("7d", format!("7{}", strings::QUOTA_UNIT_DAY), used, reset(usage, now)));
+            windows.push(Window::new("7d", format!("7{}", strings::QUOTA_UNIT_DAY()), used, reset(usage, now)));
         }
     }
     for item in data.get("limits").and_then(Value::as_array).into_iter().flatten() {

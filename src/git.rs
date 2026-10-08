@@ -221,7 +221,7 @@ impl<'a> PathResolver<'a> {
 }
 
 fn resolve_inside(root: &Path, canonical_root: &Path, path: &str) -> Result<PathBuf, String> {
-    let inside = crate::strings::WORKSPACE_PATH_INSIDE_REPO;
+    let inside = crate::strings::WORKSPACE_PATH_INSIDE_REPO();
     local_path(root)?;
     let clean = path.replace('\\', "/");
     if clean.is_empty() || clean.starts_with('/') || clean.contains(':') {
@@ -732,11 +732,19 @@ fn path_is_inside(path: &Path, root: &Path) -> bool {
 }
 
 fn config_refusal() -> String {
-    "Не удалось безопасно прочитать конфигурацию Git; доступ к репозиторию не разрешён.".to_owned()
+    crate::strings::pick(
+        "Could not safely read Git configuration; repository access is blocked.",
+        "Не удалось безопасно прочитать конфигурацию Git; доступ к репозиторию не разрешён.",
+    )
+    .to_owned()
 }
 
 fn network_refusal() -> String {
-    "Git-панель не открывает сетевые репозитории и сетевые пути конфигурации.".to_owned()
+    crate::strings::pick(
+        "The Git panel does not open network repositories or network configuration paths.",
+        "Git-панель не открывает сетевые репозитории и сетевые пути конфигурации.",
+    )
+    .to_owned()
 }
 
 /// Lexical rejection happens before any filesystem call. In particular, do
@@ -1385,7 +1393,7 @@ fn git_executable() -> Result<PathBuf, String> {
             return Ok(candidate);
         }
     }
-    Err("Не найден Git.".to_owned())
+    Err(crate::strings::pick("Git not found.", "Не найден Git.").to_owned())
 }
 
 fn global_configs(executable: &Path) -> Result<Vec<PathBuf>, String> {
@@ -2225,7 +2233,7 @@ fn parse_log(
 /// Files and message of one commit, relative to its first parent.
 pub fn commit_detail(root: &Path, hash: &str) -> Result<CommitDetail, String> {
     if !is_object_hash(hash) {
-        return Err(crate::strings::WORKSPACE_NO_SUCH_FILE.to_owned());
+        return Err(crate::strings::WORKSPACE_NO_SUCH_FILE().to_owned());
     }
     // `--end-of-options` keeps a revision from ever being read as an option,
     // so every option must precede it: git rejects options that follow.
@@ -2298,7 +2306,7 @@ pub fn commit_detail(root: &Path, hash: &str) -> Result<CommitDetail, String> {
 /// Load only the selected commit file; paths remain literal even with glob characters.
 pub fn commit_file_diff(root: &Path, hash: &str, path: &str) -> Result<String, String> {
     if !is_object_hash(hash) {
-        return Err(crate::strings::WORKSPACE_NO_SUCH_FILE.to_owned());
+        return Err(crate::strings::WORKSPACE_NO_SUCH_FILE().to_owned());
     }
     run_git(
         root,
@@ -2509,11 +2517,9 @@ fn find_shim(program: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
 /// Parses the npm shim template: `"%_prog%" "%dp0%\node_modules\...\cli.js"`.
 #[cfg(windows)]
 fn npm_shim_targets(shim: &Path) -> Option<(PathBuf, PathBuf)> {
-    const SHIM_MAX_BYTES: u64 = 64 * 1024;
-    if std::fs::metadata(shim).ok()?.len() > SHIM_MAX_BYTES {
-        return None;
-    }
-    let text = std::fs::read_to_string(shim).ok()?;
+    const SHIM_MAX_BYTES: usize = 64 * 1024;
+    // Bound the opened handle, including a shim rewritten after metadata lookup.
+    let text = String::from_utf8(crate::fsutil::read_limited(shim, SHIM_MAX_BYTES).ok()?).ok()?;
     let directory = shim.parent()?;
     let script = text
         .match_indices("%dp0%")
@@ -2624,9 +2630,13 @@ fn fit_ai_prompt<'a>(
         .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat"));
     let suffix_units = suffix.iter().map(|arg| 1 + windows_argument_units(arg.as_ref(), batch)).sum::<usize>();
     let limit = if batch { WINDOWS_BATCH_LIMIT } else { WINDOWS_COMMAND_LIMIT };
-    let available = limit
-        .checked_sub(windows_command_units(command, batch) + suffix_units + 1)
-        .ok_or_else(|| "Команда AI превышает лимит командной строки Windows".to_owned())?;
+    let available = limit.checked_sub(windows_command_units(command, batch) + suffix_units + 1).ok_or_else(|| {
+        crate::strings::pick(
+            "AI command exceeds the Windows command line limit",
+            "Команда AI превышает лимит командной строки Windows",
+        )
+        .to_owned()
+    })?;
     if windows_argument_units(prompt.as_ref(), batch) <= available {
         return Ok(prompt.into());
     }
@@ -2634,8 +2644,10 @@ fn fit_ai_prompt<'a>(
     // safely rejects multiline batch arguments rather than shell-escaping them.
     let separator = if batch { ' ' } else { '\n' };
     let marker_units = windows_argument_units(AI_TRUNCATED.as_ref(), batch) + 1;
-    let room =
-        available.checked_sub(marker_units).ok_or_else(|| "Команда AI не оставляет места для запроса".to_owned())?;
+    let room = available.checked_sub(marker_units).ok_or_else(|| {
+        crate::strings::pick("AI command leaves no room for the prompt", "Команда AI не оставляет места для запроса")
+            .to_owned()
+    })?;
     let mut used = 0;
     let mut backslashes = 0;
     let mut end = 0;
@@ -2699,7 +2711,7 @@ pub const AI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 pub fn opencode_models() -> Result<Vec<String>, String> {
     let ai_commit::Invocation { program, directory: _directory, .. } = ai_commit::prepare_models()?;
     let Some(command) = program else {
-        return Err("OpenCode: нет команды".to_owned());
+        return Err(crate::strings::pick("OpenCode: command is missing", "OpenCode: нет команды").to_owned());
     };
     // The CLI gets its credentials through the environment and may echo them
     // in its error, which the settings page then shows.
@@ -2711,7 +2723,9 @@ pub fn opencode_models() -> Result<Vec<String>, String> {
     }
     let models = parse_opencode_models(&String::from_utf8_lossy(&stdout));
     if models.is_empty() {
-        return Err("OpenCode не вернул список моделей".to_owned());
+        return Err(
+            crate::strings::pick("OpenCode returned no model list", "OpenCode не вернул список моделей").to_owned()
+        );
     }
     Ok(models)
 }
@@ -2740,7 +2754,13 @@ fn opencode_commit_config(existing: Option<&str>) -> Result<String, String> {
         Some(text) => serde_json::from_str(text).map_err(|error| format!("OPENCODE_CONFIG_CONTENT: {error}"))?,
         None => serde_json::json!({}),
     };
-    let object = config.as_object_mut().ok_or_else(|| "OPENCODE_CONFIG_CONTENT: нужен JSON-объект".to_owned())?;
+    let object = config.as_object_mut().ok_or_else(|| {
+        crate::strings::pick(
+            "OPENCODE_CONFIG_CONTENT: a JSON object is required",
+            "OPENCODE_CONFIG_CONTENT: нужен JSON-объект",
+        )
+        .to_owned()
+    })?;
     object.insert("mcp".to_owned(), serde_json::json!({}));
     object.insert("plugin".to_owned(), serde_json::json!([]));
     object.insert("command".to_owned(), serde_json::json!({}));
@@ -2784,8 +2804,9 @@ struct OpenCodeText {
 fn opencode_message(text: &str) -> Result<String, String> {
     let mut message = String::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let event: OpenCodeEvent =
-            serde_json::from_str(line).map_err(|error| format!("OpenCode: неверный JSON-ответ ({error})"))?;
+        let event: OpenCodeEvent = serde_json::from_str(line).map_err(|error| {
+            crate::tr_format!("OpenCode: invalid JSON response ({error})", "OpenCode: неверный JSON-ответ ({error})")
+        })?;
         match event {
             OpenCodeEvent::Text { part } => message.push_str(&part.text),
             OpenCodeEvent::Error { error } => {
@@ -2793,7 +2814,7 @@ fn opencode_message(text: &str) -> Result<String, String> {
                     .pointer("/data/message")
                     .or_else(|| error.get("message"))
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("OpenCode вернул ошибку")
+                    .unwrap_or(crate::strings::pick("OpenCode returned an error", "OpenCode вернул ошибку"))
                     .to_owned());
             }
             OpenCodeEvent::Other => {}
@@ -2849,7 +2870,7 @@ pub fn ai_commit_message(command: Option<&str>, prompt: &str, timeout: std::time
     };
     let message = clean_ai_message(&text);
     if message.is_empty() {
-        return Err(crate::strings::WORKSPACE_AI_EMPTY.to_owned());
+        return Err(crate::strings::WORKSPACE_AI_EMPTY().to_owned());
     }
     Ok(message.to_owned())
 }
@@ -3070,7 +3091,7 @@ fn branch_remote(root: &Path, branch: &str, pushing: bool) -> Result<String, Str
         })
         .unwrap_or_else(|| "origin".to_owned());
     if remote.starts_with('-') || remote.chars().any(char::is_control) {
-        return Err(crate::strings::WORKSPACE_PATH_INSIDE_REPO.to_owned());
+        return Err(crate::strings::WORKSPACE_PATH_INSIDE_REPO().to_owned());
     }
     Ok(remote)
 }
@@ -3078,7 +3099,7 @@ fn branch_remote(root: &Path, branch: &str, pushing: bool) -> Result<String, Str
 fn current_branch(root: &Path) -> Result<String, String> {
     let branch = run_git(root, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim().to_owned();
     if branch.is_empty() || branch == "HEAD" {
-        return Err(crate::strings::WORKSPACE_NO_BRANCH.to_owned());
+        return Err(crate::strings::WORKSPACE_NO_BRANCH().to_owned());
     }
     Ok(branch)
 }

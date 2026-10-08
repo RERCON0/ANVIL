@@ -185,15 +185,15 @@ fn network_gitfiles_and_commondir_are_rejected_by_all_command_routes() {
     ] {
         std::fs::write(fake.join(".git"), format!("gitdir: {target}\n")).unwrap();
         let error = git::repository_identity(&fake).unwrap_err();
-        assert!(error.contains("сетевые"), "{error}");
+        assert!(error.contains("network"), "{error}");
         assert!(git::find_root(&fake).is_none());
-        assert!(git::run_git(&fake, &["config", "--list"]).unwrap_err().contains("сетевые"));
-        assert!(git::status(&fake).unwrap_err().contains("сетевые"));
-        assert!(git::commit(&fake, "must not run".to_owned()).unwrap_err().contains("сетевые"));
-        assert!(git::resolve_path(Path::new(target), "tracked.txt").unwrap_err().contains("сетевые"));
+        assert!(git::run_git(&fake, &["config", "--list"]).unwrap_err().contains("network"));
+        assert!(git::status(&fake).unwrap_err().contains("network"));
+        assert!(git::commit(&fake, "must not run".to_owned()).unwrap_err().contains("network"));
+        assert!(git::resolve_path(Path::new(target), "tracked.txt").unwrap_err().contains("network"));
     }
     std::fs::write(dir.path().join(".git/commondir"), "//127.0.0.1/ANVIL-denied/common\n").unwrap();
-    assert!(git::repository_stamp(dir.path()).unwrap_err().contains("сетевые"));
+    assert!(git::repository_stamp(dir.path()).unwrap_err().contains("network"));
 }
 
 #[test]
@@ -208,8 +208,8 @@ fn network_includes_and_external_attributes_are_rejected_before_git_reads_them()
             ["//127.0.0.1/ANVIL-denied/file", r"\\?\UNC\127.0.0.1\ANVIL-denied\file", "file://example.invalid/file"]
         {
             std::fs::write(&config, format!("{original}\n[{section}]\n {key} = {}\n", quoted_config(target))).unwrap();
-            assert!(git::repository_identity(dir.path()).unwrap_err().contains("сетевые"));
-            assert!(git::run_git(dir.path(), &["config", "--includes", "--list"]).unwrap_err().contains("сетевые"));
+            assert!(git::repository_identity(dir.path()).unwrap_err().contains("network"));
+            assert!(git::run_git(dir.path(), &["config", "--includes", "--list"]).unwrap_err().contains("network"));
         }
     }
 }
@@ -267,9 +267,9 @@ fn quoted_local_alternates_work_and_octal_unc_is_rejected_by_command_consumers()
     assert!(git::repository_stamp(dir.path()).unwrap().is_hazard_free());
     assert!(!git::status(dir.path()).unwrap().branch.is_empty());
     std::fs::write(objects.join("info/alternates"), "\"\\134\\134127.0.0.1\\134ANVIL-denied\"\n").unwrap();
-    assert!(git::repository_stamp(dir.path()).unwrap_err().contains("сетевые"));
-    assert!(git::status(dir.path()).unwrap_err().contains("сетевые"));
-    assert!(git::run_git(dir.path(), &["rev-parse", "HEAD"]).unwrap_err().contains("сетевые"));
+    assert!(git::repository_stamp(dir.path()).unwrap_err().contains("network"));
+    assert!(git::status(dir.path()).unwrap_err().contains("network"));
+    assert!(git::run_git(dir.path(), &["rev-parse", "HEAD"]).unwrap_err().contains("network"));
 }
 
 #[test]

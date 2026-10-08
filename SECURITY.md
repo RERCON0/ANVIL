@@ -1,69 +1,84 @@
-# Безопасность ANVIL
+# ANVIL security
 
-## Автоматические проверки
+## Reporting
 
-- **CI:** форматирование, Clippy с запретом предупреждений и Rust-тесты.
-- **Windows x64:** настоящие ConPTY-сессии и Git-репозитории в интеграционных тестах; сборка портативного пакета, проверка его состава, лицензий, SHA-256, исходного коммита, архитектуры и PE-флагов ASLR/DEP.
-- **Конкурентная запись:** атомарная замена и чтение повторяют только кратковременные Windows access/sharing/lock-ошибки в пределах 500 мс. Проверка дескрипторов и потоков запускается в отдельном процессе тестового harness, чтобы другие тесты не искажали счётчики.
-- **Security:** проверка всего `Cargo.lock` через RustSec; уязвимости, unsound и yanked-пакеты завершают проверку ошибкой. Информационные advisory остаются видимыми в журнале.
-- **Секреты:** Gitleaks проверяет полную Git-историю с редактированием секретов в выводе. Единственное исключение — конкретный синтетический токен в тесте редактирования ошибок провайдера; оно ограничено точным значением и файлом.
-- **Workflow:** actionlint проверяет YAML, выражения Actions и shell-команды. Actions закреплены полными commit SHA; Gitleaks и actionlint — версиями и SHA-256 архивов.
-- **Обновления:** Dependabot предлагает еженедельные изменения Cargo-зависимостей и Actions. Автоматического слияния нет.
+Report credential leaks or code-execution problems privately to
+[the author on Telegram](https://t.me/rercon). Include the version, a minimal
+reproduction and expected behaviour; do not publish real tokens or keys.
 
-У workflow только `contents: read`; checkout не сохраняет Git-учётные данные.
-CI не получает ключей AI-провайдеров и не публикует GitHub Releases.
-Кэш Cargo сохраняется только из push в `main`; собственные crates проекта
-и установленные инструменты в него не входят. Push в `main` и pull request
-проверяются отдельно, без повторного запуска одной PR-ветки на её push.
+## Automated checks
 
-## Учётные данные и AI-коммиты
+- CI runs formatting, Clippy with warnings denied, Rust/Python tests and real Windows ConPTY/Git integration.
+- Packages are checked against their exact source revision, licences, file hashes, x64 GUI/CLI subsystems and ASLR/high-entropy ASLR/DEP. Dynamic Visual C++ runtime dependencies are rejected.
+- Security audits the complete locked dependency graph with RustSec; vulnerabilities, unsound and yanked dependencies fail the job. Informational advisories remain visible.
+- Gitleaks scans the complete Git history with redacted output. The single exception is an exact synthetic test token, restricted to its test file and value.
+- actionlint validates workflows and shell commands. Actions use full commit SHA pins; downloaded Gitleaks/actionlint archives have pinned SHA-256 hashes.
+- Dependabot proposes Cargo and Actions updates. Updates are reviewed rather than automatically merged.
 
-Встроенные AI-профили ограничивают инструменты, хуки и внешние плагины;
-Codex использует Responses-протокол без исполнения событий инструментов; запрос
-идёт через системный WinHTTP (TLS, прокси и хранилище сертификатов Windows) только
-на фиксированные адреса OpenAI, перенаправления не выполняются.
-Произвольная команда `workspace.aiCommitCommand` остаётся пользовательским
-кодом. Это не песочница ОС: установленным CLI и собственным командам нужно доверять.
+Workflows have only `contents: read`; checkout does not persist Git credentials.
+CI receives no AI credentials or signing key and does not publish releases.
+Dependency caches are saved only by pushes to `main`; workspace crates and
+installed tools are excluded. Push and PR events avoid duplicate PR-branch runs.
 
-Staged-diff передаётся AI-провайдеру; для внешних CLI он также попадает в
-аргумент процесса. Секреты не должны находиться в индексе перед генерацией.
-Ключи и токены встроенных профилей передаются окружением. Диагностика
-(тексты ошибок провайдера, HTTP-кода и потоковых событий) редактирует
-совпавшие значения ключей и токенов, включая унаследованные переменные
-окружения CLI. Изолированные временные каталоги удаляются после ответа;
-после аварийного завершения остатки старше часа подчищаются при старте и
-перед следующей генерацией.
+## Credentials and AI commit messages
 
-ANVIL не обновляет OAuth-токены CLI. Истёкший вход нужно восстановить в
-соответствующем клиенте. Отдельные ключи квот хранятся в Windows Credential
-Manager; это защита на уровне учётной записи Windows, не изоляция от других
-программ того же пользователя.
+Built-in AI command profiles restrict tools, hooks and plugins. Codex commit
+messages use the Responses protocol, without executing tool events. Requests use
+system WinHTTP/TLS and fixed OpenAI endpoints; redirects are disabled.
+A custom `workspace.aiCommitCommand` is trusted user code, not an OS sandbox.
 
-## Терминал, Git и файлы
+The staged diff goes to the AI provider; external CLI backends also receive it
+as a process argument. Do not stage secrets before requesting a message.
+Known keys and tokens, including inherited CLI credentials, are redacted from
+provider/HTTP/stream diagnostics. Temporary backend state is removed after use;
+crash leftovers older than one hour are swept in the background at startup
+and before another generation.
 
-- OSC 52 выключен по умолчанию. Управляющие символы фильтруются при вставке; многострочный текст без bracketed paste требует подтверждения предпросмотра.
-- Git-конфигурация, способная запускать программы, требует доверия пользователя. Разрешение живёт в памяти и сбрасывается при изменении опасных настроек.
-- Предварительная проверка Git-метаданных ограничивает объём, глубину обхода и время. Сетевые и device-пути отклоняются до обращения к их целям.
-- Git- и AI-команды панели запускаются в Windows Job Object с дедлайном и ограничением stdout/stderr. Эти ограничения не завершают живые пользовательские CLI-сессии в терминале.
-- Поиск DLL ограничен каталогом приложения и `System32`. Вендоренный ConPTY проверяется по закреплённым SHA-256 до сборки пакета.
-- Удаление из дерева файлов после подтверждения использует корзину Windows. Скрипты и исполняемые форматы через «Открыть в системе» подсвечиваются в проводнике.
+ANVIL does not refresh CLI OAuth tokens. Reauthenticate in the relevant CLI
+when a login expires. Separate quota keys use Windows Credential Manager:
+this protects at the Windows account boundary, not from other programs running
+as the same user. Quota requests run off the UI thread with response limits,
+timeouts and rate-limit backoff; application windows share polling/cache state.
 
-Точные правила, включая доверие подмодулям, — в [справочнике](docs/REFERENCE.md#панель-git).
+## Terminal, Git and files
 
-## Известные ограничения
+- OSC 52 is off by default. Paste filters control characters; multiline text requires a preview when bracketed paste is unavailable.
+- Activated links use an allowlist of schemes, reject controls and are capped at 32 KiB. URL punctuation trimming runs in linear time.
+- Git settings capable of launching programs require explicit trust. Approval is held in memory and invalidated by changes to relevant settings.
+- Git metadata preflight bounds size, traversal depth and time. Network/device paths are rejected before accessing their targets.
+- Panel Git/AI commands use deadlines, bounded stdout/stderr and Windows Job Objects to clean up subprocess trees. These limits do not terminate user CLI sessions in terminal panes.
+- DLL lookup is restricted to the application directory and `System32`. Vendored ConPTY hashes are checked before packaging.
+- File previews have bounded reads; closing a preview invalidates delayed responses. Claude integration settings are read through a handle with a 2 MiB limit, including mutation and reread boundaries.
+- Confirmed file deletion uses the Windows Recycle Bin. Executable formats opened from the browser are revealed in Explorer.
+- Atomic file reads/replacements retry only transient Windows access/sharing/lock errors, within 500 ms.
 
-Проверка Git-метаданных использует снимок файловой системы. Она не изолирует
-репозиторий атомарно от другого процесса, меняющего его между проверкой и запуском.
+Detailed Git/submodule trust rules are in the
+[reference](docs/REFERENCE.md#панель-git).
 
-Скроллбек и кэши ограничены, но общего потолка памяти нет: combining-символы
-в одной ячейке Alacritty и очередь ввода при остановившемся читателе требуют
-отдельного ограничения с обратным давлением. Пересчёт раскладки большого
-предпросмотра всё ещё может занять UI-поток. Подробности — в разделе
-[долгих CLI-сессий](docs/REFERENCE.md#долгие-cli-сессии).
+## Signed releases
 
-Текущие пакеты разработки не имеют Authenticode или detached signature.
-`BUILD.json` и SHA-256 позволяют проверять состав и целостность; издателя они
-не подтверждают. Артефакты CI доступны участникам репозитория и помечены unsigned.
+Release packages have an Ed25519-signed inventory, with every payload hash and
+source/build provenance. Verification uses an independently trusted publisher
+key, checks bounded ZIP/JSON/PE data and does not execute or extract payloads.
+The private key stays outside Git and CI. See
+[RELEASING](docs/RELEASING.md) for the fingerprint and procedure.
 
-О проблеме с учётными данными или исполнением кода сообщайте автору
-[лично в Telegram](https://t.me/rercon), без публикации самих ключей и токенов.
+This is not Authenticode, so Windows SmartScreen may still warn. CI/development
+candidates remain explicitly unsigned. Hashes in an unsigned candidate establish
+integrity against its metadata, not publisher identity.
+
+## Known boundaries
+
+Git/filesystem checks use snapshots. They do not atomically isolate a repository
+from another process changing it between validation and execution. Installed
+shells, CLIs and custom commands run as the current Windows user.
+
+Scrollback and caches are bounded, but there is no overall memory ceiling:
+combining characters inside one upstream Alacritty cell and queued input when a
+PTY reader stops still need separate limits and backpressure. Initial layout of
+a large preview can occupy the UI thread. See the
+[long-session reference](docs/REFERENCE.md#долгие-cli-сессии).
+
+External provider API compatibility is tested with fixtures; upstream changes
+may require adapter updates. Passing checks and a valid package signature do not
+establish the absence of all vulnerabilities.

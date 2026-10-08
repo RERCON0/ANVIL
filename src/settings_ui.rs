@@ -40,13 +40,13 @@ impl SettingsSection {
 
     fn title(self) -> &'static str {
         match self {
-            SettingsSection::Appearance => strings::SETTINGS_APPEARANCE,
-            SettingsSection::Terminal => strings::SETTINGS_TERMINAL,
-            SettingsSection::Profiles => strings::SETTINGS_PROFILES,
-            SettingsSection::Workspace => strings::SETTINGS_WORKSPACE,
-            SettingsSection::Hotkeys => strings::SETTINGS_HOTKEYS,
-            SettingsSection::Claude => strings::SETTINGS_CLAUDE,
-            SettingsSection::Quota => strings::SETTINGS_QUOTA,
+            SettingsSection::Appearance => strings::SETTINGS_APPEARANCE(),
+            SettingsSection::Terminal => strings::SETTINGS_TERMINAL(),
+            SettingsSection::Profiles => strings::SETTINGS_PROFILES(),
+            SettingsSection::Workspace => strings::SETTINGS_WORKSPACE(),
+            SettingsSection::Hotkeys => strings::SETTINGS_HOTKEYS(),
+            SettingsSection::Claude => strings::SETTINGS_CLAUDE(),
+            SettingsSection::Quota => strings::SETTINGS_QUOTA(),
         }
     }
 }
@@ -110,7 +110,7 @@ impl SettingsState {
             match rx.try_recv() {
                 Ok(result) => self.model_catalog = ModelCatalog::Ready(result),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.model_catalog = ModelCatalog::Ready(Err(strings::WORKSPACE_AI_EMPTY.to_owned()));
+                    self.model_catalog = ModelCatalog::Ready(Err(strings::WORKSPACE_AI_EMPTY().to_owned()));
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
@@ -161,8 +161,10 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, cx: &mut SettingsContext, state: &mut
     ui.scope_builder(
         egui::UiBuilder::new().max_rect(rect.shrink2(Vec2::new(18.0, 12.0))).id_salt("settings-page"),
         |ui| {
-            ui.label(RichText::new(strings::TAB_SETTINGS).color(theme::colors().text).font(theme::title_font(15.0)));
-            ui.label(RichText::new(strings::SETTINGS_APPLY_HINT).color(theme::colors().faint).font(theme::font(11.5)));
+            ui.label(RichText::new(strings::TAB_SETTINGS()).color(theme::colors().text).font(theme::title_font(15.0)));
+            ui.label(
+                RichText::new(strings::SETTINGS_APPLY_HINT()).color(theme::colors().faint).font(theme::font(11.5)),
+            );
             ui.add_space(10.0);
 
             // One section at a time: the list on the left, its rows on the right.
@@ -243,8 +245,8 @@ fn font_family_field(ui: &mut egui::Ui, id: egui::Id, current: &str) -> Option<S
 }
 
 fn section_appearance(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut SettingsOutcome) {
-    theme::section(ui, strings::SETTINGS_APPEARANCE);
-    theme::tag(ui, strings::SETTINGS_FONT);
+    theme::section(ui, strings::SETTINGS_APPEARANCE());
+    theme::tag(ui, strings::SETTINGS_FONT());
     ui.horizontal(|ui| {
         egui::ComboBox::from_id_salt("font-family")
             .width(220.0)
@@ -262,21 +264,21 @@ fn section_appearance(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut
             cx.config.font.family = family;
             outcome.changed = true;
         }
-        if ui.add(theme::ghost_button(strings::SETTINGS_FONT_REFRESH)).clicked() {
+        if ui.add(theme::ghost_button(strings::SETTINGS_FONT_REFRESH())).clicked() {
             outcome.refresh_fonts = true;
         }
     });
-    theme::tag(ui, strings::SETTINGS_FONT_SIZE);
+    theme::tag(ui, strings::SETTINGS_FONT_SIZE());
     outcome.changed |= theme::stepper_f32(ui, &mut cx.config.font.size, 6.0, 48.0, 1.0);
-    theme::tag(ui, strings::SETTINGS_SCHEME);
+    theme::tag(ui, strings::SETTINGS_SCHEME());
     ui.horizontal(|ui| {
         egui::ComboBox::from_id_salt("color-scheme")
             .width(220.0)
-            .selected_text(RichText::new(cx.config.color_scheme.clone()).font(theme::field_font(13.0)))
+            .selected_text(RichText::new(strings::scheme_label(&cx.config.color_scheme)).font(theme::field_font(13.0)))
             .show_ui(ui, |ui| {
                 let names = crate::app::scheme_names(cx.config);
                 for name in &names {
-                    if ui.selectable_label(*name == cx.config.color_scheme, name).clicked() {
+                    if ui.selectable_label(*name == cx.config.color_scheme, strings::scheme_label(name)).clicked() {
                         cx.config.color_scheme = name.clone();
                         outcome.changed = true;
                     }
@@ -296,15 +298,15 @@ fn section_appearance(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut
 }
 
 fn section_terminal(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut SettingsOutcome) {
-    theme::section(ui, strings::SETTINGS_TERMINAL);
-    theme::tag(ui, strings::SETTINGS_SCROLLBACK);
+    theme::section(ui, strings::SETTINGS_TERMINAL());
+    theme::tag(ui, strings::SETTINGS_SCROLLBACK());
     outcome.changed |= theme::stepper(ui, &mut cx.config.terminal.scrollback, 0, crate::config::MAX_SCROLLBACK, 1000);
-    theme::tag(ui, strings::SETTINGS_CURSOR);
+    theme::tag(ui, strings::SETTINGS_CURSOR());
     ui.horizontal(|ui| {
         for (shape, label) in [
-            (CursorShapeConfig::Block, strings::CURSOR_BLOCK),
-            (CursorShapeConfig::Bar, strings::CURSOR_BAR),
-            (CursorShapeConfig::Underline, strings::CURSOR_UNDERLINE),
+            (CursorShapeConfig::Block, strings::CURSOR_BLOCK()),
+            (CursorShapeConfig::Bar, strings::CURSOR_BAR()),
+            (CursorShapeConfig::Underline, strings::CURSOR_UNDERLINE()),
         ] {
             if theme::choice(ui, label, cx.config.terminal.cursor.shape == shape).clicked() {
                 cx.config.terminal.cursor.shape = shape;
@@ -313,17 +315,17 @@ fn section_terminal(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut S
         }
         ui.add_space(10.0);
         let blink = cx.config.terminal.cursor.blink;
-        if theme::choice(ui, strings::SETTINGS_BLINK, blink).clicked() {
+        if theme::choice(ui, strings::SETTINGS_BLINK(), blink).clicked() {
             cx.config.terminal.cursor.blink = !blink;
             outcome.changed = true;
         }
     });
     // The bell is honoured at run time, so it belongs here: a config option with no
     // row reads as a feature that was removed.
-    theme::tag(ui, strings::SETTINGS_BELL);
+    theme::tag(ui, strings::SETTINGS_BELL());
     ui.horizontal(|ui| {
         for (mode, label) in
-            [(crate::config::Bell::Off, strings::BELL_OFF), (crate::config::Bell::Visual, strings::BELL_VISUAL)]
+            [(crate::config::Bell::Off, strings::BELL_OFF()), (crate::config::Bell::Visual, strings::BELL_VISUAL())]
         {
             if theme::choice(ui, label, cx.config.terminal.bell == mode).clicked() {
                 cx.config.terminal.bell = mode;
@@ -331,12 +333,12 @@ fn section_terminal(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut S
             }
         }
     });
-    theme::tag(ui, strings::SETTINGS_RIGHT_CLICK);
+    theme::tag(ui, strings::SETTINGS_RIGHT_CLICK());
     ui.horizontal(|ui| {
         for (mode, label) in [
-            (RightClick::Clipboard, strings::RIGHT_CLICK_CLIPBOARD),
-            (RightClick::Paste, strings::RIGHT_CLICK_PASTE),
-            (RightClick::Menu, strings::RIGHT_CLICK_MENU),
+            (RightClick::Clipboard, strings::RIGHT_CLICK_CLIPBOARD()),
+            (RightClick::Paste, strings::RIGHT_CLICK_PASTE()),
+            (RightClick::Menu, strings::RIGHT_CLICK_MENU()),
         ] {
             if theme::choice(ui, label, cx.config.terminal.right_click == mode).clicked() {
                 cx.config.terminal.right_click = mode;
@@ -346,22 +348,22 @@ fn section_terminal(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut S
     });
     ui.horizontal(|ui| {
         let middle = cx.config.terminal.paste_on_middle_click;
-        if theme::choice(ui, strings::SETTINGS_MIDDLE_CLICK, middle).clicked() {
+        if theme::choice(ui, strings::SETTINGS_MIDDLE_CLICK(), middle).clicked() {
             cx.config.terminal.paste_on_middle_click = !middle;
             outcome.changed = true;
         }
         ui.add_space(10.0);
         let copy = cx.config.terminal.copy_on_select;
-        if theme::choice(ui, strings::SETTINGS_COPY_ON_SELECT, copy).clicked() {
+        if theme::choice(ui, strings::SETTINGS_COPY_ON_SELECT(), copy).clicked() {
             cx.config.terminal.copy_on_select = !copy;
             outcome.changed = true;
         }
     });
-    if theme::choice(ui, strings::SETTINGS_ALLOW_OSC52, cx.config.terminal.allow_osc52).clicked() {
+    if theme::choice(ui, strings::SETTINGS_ALLOW_OSC52(), cx.config.terminal.allow_osc52).clicked() {
         cx.config.terminal.allow_osc52 = !cx.config.terminal.allow_osc52;
         outcome.changed = true;
     }
-    theme::tag(ui, strings::SETTINGS_WORD_SEPARATORS);
+    theme::tag(ui, strings::SETTINGS_WORD_SEPARATORS());
     let field = egui::TextEdit::singleline(&mut cx.config.terminal.word_separators)
         .id(egui::Id::new("settings-word-separators"))
         .font(theme::field_font(13.0))
@@ -416,8 +418,8 @@ fn section_profiles(
     state: &mut SettingsState,
     outcome: &mut SettingsOutcome,
 ) {
-    theme::section(ui, strings::SETTINGS_PROFILES);
-    theme::tag(ui, strings::SETTINGS_DEFAULT_PROFILE);
+    theme::section(ui, strings::SETTINGS_PROFILES());
+    theme::tag(ui, strings::SETTINGS_DEFAULT_PROFILE());
     egui::ComboBox::from_id_salt("default-profile")
         .width(260.0)
         .selected_text(RichText::new(cx.config.default_profile.clone()).font(theme::field_font(13.0)))
@@ -431,7 +433,7 @@ fn section_profiles(
             }
         });
     if cx.config.profiles.is_empty() && !state.adding {
-        ui.label(RichText::new(strings::SETTINGS_NO_PROFILES).color(theme::colors().faint).font(theme::font(12.0)));
+        ui.label(RichText::new(strings::SETTINGS_NO_PROFILES()).color(theme::colors().faint).font(theme::font(12.0)));
     }
     let mut delete: Option<usize> = None;
     for (index, profile) in cx.config.profiles.iter().enumerate() {
@@ -439,10 +441,10 @@ fn section_profiles(
             ui.label(RichText::new(&profile.name).color(theme::colors().text).font(theme::font(12.5)));
             ui.label(RichText::new(&profile.command).color(theme::colors().faint).font(theme::field_font(12.0)));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add(theme::ghost_button(strings::SETTINGS_DELETE)).clicked() {
+                if ui.add(theme::ghost_button(strings::SETTINGS_DELETE())).clicked() {
                     delete = Some(index);
                 }
-                if ui.add(theme::ghost_button(strings::SETTINGS_EDIT)).clicked() {
+                if ui.add(theme::ghost_button(strings::SETTINGS_EDIT())).clicked() {
                     state.editing = Some(index);
                     state.adding = false;
                     state.draft = profile.clone();
@@ -467,7 +469,7 @@ fn section_profiles(
         }
         outcome.changed = true;
     }
-    if !state.adding && state.editing.is_none() && ui.add(theme::ghost_button(strings::SETTINGS_ADD)).clicked() {
+    if !state.adding && state.editing.is_none() && ui.add(theme::ghost_button(strings::SETTINGS_ADD())).clicked() {
         state.adding = true;
         state.editing = None;
         state.draft = draft_profile();
@@ -479,8 +481,8 @@ fn section_profiles(
 }
 
 fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut SettingsState, outcome: &mut SettingsOutcome) {
-    theme::section(ui, strings::SETTINGS_WORKSPACE);
-    theme::tag(ui, strings::SETTINGS_AI_COMMAND);
+    theme::section(ui, strings::SETTINGS_WORKSPACE());
+    theme::tag(ui, strings::SETTINGS_AI_COMMAND());
     let id = egui::Id::new("settings-ai-command");
     let mut ai = edit_buffer(ui, id, || cx.config.workspace.ai_commit_command.clone().unwrap_or_default());
     let field = egui::TextEdit::singleline(&mut ai).id(id).font(theme::field_font(13.0)).desired_width(320.0);
@@ -490,10 +492,10 @@ fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Settings
         cx.config.workspace.ai_commit_command = (!trimmed.is_empty()).then_some(trimmed);
     }
     keep_buffer(ui, id, &response, ai);
-    ui.label(RichText::new(strings::SETTINGS_AI_HINT).color(theme::colors().faint).font(theme::font(11.5)));
+    ui.label(RichText::new(strings::SETTINGS_AI_HINT()).color(theme::colors().faint).font(theme::font(11.5)));
     ui.add_space(14.0);
-    theme::tag(ui, strings::SETTINGS_AI_MODEL);
-    ui.label(RichText::new(strings::SETTINGS_AI_MODEL_HINT).color(theme::colors().faint).font(theme::font(11.5)));
+    theme::tag(ui, strings::SETTINGS_AI_MODEL());
+    ui.label(RichText::new(strings::SETTINGS_AI_MODEL_HINT()).color(theme::colors().faint).font(theme::font(11.5)));
     state.absorb_models();
     if matches!(state.model_catalog, ModelCatalog::NotLoaded) {
         state.load_models(ui.ctx());
@@ -502,13 +504,13 @@ fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Settings
         ui.add(
             egui::TextEdit::singleline(&mut state.model_filter)
                 .font(theme::field_font(13.0))
-                .hint_text(strings::SETTINGS_AI_MODEL_SEARCH)
+                .hint_text(strings::SETTINGS_AI_MODEL_SEARCH())
                 .desired_width(320.0),
         );
         if ui
             .add_enabled(
                 !matches!(state.model_catalog, ModelCatalog::Loading(_)),
-                theme::ghost_button(strings::SETTINGS_AI_MODEL_REFRESH),
+                theme::ghost_button(strings::SETTINGS_AI_MODEL_REFRESH()),
             )
             .clicked()
         {
@@ -519,7 +521,7 @@ fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Settings
         ModelCatalog::Loading(_) => {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(14.0).color(theme::colors().accent));
-                ui.label(strings::SETTINGS_AI_MODEL_LOADING);
+                ui.label(strings::SETTINGS_AI_MODEL_LOADING());
             });
         }
         ModelCatalog::Ready(Err(error)) => {
@@ -539,14 +541,14 @@ fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Settings
             egui::ComboBox::from_id_salt("ai-commit-model")
                 .width(ui.available_width().min(560.0))
                 .selected_text(
-                    cx.config.workspace.ai_commit_model.as_deref().unwrap_or(strings::SETTINGS_AI_MODEL_DEFAULT),
+                    cx.config.workspace.ai_commit_model.as_deref().unwrap_or(strings::SETTINGS_AI_MODEL_DEFAULT()),
                 )
                 .show_ui(ui, |ui| {
                     outcome.changed |= ui
                         .selectable_value(
                             &mut cx.config.workspace.ai_commit_model,
                             None,
-                            strings::SETTINGS_AI_MODEL_DEFAULT,
+                            strings::SETTINGS_AI_MODEL_DEFAULT(),
                         )
                         .changed();
                     for model in matching {
@@ -565,7 +567,7 @@ fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Settings
                 });
             if !has_matches && !query.is_empty() {
                 ui.label(
-                    RichText::new(strings::SETTINGS_AI_MODEL_NO_MATCH)
+                    RichText::new(strings::SETTINGS_AI_MODEL_NO_MATCH())
                         .color(theme::colors().faint)
                         .font(theme::font(11.5)),
                 );
@@ -576,8 +578,8 @@ fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Settings
 }
 
 fn section_hotkeys(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut SettingsOutcome) {
-    theme::section(ui, strings::SETTINGS_HOTKEYS);
-    ui.label(RichText::new(strings::SETTINGS_HOTKEYS_HINT).color(theme::colors().faint).font(theme::font(11.5)));
+    theme::section(ui, strings::SETTINGS_HOTKEYS());
+    ui.label(RichText::new(strings::SETTINGS_HOTKEYS_HINT()).color(theme::colors().faint).font(theme::font(11.5)));
     ui.add_space(2.0);
     for (action, chords) in cx.keymap_rows {
         let label = crate::hotkeys::Action::from_id(action)
@@ -592,52 +594,56 @@ fn section_hotkeys(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut Se
         theme::hairline(ui);
     }
     ui.add_space(6.0);
-    if ui.add(theme::ghost_button(strings::SETTINGS_OPEN_CONFIG)).clicked() {
+    if ui.add(theme::ghost_button(strings::SETTINGS_OPEN_CONFIG())).clicked() {
         outcome.open_config = true;
     }
 }
 
 fn section_claude(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut SettingsOutcome) {
     use crate::claude_setup::LineState;
-    theme::section(ui, strings::SETTINGS_CLAUDE);
+    theme::section(ui, strings::SETTINGS_CLAUDE());
     let (current, color) = match cx.claude_line {
-        LineState::Missing => (strings::SETTINGS_CLAUDE_LINE_MISSING.to_owned(), theme::colors().dim),
-        LineState::Anvil => (strings::SETTINGS_CLAUDE_LINE_ANVIL.to_owned(), theme::colors().status_green),
+        LineState::Missing => (strings::SETTINGS_CLAUDE_LINE_MISSING().to_owned(), theme::colors().dim),
+        LineState::Anvil => (strings::SETTINGS_CLAUDE_LINE_ANVIL().to_owned(), theme::colors().status_green),
         LineState::Foreign(command) => {
-            (format!("{} {command}", strings::SETTINGS_CLAUDE_LINE_FOREIGN), theme::colors().text)
+            (format!("{} {command}", strings::SETTINGS_CLAUDE_LINE_FOREIGN()), theme::colors().text)
         }
         LineState::Broken(error) => {
-            (format!("{} {error}", strings::SETTINGS_CLAUDE_LINE_BROKEN), theme::colors().status_yellow)
+            (format!("{} {error}", strings::SETTINGS_CLAUDE_LINE_BROKEN()), theme::colors().status_yellow)
         }
     };
     ui.horizontal(|ui| {
-        ui.label(RichText::new(strings::SETTINGS_CLAUDE_NOW).color(theme::colors().dim).font(theme::font(12.0)));
+        ui.label(RichText::new(strings::SETTINGS_CLAUDE_NOW()).color(theme::colors().dim).font(theme::font(12.0)));
         ui.add(egui::Label::new(RichText::new(current).color(color).font(theme::field_font(12.0))).truncate());
     });
     ui.add_space(4.0);
 
     let enabled = cx.config.claude_status.enabled;
-    if theme::choice(ui, strings::SETTINGS_CLAUDE_ENABLED, enabled).clicked() {
+    if theme::choice(ui, strings::SETTINGS_CLAUDE_ENABLED(), enabled).clicked() {
         cx.config.claude_status.enabled = !enabled;
         outcome.changed = true;
         outcome.install_claude = !enabled;
     }
-    ui.label(RichText::new(strings::SETTINGS_CLAUDE_ENABLED_HINT).color(theme::colors().faint).font(theme::font(11.5)));
+    ui.label(
+        RichText::new(strings::SETTINGS_CLAUDE_ENABLED_HINT()).color(theme::colors().faint).font(theme::font(11.5)),
+    );
     if cx.config.claude_status.declined_command.is_some() {
         ui.label(
-            RichText::new(strings::SETTINGS_CLAUDE_DECLINED)
+            RichText::new(strings::SETTINGS_CLAUDE_DECLINED())
                 .color(theme::colors().status_yellow)
                 .font(theme::font(12.0)),
         );
     } else if enabled && cx.config.claude_status.installed_command.is_none() {
         ui.label(
-            RichText::new(strings::SETTINGS_CLAUDE_PENDING).color(theme::colors().status_green).font(theme::font(12.0)),
+            RichText::new(strings::SETTINGS_CLAUDE_PENDING())
+                .color(theme::colors().status_green)
+                .font(theme::font(12.0)),
         );
     }
     ui.add_space(6.0);
 
     let badge = cx.config.claude_status.badge;
-    if theme::choice(ui, strings::SETTINGS_CLAUDE_BADGE, badge).clicked() {
+    if theme::choice(ui, strings::SETTINGS_CLAUDE_BADGE(), badge).clicked() {
         cx.config.claude_status.badge = !badge;
         outcome.changed = true;
     }
@@ -646,20 +652,20 @@ fn section_claude(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut Set
     let mut changed = false;
     egui::Grid::new("claude-fields").num_columns(3).spacing([18.0, 2.0]).show(ui, |ui| {
         let head = |text: &str| RichText::new(text).color(theme::colors().faint).font(theme::font(11.5));
-        ui.label(head(strings::SETTINGS_CLAUDE_FIELDS));
-        ui.label(head(strings::SETTINGS_CLAUDE_IN_CLAUDE));
-        ui.label(head(strings::SETTINGS_CLAUDE_UNDER_TAB));
+        ui.label(head(strings::SETTINGS_CLAUDE_FIELDS()));
+        ui.label(head(strings::SETTINGS_CLAUDE_IN_CLAUDE()));
+        ui.label(head(strings::SETTINGS_CLAUDE_UNDER_TAB()));
         ui.end_row();
         let line = &mut status.line_fields;
         let tab = &mut status.badge_fields;
         let rows: [(&str, &mut bool, Option<&mut bool>); 7] = [
-            (strings::SETTINGS_CLAUDE_FIELD_MODEL, &mut line.model, Some(&mut tab.model)),
-            (strings::SETTINGS_CLAUDE_FIELD_DIR, &mut line.dir, None),
-            (strings::SETTINGS_CLAUDE_FIELD_BRANCH, &mut line.branch, None),
-            (strings::SETTINGS_CLAUDE_FIELD_CONTEXT, &mut line.context, Some(&mut tab.context)),
-            (strings::SETTINGS_CLAUDE_FIELD_FIVE_HOUR, &mut line.five_hour, Some(&mut tab.five_hour)),
-            (strings::SETTINGS_CLAUDE_FIELD_SEVEN_DAY, &mut line.seven_day, Some(&mut tab.seven_day)),
-            (strings::SETTINGS_CLAUDE_FIELD_AGENT, &mut line.agent, Some(&mut tab.agent)),
+            (strings::SETTINGS_CLAUDE_FIELD_MODEL(), &mut line.model, Some(&mut tab.model)),
+            (strings::SETTINGS_CLAUDE_FIELD_DIR(), &mut line.dir, None),
+            (strings::SETTINGS_CLAUDE_FIELD_BRANCH(), &mut line.branch, None),
+            (strings::SETTINGS_CLAUDE_FIELD_CONTEXT(), &mut line.context, Some(&mut tab.context)),
+            (strings::SETTINGS_CLAUDE_FIELD_FIVE_HOUR(), &mut line.five_hour, Some(&mut tab.five_hour)),
+            (strings::SETTINGS_CLAUDE_FIELD_SEVEN_DAY(), &mut line.seven_day, Some(&mut tab.seven_day)),
+            (strings::SETTINGS_CLAUDE_FIELD_AGENT(), &mut line.agent, Some(&mut tab.agent)),
         ];
         for (label, in_claude, under_tab) in rows {
             ui.label(RichText::new(label).color(theme::colors().dim).font(theme::font(12.0)));
@@ -688,20 +694,20 @@ fn section_claude(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut Set
     outcome.changed |= changed;
     if !ours {
         ui.label(
-            RichText::new(strings::SETTINGS_CLAUDE_FIELDS_NEED_ANVIL)
+            RichText::new(strings::SETTINGS_CLAUDE_FIELDS_NEED_ANVIL())
                 .color(theme::colors().faint)
                 .font(theme::font(11.5)),
         );
     }
     ui.add_space(6.0);
-    ui.label(strings::SETTINGS_CLAUDE_GLOBAL_HINT);
-    if enabled && ui.add(theme::ghost_button(strings::SETTINGS_CLAUDE_INSTALL)).clicked() {
+    ui.label(strings::SETTINGS_CLAUDE_GLOBAL_HINT());
+    if enabled && ui.add(theme::ghost_button(strings::SETTINGS_CLAUDE_INSTALL())).clicked() {
         outcome.install_claude = true;
     }
     if !enabled
         && (cx.config.claude_status.installed_command.is_some()
             || cx.config.claude_status.previous_status_line.is_some())
-        && ui.add(theme::ghost_button(strings::SETTINGS_CLAUDE_RESTORE)).clicked()
+        && ui.add(theme::ghost_button(strings::SETTINGS_CLAUDE_RESTORE())).clicked()
     {
         outcome.restore_claude = true;
     }
@@ -733,21 +739,21 @@ fn quota_provider_row(
             }
         });
         let (source, color) = match snapshot {
-            Some(s) => (format!("{} {}", strings::QUOTA_LOGIN, s.source), theme::colors().dim),
-            None => (strings::SETTINGS_QUOTA_NO_LOGIN.to_owned(), theme::colors().faint),
+            Some(s) => (format!("{} {}", strings::QUOTA_LOGIN(), strings::localize(&s.source)), theme::colors().dim),
+            None => (strings::SETTINGS_QUOTA_NO_LOGIN().to_owned(), theme::colors().faint),
         };
         ui.label(RichText::new(source).color(color).font(theme::font(12.0)));
         if id.accepts_own_key() {
             let label = match snapshot {
-                Some(s) if s.source == anvil_key => strings::SETTINGS_QUOTA_CHANGE_KEY,
-                Some(_) => strings::SETTINGS_QUOTA_OWN_KEY,
-                None => strings::SETTINGS_QUOTA_SET_KEY,
+                Some(s) if strings::localize(&s.source) == anvil_key => strings::SETTINGS_QUOTA_CHANGE_KEY(),
+                Some(_) => strings::SETTINGS_QUOTA_OWN_KEY(),
+                None => strings::SETTINGS_QUOTA_SET_KEY(),
             };
             if ui.add(theme::ghost_button(label)).clicked() {
                 open_key = Some(id);
             }
         } else if id == ProviderId::OpencodeZen && !found {
-            let hint = RichText::new(strings::SETTINGS_QUOTA_ZEN_LOGIN);
+            let hint = RichText::new(strings::SETTINGS_QUOTA_ZEN_LOGIN());
             ui.label(hint.color(theme::colors().faint).font(theme::font(11.5)));
         }
     });
@@ -761,14 +767,18 @@ fn quota_provider_row(
         // Windows by their label, balances with their value ("баланс (¥12.40)"):
         // a provider may report one balance per currency.
         let balance = |b: &crate::quota::model::Balance| {
-            (b.key.clone(), format!("{} ({})", b.label, crate::quota::view::balance_text(b)))
+            (b.key.clone(), format!("{} ({})", strings::localize(&b.label), crate::quota::view::balance_text(b)))
         };
-        let items: Vec<(String, String)> =
-            s.windows.iter().map(|w| (w.key.clone(), w.label.clone())).chain(s.balances.iter().map(balance)).collect();
+        let items: Vec<(String, String)> = s
+            .windows
+            .iter()
+            .map(|w| (w.key.clone(), strings::quota_window_label(&w.label)))
+            .chain(s.balances.iter().map(balance))
+            .collect();
         ui.horizontal_wrapped(|ui| {
             ui.add_space(22.0);
             if items.is_empty() && s.state == crate::quota::model::ProviderState::Idle {
-                let hint = RichText::new(strings::SETTINGS_QUOTA_WINDOWS_LATER);
+                let hint = RichText::new(strings::SETTINGS_QUOTA_WINDOWS_LATER());
                 ui.label(hint.color(theme::colors().faint).font(theme::font(11.5)));
             }
             for (key, label) in &items {
@@ -790,9 +800,9 @@ fn section_quota(
     outcome: &mut SettingsOutcome,
 ) {
     use crate::quota::ProviderId;
-    theme::section(ui, strings::SETTINGS_QUOTA);
+    theme::section(ui, strings::SETTINGS_QUOTA());
     let enabled = cx.config.quota.enabled;
-    if theme::choice(ui, strings::SETTINGS_QUOTA_ENABLED, enabled).clicked() {
+    if theme::choice(ui, strings::SETTINGS_QUOTA_ENABLED(), enabled).clicked() {
         cx.config.quota.enabled = !enabled;
         outcome.changed = true;
     }
@@ -800,8 +810,8 @@ fn section_quota(
         return;
     }
     ui.horizontal(|ui| {
-        ui.label(RichText::new(strings::SETTINGS_QUOTA_INTERVAL).color(theme::colors().dim).font(theme::font(12.0)));
-        if ui.add(theme::ghost_button(strings::SETTINGS_QUOTA_REFRESH)).clicked() {
+        ui.label(RichText::new(strings::SETTINGS_QUOTA_INTERVAL()).color(theme::colors().dim).font(theme::font(12.0)));
+        if ui.add(theme::ghost_button(strings::SETTINGS_QUOTA_REFRESH())).clicked() {
             outcome.quota_refresh = true;
         }
     });
@@ -842,13 +852,13 @@ fn quota_key_editor(
                 egui::TextEdit::singleline(text).password(true).desired_width(260.0).font(theme::field_font(12.5));
             let response = ui.add(field);
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui.add(theme::accent_button(strings::SETTINGS_SAVE)).clicked() || enter {
+            if ui.add(theme::accent_button(strings::SETTINGS_SAVE())).clicked() || enter {
                 action = Some(KeyAction::Save);
             }
-            if ui.add(theme::ghost_button(strings::SETTINGS_QUOTA_DELETE_KEY)).clicked() {
+            if ui.add(theme::ghost_button(strings::SETTINGS_QUOTA_DELETE_KEY())).clicked() {
                 action = Some(KeyAction::Delete);
             }
-            if ui.add(theme::ghost_button(strings::SETTINGS_CANCEL)).clicked() {
+            if ui.add(theme::ghost_button(strings::SETTINGS_CANCEL())).clicked() {
                 action = Some(KeyAction::Cancel);
             }
         });
@@ -864,7 +874,7 @@ fn quota_key_editor(
         Some(KeyAction::Save) => {
             let typed = state.quota_key.as_ref().map(|(_, text)| text.as_str()).unwrap_or("");
             match credman::clean_key(typed) {
-                None => state.quota_key_error = Some(strings::SETTINGS_QUOTA_KEY_INVALID),
+                None => state.quota_key_error = Some(strings::SETTINGS_QUOTA_KEY_INVALID()),
                 Some(key) => match credman::write(&target, &key) {
                     Ok(()) => {
                         state.quota_key = None;
@@ -873,7 +883,7 @@ fn quota_key_editor(
                     }
                     Err(code) => {
                         log::warn!("quota: CredWriteW failed with {code}");
-                        state.quota_key_error = Some(strings::SETTINGS_QUOTA_KEY_FAILED);
+                        state.quota_key_error = Some(strings::SETTINGS_QUOTA_KEY_FAILED());
                     }
                 },
             }
@@ -889,7 +899,7 @@ fn quota_key_editor(
                 }
                 Err(code) => {
                     log::warn!("quota: CredDeleteW failed with {code}");
-                    state.quota_key_error = Some(strings::SETTINGS_QUOTA_KEY_DELETE_FAILED);
+                    state.quota_key_error = Some(strings::SETTINGS_QUOTA_KEY_DELETE_FAILED());
                 }
             }
         }
@@ -916,11 +926,11 @@ fn profile_editor(
         egui::StrokeKind::Middle,
     );
     ui.add_space(4.0);
-    theme::tag(ui, strings::SETTINGS_NAME);
+    theme::tag(ui, strings::SETTINGS_NAME());
     ui.add(egui::TextEdit::singleline(&mut draft.name).font(theme::field_font(13.0)).desired_width(320.0));
-    theme::tag(ui, strings::SETTINGS_COMMAND);
+    theme::tag(ui, strings::SETTINGS_COMMAND());
     ui.add(egui::TextEdit::singleline(&mut draft.command).font(theme::field_font(13.0)).desired_width(520.0));
-    theme::tag(ui, strings::SETTINGS_ARGS);
+    theme::tag(ui, strings::SETTINGS_ARGS());
     let id = egui::Id::new("profile-args");
     let mut args = edit_buffer(ui, id, || join_args(&draft.args));
     let field = egui::TextEdit::singleline(&mut args).id(id).font(theme::field_font(13.0)).desired_width(420.0);
@@ -929,7 +939,7 @@ fn profile_editor(
         draft.args = split_args(&args);
     }
     keep_buffer(ui, id, &response, args);
-    theme::tag(ui, strings::SETTINGS_CWD);
+    theme::tag(ui, strings::SETTINGS_CWD());
     let id = egui::Id::new("profile-cwd");
     let mut cwd =
         edit_buffer(ui, id, || draft.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default());
@@ -941,7 +951,7 @@ fn profile_editor(
     keep_buffer(ui, id, &response, cwd);
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        if ui.add(theme::accent_button(strings::SETTINGS_SAVE)).clicked() && !draft.command.trim().is_empty() {
+        if ui.add(theme::accent_button(strings::SETTINGS_SAVE())).clicked() && !draft.command.trim().is_empty() {
             if draft.name.trim().is_empty() {
                 draft.name = draft.command.clone();
             }
@@ -956,7 +966,7 @@ fn profile_editor(
             state.editing = None;
             outcome.changed = true;
         }
-        if ui.add(theme::ghost_button(strings::SETTINGS_CANCEL)).clicked() {
+        if ui.add(theme::ghost_button(strings::SETTINGS_CANCEL())).clicked() {
             state.adding = false;
             state.editing = None;
         }

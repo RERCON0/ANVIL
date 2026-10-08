@@ -45,11 +45,11 @@ pub fn parse_credits(body: &[u8]) -> Result<Fetched, FetchError> {
         return Err(FetchError::Format("no credit amounts".into()));
     }
     let total: f64 = parts.iter().flatten().sum();
-    let balance = Balance::new("credits", strings::QUOTA_CREDITS, total, Unit::Credits, BalanceKind::Remaining);
+    let balance = Balance::new("credits", strings::QUOTA_CREDITS(), total, Unit::Credits, BalanceKind::Remaining);
     let limits = root.get("windowLimits");
     let windows = [
-        window(limits.and_then(|l| l.get("fiveHour")), "5h", format!("5{}", strings::QUOTA_UNIT_HOUR)),
-        window(limits.and_then(|l| l.get("weekly")), "7d", format!("7{}", strings::QUOTA_UNIT_DAY)),
+        window(limits.and_then(|l| l.get("fiveHour")), "5h", format!("5{}", strings::QUOTA_UNIT_HOUR())),
+        window(limits.and_then(|l| l.get("weekly")), "7d", format!("7{}", strings::QUOTA_UNIT_DAY())),
     ]
     .into_iter()
     .flatten()

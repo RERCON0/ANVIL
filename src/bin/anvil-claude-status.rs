@@ -12,7 +12,9 @@ fn main() {
     let Some(payload) = read_payload(std::io::stdin()) else { return };
     // The fields chosen in ANVIL's settings; an absent or unreadable config.json
     // (never quarantined from here) means every field, as before.
-    let fields = Config::load_for_reload(&Config::path()).map(|c| c.claude_status.line_fields).unwrap_or_default();
+    let config = Config::load_for_reload(&Config::path()).unwrap_or_default();
+    anvil::strings::set_language(config.language);
+    let fields = config.claude_status.line_fields;
     let branch = if fields.branch {
         payload.dir.as_deref().and_then(|d| git_branch(std::path::Path::new(d), Duration::from_millis(800)))
     } else {

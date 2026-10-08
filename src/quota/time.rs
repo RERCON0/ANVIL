@@ -165,11 +165,11 @@ pub fn format_left(secs: i64) -> String {
     let secs = secs.max(0);
     let (days, hours, minutes) = (secs / 86_400, secs % 86_400 / 3_600, secs % 3_600 / 60);
     if days > 0 {
-        format!("{days}д{hours}ч")
+        crate::tr_format!("{days}d{hours}h", "{days}д{hours}ч")
     } else if hours > 0 {
-        format!("{hours}ч{minutes}м")
+        crate::tr_format!("{hours}h{minutes}m", "{hours}ч{minutes}м")
     } else {
-        format!("{minutes}м")
+        crate::tr_format!("{minutes}m", "{minutes}м")
     }
 }
 

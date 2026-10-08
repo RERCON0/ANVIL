@@ -37,7 +37,7 @@ jobs:
         run: python -B -m unittest discover -s tests -p 'test_*.py' -v
       # The icon generator test needs fontTools, which is not installed here:
       # it is reported as skipped and only runs on a developer machine.
-      - name: Test package check script
+      - name: Test package checks and real Ed25519 verification
         run: python -B -m unittest discover -s scripts -p 'test_*.py' -v
 
   windows:

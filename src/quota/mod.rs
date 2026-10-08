@@ -63,6 +63,22 @@ pub struct QuotaHandle {
 }
 
 impl QuotaHandle {
+    /// Read-only snapshot for the development capture; no worker or credential mutation.
+    #[cfg(debug_assertions)]
+    pub fn read_only(snapshot: Snapshot, folder: &std::path::Path) -> Self {
+        Self {
+            paths: Paths::in_dir(folder),
+            shared: Arc::new(Shared {
+                stop: AtomicBool::new(false),
+                version: AtomicU64::new(1),
+                snapshot: Mutex::new(snapshot),
+                prefs: Box::new(|| None),
+                repaint: Box::new(|| {}),
+                manual_wait: AtomicU64::new(0),
+            }),
+        }
+    }
+
     pub fn start(
         paths: Paths,
         prefs: impl Fn() -> Option<Prefs> + Send + Sync + 'static,

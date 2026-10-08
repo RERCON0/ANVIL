@@ -117,7 +117,7 @@ fn resets_in(resets_at_secs: f64, now_ms: i64) -> Option<String> {
     let left = ((secs * 1000.0) as i64 - now_ms).clamp(0, 7 * 86_400_000);
     let h = left / 3_600_000;
     let m = (left % 3_600_000) / 60_000;
-    Some(if h > 0 { format!("{h}ч{m}м") } else { format!("{m}м") })
+    Some(if h > 0 { crate::tr_format!("{h}h{m}m", "{h}ч{m}м") } else { crate::tr_format!("{m}m", "{m}м") })
 }
 
 /// Percentages outside 0-100 (a broken or hostile payload) are clamped.

@@ -14,6 +14,7 @@ use crate::fsutil::atomic_write;
 #[serde(default, rename_all = "camelCase")]
 pub struct Config {
     pub version: u32,
+    pub language: crate::strings::Language,
     pub font: FontConfig,
     pub color_scheme: String,
     pub custom_color_schemes: Vec<SchemeConfig>,
@@ -260,6 +261,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             version: 1,
+            language: crate::strings::Language::English,
             font: FontConfig::default(),
             color_scheme: crate::strings::SCHEME_DARK.into(),
             custom_color_schemes: Vec::new(),
@@ -345,7 +347,7 @@ impl Config {
                 log::warn!("cannot read {}: {e}", path.display());
                 return LoadOutcome {
                     config: Config::default(),
-                    notice: Some(crate::strings::CONFIG_UNREADABLE.to_owned()),
+                    notice: Some(crate::strings::CONFIG_UNREADABLE().to_owned()),
                 };
             }
         };
@@ -360,7 +362,7 @@ impl Config {
                 let mut aside = path.as_os_str().to_os_string();
                 aside.push(format!(".broken-{secs}"));
                 let _ = std::fs::rename(path, &aside);
-                LoadOutcome { config: Config::default(), notice: Some(crate::strings::CONFIG_BROKEN.to_owned()) }
+                LoadOutcome { config: Config::default(), notice: Some(crate::strings::CONFIG_BROKEN().to_owned()) }
             }
         }
     }
@@ -675,4 +677,21 @@ mod tests {
         .unwrap();
         assert_eq!(back, quota.providers);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn language_defaults_and_saved_selection_are_backward_compatible() {
+    let old: Config = serde_json::from_str("{}").unwrap();
+    assert_eq!(old.language, crate::strings::Language::English);
+    let mut ru = old.clone();
+    ru.language = crate::strings::Language::Russian;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    ru.save(&path).unwrap();
+    assert_eq!(Config::load(&path).config.language, crate::strings::Language::Russian);
+    assert_eq!(
+        serde_json::from_str::<Config>(r#"{"language":"fr"}"#).unwrap().language,
+        crate::strings::Language::English
+    );
 }

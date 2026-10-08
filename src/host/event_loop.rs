@@ -30,15 +30,44 @@ struct Host {
     app: AnvilApp,
     modifiers: ModifiersState,
     repaint_at: Option<Instant>,
+    #[cfg(debug_assertions)]
+    capture: Option<(std::path::PathBuf, Instant)>,
 }
 
 pub fn run(app: AnvilApp) {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");
     let proxy = event_loop.create_proxy();
-    let mut host = Host { proxy, gl: None, egui: None, app, modifiers: ModifiersState::empty(), repaint_at: None };
+    let mut host = Host {
+        proxy,
+        gl: None,
+        egui: None,
+        app,
+        modifiers: ModifiersState::empty(),
+        repaint_at: None,
+        #[cfg(debug_assertions)]
+        capture: None,
+    };
     if let Err(e) = event_loop.run_app(&mut host) {
         log::error!("event loop failed: {e}");
     }
+}
+
+/// Capture the actual OpenGL window from an isolated development scene.
+/// This entry point and its fixtures are absent from release binaries.
+#[cfg(debug_assertions)]
+pub fn run_capture(app: AnvilApp, output: std::path::PathBuf) {
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");
+    let proxy = event_loop.create_proxy();
+    let mut host = Host {
+        proxy,
+        gl: None,
+        egui: None,
+        app,
+        modifiers: ModifiersState::empty(),
+        repaint_at: None,
+        capture: Some((output, Instant::now() + Duration::from_secs(30))),
+    };
+    event_loop.run_app(&mut host).expect("capture event loop");
 }
 
 fn resize_direction(edge: Edge) -> ResizeDirection {
@@ -99,6 +128,34 @@ impl Host {
             egui.painter.gl().clear(glow::COLOR_BUFFER_BIT);
         }
         egui.paint(&gl.window);
+        #[cfg(debug_assertions)]
+        if let Some((output, deadline)) = &self.capture {
+            if Instant::now() >= *deadline {
+                use glow::HasContext;
+                let size = gl.window.inner_size();
+                let mut pixels = vec![0; size.width as usize * size.height as usize * 4];
+                // SAFETY: current GL context, RGBA storage matches the window's dimensions.
+                unsafe {
+                    let context = egui.painter.gl();
+                    context.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+                    context.read_pixels(
+                        0,
+                        0,
+                        size.width as i32,
+                        size.height as i32,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelPackData::Slice(Some(&mut pixels)),
+                    );
+                }
+                let mut image = image::RgbaImage::from_raw(size.width, size.height, pixels).expect("capture pixels");
+                image::imageops::flip_vertical_in_place(&mut image);
+                image.save(output).expect("save screenshot");
+                event_loop.exit();
+                return;
+            }
+            egui.egui_ctx.request_repaint_after(Duration::from_millis(100));
+        }
         gl.swap_buffers();
         gl.window.set_visible(true);
         self.execute(event_loop, commands);

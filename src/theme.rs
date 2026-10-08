@@ -227,12 +227,12 @@ impl TabColor {
     /// Label of the colour in the tab's menu.
     pub fn label(self) -> &'static str {
         match self {
-            TabColor::Blue => crate::strings::TAB_COLOR_BLUE,
-            TabColor::Green => crate::strings::TAB_COLOR_GREEN,
-            TabColor::Orange => crate::strings::TAB_COLOR_ORANGE,
-            TabColor::Purple => crate::strings::TAB_COLOR_PURPLE,
-            TabColor::Red => crate::strings::TAB_COLOR_RED,
-            TabColor::Yellow => crate::strings::TAB_COLOR_YELLOW,
+            TabColor::Blue => crate::strings::TAB_COLOR_BLUE(),
+            TabColor::Green => crate::strings::TAB_COLOR_GREEN(),
+            TabColor::Orange => crate::strings::TAB_COLOR_ORANGE(),
+            TabColor::Purple => crate::strings::TAB_COLOR_PURPLE(),
+            TabColor::Red => crate::strings::TAB_COLOR_RED(),
+            TabColor::Yellow => crate::strings::TAB_COLOR_YELLOW(),
         }
     }
 }

@@ -5,6 +5,13 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+pub const MAX_SETTINGS_BYTES: usize = 2 * 1024 * 1024;
+
+pub fn read_settings(path: &Path) -> std::io::Result<String> {
+    String::from_utf8(crate::fsutil::read_limited(path, MAX_SETTINGS_BYTES)?)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Plan {
     /// statusLine already runs our command.
@@ -211,9 +218,12 @@ fn write_confirmed_checked(
         use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
         options.share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
     }
-    let mut file = options.open(path)?;
+    let file = options.open(path)?;
     let mut current = String::new();
-    file.read_to_string(&mut current)?;
+    file.take(MAX_SETTINGS_BYTES as u64 + 1).read_to_string(&mut current)?;
+    if current.len() > MAX_SETTINGS_BYTES {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Claude settings exceed size limit"));
+    }
     if current != expected {
         return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "Claude settings changed after confirmation"));
     }
@@ -236,7 +246,7 @@ fn write_confirmed_checked(
         }
         before_recheck();
         // Detect an editor replacing the pathname while we held the old snapshot.
-        if std::fs::read_to_string(path)? != expected {
+        if read_settings(path)? != expected {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
                 "Claude settings changed after confirmation",
@@ -425,4 +435,17 @@ mod tests {
         write_confirmed(&missing, None, &installed).unwrap();
         assert_eq!(std::fs::read_to_string(missing).unwrap(), installed);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn oversized_settings_cannot_be_installed_or_backed_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let oversized = " ".repeat(MAX_SETTINGS_BYTES + 1);
+    std::fs::write(&path, &oversized).unwrap();
+    assert_eq!(read_settings(&path).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    assert!(write_confirmed(&path, Some(&oversized), "{}").is_err());
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), oversized.len() as u64);
+    assert!(!dir.path().join("settings.json.anvil-backup").exists());
 }

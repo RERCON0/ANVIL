@@ -26,7 +26,7 @@ pub fn parse(body: &[u8], now: i64) -> Result<Fetched, FetchError> {
         let Some(used) = number(window.get("used_percent")) else { continue };
         let (key, label) = match window.get("limit_window_seconds").and_then(Value::as_i64) {
             Some(secs @ (18_000 | 604_800)) => duration_window(secs).expect("whole hours and days"),
-            Some(2_628_000) => ("month".to_owned(), strings::QUOTA_MONTH.to_owned()),
+            Some(2_628_000) => ("month".to_owned(), strings::QUOTA_MONTH().to_owned()),
             _ => continue,
         };
         if !windows.iter().any(|w| w.key == key) {
@@ -35,7 +35,7 @@ pub fn parse(body: &[u8], now: i64) -> Result<Fetched, FetchError> {
     }
     if let Some(window) = value.pointer("/code_review_rate_limit/primary_window") {
         if let Some(used) = number(window.get("used_percent")) {
-            windows.push(Window::new("review", strings::QUOTA_REVIEW, used, reset(window, now)));
+            windows.push(Window::new("review", strings::QUOTA_REVIEW(), used, reset(window, now)));
         }
     }
     if windows.is_empty() {
@@ -56,7 +56,7 @@ fn credits(value: &Value) -> Option<Balance> {
     if credits.get("has_credits") == Some(&Value::Bool(false)) && amount <= 0.0 {
         return None;
     }
-    Some(Balance::new("credits", strings::QUOTA_CREDITS, amount, Unit::Credits, BalanceKind::Remaining))
+    Some(Balance::new("credits", strings::QUOTA_CREDITS(), amount, Unit::Credits, BalanceKind::Remaining))
 }
 
 /// `plan_type` (or the `chatgpt_plan_type` claim) for display.

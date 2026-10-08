@@ -58,13 +58,13 @@ pub enum Source {
 impl Source {
     pub fn label(&self) -> String {
         match self {
-            Source::ClaudeCode => strings::QUOTA_SOURCE_CLAUDE_CODE.to_owned(),
-            Source::CodexCli => strings::QUOTA_SOURCE_CODEX.to_owned(),
-            Source::Omp => strings::QUOTA_SOURCE_OMP.to_owned(),
-            Source::OpenCode => strings::QUOTA_SOURCE_OPENCODE.to_owned(),
-            Source::AnvilKey => strings::QUOTA_SOURCE_ANVIL_KEY.to_owned(),
-            Source::Env(name) => format!("{} {name}", strings::QUOTA_SOURCE_ENV),
-            Source::ClaudeSettings => strings::QUOTA_SOURCE_CLAUDE_SETTINGS.to_owned(),
+            Source::ClaudeCode => strings::QUOTA_SOURCE_CLAUDE_CODE().to_owned(),
+            Source::CodexCli => strings::QUOTA_SOURCE_CODEX().to_owned(),
+            Source::Omp => strings::QUOTA_SOURCE_OMP().to_owned(),
+            Source::OpenCode => strings::QUOTA_SOURCE_OPENCODE().to_owned(),
+            Source::AnvilKey => strings::QUOTA_SOURCE_ANVIL_KEY().to_owned(),
+            Source::Env(name) => format!("{} {name}", strings::QUOTA_SOURCE_ENV()),
+            Source::ClaudeSettings => strings::QUOTA_SOURCE_CLAUDE_SETTINGS().to_owned(),
         }
     }
 }

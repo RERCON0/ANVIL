@@ -22,7 +22,7 @@ const MICRO_CENTS_PER_DOLLAR: f64 = 100_000_000.0;
 pub fn fetch_go(http: &dyn Http, headers: &[(&'static str, String)], now: i64) -> Result<Fetched, FetchError> {
     let response = send(http, &GO, None, headers)?;
     if response.status == 403 && not_subscribed(&response.body) {
-        return Err(FetchError::Rejected(strings::QUOTA_NO_SUBSCRIPTION.to_owned()));
+        return Err(FetchError::Rejected(strings::QUOTA_NO_SUBSCRIPTION().to_owned()));
     }
     parse_go(&body(response, now)?)
 }
@@ -39,9 +39,9 @@ pub fn parse_go(body: &[u8]) -> Result<Fetched, FetchError> {
     let value = json(body)?;
     let usage = value.get("usage").filter(|u| u.is_object()).ok_or_else(|| FetchError::Format("no usage".into()))?;
     let spans = [
-        ("rolling", "5h", format!("5{}", strings::QUOTA_UNIT_HOUR)),
-        ("weekly", "7d", format!("7{}", strings::QUOTA_UNIT_DAY)),
-        ("monthly", "month", strings::QUOTA_MONTH.to_owned()),
+        ("rolling", "5h", format!("5{}", strings::QUOTA_UNIT_HOUR())),
+        ("weekly", "7d", format!("7{}", strings::QUOTA_UNIT_DAY())),
+        ("monthly", "month", strings::QUOTA_MONTH().to_owned()),
     ];
     let mut windows = Vec::new();
     for (field, key, label) in spans {
@@ -69,7 +69,7 @@ pub fn fetch_zen(
     now: i64,
 ) -> Result<Fetched, FetchError> {
     if credential.server.as_deref().is_some_and(|server| server.trim_end_matches('/') != ZEN_SERVER) {
-        return Err(FetchError::Rejected(strings::QUOTA_ZEN_OTHER_SERVER.to_owned()));
+        return Err(FetchError::Rejected(strings::QUOTA_ZEN_OTHER_SERVER().to_owned()));
     }
     let status = get(http, &ZEN_STATUS, None, headers, now)?;
     // An expired console session answers with the HTML sign-in page.
@@ -79,7 +79,7 @@ pub fn fetch_zen(
     let mut fetched = parse_zen_balance(&status)?;
     // The credit limit only adds a line to the hover text; its failure is not one.
     if let Some(limit) = get(http, &ZEN_ACCOUNT, None, headers, now).ok().and_then(|b| parse_zen_credit_limit(&b)) {
-        let detail = format!("{} {}", strings::QUOTA_CREDIT_LIMIT, format_amount(limit, Unit::Usd));
+        let detail = format!("{} {}", strings::QUOTA_CREDIT_LIMIT(), format_amount(limit, Unit::Usd));
         if let Some(balance) = fetched.balances.first_mut() {
             balance.detail = Some(detail);
         }
@@ -94,7 +94,8 @@ fn micro_cents(value: Option<&Value>) -> Option<f64> {
 pub fn parse_zen_balance(body: &[u8]) -> Result<Fetched, FetchError> {
     let value = json(body)?;
     let dollars = micro_cents(value.get("balanceMicroCents")).ok_or_else(|| FetchError::Format("no balance".into()))?;
-    let balance = Balance::new("balance", strings::QUOTA_BALANCE, dollars.max(0.0), Unit::Usd, BalanceKind::Remaining);
+    let balance =
+        Balance::new("balance", strings::QUOTA_BALANCE(), dollars.max(0.0), Unit::Usd, BalanceKind::Remaining);
     Ok(Fetched { plan: None, windows: Vec::new(), balances: vec![balance] })
 }
 

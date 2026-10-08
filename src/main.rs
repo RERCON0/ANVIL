@@ -4,7 +4,10 @@
 
 fn main() {
     if let Err(error) = secure_dll_search() {
-        show_fatal(&format!("Не удалось защитить поиск DLL: {error}"));
+        show_fatal(&anvil::tr_format!(
+            "Could not secure DLL search: {error}",
+            "Не удалось защитить поиск DLL: {error}"
+        ));
         return;
     }
     let dir = anvil::config::app_dir();
@@ -18,7 +21,8 @@ fn main() {
         if std::thread::current().id() == main_thread {
             static SHOWN: std::sync::OnceLock<()> = std::sync::OnceLock::new();
             if SHOWN.set(()).is_ok() {
-                show_fatal(&format!(
+                show_fatal(&anvil::tr_format!(
+                    "ANVIL stopped after an internal error.\n\n{info}\n\nDetails: {}",
                     "ANVIL остановлен внутренней ошибкой.\n\n{info}\n\nПодробности: {}",
                     dir.join("anvil.log").display()
                 ));

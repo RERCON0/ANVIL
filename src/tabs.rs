@@ -353,7 +353,7 @@ impl Tab {
                                 painter.rect_filled(button, 0.0, theme::colors().tab_hover_bg);
                             }
                             painter.text(button.center(), Align2::CENTER_CENTER, "≡", theme::font(14.0), color);
-                            let _ = response.clone().on_hover_text(strings::WORKSPACE_TOGGLE_HINT);
+                            let _ = response.clone().on_hover_text(strings::WORKSPACE_TOGGLE_HINT());
                             if response.clicked() {
                                 entry.workspace.open = true;
                                 entry.workspace.refresh_soon();
@@ -415,7 +415,7 @@ impl Tab {
                         painter.text(
                             button.center(),
                             Align2::CENTER_CENTER,
-                            strings::PANE_CLOSE,
+                            strings::PANE_CLOSE(),
                             theme::font(12.5),
                             theme::colors().tab_active_text,
                         );
@@ -511,7 +511,7 @@ impl Tab {
                     if !window_edge && response.drag_started_by(egui::PointerButton::Primary) {
                         self.dragging_pane = Some(*id);
                     }
-                    let _ = response.on_hover_text(strings::PANE_REARRANGE_HINT);
+                    let _ = response.on_hover_text(strings::PANE_REARRANGE_HINT());
                 });
         }
         let Some(source) = self.dragging_pane else { return };

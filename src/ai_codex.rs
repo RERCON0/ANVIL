@@ -75,7 +75,11 @@ fn login_with(home: &Path, env_key: Option<String>) -> Result<Login, String> {
         .and_then(serde_json::Value::as_str)
         .filter(|token| !token.trim().is_empty())
         .ok_or_else(|| {
-            "Codex: нет сохранённой авторизации; выполните `codex login` или задайте OPENAI_API_KEY".to_owned()
+            crate::strings::pick(
+                "Codex: no saved login; run `codex login` or set OPENAI_API_KEY",
+                "Codex: нет сохранённой авторизации; выполните `codex login` или задайте OPENAI_API_KEY",
+            )
+            .to_owned()
         })?;
     let id_token = tokens.and_then(|t| t.get("id_token")).and_then(serde_json::Value::as_str).unwrap_or("");
     let account = tokens
@@ -118,7 +122,7 @@ fn model(home: &Path, override_model: Option<&str>) -> Result<String, String> {
             toml::from_str(&text).map_err(|e| format!("Codex: config.toml: {}", toml_error(&e, &text)))?;
         if let Some(provider) = config.get("model_provider").and_then(toml::Value::as_str) {
             if provider != "openai" {
-                return Err("Codex: безопасная генерация работает только с провайдером openai; настройте model_provider = \"openai\"".to_owned());
+                return Err(crate::strings::pick("Codex: safe generation requires the openai provider; set model_provider = \"openai\"", "Codex: безопасная генерация работает только с провайдером openai; настройте model_provider = \"openai\"").to_owned());
             }
         }
         if let Some(model) = config.get("model").and_then(toml::Value::as_str).filter(|m| !m.trim().is_empty()) {
@@ -196,8 +200,8 @@ fn complete(http: &WinHttp, request: &Request, timeout: std::time::Duration) -> 
         return Err(match status {
             // OpenAI rotates refresh tokens on use, so a refresh here would log
             // the user's own Codex CLI out. Ask for a fresh login instead.
-            401 | 403 => "Codex: сохранённый вход не принят (токен истёк). ANVIL не обновляет токены Codex, чтобы не сломать ваш вход: выполните `codex login` или задайте OPENAI_API_KEY".to_owned(),
-            429 => format!("Codex: превышен лимит запросов. {detail}"),
+            401 | 403 => crate::strings::pick("Codex: saved login was rejected (token expired). ANVIL does not refresh Codex tokens: run `codex login` or set OPENAI_API_KEY", "Codex: сохранённый вход не принят (токен истёк). ANVIL не обновляет токены Codex, чтобы не сломать ваш вход: выполните `codex login` или задайте OPENAI_API_KEY").to_owned(),
+            429 => crate::tr_format!("Codex: rate limit exceeded. {detail}", "Codex: превышен лимит запросов. {detail}"),
             _ => format!("Codex: HTTP {shown}. {detail}"),
         });
     }
@@ -210,7 +214,9 @@ fn send<'a>(http: &'a WinHttp, request: &Request, timeout: std::time::Duration) 
     headers.extend(request.headers.iter().map(|(name, value)| (*name, value.as_str())));
     let body = serde_json::to_vec(&request.body).map_err(|e| format!("Codex: {e}"))?;
     http.post(&request.endpoint, &headers, &body, timeout).map_err(|e| match e {
-        HttpError::Timeout => format!("Codex не ответил за {} с", timeout.as_secs()),
+        HttpError::Timeout => {
+            crate::tr_format!("Codex did not respond within {} s", "Codex не ответил за {} с", timeout.as_secs())
+        }
         e => format!("Codex: {e}"),
     })
 }
@@ -227,13 +233,17 @@ fn read_stream(reader: impl std::io::Read, timeout: std::time::Duration) -> Resu
     let mut bytes_read = 0;
     loop {
         if std::time::Instant::now() > deadline {
-            return Err(format!("Codex не ответил за {} с", timeout.as_secs()));
+            return Err(crate::tr_format!(
+                "Codex did not respond within {} s",
+                "Codex не ответил за {} с",
+                timeout.as_secs()
+            ));
         }
         let mut line = Vec::new();
         let count = reader.by_ref().take((LINE_CAP + 1) as u64).read_until(b'\n', &mut line);
         let count = count.map_err(|e| {
             if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) {
-                format!("Codex не ответил за {} с", timeout.as_secs())
+                crate::tr_format!("Codex did not respond within {} s", "Codex не ответил за {} с", timeout.as_secs())
             } else {
                 format!("Codex: {e}")
             }
@@ -243,7 +253,11 @@ fn read_stream(reader: impl std::io::Read, timeout: std::time::Duration) -> Resu
         }
         bytes_read += count;
         if count > LINE_CAP || bytes_read > STREAM_CAP {
-            return Err("Codex: поток ответа слишком велик".to_owned());
+            return Err(crate::strings::pick(
+                "Codex: response stream is too large",
+                "Codex: поток ответа слишком велик",
+            )
+            .to_owned());
         }
         let line = std::str::from_utf8(&line).map_err(|_| "Codex: invalid UTF-8".to_owned())?;
         let Some(data) = line.strip_prefix("data:") else { continue };
@@ -252,7 +266,11 @@ fn read_stream(reader: impl std::io::Read, timeout: std::time::Duration) -> Resu
             Some("response.output_text.delta") => {
                 if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str) {
                     if delta.len() > OUTPUT_CAP - text.len() {
-                        return Err("Codex: сообщение коммита слишком велико".to_owned());
+                        return Err(crate::strings::pick(
+                            "Codex: commit message is too large",
+                            "Codex: сообщение коммита слишком велико",
+                        )
+                        .to_owned());
                     }
                     text.push_str(delta);
                 }
@@ -264,7 +282,7 @@ fn read_stream(reader: impl std::io::Read, timeout: std::time::Duration) -> Resu
                         .or_else(|| event.pointer("/error/message"))
                         .or_else(|| event.get("message"))
                         .and_then(serde_json::Value::as_str)
-                        .unwrap_or("Codex: запрос отклонён")
+                        .unwrap_or(crate::strings::pick("Codex: request rejected", "Codex: запрос отклонён"))
                         .to_owned(),
                 );
                 break;
@@ -278,8 +296,16 @@ fn read_stream(reader: impl std::io::Read, timeout: std::time::Duration) -> Resu
     }
     match failure {
         Some(error) => Err(error),
-        None if !completed => Err("Codex: поток ответа завершился до завершения генерации".to_owned()),
-        None if text.trim().is_empty() => Err("Codex: модель не вернула сообщение коммита".to_owned()),
+        None if !completed => Err(crate::strings::pick(
+            "Codex: response stream ended before generation completed",
+            "Codex: поток ответа завершился до завершения генерации",
+        )
+        .to_owned()),
+        None if text.trim().is_empty() => Err(crate::strings::pick(
+            "Codex: model returned no commit message",
+            "Codex: модель не вернула сообщение коммита",
+        )
+        .to_owned()),
         None => Ok(text),
     }
 }

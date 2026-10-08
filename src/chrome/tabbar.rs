@@ -166,14 +166,14 @@ pub fn show(
     let plus = ui.interact(plus_rect, ui.id().with("tab-new"), Sense::click());
     let plus_color = if plus.hovered() { theme::colors().icon_hover } else { theme::colors().icon };
     painter.text(plus_rect.center(), Align2::CENTER_CENTER, "+", theme::font(17.0), plus_color);
-    if plus.on_hover_text(strings::TAB_NEW).clicked() {
+    if plus.on_hover_text(strings::TAB_NEW()).clicked() {
         actions.push(TabbarAction::NewTab);
     }
     let profile_rect = Rect::from_min_size(Pos2::new(rect.min.x + 44.0, y + 8.0), Vec2::new(28.0, 24.0));
     let profile = ui.interact(profile_rect, ui.id().with("tab-profiles"), Sense::click());
     let profile_color = if profile.hovered() { theme::colors().icon_hover } else { theme::colors().icon };
     painter.text(profile_rect.center(), Align2::CENTER_CENTER, "»", theme::font(14.0), profile_color);
-    if profile.on_hover_text(strings::TAB_PROFILES).clicked() {
+    if profile.on_hover_text(strings::TAB_PROFILES()).clicked() {
         actions.push(TabbarAction::Profiles);
     }
 
@@ -193,7 +193,7 @@ pub fn show(
         let count = painter.layout_no_wrap(collapsed.to_string(), theme::font(11.0), collapsed_color);
         painter.galley(Pos2::new(collapsed_rect.max.x + 4.0, center.y - count.size().y / 2.0), count, collapsed_color);
     }
-    if collapsed_button.on_hover_text(strings::TAB_COLLAPSED).clicked() {
+    if collapsed_button.on_hover_text(strings::TAB_COLLAPSED()).clicked() {
         actions.push(TabbarAction::CollapsedList);
     }
 
@@ -205,7 +205,7 @@ pub fn show(
     }
     let settings_color =
         if settings_open || settings.hovered() { theme::colors().icon_hover } else { theme::colors().icon };
-    let label = painter.layout_no_wrap(strings::TAB_SETTINGS.to_owned(), theme::font(12.5), settings_color);
+    let label = painter.layout_no_wrap(strings::TAB_SETTINGS().to_owned(), theme::font(12.5), settings_color);
     let label_pos = Pos2::new(settings_rect.min.x + 24.0, settings_rect.center().y - label.size().y / 2.0);
     // Align to the visible letters, not the font's ascent/descent box: the
     // chevron glyph's optical center was lower than the Cyrillic label.
@@ -334,11 +334,11 @@ fn tab_row(
         }
     }
     response.context_menu(|ui| {
-        if ui.button(strings::TAB_RENAME).clicked() {
+        if ui.button(strings::TAB_RENAME()).clicked() {
             state.rename = Some(RenameEdit { tab: index, text: tab.title.to_string(), focus: true });
             ui.close_kind(egui::UiKind::Menu);
         }
-        if ui.button(strings::TAB_DUPLICATE).clicked() {
+        if ui.button(strings::TAB_DUPLICATE()).clicked() {
             actions.push(TabbarAction::Duplicate(index));
             ui.close_kind(egui::UiKind::Menu);
         }
@@ -346,12 +346,12 @@ fn tab_row(
         // the menu answers "which colour is this" without opening it.
         let mut submenu = egui::text::LayoutJob::default();
         submenu.append(
-            strings::TAB_COLOR,
+            strings::TAB_COLOR(),
             0.0,
             egui::TextFormat { font_id: theme::field_font(13.0), color: theme::colors().text, ..Default::default() },
         );
         submenu.append(
-            &format!("  {}", tab.color.map_or(strings::TAB_COLOR_NONE, theme::TabColor::label)),
+            &format!("  {}", tab.color.map_or(strings::TAB_COLOR_NONE(), theme::TabColor::label)),
             0.0,
             egui::TextFormat { font_id: theme::field_font(11.5), color: theme::colors().faint, ..Default::default() },
         );
@@ -367,11 +367,11 @@ fn tab_row(
                 }
             }
         });
-        if ui.button(strings::TAB_CLOSE).clicked() {
+        if ui.button(strings::TAB_CLOSE()).clicked() {
             actions.push(TabbarAction::Close(index));
             ui.close_kind(egui::UiKind::Menu);
         }
-        if ui.button(strings::TAB_CLOSE_OTHERS).clicked() {
+        if ui.button(strings::TAB_CLOSE_OTHERS()).clicked() {
             actions.push(TabbarAction::CloseOthers(index));
             ui.close_kind(egui::UiKind::Menu);
         }
@@ -397,7 +397,7 @@ fn color_item(ui: &mut egui::Ui, selected: bool, color: Option<theme::TabColor>)
         ),
     }
     job.append(
-        color.map_or(strings::TAB_COLOR_NONE, theme::TabColor::label),
+        color.map_or(strings::TAB_COLOR_NONE(), theme::TabColor::label),
         0.0,
         egui::TextFormat { font_id: theme::field_font(13.0), color: theme::colors().text, ..Default::default() },
     );
@@ -595,7 +595,7 @@ mod tests {
                 .shapes
                 .iter()
                 .find_map(|shape| match &shape.shape {
-                    egui::Shape::Text(text) if text.galley.text() == strings::TAB_SETTINGS => {
+                    egui::Shape::Text(text) if text.galley.text() == strings::TAB_SETTINGS() => {
                         Some(text.visual_bounding_rect())
                     }
                     _ => None,

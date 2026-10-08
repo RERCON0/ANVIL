@@ -214,7 +214,14 @@ impl ReloadLog {
     }
 }
 
+#[cfg(debug_assertions)]
+mod readme;
+
 pub struct AnvilApp {
+    #[cfg(debug_assertions)]
+    readme_root: Option<PathBuf>,
+    #[cfg(debug_assertions)]
+    readme_keys: HashMap<(PaneId, u8), Instant>,
     config: Config,
     config_path: PathBuf,
     config_mtime: Option<SystemTime>,
@@ -314,12 +321,17 @@ impl AnvilApp {
         extra_window: bool,
         status_dir: PathBuf,
     ) -> Self {
+        strings::set_language(config.language);
         let (keymap, problems) = Keymap::with_overrides(&config.hotkeys);
         let has_problems = !problems.is_empty();
         let palette = scheme_palette(&config);
         theme::set_scheme(&palette);
         let session_window = session.window;
         let mut app = AnvilApp {
+            #[cfg(debug_assertions)]
+            readme_root: None,
+            #[cfg(debug_assertions)]
+            readme_keys: HashMap::new(),
             config,
             config_path,
             config_mtime,
@@ -372,7 +384,7 @@ impl AnvilApp {
             log::warn!("config hotkeys: {problem}");
         }
         if has_problems {
-            app.toast(strings::UNKNOWN_HOTKEYS.to_owned());
+            app.toast(strings::UNKNOWN_HOTKEYS().to_owned());
         }
         app
     }
@@ -407,6 +419,11 @@ impl AnvilApp {
         }
         let c = ctx.clone();
         self.repaint = Some(Arc::new(move || c.request_repaint()));
+        #[cfg(debug_assertions)]
+        if self.readme_root.is_some() {
+            self.start_readme_scene();
+            return;
+        }
         self.builtin_profiles = profiles::detect_builtin();
         let (tx, rx) = std::sync::mpsc::channel();
         self.wsl_results = Some(rx);
@@ -441,7 +458,7 @@ impl AnvilApp {
         // The DLL is loaded while the first pane starts, so check it now.
         if !crate::term::pane::bundled_conpty_loaded() {
             log::warn!("conpty.dll is not loaded; the system ConPTY is in use");
-            self.toast(strings::CONPTY_MISSING.to_owned());
+            self.toast(strings::CONPTY_MISSING().to_owned());
         }
     }
 
@@ -453,6 +470,8 @@ impl AnvilApp {
         self.check_config(&ctx);
         self.absorb_wsl_profiles();
         self.poll_panes(&ctx);
+        #[cfg(debug_assertions)]
+        self.readme_startup_keys();
         self.poll_statuses();
         self.expire_toasts();
         // On a border the press belongs to the window resize, not to the pane
@@ -466,7 +485,14 @@ impl AnvilApp {
             }
             let full = ui.max_rect();
             let title = Rect::from_min_size(full.min, Vec2::new(full.width(), theme::TITLEBAR_HEIGHT));
-            title_bar(ui, title, maximized, window_edge, &mut commands);
+            if title_bar(ui, title, maximized, window_edge, &mut commands) {
+                let mut config = self.config.clone();
+                config.language = match config.language {
+                    strings::Language::English => strings::Language::Russian,
+                    strings::Language::Russian => strings::Language::English,
+                };
+                self.apply_config(ctx.clone(), config, true);
+            }
             // The quota line takes the bottom of the window while quotas are on;
             // tabs and panes get the rest, so nothing is ever drawn under it.
             let footer = if self.quota.is_some() { crate::chrome::quota_bar::HEIGHT } else { 0.0 };
@@ -625,7 +651,7 @@ impl AnvilApp {
             }
         }
         if bells > 0 && self.config.terminal.bell == Bell::Visual {
-            self.toast(strings::BELL.to_owned());
+            self.toast(strings::BELL().to_owned());
         }
         // By id: closing one tab shifts the indices of the tabs after it.
         for id in close {
@@ -720,8 +746,12 @@ impl AnvilApp {
         if mtime.is_some() && mtime == self.claude_line.0 {
             return;
         }
-        let text = std::fs::read_to_string(&path).ok();
-        self.claude_line = (mtime, claude_setup::describe(text.as_deref()));
+        let state = match claude_setup::read_settings(&path) {
+            Ok(text) => claude_setup::describe(Some(&text)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => claude_setup::LineState::Missing,
+            Err(error) => claude_setup::LineState::Broken(error.to_string()),
+        };
+        self.claude_line = (mtime, state);
     }
 
     fn show_settings(&mut self, ui: &mut egui::Ui, rect: Rect) {
@@ -850,7 +880,7 @@ impl AnvilApp {
         let Some(quota) = &self.quota else { return };
         let wait = quota.refresh();
         if wait > 0 {
-            self.toast(strings::QUOTA_REFRESH_DEFERRED.replace("{0}", &wait.to_string()));
+            self.toast(strings::QUOTA_REFRESH_DEFERRED().replace("{0}", &wait.to_string()));
         }
     }
 
@@ -916,7 +946,7 @@ impl AnvilApp {
             TabAction::Pane(id, command) => self.apply_pane_command(id, command, ctx),
             TabAction::Bell => {
                 if self.config.terminal.bell == Bell::Visual {
-                    self.toast(strings::BELL.to_owned());
+                    self.toast(strings::BELL().to_owned());
                 }
             }
             TabAction::NeedsFallbacks => self.load_fallbacks(ctx),
@@ -952,7 +982,7 @@ impl AnvilApp {
             PaneCommand::Copy => {
                 if let Some(text) = self.selection_text(id) {
                     self.set_clipboard(&text);
-                    self.toast(strings::COPIED.to_owned());
+                    self.toast(strings::COPIED().to_owned());
                 }
                 if let Some(pane) = self.pane(id) {
                     pane.term.lock().selection = None;
@@ -1559,7 +1589,7 @@ impl AnvilApp {
             Ok(pane) => PaneEntry { content: PaneContent::Live(pane), ..base },
             Err(e) => {
                 log::error!("cannot start {}: {e}", profile.command);
-                PaneEntry { content: PaneContent::Error(format!("{}: {e}", strings::SPAWN_FAILED)), ..base }
+                PaneEntry { content: PaneContent::Error(format!("{}: {e}", strings::SPAWN_FAILED())), ..base }
             }
         }
     }
@@ -1797,6 +1827,11 @@ impl AnvilApp {
     /// Applies a configuration. `save` is set for edits made in the settings
     /// page (they must persist); external reloads never write the file back.
     fn apply_config(&mut self, ctx: egui::Context, config: Config, save: bool) {
+        let language_changed = config.language != self.config.language;
+        strings::set_language(config.language);
+        if language_changed {
+            self.quota_segments = QuotaSegments::default();
+        }
         let family_changed = config.font.family != self.config.font.family;
         let scheme_changed = config.color_scheme != self.config.color_scheme;
         let profiles_changed =
@@ -1833,7 +1868,7 @@ impl AnvilApp {
                 for problem in &problems {
                     log::warn!("config hotkeys: {problem}");
                 }
-                self.toast(strings::UNKNOWN_HOTKEYS.to_owned());
+                self.toast(strings::UNKNOWN_HOTKEYS().to_owned());
             }
         }
         if family_changed {
@@ -2025,7 +2060,7 @@ impl AnvilApp {
             return;
         };
         if !exe_dir.join("anvil-claude-status.exe").is_file() {
-            self.toast(strings::CLAUDE_HELPER_MISSING.to_owned());
+            self.toast(strings::CLAUDE_HELPER_MISSING().to_owned());
             return;
         }
         let ours = claude_setup::status_command(&exe_dir);
@@ -2035,15 +2070,15 @@ impl AnvilApp {
         if self.config.claude_status.installed_command.is_some()
             && self.config.claude_status.installed_settings_path.as_ref().is_some_and(|installed| *installed != path)
         {
-            self.toast(strings::CLAUDE_DIRECTORY_CHANGED.to_owned());
+            self.toast(strings::CLAUDE_DIRECTORY_CHANGED().to_owned());
             return;
         }
-        let settings = match std::fs::read_to_string(&path) {
+        let settings = match claude_setup::read_settings(&path) {
             Ok(text) => Some(text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
                 log::warn!("cannot read {}: {e}", path.display());
-                self.toast(strings::CLAUDE_SETTINGS_BROKEN.to_owned());
+                self.toast(strings::CLAUDE_SETTINGS_BROKEN().to_owned());
                 return;
             }
         };
@@ -2062,7 +2097,7 @@ impl AnvilApp {
                 Plan::AskReplace { current } => (current, false),
                 Plan::Broken(message) => {
                     log::warn!("{message}");
-                    self.toast(strings::CLAUDE_SETTINGS_BROKEN.to_owned());
+                    self.toast(strings::CLAUDE_SETTINGS_BROKEN().to_owned());
                     return;
                 }
                 Plan::AlreadyInstalled | Plan::Declined => return,
@@ -2109,7 +2144,7 @@ impl AnvilApp {
             .clone()
             .or_else(|| claude_setup::settings_path(claude_dir.as_deref(), home.as_deref()));
         let Some(path) = path else { return };
-        let Ok(fresh) = std::fs::read_to_string(&path) else { return };
+        let Ok(fresh) = claude_setup::read_settings(&path) else { return };
         let ours = self.config.claude_status.installed_command.clone().or_else(|| {
             // Older opted-in configurations did not record their helper path.
             serde_json::from_str::<serde_json::Value>(&fresh)
@@ -2123,7 +2158,7 @@ impl AnvilApp {
                 if let Err(e) = claude_setup::write_confirmed(&path, Some(&fresh), &text) {
                     // Keep the saved original: a later disable must be able to retry.
                     log::warn!("cannot restore {}: {e}", path.display());
-                    self.toast(strings::CLAUDE_SETTINGS_CHANGED.to_owned());
+                    self.toast(strings::CLAUDE_SETTINGS_CHANGED().to_owned());
                     return;
                 }
                 self.config.claude_status.previous_status_line = None;
@@ -2233,7 +2268,7 @@ impl AnvilApp {
             }
             view.font_size
         };
-        self.ui.toasts.retain(|toast| !toast.text.starts_with(strings::ZOOM_TOAST_PREFIX));
+        self.ui.toasts.retain(|toast| !toast.text.starts_with(strings::ZOOM_TOAST_PREFIX()));
         self.toast(strings::zoom_toast(size));
     }
 
@@ -2354,7 +2389,7 @@ impl AnvilApp {
                     if self.config.claude_status.enabled {
                         if let Err(e) = self.install_claude(&path, &ours, expected.as_deref(), keep_previous) {
                             log::warn!("cannot update {}: {e}", path.display());
-                            self.toast(strings::CLAUDE_SETTINGS_CHANGED.to_owned());
+                            self.toast(strings::CLAUDE_SETTINGS_CHANGED().to_owned());
                         }
                     }
                 }
@@ -2676,7 +2711,7 @@ mod tests {
             dir.path().into(),
         );
         let ctx = egui::Context::default();
-        let reported = |app: &AnvilApp| app.ui.toasts.iter().any(|toast| toast.text == strings::UNKNOWN_HOTKEYS);
+        let reported = |app: &AnvilApp| app.ui.toasts.iter().any(|toast| toast.text == strings::UNKNOWN_HOTKEYS());
         assert!(reported(&app), "the problem is reported at startup");
         app.ui.toasts.clear();
         let mut edited = config.clone();
@@ -2695,12 +2730,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut app = bare_app(dir.path());
         for _ in 0..50 {
-            app.toast(strings::BELL.to_owned());
+            app.toast(strings::BELL().to_owned());
         }
-        app.toast(strings::COPIED.to_owned());
-        app.toast(strings::BELL.to_owned());
+        app.toast(strings::COPIED().to_owned());
+        app.toast(strings::BELL().to_owned());
         let texts: Vec<_> = app.ui.toasts.iter().map(|toast| toast.text.as_str()).collect();
-        assert_eq!(texts, [strings::COPIED, strings::BELL]);
+        assert_eq!(texts, [strings::COPIED(), strings::BELL()]);
     }
 
     #[test]

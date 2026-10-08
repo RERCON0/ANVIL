@@ -16,7 +16,7 @@ pub fn parse(body: &[u8]) -> Result<Fetched, FetchError> {
         (Some(limit), Some(remaining)) if remaining <= limit => limit - remaining,
         _ => usage,
     };
-    let spend = Balance::new("spend", strings::QUOTA_SPEND, spent, Unit::Usd, BalanceKind::Spent).with_limit(limit);
+    let spend = Balance::new("spend", strings::QUOTA_SPEND(), spent, Unit::Usd, BalanceKind::Spent).with_limit(limit);
     Ok(Fetched { plan: None, windows: Vec::new(), balances: vec![spend] })
 }
 

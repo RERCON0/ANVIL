@@ -64,14 +64,14 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, segments: &[Segment]) -> Option<BarAc
     // Refresh at the right edge, always in the same place.
     let refresh = Rect::from_min_max(Pos2::new(rect.max.x - REFRESH_WIDTH, rect.min.y), rect.max);
     let response = ui.interact(refresh, ui.id().with("quota-refresh"), Sense::click());
-    let icon = if ui.fonts_mut(|f| f.has_glyphs(&font, "↻")) { "↻" } else { strings::QUOTA_REFRESH_FALLBACK };
+    let icon = if ui.fonts_mut(|f| f.has_glyphs(&font, "↻")) { "↻" } else { strings::QUOTA_REFRESH_FALLBACK() };
     let icon_color = if response.hovered() { c.icon_hover } else { c.icon };
     painter.text(refresh.center(), Align2::CENTER_CENTER, icon, font.clone(), icon_color);
-    let response = response.on_hover_text(strings::QUOTA_REFRESH_HINT);
+    let response = response.on_hover_text(strings::QUOTA_REFRESH_HINT());
     let action = response.clicked().then_some(BarAction::Refresh);
 
     if segments.is_empty() {
-        painter.text(Pos2::new(rect.min.x + PAD, y), Align2::LEFT_CENTER, strings::QUOTA_NO_DATA, font, c.dim);
+        painter.text(Pos2::new(rect.min.x + PAD, y), Align2::LEFT_CENTER, strings::QUOTA_NO_DATA(), font, c.dim);
         return action;
     }
     let reset_icon = ui.fonts_mut(|f| f.has_glyphs(&font, "↺"));

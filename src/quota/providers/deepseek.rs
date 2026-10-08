@@ -28,16 +28,16 @@ pub fn parse(body: &[u8]) -> Result<Fetched, FetchError> {
         let detail = match (number(info.get("topped_up_balance")), number(info.get("granted_balance"))) {
             (Some(topped), Some(granted)) => Some(format!(
                 "{} {} · {} {}",
-                strings::QUOTA_TOPPED_UP,
+                strings::QUOTA_TOPPED_UP(),
                 format_amount(topped, unit),
-                strings::QUOTA_GRANTED,
+                strings::QUOTA_GRANTED(),
                 format_amount(granted, unit)
             )),
             _ => None,
         };
         if !balances.iter().any(|b: &Balance| b.key == key) {
             balances.push(
-                Balance::new(key, strings::QUOTA_BALANCE, total, unit, BalanceKind::Remaining).with_detail(detail),
+                Balance::new(key, strings::QUOTA_BALANCE(), total, unit, BalanceKind::Remaining).with_detail(detail),
             );
         }
     }

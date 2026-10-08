@@ -42,7 +42,7 @@ pub fn show(ctx: &egui::Context, picker: &mut PickerState, profiles: &[(String, 
             let field = ui.add(
                 egui::TextEdit::singleline(&mut picker.filter)
                     .font(crate::theme::field_font(13.0))
-                    .hint_text(strings::PICKER_FILTER)
+                    .hint_text(strings::PICKER_FILTER())
                     .desired_width(f32::INFINITY),
             );
             if picker.focus {
@@ -55,7 +55,7 @@ pub fn show(ctx: &egui::Context, picker: &mut PickerState, profiles: &[(String, 
             ui.separator();
             egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
                 if matches.is_empty() {
-                    ui.label(strings::PICKER_EMPTY);
+                    ui.label(strings::PICKER_EMPTY());
                 }
                 for (rank, (_, index)) in matches.iter().enumerate() {
                     let (id, name) = &profiles[*index];

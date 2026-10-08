@@ -389,32 +389,32 @@ impl TerminalView {
             .open_memory(None)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
             .show(|ui| {
-                if ui.button(strings::MENU_COPY).clicked() {
+                if ui.button(strings::MENU_COPY()).clicked() {
                     commands.push(PaneCommand::Copy);
                     ui.close();
                 }
-                if ui.button(strings::MENU_PASTE).clicked() {
+                if ui.button(strings::MENU_PASTE()).clicked() {
                     commands.push(PaneCommand::Paste);
                     ui.close();
                 }
-                if ui.button(strings::MENU_SELECT_ALL).clicked() {
+                if ui.button(strings::MENU_SELECT_ALL()).clicked() {
                     commands.push(PaneCommand::SelectAll);
                     ui.close();
                 }
-                if ui.button(strings::MENU_CLEAR).clicked() {
+                if ui.button(strings::MENU_CLEAR()).clicked() {
                     commands.push(PaneCommand::Clear);
                     ui.close();
                 }
                 ui.separator();
-                if ui.button(strings::MENU_SPLIT_RIGHT).clicked() {
+                if ui.button(strings::MENU_SPLIT_RIGHT()).clicked() {
                     commands.push(PaneCommand::SplitRight);
                     ui.close();
                 }
-                if ui.button(strings::MENU_SPLIT_DOWN).clicked() {
+                if ui.button(strings::MENU_SPLIT_DOWN()).clicked() {
                     commands.push(PaneCommand::SplitDown);
                     ui.close();
                 }
-                if ui.button(strings::MENU_CLOSE_PANE).clicked() {
+                if ui.button(strings::MENU_CLOSE_PANE()).clicked() {
                     commands.push(PaneCommand::ClosePane);
                     ui.close();
                 }
@@ -585,7 +585,7 @@ impl TerminalView {
                     ui.horizontal(|ui| {
                         let field = ui.add(
                             egui::TextEdit::singleline(&mut self.search.query)
-                                .hint_text(strings::SEARCH_PLACEHOLDER)
+                                .hint_text(strings::SEARCH_PLACEHOLDER())
                                 // Enter navigates; the default single-line
                                 // behaviour would drop the focus and route the
                                 // next keystrokes to the shell.
@@ -605,23 +605,24 @@ impl TerminalView {
                         }
                         if ui
                             .selectable_label(self.search.case_sensitive, "Aa")
-                            .on_hover_text(strings::SEARCH_CASE)
+                            .on_hover_text(strings::SEARCH_CASE())
                             .clicked()
                         {
                             self.search.case_sensitive = !self.search.case_sensitive;
                             self.search.current = None;
                         }
-                        if ui.selectable_label(self.search.regex, ".*").on_hover_text(strings::SEARCH_REGEX).clicked() {
+                        if ui.selectable_label(self.search.regex, ".*").on_hover_text(strings::SEARCH_REGEX()).clicked()
+                        {
                             self.search.regex = !self.search.regex;
                             self.search.current = None;
                         }
-                        if ui.small_button("↑").on_hover_text(strings::SEARCH_PREV).clicked() {
+                        if ui.small_button("↑").on_hover_text(strings::SEARCH_PREV()).clicked() {
                             nav_prev = true;
                         }
-                        if ui.small_button("↓").on_hover_text(strings::SEARCH_NEXT).clicked() {
+                        if ui.small_button("↓").on_hover_text(strings::SEARCH_NEXT()).clicked() {
                             nav_next = true;
                         }
-                        if ui.small_button("×").on_hover_text(strings::SEARCH_CLOSE).clicked() {
+                        if ui.small_button("×").on_hover_text(strings::SEARCH_CLOSE()).clicked() {
                             close = true;
                         }
                         if ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift) {

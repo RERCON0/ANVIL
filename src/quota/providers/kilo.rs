@@ -18,7 +18,7 @@ pub fn fetch(http: &dyn Http, headers: &[(&'static str, String)], now: i64) -> R
     let state = get(http, &STATE, Some(STATE_QUERY), headers, now)?;
     match parse_pass(&state)? {
         Some(pass) => {
-            Ok(Fetched { plan: Some(strings::QUOTA_KILO_PASS.to_owned()), windows: Vec::new(), balances: vec![pass] })
+            Ok(Fetched { plan: Some(strings::QUOTA_KILO_PASS().to_owned()), windows: Vec::new(), balances: vec![pass] })
         }
         None => parse_balance(&get(http, &BALANCE, None, headers, now)?),
     }
@@ -48,7 +48,7 @@ pub fn parse_pass(body: &[u8]) -> Result<Option<Balance>, FetchError> {
     let resets_at =
         ["nextBillingAt", "nextRenewalAt"].iter().find_map(|k| subscription.get(*k).and_then(epoch_from_json));
     Ok(Some(
-        Balance::new("pass", strings::QUOTA_KILO_PASS, (total - usage).max(0.0), Unit::Usd, BalanceKind::Remaining)
+        Balance::new("pass", strings::QUOTA_KILO_PASS(), (total - usage).max(0.0), Unit::Usd, BalanceKind::Remaining)
             .with_limit(Some(total))
             .resetting(resets_at),
     ))
@@ -58,7 +58,7 @@ pub fn parse_balance(body: &[u8]) -> Result<Fetched, FetchError> {
     let value = json(body)?;
     let balance =
         number(value.get("balance")).filter(|b| *b >= 0.0).ok_or_else(|| FetchError::Format("no balance".into()))?;
-    let balance = Balance::new("balance", strings::QUOTA_BALANCE, balance, Unit::Usd, BalanceKind::Remaining);
+    let balance = Balance::new("balance", strings::QUOTA_BALANCE(), balance, Unit::Usd, BalanceKind::Remaining);
     Ok(Fetched { plan: None, windows: Vec::new(), balances: vec![balance] })
 }
 
