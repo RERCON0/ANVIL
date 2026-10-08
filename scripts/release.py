@@ -163,7 +163,7 @@ def verify_package(path: Path, trusted_key: Path = PUBLIC_KEY) -> dict:
             raise ValueError("Invalid payload record")
         if type(record["size"]) is not int or record["size"] != len(content[name]) or record["sha256"] != sha256(content[name]):
             raise ValueError(f"Payload hash/size mismatch: {name}")
-        if name.endswith(".exe") and record["pe"] != pe_info(content[name], 2 if name == "anvil.exe" else 3):
+        if name.endswith(".exe") and record["pe"] != pe_info(content[name], 3 if name == "anvil-claude-status.exe" else 2):
             raise ValueError("PE metadata mismatch")
     return manifest
 
@@ -198,7 +198,7 @@ def package(payload: dict[str, bytes], source: dict, toolchain: dict, version: s
             raise ValueError(f"Invalid payload size: {name}")
         files[name] = {"sha256": sha256(data), "size": len(data)}
         if name.endswith(".exe"):
-            files[name]["pe"] = pe_info(data, 2 if name == "anvil.exe" else 3)
+            files[name]["pe"] = pe_info(data, 3 if name == "anvil-claude-status.exe" else 2)
     manifest = {"schema": 1, "project": "ANVIL", "version": version, "target": TARGET,
                 "source": source, "toolchain": toolchain, "files": files, "signer_sha256": sha256(der)}
     raw = canonical(manifest)
@@ -323,7 +323,7 @@ def main() -> None:
     binaries.add_argument("directory", type=Path)
     args = parser.parse_args()
     if args.command == "check-binaries":
-        for name, subsystem in (("anvil.exe", 2), ("anvil-claude-status.exe", 3), ("OpenConsole.exe", 3)):
+        for name, subsystem in (("anvil.exe", 2), ("anvil-claude-status.exe", 3), ("OpenConsole.exe", 2)):
             path = args.directory / name
             if not 0 < path.stat().st_size <= MAX_FILE:
                 raise ValueError("Invalid executable size")

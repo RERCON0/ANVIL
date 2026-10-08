@@ -38,7 +38,7 @@ class ReleaseTests(unittest.TestCase):
         cls.other_key, cls.other_public = cls.folder / "other.pem", cls.folder / "other-public.pem"
         release.keygen(cls.other_key, cls.other_public)
         cls.payload = {name: b"sample payload\n" for name in release.PAYLOAD}
-        for name, subsystem in (("anvil.exe", 2), ("anvil-claude-status.exe", 3), ("OpenConsole.exe", 3)):
+        for name, subsystem in (("anvil.exe", 2), ("anvil-claude-status.exe", 3), ("OpenConsole.exe", 2)):
             cls.payload[name] = executable(subsystem)
         cls.source = {"commit": "a" * 40, "tree": "b" * 40, "inputs_sha256": "c" * 64,
                       "url": "https://github.com/RERCON0/ANVIL/tree/" + "a" * 40}
@@ -163,10 +163,17 @@ class ReleaseTests(unittest.TestCase):
                 release.pe_info(executable()[:size], 2)
 
     def test_pe_rejects_dynamic_crt(self):
-        data = bytearray(executable())
-        data[576:593] = b"vcruntime140.dll\0"
-        with self.assertRaises(ValueError):
-            release.pe_info(bytes(data), 2)
+        for name in (b"vcruntime140.dll", b"msvcp140.dll", b"msvcr120.dll", b"concrt140.dll", b"vcomp140.dll"):
+            data = bytearray(executable())
+            data[576:640] = name + b"\0" * (64 - len(name))
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                release.pe_info(bytes(data), 2)
+
+    def test_pinned_microsoft_conpty_uses_supported_system_imports(self):
+        for name in ("OpenConsole.exe", "conpty.dll"):
+            info = release.pe_info((release.ROOT / "vendor/conpty/x64" / name).read_bytes(), 2)
+            self.assertEqual(info["subsystem"], 2)
+            self.assertIn("api-ms-win-crt-runtime-l1-1-0.dll", info["imports"])
 
 
 if __name__ == "__main__":

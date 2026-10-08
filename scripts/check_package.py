@@ -83,6 +83,7 @@ def check(package):
         raise ValueError("Source notice differs from CI revision")
     check_pe(payload["anvil.exe"], 2, "anvil.exe")
     check_pe(payload["anvil-claude-status.exe"], 3, "anvil-claude-status.exe")
+    check_pe(payload["OpenConsole.exe"], 2, "OpenConsole.exe")
     for name in ("anvil.exe", "anvil-claude-status.exe"):
         check_no_build_paths(payload[name], name)
     checksum = hashlib.sha256(package.read_bytes()).hexdigest()

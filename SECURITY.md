@@ -9,7 +9,7 @@ reproduction and expected behaviour; do not publish real tokens or keys.
 ## Automated checks
 
 - CI runs formatting, Clippy with warnings denied, Rust/Python tests and real Windows ConPTY/Git integration.
-- Packages are checked against their exact source revision, licences, file hashes, x64 GUI/CLI subsystems and ASLR/high-entropy ASLR/DEP. Dynamic Visual C++ runtime dependencies are rejected.
+- Packages are checked against their exact source revision, licences, file hashes, x64 GUI/CLI subsystems and ASLR/high-entropy ASLR/DEP. Redistributable-only Visual C++ runtime DLLs are rejected; Microsoft's pinned ConPTY uses the system UCRT.
 - Security audits the complete locked dependency graph with RustSec; vulnerabilities, unsound and yanked dependencies fail the job. Informational advisories remain visible.
 - Gitleaks scans the complete Git history with redacted output. The single exception is an exact synthetic test token, restricted to its test file and value.
 - actionlint validates workflows and shell commands. Actions use full commit SHA pins; downloaded Gitleaks/actionlint archives have pinned SHA-256 hashes.

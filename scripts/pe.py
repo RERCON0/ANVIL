@@ -4,7 +4,7 @@ import struct
 MAX_META = 1024 * 1024
 
 def pe_info(data: bytes, subsystem: int) -> dict:
-    """Reject wrong architecture, missing exploit mitigations and dynamic CRT."""
+    """Reject wrong architecture, missing mitigations and non-system VC runtimes."""
     def unpack(fmt: str, offset: int) -> tuple:
         size = struct.calcsize(fmt)
         if offset < 0 or offset + size > len(data):
@@ -54,7 +54,9 @@ def pe_info(data: bytes, subsystem: int) -> dict:
         name = data[at:at + 256].split(b"\0", 1)[0].decode("ascii").lower()
         if not re.fullmatch(r"[a-z0-9_.-]+\.dll", name):
             raise ValueError("Invalid PE import name")
-        if name.startswith(("vcruntime", "msvcp", "api-ms-win-crt")) or name == "ucrtbase.dll":
+        # UCRT/API-set contracts are OS components on supported Windows 10/11.
+        # The pinned Microsoft ConPTY uses them; they need no VC redistributable.
+        if name.startswith(("vcruntime", "msvcp", "concrt", "vcomp")) or (name.startswith("msvcr") and name != "msvcrt.dll"):
             raise ValueError(f"Dynamic Visual C++ runtime dependency: {name}")
         imports.append(name)
     else:

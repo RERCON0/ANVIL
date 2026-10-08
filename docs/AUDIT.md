@@ -14,7 +14,7 @@ Provider parsing was exercised with fixtures; no paid model task was submitted.
 | Unbounded Claude settings reads | Oversized settings reached UI/setup reads and could grow between metadata checks and the backup read | A 2 MiB handle-based read limit at UI, mutation and reread boundaries; an oversized settings test proves no backup or replacement occurs. |
 | npm shim read could outgrow its metadata limit | A concurrent writer could enlarge a shim between the size check and read | Read through the opened handle with a 64 KiB bound. |
 | Timestamp subtraction overflow | Extreme commit/reset timestamps could overflow signed subtraction | Saturating age/reset calculations; extreme-date regression coverage. |
-| Portable executable required an unbundled Visual C++ runtime | PE imports included `vcruntime140.dll`, so a clean Windows machine could fail at launch | Static CRT in normal and package builds; package validation rejects dynamic CRT imports and checks x64/subsystem/ASLR/DEP. |
+| Portable executable required an unbundled Visual C++ runtime | PE imports included `vcruntime140.dll`, so a clean Windows machine could fail at launch | Static CRT in ANVIL/helper builds; package validation rejects redistributable-only runtime imports and checks x64/subsystem/ASLR/DEP. |
 | Fresh build embedded the workstation path through generated OpenGL bindings | A release built outside the checkout retained `file!()` paths from the temporary target tree | Remap the absolute target directory as well as source/toolchain paths; reject external target paths in UTF-8/UTF-16. The first candidate was rejected before signing. |
 | Package hashes did not authenticate the publisher | Replacing files and recomputing unsigned hashes produced no publisher identity | Independent Ed25519 key, exact signed payload inventory, clean source provenance, bounded verification and negative signature/ZIP/PE tests. |
 
@@ -41,6 +41,12 @@ acceptance uses their normal interactive controls for the generated repository.
 - Fresh signed package build, PE/import inspection and independent signature verification.
 
 These checks are release gates, not a claim that all possible flaws were found.
+
+The Microsoft `OpenConsole.exe` is a GUI console host (PE subsystem 2), not a
+console-subsystem CLI. Its UCRT/API-set dependencies, also used by `conpty.dll`,
+are [Windows 10/11 system components](https://learn.microsoft.com/en-us/cpp/windows/universal-crt-deployment?view=msvc-170).
+Tests inspect the actual pinned vendor binaries as well as synthetic PE fixtures;
+they continue to reject `vcruntime`, `msvcp` and other redistributable-only DLLs.
 
 ## Remaining boundaries
 
