@@ -25,18 +25,18 @@ if ($seenRuntimeNames.Count -ne 2) { throw 'Incomplete ConPTY checksum manifest'
 
 # Honour CARGO_TARGET_DIR / CARGO_BUILD_TARGET so the staged files always come
 # from the build we just ran.
-$targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }
+$targetDir = [IO.Path]::GetFullPath($(if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root 'target' }))
 $targetTriple = 'x86_64-pc-windows-msvc'
 # Panic locations and debug info embed absolute source paths. Remap the checkout,
-# the cargo home and the toolchain so the archive does not carry the builder's
-# directories, and ask the linker for a content-derived timestamp (/Brepro) so
-# the same sources give the same executables. For this build the variable
+# cargo home, toolchain and generated-code tree so the archive does not carry
+# the builder's directories, including a fresh target tree outside the checkout.
+# Ask the linker for a content-derived timestamp (/Brepro). For this build the variable
 # replaces RUSTFLAGS and any rustflags from the cargo configuration.
 $sysroot = "$(rustc --print sysroot)".Trim()
 if ($LASTEXITCODE -ne 0 -or -not $sysroot) { throw 'Cannot determine the Rust sysroot' }
 $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.cargo' }
 $previousRustflags = $env:CARGO_ENCODED_RUSTFLAGS
-$env:CARGO_ENCODED_RUSTFLAGS = @("--remap-path-prefix=$root=/anvil", "--remap-path-prefix=$cargoHome=/cargo", "--remap-path-prefix=$sysroot=/rust", '-Clink-arg=/Brepro', '-Ctarget-feature=+crt-static') -join [char]0x1f
+$env:CARGO_ENCODED_RUSTFLAGS = @("--remap-path-prefix=$root=/anvil", "--remap-path-prefix=$cargoHome=/cargo", "--remap-path-prefix=$sysroot=/rust", "--remap-path-prefix=$targetDir=/build", '-Clink-arg=/Brepro', '-Ctarget-feature=+crt-static') -join [char]0x1f
 try {
     cargo build --locked --release --bin anvil --bin anvil-claude-status --target $targetTriple --target-dir $targetDir
 } finally {

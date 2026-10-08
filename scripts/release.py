@@ -248,14 +248,15 @@ def build(output: Path, private_key: Path) -> dict:
         target = Path(folder) / "target"
         previous = os.environ.get("CARGO_TARGET_DIR")
         os.environ["CARGO_TARGET_DIR"] = str(target)
+        candidate = ROOT / f"dist/anvil-{version}-x64.zip"
         try:
             run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ROOT / "scripts/package.ps1")],
                 capture=False, timeout=2400)
+            # Keep the fresh target path available to the privacy check as well.
+            check_candidate(candidate)
         finally:
             if previous is None: os.environ.pop("CARGO_TARGET_DIR", None)
             else: os.environ["CARGO_TARGET_DIR"] = previous
-        candidate = ROOT / f"dist/anvil-{version}-x64.zip"
-        check_candidate(candidate)
         with zipfile.ZipFile(candidate) as archive:
             payload = {name: archive.read(name) for name in EXPECTED}
         payload["SOURCE.txt"] = payload["SOURCE.txt"].decode("utf-8-sig").replace(

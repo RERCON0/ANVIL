@@ -36,7 +36,7 @@ def check_no_build_paths(data, name):
     """package.ps1 remaps the builder's directories; none may survive in the executables."""
     haystack = data.lower()
     builder = {Path.home(), ROOT}
-    builder |= {Path(os.environ[key]) for key in ("CARGO_HOME", "RUSTUP_HOME") if os.environ.get(key)}
+    builder |= {Path(os.environ[key]) for key in ("CARGO_HOME", "RUSTUP_HOME", "CARGO_TARGET_DIR") if os.environ.get(key)}
     for path in builder:
         if len(path.parts) < 2:  # a drive or filesystem root would match every path
             continue

@@ -15,6 +15,7 @@ Provider parsing was exercised with fixtures; no paid model task was submitted.
 | npm shim read could outgrow its metadata limit | A concurrent writer could enlarge a shim between the size check and read | Read through the opened handle with a 64 KiB bound. |
 | Timestamp subtraction overflow | Extreme commit/reset timestamps could overflow signed subtraction | Saturating age/reset calculations; extreme-date regression coverage. |
 | Portable executable required an unbundled Visual C++ runtime | PE imports included `vcruntime140.dll`, so a clean Windows machine could fail at launch | Static CRT in normal and package builds; package validation rejects dynamic CRT imports and checks x64/subsystem/ASLR/DEP. |
+| Fresh build embedded the workstation path through generated OpenGL bindings | A release built outside the checkout retained `file!()` paths from the temporary target tree | Remap the absolute target directory as well as source/toolchain paths; reject external target paths in UTF-8/UTF-16. The first candidate was rejected before signing. |
 | Package hashes did not authenticate the publisher | Replacing files and recomputing unsigned hashes produced no publisher identity | Independent Ed25519 key, exact signed payload inventory, clean source provenance, bounded verification and negative signature/ZIP/PE tests. |
 
 ## Usability and release preparation

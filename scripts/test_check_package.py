@@ -3,9 +3,11 @@
 Run: python -B -m unittest discover -s scripts -p "test_*.py"
 """
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import check_package
 
@@ -21,7 +23,15 @@ class BuildPathGuard(unittest.TestCase):
                         check_package.check_no_build_paths(data, "anvil.exe")
 
     def test_accepts_remapped_paths(self):
-        check_package.check_no_build_paths(b"MZ\0\0at /cargo/registry/src/x/lib.rs, /anvil/src/app.rs, /rust/library\0", "anvil.exe")
+        check_package.check_no_build_paths(b"MZ\0\0at /cargo/registry/src/x/lib.rs, /anvil/src/app.rs, /rust/library, /build/glutin/out/egl_bindings.rs\0", "anvil.exe")
+
+    def test_rejects_generated_paths_from_a_target_outside_the_checkout_and_home(self):
+        target = Path(check_package.ROOT.anchor) / "anvil-external-build" / "target"
+        for encoding in ("utf-8", "utf-16le"):
+            leaked = str(target / "build" / "glutin" / "out" / "egl_bindings.rs").encode(encoding)
+            with self.subTest(encoding=encoding), patch.dict(os.environ, {"CARGO_TARGET_DIR": str(target)}):
+                with self.assertRaises(ValueError):
+                    check_package.check_no_build_paths(b"MZ\0" + leaked + b"\0", "anvil.exe")
 
 
 class WorkingTreeCleanliness(unittest.TestCase):
