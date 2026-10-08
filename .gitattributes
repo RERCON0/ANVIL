@@ -18,3 +18,5 @@ LICENSE text eol=lf
 *.woff binary
 *.dll binary
 *.exe binary
+# This reviewed input is hash-pinned including its original CRLF bytes.
+vendor/seti/setiIconMap.ts -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

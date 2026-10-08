@@ -8,6 +8,9 @@ not an unmodified upstream TypeScript file. Its original generator revision
 was not retained; the exact reviewed input is pinned below. Do not infer an
 upstream source revision from the generated file.
 
+Git preserves this reviewed mapping byte for byte, including its CRLF line
+endings, so fresh Linux and Windows checkouts match the same SHA-256 pin.
+
 `scripts/gen_seti_icons.py` generates the committed font and Rust table from
 these inputs. CI installs the hash-pinned fontTools wheel from
 `scripts/requirements-icons.txt` and tests deterministic regeneration.
