@@ -142,6 +142,13 @@ impl Tab {
         self.panes.get_mut(&self.focused).map(|entry| &mut entry.workspace)
     }
 
+    /// An open panel's branch picker is waiting for a key: it must own the
+    /// keyboard even when no widget holds focus, or Esc would reach the shell
+    /// and leave the list open (see `AnvilApp::key_focus`).
+    pub fn branch_picker_open(&self) -> bool {
+        self.panes.values().any(|entry| entry.workspace.open && entry.workspace.branch_picker)
+    }
+
     pub fn new(tree: SplitTree, panes: HashMap<PaneId, PaneEntry>, focused: PaneId) -> Tab {
         Tab {
             tree,
@@ -380,7 +387,10 @@ impl Tab {
                             let actions = entry.workspace.show(ui, panel_rect, *id, env.ai_command.as_deref());
                             for action in actions {
                                 match action {
-                                    crate::workspace::WorkspaceAction::Close => entry.workspace.open = false,
+                                    crate::workspace::WorkspaceAction::Close => {
+                                        entry.workspace.open = false;
+                                        entry.workspace.close_branch_picker();
+                                    }
                                 }
                             }
                             let handle = Rect::from_min_size(
@@ -821,5 +831,19 @@ mod tests {
         assert!(tab.collapsed.is_empty());
         assert_eq!(tab.focused, 2);
         assert!(tab.panes.contains_key(&2) && !tab.panes.contains_key(&1));
+    }
+
+    /// An open branch picker owns the keyboard so Esc closes it instead of
+    /// reaching the shell; a hidden panel must not keep that claim.
+    #[test]
+    fn only_an_open_panel_with_an_open_picker_owns_the_keyboard() {
+        let mut tab = two_panes();
+        assert!(!tab.branch_picker_open(), "no open panel, no picker");
+        tab.panes.get_mut(&1).unwrap().workspace.open = true;
+        assert!(!tab.branch_picker_open(), "the picker is closed");
+        tab.panes.get_mut(&1).unwrap().workspace.branch_picker = true;
+        assert!(tab.branch_picker_open());
+        tab.panes.get_mut(&1).unwrap().workspace.open = false;
+        assert!(!tab.branch_picker_open(), "a hidden panel must not keep the keyboard");
     }
 }

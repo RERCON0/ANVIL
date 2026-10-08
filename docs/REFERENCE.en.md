@@ -98,6 +98,18 @@ Its state is retained and it reappears when the pane is widened.
 - Fetch and push update history. External HEAD/upstream changes are detected by
   background polling. First push considers `branch.<name>.pushRemote`,
   `remote.pushDefault`, then `branch.<name>.remote`, with `origin` as fallback.
+- Switch branches from the panel: the branch name opens a filtered list (the
+  current branch first, then local ones, then remote-tracking ones). Checking
+  out a remote branch creates the local branch that tracks it, or uses the
+  local branch of the same name when it already exists; a separate field
+  creates a branch at HEAD and switches to it. Git carries uncommitted changes
+  itself and refuses when they conflict, with its reason shown and nothing
+  overwritten. Names are checked before git runs: a leading `-`, control
+  characters, `..`, `@{`, `.lock`, Windows device names and other invalid ref
+  forms are refused. `post-checkout` hooks and smudge filters are covered by
+  the same repository trust approval as commit. After a switch the panel drops
+  the diff, file list and history of the branch that was left and reads them
+  again; the commit draft stays.
 - The Files tab has a collapsible tree and fuzzy filter, text/Markdown previews,
   project line counting, create/rename and confirmed Recycle Bin deletion.
   Markdown renders headings, lists, quotes, code, tables and inline formatting.

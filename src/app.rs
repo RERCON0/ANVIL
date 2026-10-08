@@ -619,8 +619,13 @@ impl AnvilApp {
 
     pub fn key_focus(&self, ctx: &egui::Context) -> KeyFocus {
         // Open overlays own the keyboard even when their widgets lost focus,
-        // otherwise Esc would reach the shell and leave a stuck popup.
-        let overlay = self.ui.picker.is_some() || self.ui.collapsed_list.is_some() || self.ui.dialog.is_some();
+        // otherwise Esc would reach the shell and leave a stuck popup. An open
+        // branch picker is one of them: clicking a row of it surrenders the
+        // filter's focus, and Esc still has to close the list.
+        let overlay = self.ui.picker.is_some()
+            || self.ui.collapsed_list.is_some()
+            || self.ui.dialog.is_some()
+            || self.tabs.get(self.active).is_some_and(Tab::branch_picker_open);
         KeyFocus {
             egui_wants_keyboard: ctx.egui_wants_keyboard_input() || overlay,
             terminal_focused: !self.settings_open && self.tabs.get(self.active).is_some(),
@@ -1258,6 +1263,9 @@ impl AnvilApp {
                     workspace.open = !workspace.open;
                     if workspace.open {
                         workspace.refresh_soon();
+                    } else {
+                        // The hidden picker must not keep the keyboard.
+                        workspace.close_branch_picker();
                     }
                 }
             }

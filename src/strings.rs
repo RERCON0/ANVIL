@@ -287,6 +287,13 @@ texts! {
     WORKSPACE_FILE_TRUNCATED,
     WORKSPACE_PUSH_HINT,
     WORKSPACE_FETCH_HINT,
+    WORKSPACE_BRANCH_HINT,
+    WORKSPACE_BRANCH_FILTER,
+    WORKSPACE_BRANCHES_LOADING,
+    WORKSPACE_BRANCH_NEW,
+    WORKSPACE_BRANCH_CREATE,
+    WORKSPACE_BRANCH_INVALID,
+    WORKSPACE_BRANCH_REMOTE_HINT,
     WORKSPACE_NO_BRANCH,
     WORKSPACE_NO_AI_COMMAND,
     WORKSPACE_AI_EMPTY,
@@ -344,6 +351,12 @@ pub fn workspace_pushed(branch: &str) -> String {
     match language() {
         Language::English => en::workspace_pushed(branch),
         Language::Russian => ru::workspace_pushed(branch),
+    }
+}
+pub fn workspace_switched(branch: &str) -> String {
+    match language() {
+        Language::English => en::workspace_switched(branch),
+        Language::Russian => ru::workspace_switched(branch),
     }
 }
 pub fn workspace_fetch_done(what: &str) -> String {

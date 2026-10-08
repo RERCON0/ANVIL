@@ -98,6 +98,16 @@ pub enum Request {
     },
     Fetch,
     Push,
+    /// Local and remote-tracking branches for the picker under the repo row.
+    Branches,
+    /// `git switch` to a name the picker listed (local or remote-tracking).
+    Checkout {
+        branch: String,
+    },
+    /// `git switch -c`: create a branch at HEAD and switch to it.
+    NewBranch {
+        name: String,
+    },
     WritePath {
         path: String,
         folder: bool,
@@ -171,6 +181,9 @@ enum Response {
     Applied,
     Fetched(String),
     Pushed(String),
+    Branches(Vec<git::Branch>),
+    /// The branch now checked out, or why git refused.
+    CheckedOut(Result<String, String>),
     Error(String),
 }
 
@@ -280,6 +293,18 @@ pub struct Workspace {
     pub detail: Option<(String, git::CommitDetail)>,
     detail_file: Option<CommitFile>,
     pub files: Vec<String>,
+    /// Local and remote branches the picker shows; loaded when it opens.
+    pub branches: Vec<git::Branch>,
+    /// The picker under the repo row is open.
+    pub branch_picker: bool,
+    branch_filter: String,
+    new_branch: String,
+    branch_filter_focus: bool,
+    /// The branch list has arrived for the picker's current open state.
+    branches_loaded: bool,
+    /// A checkout request is on its way: further switches are refused until
+    /// the worker answers, so a double click cannot run two of them.
+    switching: bool,
     /// Folders of the file tree that the user opened; the tree starts folded.
     pub file_expanded: HashSet<String>,
     /// Files and total lines of the last "Посчитать строки" run.
@@ -349,6 +374,13 @@ impl Default for Workspace {
             detail: None,
             detail_file: None,
             files: Vec::new(),
+            branches: Vec::new(),
+            branch_picker: false,
+            branch_filter: String::new(),
+            new_branch: String::new(),
+            branch_filter_focus: false,
+            branches_loaded: false,
+            switching: false,
             file_expanded: HashSet::new(),
             line_count: None,
             file_filter: String::new(),
@@ -467,6 +499,8 @@ impl Workspace {
         self.detail_file = None;
         self.files.clear();
         self.files_loaded = false;
+        self.close_branch_picker();
+        self.switching = false;
         self.file_expanded.clear();
         self.line_count = None;
         self.close_file_preview();
@@ -497,6 +531,97 @@ impl Workspace {
         self.busy = true;
         self.notice = None;
         self.request(Request::Commit { message: self.commit_message.clone() });
+    }
+
+    /// The branch chip: opens the picker and loads the branch list again; a
+    /// second click closes it. The list is re-read on every open, so refs a
+    /// fetch or another client added in between are there.
+    fn toggle_branch_picker(&mut self) {
+        if self.branch_picker {
+            self.close_branch_picker();
+            return;
+        }
+        // Without a worker there is nobody to answer the list request.
+        if self.tx.is_none() {
+            return;
+        }
+        self.branch_picker = true;
+        self.branch_filter.clear();
+        self.new_branch.clear();
+        self.branch_filter_focus = true;
+        self.branches.clear();
+        self.branches_loaded = false;
+        self.busy = true;
+        self.request(Request::Branches);
+    }
+
+    /// Closes the branch picker and drops its state. The panel calls this when
+    /// it is hidden: a closed panel must not keep a stale list, and the open
+    /// picker owns the keyboard, so leaving it set would keep Esc from the
+    /// shell after the panel is gone.
+    pub fn close_branch_picker(&mut self) {
+        self.branch_picker = false;
+        self.branch_filter.clear();
+        self.new_branch.clear();
+        self.branch_filter_focus = false;
+        self.branches.clear();
+        self.branches_loaded = false;
+    }
+
+    /// Sends a switch for the branch the user picked; the picker stays open so
+    /// a refused switch can be retried on another branch.
+    fn start_checkout(&mut self, branch: String) {
+        if self.switching || self.tx.is_none() {
+            return;
+        }
+        self.switching = true;
+        self.busy = true;
+        self.notice = None;
+        self.request(Request::Checkout { branch });
+    }
+
+    /// Sends the create-and-switch for the typed name.
+    fn start_new_branch(&mut self, name: String) {
+        if self.switching || self.tx.is_none() {
+            return;
+        }
+        self.switching = true;
+        self.busy = true;
+        self.notice = None;
+        self.request(Request::NewBranch { name });
+    }
+
+    /// The worktree was rewritten under the panel: every cached diff, file
+    /// list and history view belongs to the branch that was left. The commit
+    /// draft and the repository approval stay; a refresh picks the new state up.
+    fn forget_branch_view(&mut self) {
+        self.selected.clear();
+        self.collapsed.clear();
+        self.close_diff();
+        self.detail = None;
+        self.detail_file = None;
+        self.files.clear();
+        self.files_loaded = false;
+        self.file_expanded.clear();
+        self.line_count = None;
+        self.close_file_preview();
+        self.file_rows.clear();
+        self.file_rows_dirty = true;
+        self.change_rows_cache.clear();
+        self.changes_dirty = true;
+        self.preview_rows.clear();
+        self.preview_wrapped = WrappedRows::default();
+        self.markdown = MarkdownCache::default();
+        self.log = CommitLog::default();
+        self.graph.clear();
+        self.prompt = None;
+        self.close_branch_picker();
+        self.log_status_seen = false;
+        self.last_poll = Instant::now() - POLL_INTERVAL;
+        self.request(Request::Log);
+        if self.tab == PanelTab::Files {
+            self.request(Request::Files);
+        }
     }
 
     fn trust_view(&mut self, ui: &mut egui::Ui) {
@@ -612,6 +737,12 @@ impl Workspace {
                         || self.status.behind != status.behind;
                     if root_changed {
                         self.clear_repository_view();
+                    }
+                    // A branch changed outside the panel (another client, a
+                    // shell command) while the picker is open: the dots are
+                    // stale, so the list is read again.
+                    if self.branch_picker && !root_changed && self.status.branch != status.branch {
+                        self.request(Request::Branches);
                     }
                     self.log_status_seen = true;
                     self.root = root;
@@ -765,6 +896,10 @@ impl Workspace {
                     self.notice = Some((notice_text(&strings::workspace_fetch_done(&what)), false));
                     self.last_poll = Instant::now() - POLL_INTERVAL;
                     self.request(Request::Log);
+                    if self.branch_picker {
+                        self.busy = true;
+                        self.request(Request::Branches);
+                    }
                 }
                 Response::Pushed(branch) => {
                     self.busy = false;
@@ -772,8 +907,27 @@ impl Workspace {
                     self.last_poll = Instant::now() - POLL_INTERVAL;
                     self.request(Request::Log);
                 }
+                Response::Branches(branches) => {
+                    self.busy = false;
+                    self.branches_loaded = true;
+                    if self.branches != branches {
+                        self.branches = branches;
+                    }
+                }
+                Response::CheckedOut(result) => {
+                    self.busy = false;
+                    self.switching = false;
+                    match result {
+                        Ok(branch) => {
+                            self.notice = Some((notice_text(&strings::workspace_switched(&branch)), false));
+                            self.forget_branch_view();
+                        }
+                        Err(message) => self.notice = Some((notice_text(&message), true)),
+                    }
+                }
                 Response::Error(message) => {
                     self.busy = false;
+                    self.switching = false;
                     self.notice = Some((notice_text(&message), true));
                 }
             }
@@ -786,6 +940,7 @@ impl Workspace {
             self.busy = false;
             self.ai_generating = false;
             self.committing = false;
+            self.switching = false;
             self.trust_approval_pending = false;
             self.inflight = 0;
             if self.notice.is_none() {
@@ -834,6 +989,9 @@ impl Workspace {
                     let text = egui::RichText::new(format!("{dot} {label}")).font(theme::field_font(12.5)).color(color);
                     if ui.add(egui::Button::new(text)).clicked() {
                         self.tab = tab;
+                        // The picker belongs to the Changes column; leaving it
+                        // open would resurrect a stale list on return.
+                        self.close_branch_picker();
                         self.refresh_soon();
                         match tab {
                             PanelTab::Changes => {
@@ -886,6 +1044,9 @@ impl Workspace {
         // the rest of the column and scrolls on its own (Helm's layout), so
         // scrolling the history never carries the header away.
         self.repo_row(ui);
+        if self.branch_picker {
+            self.branch_picker_view(ui);
+        }
         self.commit_box(ui);
         self.change_rows(ui);
         ui.add_space(6.0);
@@ -902,9 +1063,14 @@ impl Workspace {
         ui.horizontal(|ui| {
             ui.label(RichText::new(name).color(theme::colors().text).font(theme::font(12.5)));
             if !self.status.branch.is_empty() {
-                ui.label(
-                    RichText::new(&self.status.branch).color(theme::colors().accent).font(theme::field_font(12.0)),
+                let label = format!("{} ▾", display(&self.status.branch, 40));
+                let chip = ui.add(
+                    egui::Button::new(RichText::new(label).color(theme::colors().accent).font(theme::field_font(12.0)))
+                        .frame(false),
                 );
+                if chip.on_hover_text(strings::WORKSPACE_BRANCH_HINT()).clicked() && !self.switching {
+                    self.toggle_branch_picker();
+                }
                 if self.status.ahead > 0 {
                     ui.label(
                         RichText::new(format!("↑{}", self.status.ahead))
@@ -959,6 +1125,121 @@ impl Workspace {
             notice_label(ui, notice, colour);
         }
         theme::hairline(ui);
+    }
+
+    /// Branches matching the picker's filter, in the list's own order.
+    fn filtered_branches(&self) -> Vec<&git::Branch> {
+        self.branches
+            .iter()
+            .filter(|branch| crate::profiles::fuzzy_score(&self.branch_filter, &branch.name).is_some())
+            .collect()
+    }
+
+    /// The branch list under the repo row: a filter, the branches and a
+    /// create-from-HEAD field. Every action goes to the worker; the UI thread
+    /// never runs git here.
+    fn branch_picker_view(&mut self, ui: &mut egui::Ui) {
+        let mut switch: Option<String> = None;
+        let mut create: Option<String> = None;
+        ui.add_space(2.0);
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut self.branch_filter)
+                .font(theme::field_font(12.0))
+                .hint_text(strings::WORKSPACE_BRANCH_FILTER())
+                .desired_width(f32::INFINITY),
+        );
+        if self.branch_filter_focus {
+            field.request_focus();
+            self.branch_filter_focus = false;
+        }
+        if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if let Some(branch) = self.filtered_branches().first() {
+                switch = Some(branch.name.clone());
+            }
+        }
+        // Rows are fixed-height so a repository with many branches scrolls
+        // without laying every one of them out on every frame.
+        const ROW_HEIGHT: f32 = 20.0;
+        if !self.branches_loaded {
+            ui.label(
+                RichText::new(strings::WORKSPACE_BRANCHES_LOADING())
+                    .color(theme::colors().faint)
+                    .font(theme::font(11.5)),
+            );
+        } else {
+            let matches = self.filtered_branches();
+            if matches.is_empty() {
+                ui.label(RichText::new(strings::PICKER_EMPTY()).color(theme::colors().faint).font(theme::font(11.5)));
+            } else {
+                let limit = (ui.available_height() * 0.4).clamp(ROW_HEIGHT * 3.0, 240.0);
+                let spacing = ui.spacing().item_spacing.y;
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ScrollArea::vertical()
+                    .id_salt("workspace-branches")
+                    .max_height(limit)
+                    .auto_shrink([false, true])
+                    .show_rows(ui, ROW_HEIGHT, matches.len(), |ui, visible| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for index in visible {
+                            let branch = matches[index];
+                            let (rect, response) =
+                                ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::click());
+                            let painter = ui.painter_at(rect);
+                            if response.hovered() {
+                                painter.rect_filled(rect, 0.0, theme::colors().tab_hover_bg);
+                            }
+                            let (dot, colour) = if branch.current {
+                                ("●", theme::colors().accent)
+                            } else if branch.remote {
+                                ("○", theme::colors().faint)
+                            } else {
+                                ("○", theme::colors().text)
+                            };
+                            painter.text(
+                                rect.left_center(),
+                                Align2::LEFT_CENTER,
+                                format!("{dot} {}", display(&branch.name, 80)),
+                                theme::field_font(11.5),
+                                colour,
+                            );
+                            let response = if branch.remote {
+                                response.on_hover_text(strings::WORKSPACE_BRANCH_REMOTE_HINT())
+                            } else {
+                                response
+                            };
+                            if response.clicked() {
+                                switch = Some(branch.name.clone());
+                            }
+                        }
+                    });
+                ui.spacing_mut().item_spacing.y = spacing;
+            }
+        }
+        theme::hairline(ui);
+        ui.horizontal(|ui| {
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut self.new_branch)
+                    .font(theme::field_font(12.0))
+                    .hint_text(strings::WORKSPACE_BRANCH_NEW())
+                    .desired_width((ui.available_width() - 150.0).max(80.0)),
+            );
+            let name = self.new_branch.trim();
+            let valid = git::valid_branch_name(name);
+            let button =
+                ui.add_enabled(valid && !self.switching, theme::ghost_button(strings::WORKSPACE_BRANCH_CREATE()));
+            if button.clicked() || (valid && field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                create = Some(name.to_owned());
+            }
+        });
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.close_branch_picker();
+            return;
+        }
+        if let Some(branch) = switch {
+            self.start_checkout(branch);
+        } else if let Some(name) = create {
+            self.start_new_branch(name);
+        }
     }
 
     fn commit_box(&mut self, ui: &mut egui::Ui) {
@@ -2961,6 +3242,7 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                 send(match request {
                     Request::AiMessage { .. } => Response::AiMessage(Err(error)),
                     Request::Commit { .. } => Response::Committed(Err(error)),
+                    Request::Checkout { .. } | Request::NewBranch { .. } => Response::CheckedOut(Err(error)),
                     Request::OpenExternal { .. } | Request::Reveal { .. } => Response::Launch(None),
                     _ => Response::Error(error),
                 });
@@ -3232,6 +3514,21 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                         Err(e) => send(Response::Error(e)),
                     },
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO().to_owned())),
+                },
+                Request::Branches => match &root {
+                    Some(root) => match git::branches(root) {
+                        Ok(branches) => send(Response::Branches(branches)),
+                        Err(e) => send(Response::Error(e)),
+                    },
+                    None => send(Response::Branches(Vec::new())),
+                },
+                Request::Checkout { branch } => match &root {
+                    Some(root) => send(Response::CheckedOut(git::checkout(root, &branch))),
+                    None => send(Response::CheckedOut(Err(strings::WORKSPACE_NO_REPO().to_owned()))),
+                },
+                Request::NewBranch { name } => match &root {
+                    Some(root) => send(Response::CheckedOut(git::create_branch(root, &name))),
+                    None => send(Response::CheckedOut(Err(strings::WORKSPACE_NO_REPO().to_owned()))),
                 },
                 Request::WritePath { path, folder } => match &root {
                     Some(root) => match write_path(root, &path, folder) {
@@ -3678,6 +3975,125 @@ mod tests {
             requests.iter().any(|request| matches!(request, Request::Log)),
             "the new repository must be read again"
         );
+    }
+
+    /// A branch switch rewrites the worktree: the diff, the file lists and the
+    /// history of the previous branch must not stay on screen, while the commit
+    /// draft and the repository root stay and the new state is read again.
+    #[test]
+    fn a_branch_switch_forgets_the_previous_branch_view() {
+        let mut workspace = Workspace {
+            root: Some(PathBuf::from("C:/repo")),
+            status: Status { branch: "old".to_owned(), changes: vec![changed_file("old.txt")], ..Default::default() },
+            files: vec!["old.txt".to_owned()],
+            file_preview: Some(("old.txt".to_owned(), "text".to_owned(), false)),
+            commit_message: "feat: keep me".to_owned(),
+            branch_picker: true,
+            switching: true,
+            log: CommitLog { commits: vec![commit("0123456789", git::Section::History)], ..Default::default() },
+            ..Default::default()
+        };
+        workspace.selected.insert("old.txt".to_owned());
+        workspace.diff_path = Some("old.txt".to_owned());
+
+        let (request_tx, request_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+        workspace.tx = Some(request_tx);
+        workspace.rx = Some(response_rx);
+        response_tx.send(Response::CheckedOut(Ok("feature".to_owned()))).unwrap();
+
+        assert!(workspace.absorb(), "a response must ask for a repaint");
+        assert!(!workspace.branch_picker, "the picker closes on a successful switch");
+        assert!(!workspace.switching, "the next switch is allowed again");
+        assert_eq!(workspace.notice, Some((strings::workspace_switched("feature"), false)));
+        assert!(workspace.selected.is_empty() && workspace.diff_path.is_none());
+        assert!(workspace.files.is_empty() && workspace.file_preview.is_none() && workspace.detail.is_none());
+        assert!(workspace.log.commits.is_empty() && workspace.graph.is_empty());
+        assert_eq!(workspace.commit_message, "feat: keep me", "the draft survives");
+        assert!(workspace.last_poll.elapsed() >= POLL_INTERVAL, "the new branch is polled next frame");
+        let requests: Vec<Request> = request_rx.try_iter().map(|(_, request)| request).collect();
+        assert!(
+            requests.iter().any(|request| matches!(request, Request::Log)),
+            "the new branch's history is read again"
+        );
+    }
+
+    /// The picker under the repo row: opening it reads the list from the
+    /// worker, and a click on a row asks for that branch — the UI thread never
+    /// runs git itself.
+    #[test]
+    fn the_branch_picker_reads_the_list_and_switches_from_a_row() {
+        let (request_tx, request_rx) = mpsc::channel();
+        let mut workspace = Workspace {
+            tx: Some(request_tx),
+            status: Status { branch: "main".to_owned(), ..Default::default() },
+            ..Default::default()
+        };
+        workspace.toggle_branch_picker();
+        assert!(workspace.branch_picker, "the chip opens the picker");
+        assert!(!workspace.branches_loaded, "opening reads the list again");
+        let requests: Vec<Request> = request_rx.try_iter().map(|(_, request)| request).collect();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(requests[0], Request::Branches));
+
+        // The worker's answer, applied as `absorb` would:
+        workspace.branches = vec![
+            git::Branch { name: "main".to_owned(), remote: false, current: true },
+            git::Branch { name: "feature/x".to_owned(), remote: false, current: false },
+            git::Branch { name: "origin/main".to_owned(), remote: true, current: false },
+        ];
+        workspace.branches_loaded = true;
+        workspace.busy = false;
+
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 700.0));
+        let frame = |workspace: &mut Workspace, events: Vec<egui::Event>, time: f64| {
+            let input = egui::RawInput { screen_rect: Some(rect), time: Some(time), events, ..Default::default() };
+            ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    let _ = workspace.show(ui, rect, 1, None);
+                });
+            })
+            .shapes
+        };
+        let shapes = frame(&mut workspace, Vec::new(), 0.0);
+        let point = shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text() == "○ feature/x" => {
+                    Some(text.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .expect("the branch row is painted");
+        let click = vec![
+            egui::Event::PointerMoved(point),
+            egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ];
+        frame(&mut workspace, click, 0.1);
+        assert!(workspace.switching, "the switch owns the picker until the worker answers");
+        let requests: Vec<Request> = request_rx.try_iter().map(|(_, request)| request).collect();
+        assert!(
+            requests.iter().any(|request| matches!(request, Request::Checkout { branch } if branch == "feature/x")),
+            "clicking a row asks for that branch"
+        );
+
+        // Closing drops the list with the picker: a hidden panel must not keep
+        // a stale list, and the open picker owns the keyboard.
+        workspace.close_branch_picker();
+        assert!(!workspace.branch_picker && workspace.branches.is_empty() && !workspace.branches_loaded);
     }
 
     pub(super) fn git(dir: &Path, args: &[&str]) -> bool {

@@ -948,3 +948,78 @@ fn commit_detail_lists_files_and_loads_only_the_selected_patch() {
     let first_patch = git::commit_file_diff(&root, &first_hash, "src/lib.rs").expect("root commit file diff");
     assert!(first_patch.contains("+pub fn a() {}") && !first_patch.contains("+one"), "patch: {first_patch}");
 }
+
+/// The panel's branch picker: listing local and remote-tracking entries, then
+/// switching and creating from the same API the worker uses.
+#[test]
+fn branch_listing_and_checkout_cover_local_and_remote_entries() {
+    let Some(dir) = repo() else { return };
+    let root = git::find_root(dir.path()).expect("root");
+    let base = git::status(&root).expect("status").branch;
+    let upstream = tempfile::tempdir().unwrap();
+    run(upstream.path(), &["init", "--quiet", "--bare"]);
+    run(&root, &["remote", "add", "origin", upstream.path().to_str().unwrap()]);
+    assert_eq!(git::push(&root).expect("first push"), base);
+    run(&root, &["switch", "--quiet", "-c", "feature/x"]);
+    std::fs::write(root.join("feature.txt"), "feature\n").unwrap();
+    run(&root, &["add", "-A"]);
+    run(&root, &["commit", "--quiet", "-m", "feature"]);
+    assert_eq!(git::push(&root).expect("feature push"), "feature/x");
+    run(&root, &["switch", "--quiet", &base]);
+    run(&root, &["branch", "-D", "feature/x"]);
+
+    let branches = git::branches(&root).expect("branches");
+    assert!(
+        branches.iter().any(|branch| branch.name == base && branch.current && !branch.remote),
+        "the current branch leads the list: {branches:?}"
+    );
+    assert!(
+        branches.iter().any(|branch| branch.name == "origin/feature/x" && branch.remote && !branch.current),
+        "the remote-tracking branch is listed: {branches:?}"
+    );
+    assert!(
+        !branches.iter().any(|branch| branch.name.ends_with("/HEAD")),
+        "origin/HEAD is a pointer, not a branch: {branches:?}"
+    );
+
+    // The remote entry creates the local branch and makes it track the remote.
+    assert_eq!(git::checkout(&root, "origin/feature/x").expect("remote checkout"), "feature/x");
+    assert_eq!(git::status(&root).unwrap().branch, "feature/x");
+    assert_eq!(git::upstream(&root).as_deref(), Some("origin/feature/x"));
+    // With the local branch existing, its remote entry resolves to it.
+    assert_eq!(git::checkout(&root, &base).expect("back"), base);
+    assert_eq!(git::checkout(&root, "origin/feature/x").expect("the local branch wins"), "feature/x");
+
+    // Creating a branch starts at HEAD and switches to it.
+    assert_eq!(git::create_branch(&root, "panel/new").expect("create"), "panel/new");
+    assert_eq!(git::status(&root).unwrap().branch, "panel/new");
+    let branches = git::branches(&root).unwrap();
+    assert!(branches.iter().any(|branch| branch.name == "panel/new" && branch.current));
+
+    // Names git would read as options or paths never reach a command line.
+    for bad in ["-evil", "--evil", "bad..name", "two words", "a.lock", "HEAD"] {
+        assert!(git::checkout(&root, bad).is_err(), "{bad} must be refused before git runs");
+        assert!(git::create_branch(&root, bad).is_err(), "{bad} must never become a command line");
+    }
+    assert_eq!(git::status(&root).unwrap().branch, "panel/new", "a refused name changes nothing");
+}
+
+/// A switch that would overwrite uncommitted work is git's own refusal, and
+/// the panel only reports it: the branch and the file stay as they were.
+#[test]
+fn switching_with_conflicting_local_changes_is_refused() {
+    let Some(dir) = repo() else { return };
+    let root = git::find_root(dir.path()).expect("root");
+    let base = git::status(&root).unwrap().branch;
+    run(&root, &["switch", "--quiet", "-c", "other"]);
+    std::fs::write(root.join("tracked.txt"), "other\n").unwrap();
+    run(&root, &["add", "-A"]);
+    run(&root, &["commit", "--quiet", "-m", "other"]);
+    run(&root, &["switch", "--quiet", &base]);
+    std::fs::write(root.join("tracked.txt"), "uncommitted local edit\n").unwrap();
+
+    let error = git::checkout(&root, "other").expect_err("git refuses to overwrite the edit");
+    assert!(!error.is_empty());
+    assert_eq!(git::status(&root).unwrap().branch, base, "the branch did not move");
+    assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "uncommitted local edit\n");
+}

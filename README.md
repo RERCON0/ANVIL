@@ -68,7 +68,7 @@ reproduction script](docs/PERFORMANCE.md).
 |---|---|
 | Project tabs | Name, colour, reorder and switch between projects |
 | Split panes | Split right/down, move running sessions, navigate with the keyboard, maximise or collapse |
-| Git panel | Inspect changes and history, stage files or individual hunks, edit AI-assisted commit messages, commit, fetch and push |
+| Git panel | Inspect changes and history, stage files or individual hunks, switch and create branches, edit AI-assisted commit messages, commit, fetch and push |
 | File browser | Filter files, preview text and Markdown, create, rename and send files to the Recycle Bin |
 | AI quotas | View usage windows, reset times, balances or spending for 19 providers; windows share one polling worker |
 | Claude Code | Optional statusLine and tab badge with model, context usage, limits and agent |

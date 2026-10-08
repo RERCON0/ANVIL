@@ -227,6 +227,13 @@ pub const WORKSPACE_FILE_FILTER: &str = "Filter files";
 pub const WORKSPACE_FILE_TRUNCATED: &str = "… file preview is truncated";
 pub const WORKSPACE_PUSH_HINT: &str = "Push to the configured remote";
 pub const WORKSPACE_FETCH_HINT: &str = "Fetch from the configured remote";
+pub const WORKSPACE_BRANCH_HINT: &str = "Switch branch";
+pub const WORKSPACE_BRANCH_FILTER: &str = "Filter branches";
+pub const WORKSPACE_BRANCHES_LOADING: &str = "Loading branches…";
+pub const WORKSPACE_BRANCH_NEW: &str = "New branch";
+pub const WORKSPACE_BRANCH_CREATE: &str = "Create and switch";
+pub const WORKSPACE_BRANCH_INVALID: &str = "invalid branch name";
+pub const WORKSPACE_BRANCH_REMOTE_HINT: &str = "A local branch that tracks this remote one is created and checked out";
 pub const WORKSPACE_NO_BRANCH: &str = "no current branch";
 pub const WORKSPACE_NO_AI_COMMAND: &str = "no AI command selected";
 pub const WORKSPACE_AI_EMPTY: &str = "CLI returned an empty message";
@@ -284,6 +291,9 @@ pub fn relative_time(now_secs: i64, then_secs: i64) -> String {
 }
 pub fn workspace_pushed(branch: &str) -> String {
     format!("push {branch} — done")
+}
+pub fn workspace_switched(branch: &str) -> String {
+    format!("switched to {branch}")
 }
 pub fn workspace_fetch_done(what: &str) -> String {
     format!("{what} — done")

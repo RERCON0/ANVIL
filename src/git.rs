@@ -89,6 +89,9 @@ impl Status {
 const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const GIT_TIMEOUT_NETWORK: std::time::Duration = std::time::Duration::from_secs(120);
 const GIT_TIMEOUT_COMMIT: std::time::Duration = std::time::Duration::from_secs(600);
+/// A branch switch rewrites the worktree; killing it midway would leave a
+/// half-updated tree and an index.lock behind, so it gets the long deadline.
+const GIT_TIMEOUT_CHECKOUT: std::time::Duration = std::time::Duration::from_secs(600);
 const GIT_MAX_OUTPUT: usize = 8 * 1024 * 1024;
 
 /// Runs `git` in `root` and returns stdout; stderr becomes the error text.
@@ -3244,6 +3247,171 @@ pub fn push(root: &Path) -> Result<String, String> {
     Ok(branch)
 }
 
+/// One entry of the branch picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Branch {
+    /// Short name as git prints it: `main` or `origin/feature/x`.
+    pub name: String,
+    /// A `refs/remotes/*` entry: checking it out creates or uses the local
+    /// branch of the same name.
+    pub remote: bool,
+    /// The branch `HEAD` currently points at.
+    pub current: bool,
+}
+
+/// Above this many refs the picker would be unusable; the list is cut to keep
+/// the panel and its filter bounded on a repository with a huge ref namespace.
+const MAX_BRANCHES: usize = 2048;
+
+/// Local and remote-tracking branches for the picker: the current branch
+/// first, then local branches, then remote ones, each alphabetical.
+pub fn branches(root: &Path) -> Result<Vec<Branch>, String> {
+    let raw = run_git_bytes(
+        root,
+        &["for-each-ref", "--format=%(refname)%00%(refname:short)%00%(HEAD)%00%(symref)", "refs/heads", "refs/remotes"],
+    )?;
+    Ok(parse_branches(&raw))
+}
+
+/// Parses `for-each-ref` records: refname, short name, HEAD marker and symref
+/// target, NUL-separated. A symbolic ref (`origin/HEAD`) is a pointer, not a
+/// branch, and is skipped. Untrusted names are re-checked before display.
+pub fn parse_branches(bytes: &[u8]) -> Vec<Branch> {
+    let mut branches = Vec::new();
+    for record in bytes.split(|byte| *byte == b'\n') {
+        if record.is_empty() {
+            continue;
+        }
+        let mut fields = record.split(|byte| *byte == 0);
+        let (Some(refname), Some(short), Some(head), Some(symref)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if !symref.is_empty() {
+            continue;
+        }
+        let local = refname.starts_with(b"refs/heads/");
+        let remote = refname.starts_with(b"refs/remotes/");
+        if !local && !remote {
+            continue;
+        }
+        let name = String::from_utf8_lossy(short).into_owned();
+        if !valid_branch_name(&name) {
+            continue;
+        }
+        branches.push(Branch { name, remote, current: head == b"*" });
+        if branches.len() >= MAX_BRANCHES {
+            break;
+        }
+    }
+    branches.sort_by(|a, b| (a.remote, !a.current, &a.name).cmp(&(b.remote, !b.current, &b.name)));
+    branches
+}
+
+/// Whether git would accept `name` as a branch name, applied before a name
+/// from a ref list or a typed field reaches a command line: a leading `-`
+/// would be an option, and control characters do not belong in a ref. The
+/// check is a readable subset of `git check-ref-format --branch`, plus the
+/// Windows device names a ref file cannot be created under.
+pub fn valid_branch_name(name: &str) -> bool {
+    const MAX_COMPONENT: usize = 255;
+    const MAX_TOTAL: usize = 1024;
+    !name.is_empty()
+        && name.len() <= MAX_TOTAL
+        && name != "@"
+        && name != "HEAD"
+        && !name.starts_with('-')
+        && !name.starts_with('/')
+        && !name.ends_with('/')
+        && !name.ends_with('.')
+        && !name.ends_with(".lock")
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name.contains("//")
+        && !name.chars().any(|ch| ch.is_control() || matches!(ch, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+        && name.split('/').all(|part| {
+            part.len() <= MAX_COMPONENT
+                && !part.starts_with('.')
+                && !part.ends_with(".lock")
+                && !is_reserved_device_name(part)
+        })
+}
+
+/// Switches the worktree to `branch`, a name the picker listed. The name is
+/// validated before git runs and passed after `--`, so a repository-supplied
+/// ref can never be read as an option; `post-checkout` hooks and smudge
+/// filters are covered by the repository trust digest the same way commit is.
+/// A remote-tracking entry checks out the local branch of the same name when
+/// it exists, and creates a tracking one otherwise. Returns the branch now
+/// checked out.
+pub fn checkout(root: &Path, branch: &str) -> Result<String, String> {
+    if !valid_branch_name(branch) {
+        return Err(crate::strings::WORKSPACE_BRANCH_INVALID().to_owned());
+    }
+    if local_branch_exists(root, branch) {
+        return switch_to(root, branch);
+    }
+    if let Some(local) = local_name_of_remote(root, branch) {
+        if local_branch_exists(root, &local) {
+            return switch_to(root, &local);
+        }
+        switch_worktree(root, &["--track", "--", branch])?;
+        return Ok(local);
+    }
+    // Neither a local branch nor a remote-tracking one: let git report why.
+    switch_to(root, branch)
+}
+
+/// Creates `name` at the current `HEAD` and switches to it.
+pub fn create_branch(root: &Path, name: &str) -> Result<String, String> {
+    if !valid_branch_name(name) {
+        return Err(crate::strings::WORKSPACE_BRANCH_INVALID().to_owned());
+    }
+    // A validated name cannot begin with `-`, so it is `-c`'s value and never
+    // an option; the trailing `--` ends option parsing.
+    run_git_timeout(root, &["switch", "--quiet", "-c", name, "--"], GIT_TIMEOUT_CHECKOUT)?;
+    Ok(name.to_owned())
+}
+
+fn switch_to(root: &Path, branch: &str) -> Result<String, String> {
+    switch_worktree(root, &["--", branch])?;
+    Ok(branch.to_owned())
+}
+
+fn switch_worktree(root: &Path, args: &[&str]) -> Result<(), String> {
+    let mut command: Vec<&str> = vec!["switch", "--quiet"];
+    command.extend_from_slice(args);
+    run_git_timeout(root, &command, GIT_TIMEOUT_CHECKOUT).map(|_| ())
+}
+
+/// Whether `refs/heads/<name>` resolves.
+fn local_branch_exists(root: &Path, name: &str) -> bool {
+    run_git(root, &["rev-parse", "--verify", "--quiet", "--end-of-options", &format!("refs/heads/{name}")]).is_ok()
+}
+
+/// The local branch a remote-tracking entry maps to (`origin/feature/x` ->
+/// `feature/x`): the rest after the longest configured remote name that
+/// prefixes it. `None` when `refs/remotes/<branch>` does not exist or no
+/// configured remote matches, so a lookup can never alias another branch.
+fn local_name_of_remote(root: &Path, branch: &str) -> Option<String> {
+    run_git(root, &["rev-parse", "--verify", "--quiet", "--end-of-options", &format!("refs/remotes/{branch}")]).ok()?;
+    let remotes = run_git(root, &["remote"]).ok()?;
+    let mut best: Option<String> = None;
+    for remote in remotes.lines().map(str::trim).filter(|remote| !remote.is_empty()) {
+        let Some(rest) = branch.strip_prefix(remote).and_then(|rest| rest.strip_prefix('/')) else { continue };
+        if rest.is_empty() || !valid_branch_name(rest) {
+            continue;
+        }
+        // The longest remote name leaves the shortest local name, exactly as
+        // `git switch --track` derives it.
+        if best.as_ref().is_none_or(|current| rest.len() < current.len()) {
+            best = Some(rest.to_owned());
+        }
+    }
+    best
+}
+
 /// The prompt sent to the AI CLI, built from the diff and recent subjects.
 /// Appended where the prompt's status or diff was cut.
 pub const AI_TRUNCATED: &str = "[… truncated]";
@@ -4454,5 +4622,70 @@ index 111..222 100644\n\
             .set_times(std::fs::FileTimes::new().set_modified(modified))
             .unwrap();
         assert!(!source.is_current(&mut Walk::default()), "mtime is not a content fingerprint");
+    }
+
+    /// The picker's order is part of its behaviour: the current branch first,
+    /// local branches next, remote-tracking ones last, each alphabetical.
+    #[test]
+    fn branch_records_mark_current_and_remote_and_skip_symbolic_refs() {
+        let raw = concat!(
+            "refs/heads/main\0main\0*\0\n",
+            "refs/heads/feature/x\0feature/x\0 \0\n",
+            "refs/remotes/origin/HEAD\0origin/HEAD\0 \0refs/remotes/origin/main\n",
+            "refs/remotes/origin/feature/x\0origin/feature/x\0 \0\n",
+            "refs/remotes/origin/main\0origin/main\0 \0\n",
+            "refs/notes/commits\0commits\0 \0\n",
+            "refs/heads/-evil\0-evil\0 \0\n",
+        );
+        let branches = parse_branches(raw.as_bytes());
+        assert_eq!(
+            branches,
+            vec![
+                Branch { name: "main".to_owned(), remote: false, current: true },
+                Branch { name: "feature/x".to_owned(), remote: false, current: false },
+                Branch { name: "origin/feature/x".to_owned(), remote: true, current: false },
+                Branch { name: "origin/main".to_owned(), remote: true, current: false },
+            ],
+            "the symbolic ref, the notes ref and the option-like name are dropped"
+        );
+    }
+
+    #[test]
+    fn branch_name_validation_follows_git_and_refuses_windows_devices() {
+        for name in ["main", "feature/x", "release-1.2", "fix#1", "a@b", "ünïcode", "a/b.c/d"] {
+            assert!(valid_branch_name(name), "{name} is a legal branch name");
+        }
+        for name in [
+            "",
+            "-evil",
+            "HEAD",
+            "a b",
+            "a..b",
+            "a.lock",
+            "a/b.lock",
+            "a.",
+            "a/",
+            "/a",
+            ".hidden",
+            "a/.hidden",
+            "a//b",
+            "a@{b}",
+            "a~b",
+            "a^b",
+            "a:b",
+            "a?b",
+            "a*b",
+            "a[b",
+            "a\\b",
+            "a\u{7}b",
+            "a\nb",
+            "nul",
+            "con",
+            "com1",
+            "lpt9",
+            "a/con",
+        ] {
+            assert!(!valid_branch_name(name), "{name:?} must never reach a git command line");
+        }
     }
 }

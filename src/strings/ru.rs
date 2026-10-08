@@ -272,6 +272,13 @@ pub const WORKSPACE_FILE_FILTER: &str = "Фильтр файлов";
 pub const WORKSPACE_FILE_TRUNCATED: &str = "… файл показан не полностью";
 pub const WORKSPACE_PUSH_HINT: &str = "Отправить в настроенный remote";
 pub const WORKSPACE_FETCH_HINT: &str = "Забрать изменения из настроенного remote";
+pub const WORKSPACE_BRANCH_HINT: &str = "Сменить ветку";
+pub const WORKSPACE_BRANCH_FILTER: &str = "Фильтр веток";
+pub const WORKSPACE_BRANCHES_LOADING: &str = "Загрузка веток…";
+pub const WORKSPACE_BRANCH_NEW: &str = "Новая ветка";
+pub const WORKSPACE_BRANCH_CREATE: &str = "Создать и перейти";
+pub const WORKSPACE_BRANCH_INVALID: &str = "недопустимое имя ветки";
+pub const WORKSPACE_BRANCH_REMOTE_HINT: &str = "Будет создана и включена локальная ветка, следящая за удалённой";
 
 pub const WORKSPACE_NO_BRANCH: &str = "нет текущей ветки";
 pub const WORKSPACE_NO_AI_COMMAND: &str = "не выбрана AI-команда";
@@ -307,6 +314,10 @@ pub fn relative_time(now_secs: i64, then_secs: i64) -> String {
 
 pub fn workspace_pushed(branch: &str) -> String {
     format!("push {branch} — готово")
+}
+
+pub fn workspace_switched(branch: &str) -> String {
+    format!("переключено на {branch}")
 }
 
 pub fn workspace_fetch_done(what: &str) -> String {
