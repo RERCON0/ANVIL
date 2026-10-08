@@ -519,7 +519,7 @@ impl TerminalView {
                         Pos2::new(inner.min.x + start as f32 * metrics.width, y),
                         Pos2::new(inner.min.x + end as f32 * metrics.width, y),
                     ],
-                    egui::Stroke::new(1.0, input.palette.foreground),
+                    egui::Stroke::new(1.0_f32, input.palette.foreground),
                 );
             }
             let _ = url;

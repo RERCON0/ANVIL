@@ -184,7 +184,7 @@ pub fn show(
     let collapsed_button = ui.interact(collapsed_rect, ui.id().with("tab-collapsed"), Sense::click());
     let collapsed_color = if collapsed_button.hovered() { theme::colors().icon_hover } else { theme::colors().icon };
     let center = collapsed_rect.center();
-    let stroke = Stroke::new(1.5, collapsed_color);
+    let stroke = Stroke::new(1.5_f32, collapsed_color);
     for dy in [-4.0, 0.0, 4.0] {
         painter
             .line_segment([Pos2::new(center.x - 5.0, center.y + dy), Pos2::new(center.x + 5.0, center.y + dy)], stroke);
@@ -210,7 +210,7 @@ pub fn show(
     // Align to the visible letters, not the font's ascent/descent box: the
     // chevron glyph's optical center was lower than the Cyrillic label.
     let center = Pos2::new(settings_rect.min.x + 12.0, label_pos.y + label.mesh_bounds.center().y);
-    let stroke = Stroke::new(1.0, settings_color);
+    let stroke = Stroke::new(1.0_f32, settings_color);
     painter.line_segment([center + Vec2::new(-1.5, -3.0), center + Vec2::new(1.5, 0.0)], stroke);
     painter.line_segment([center + Vec2::new(1.5, 0.0), center + Vec2::new(-1.5, 3.0)], stroke);
     painter.galley(label_pos, label, settings_color);

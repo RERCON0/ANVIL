@@ -51,13 +51,62 @@ fn walk_descendants(procs: &[ProcInfo], root: u32, mut visit: impl FnMut(&ProcIn
 /// when its script argument is a known CLI entrypoint, never from its name or
 /// from a package name mentioned inside `node -e`.
 pub fn detected_cli_names(procs: &[ProcInfo], root: u32) -> HashSet<String> {
-    let mut names = HashSet::new();
-    walk_descendants(procs, root, |process| {
-        if let Some(cli) = process_cli(process) {
+    ProcessIndex::new(procs).cli_names(root)
+}
+
+/// One process index shared by every pane adopting the same snapshot.
+pub(crate) struct ProcessIndex<'a> {
+    processes: HashMap<u32, &'a ProcInfo>,
+    children: HashMap<u32, Vec<&'a ProcInfo>>,
+}
+
+impl<'a> ProcessIndex<'a> {
+    pub(crate) fn new(procs: &'a [ProcInfo]) -> Self {
+        let mut children: HashMap<u32, Vec<&ProcInfo>> = HashMap::new();
+        for process in procs {
+            if process.pid != process.ppid {
+                children.entry(process.ppid).or_default().push(process);
+            }
+        }
+        Self { processes: procs.iter().map(|process| (process.pid, process)).collect(), children }
+    }
+
+    /// The outermost agent owns the interactive conversation. A nested agent
+    /// launched as its tool must not replace it in the saved workspace.
+    pub(crate) fn primary_cli(&self, root: u32) -> Option<&'static str> {
+        let mut seen = HashSet::new();
+        let mut queue = VecDeque::from([root]);
+        while let Some(pid) = queue.pop_front() {
+            if !seen.insert(pid) {
+                continue;
+            }
+            if let Some(cli) = self.processes.get(&pid).and_then(|process| process_cli(process)) {
+                return Some(cli);
+            }
+            queue.extend(self.children.get(&pid).into_iter().flatten().map(|process| process.pid));
+        }
+        None
+    }
+
+    pub(crate) fn cli_names(&self, root: u32) -> HashSet<String> {
+        let mut names = HashSet::new();
+        if let Some(cli) = self.processes.get(&root).and_then(|process| process_cli(process)) {
             names.insert(cli.to_owned());
         }
-    });
-    names
+        let mut seen = HashSet::from([root]);
+        let mut queue = VecDeque::from([root]);
+        while let Some(pid) = queue.pop_front() {
+            for child in self.children.get(&pid).into_iter().flatten() {
+                if seen.insert(child.pid) {
+                    if let Some(cli) = process_cli(child) {
+                        names.insert(cli.to_owned());
+                    }
+                    queue.push_back(child.pid);
+                }
+            }
+        }
+        names
+    }
 }
 
 pub fn runs_claude(procs: &[ProcInfo], shell: u32) -> bool {
@@ -75,6 +124,7 @@ fn process_cli(process: &ProcInfo) -> Option<&'static str> {
         ("codex", "codex.exe"),
         ("gemini", "gemini.exe"),
         ("aider", "aider.exe"),
+        ("omp", "omp.exe"),
     ]
     .into_iter()
     .find_map(|(cli, executable)| {
@@ -254,5 +304,16 @@ mod tests {
         let procs = vec![p(1, 2, "a.exe"), p(2, 1, "b.exe"), p(3, 3, "self.exe")];
         assert!(!has_descendant_named(&procs, 1, "claude.exe"));
         assert!(!has_descendant_named(&procs, 3, "claude.exe"));
+    }
+
+    #[test]
+    fn one_process_index_detects_native_agents_at_roots_and_under_shells() {
+        let procs = [p(10, 1, "omp.exe"), p(20, 1, "bash.exe"), p(21, 20, "claude.exe"), p(30, 1, "other.exe")];
+        let index = ProcessIndex::new(&procs);
+        assert_eq!(index.cli_names(10), HashSet::from(["omp".into()]));
+        assert_eq!(index.cli_names(20), HashSet::from(["claude".into()]));
+        assert!(index.cli_names(30).is_empty());
+        let nested = [p(1, 0, "bash.exe"), p(2, 1, "opencode.exe"), p(3, 2, "claude.exe")];
+        assert_eq!(ProcessIndex::new(&nested).primary_cli(1), Some("opencode"));
     }
 }

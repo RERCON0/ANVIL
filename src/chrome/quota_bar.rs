@@ -57,7 +57,7 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, segments: &[Segment]) -> Option<BarAc
     let painter = ui.painter_at(rect);
     let c = theme::colors();
     painter.rect_filled(rect, 0.0, c.chrome_bg);
-    painter.hline(rect.x_range(), rect.min.y + 0.5, Stroke::new(1.0, c.border));
+    painter.hline(rect.x_range(), rect.min.y + 0.5, Stroke::new(1.0_f32, c.border));
     let font = FontId::proportional(FONT_SIZE);
     let y = rect.center().y;
 
@@ -78,7 +78,7 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, segments: &[Segment]) -> Option<BarAc
     let measure = |text: &str| painter.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE).size().x;
     let width = refresh.min.x - rect.min.x - 2.0 * PAD;
     let layout = view::layout(segments, width, GAP, reset_icon, measure);
-    let separator = Stroke::new(1.0, c.line);
+    let separator = Stroke::new(1.0_f32, c.line);
     let rule = Rangef::new(rect.min.y + 6.0, rect.max.y - 6.0);
     let mut x = rect.min.x + PAD;
     for (index, segment) in segments.iter().take(layout.shown).enumerate() {
@@ -89,8 +89,9 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, segments: &[Segment]) -> Option<BarAc
         let size = galley.size();
         let hover = Rect::from_min_size(Pos2::new(x, rect.min.y), Vec2::new(size.x, rect.height()));
         painter.galley(Pos2::new(x, y - size.y / 2.0), galley, c.tab_text);
-        let _ =
-            ui.interact(hover, ui.id().with(("quota-segment", index)), Sense::hover()).on_hover_text(&segment.tooltip);
+        let _ = ui.interact(hover, ui.id().with(("quota-segment", index)), Sense::hover()).on_hover_ui(|ui| {
+            ui.label(&segment.tooltip);
+        });
         x += size.x + GAP;
     }
     if layout.hidden > 0 {
@@ -101,8 +102,10 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, segments: &[Segment]) -> Option<BarAc
         let size = galley.size();
         let hover = Rect::from_min_size(Pos2::new(x, rect.min.y), Vec2::new(size.x, rect.height()));
         painter.galley(Pos2::new(x, y - size.y / 2.0), galley, c.dim);
-        let folded: Vec<&str> = segments[layout.shown..].iter().map(|s| s.tooltip.as_str()).collect();
-        let _ = ui.interact(hover, ui.id().with("quota-more"), Sense::hover()).on_hover_text(folded.join("\n\n"));
+        let _ = ui.interact(hover, ui.id().with("quota-more"), Sense::hover()).on_hover_ui(|ui| {
+            let folded: Vec<&str> = segments[layout.shown..].iter().map(|s| s.tooltip.as_str()).collect();
+            ui.label(folded.join("\n\n"));
+        });
     }
     action
 }

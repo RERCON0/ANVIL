@@ -214,14 +214,18 @@ impl ReloadLog {
     }
 }
 
+mod close;
 #[cfg(debug_assertions)]
 mod readme;
+#[cfg(debug_assertions)]
+pub(crate) use readme::ReadmeDemo;
 
 pub struct AnvilApp {
     #[cfg(debug_assertions)]
     readme_root: Option<PathBuf>,
     #[cfg(debug_assertions)]
     readme_keys: HashMap<(PaneId, u8), Instant>,
+    approved_close_window: bool,
     config: Config,
     config_path: PathBuf,
     config_mtime: Option<SystemTime>,
@@ -239,6 +243,7 @@ pub struct AnvilApp {
     font_entries: Vec<(String, String)>,
     font_families: Vec<String>,
     ai_commands: HashMap<PaneId, String>,
+    running_agents: HashMap<PaneId, String>,
     tabs: Vec<Tab>,
     active: usize,
     settings_open: bool,
@@ -332,6 +337,7 @@ impl AnvilApp {
             readme_root: None,
             #[cfg(debug_assertions)]
             readme_keys: HashMap::new(),
+            approved_close_window: false,
             config,
             config_path,
             config_mtime,
@@ -347,6 +353,7 @@ impl AnvilApp {
             font_entries: Vec::new(),
             font_families: Vec::new(),
             ai_commands: HashMap::new(),
+            running_agents: HashMap::new(),
             tabs: Vec::new(),
             active: 0,
             settings_open: false,
@@ -440,9 +447,13 @@ impl AnvilApp {
         self.sync_quota();
 
         let mut tabs = Vec::new();
+        let mut active = 0;
         if self.config.restore_session {
-            for state in self.session.tabs.clone() {
+            for (saved_index, state) in self.session.tabs.clone().into_iter().enumerate() {
                 if let Some(tab) = self.restore_tab(&state) {
+                    if saved_index <= self.session.active_tab {
+                        active = tabs.len();
+                    }
                     tabs.push(tab);
                 }
             }
@@ -451,7 +462,7 @@ impl AnvilApp {
             let profile = self.default_profile();
             tabs.push(self.new_tab(&profile, None));
         }
-        self.active = self.session.active_tab.min(tabs.len() - 1);
+        self.active = active.min(tabs.len() - 1);
         self.tabs = tabs;
         self.tabbar.rename = None;
         self.mark_session_dirty();
@@ -463,6 +474,15 @@ impl AnvilApp {
     }
 
     pub fn frame(&mut self, ui: &mut egui::Ui, maximized: bool) -> Vec<WindowCommand> {
+        crate::fsutil::ui_io(|| self.frame_inner(ui, maximized))
+    }
+
+    /// Includes egui layout, tessellation and GL uploads; excludes vsync wait.
+    pub(crate) fn host_frame_finished(&mut self, elapsed: Duration) {
+        self.frame_ms = elapsed.as_secs_f32() * 1000.0;
+    }
+
+    fn frame_inner(&mut self, ui: &mut egui::Ui, maximized: bool) -> Vec<WindowCommand> {
         let ctx = ui.ctx().clone();
         let started = Instant::now();
         let mut commands = Vec::new();
@@ -510,7 +530,7 @@ impl AnvilApp {
             ui.painter().vline(
                 tabbar_rect.max.x - 0.5,
                 tabbar_rect.y_range(),
-                egui::Stroke::new(1.0, theme::colors().border),
+                egui::Stroke::new(1.0_f32, theme::colors().border),
             );
 
             let badge = &self.config.claude_status;
@@ -545,11 +565,14 @@ impl AnvilApp {
         self.show_picker(&ctx);
         self.show_collapsed_list(&ctx);
         self.show_dialog(&ctx);
+        if self.approved_close_window {
+            commands.push(WindowCommand::Close);
+        }
         self.flush_config_if_due(&ctx);
         if let Some(at) = self.session_dirty {
             if at.elapsed() >= Duration::from_secs(1) {
-                self.save_session();
                 self.session_dirty = None;
+                self.save_session();
             } else {
                 // Idle windows draw no frames, so ask for one when the save is due.
                 ctx.request_repaint_after(Duration::from_millis(1200));
@@ -675,6 +698,7 @@ impl AnvilApp {
             min_pane_height: cell_h * 3.0,
             fallbacks_loaded: self.fallbacks_loaded,
             ai_command: self.ai_command(),
+            codex_chatgpt_login: self.config.workspace.codex_chatgpt_login,
             window_edge,
         };
         let actions = match self.tabs.get_mut(self.active) {
@@ -1080,7 +1104,7 @@ impl AnvilApp {
     pub fn window_focus_changed(&mut self, focused: bool) {
         if !focused {
             // Another window or program may read config.json next.
-            self.flush_config();
+            crate::fsutil::ui_io(|| self.flush_config());
         }
         if let Some(pane) = self.focused_pane() {
             if pane.term.lock().mode().contains(TermMode::FOCUS_IN_OUT) {
@@ -1356,9 +1380,16 @@ impl AnvilApp {
     }
 
     fn close_pane_in(&mut self, index: usize, id: PaneId) {
+        if self.confirm_sessions(vec![id], false) {
+            return;
+        }
+        self.close_pane_in_unchecked(index, id);
+    }
+
+    fn close_pane_in_unchecked(&mut self, index: usize, id: PaneId) {
         let Some(tab) = self.tabs.get_mut(index) else { return };
         if tab.remove_pane(id) {
-            self.close_tab(index);
+            self.close_tab_unchecked(index);
             return;
         }
         self.mark_session_dirty();
@@ -1611,6 +1642,14 @@ impl AnvilApp {
     }
 
     fn close_tab(&mut self, index: usize) {
+        let Some(tab) = self.tabs.get(index) else { return };
+        if self.confirm_sessions(tab.panes.keys().copied().collect(), false) {
+            return;
+        }
+        self.close_tab_unchecked(index);
+    }
+
+    fn close_tab_unchecked(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
         }
@@ -1639,11 +1678,28 @@ impl AnvilApp {
         if index >= self.tabs.len() {
             return;
         }
+        let panes = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .flat_map(|(_, tab)| tab.panes.keys().copied())
+            .collect();
+        if self.confirm_sessions(panes, false) {
+            return;
+        }
+        self.close_other_tabs_unchecked(index);
+    }
+
+    fn close_other_tabs_unchecked(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
         for closed in (0..self.tabs.len()).rev().filter(|closed| *closed != index) {
             self.tabbar.tab_removed(closed);
         }
         let keep = self.tabs.remove(index);
-        let others: Vec<Tab> = self.tabs.drain(..).collect();
+        let others = std::mem::take(&mut self.tabs);
         for tab in others {
             let state = self.tab_state(&tab);
             self.closed_tabs.push(ClosedTab { state });
@@ -1732,7 +1788,7 @@ impl AnvilApp {
                             .map(profiles::wsl_profile)
                     })
                     .unwrap_or_else(|| self.default_profile());
-                let mut entry = self.spawn_entry(id, &profile, pane_state.cwd.clone());
+                let mut entry = self.restore_entry(id, &profile, pane_state);
                 entry.workspace.open = pane_state.workspace_open;
                 if let Some(width) = pane_state.workspace_width {
                     entry.workspace.width = crate::workspace::clamp_width(width);
@@ -1751,6 +1807,7 @@ impl AnvilApp {
         let tree = SplitTree::from_root(node);
         let focused = order.get(state.focused).copied().unwrap_or(order[0]);
         let mut tab = Tab::new(tree, entries, focused);
+        tab.maximized = state.maximized.and_then(|index| order.get(index).copied());
         tab.custom_title = state.custom_title.clone();
         tab.color = state.color;
         // Hidden panes come back hidden: their shell, cwd and workspace state
@@ -1767,7 +1824,7 @@ impl AnvilApp {
                     saved.pane.profile_id.strip_prefix("wsl-").filter(|d| !d.is_empty()).map(profiles::wsl_profile)
                 })
                 .unwrap_or_else(|| self.default_profile());
-            let mut entry = self.spawn_entry(id, &profile, saved.pane.cwd.clone());
+            let mut entry = self.restore_entry(id, &profile, &saved.pane);
             entry.workspace.open = saved.pane.workspace_open;
             if let Some(width) = saved.pane.workspace_width {
                 entry.workspace.width = crate::workspace::clamp_width(width);
@@ -1782,18 +1839,71 @@ impl AnvilApp {
         Some(tab)
     }
 
+    fn restore_entry(&mut self, id: PaneId, profile: &Profile, state: &PaneState) -> PaneEntry {
+        let mut selected = profile.clone();
+        let mut error = None;
+        if self.config.restore_agents {
+            if let Some(agent) = state.agent.as_deref().filter(|name| crate::agents::continue_args(name).is_some()) {
+                if session::usable_cwd(state.cwd.as_deref()).is_none() {
+                    error = Some(
+                        strings::pick(
+                            "Cannot restore the agent: its saved folder is unavailable.",
+                            "Не удалось восстановить агента: сохранённая папка недоступна.",
+                        )
+                        .to_owned(),
+                    );
+                } else {
+                    match crate::agents::resumed_profile(profile, agent) {
+                        Ok(Some(resumed)) => {
+                            selected = resumed;
+                            self.running_agents.insert(id, agent.to_owned());
+                        }
+                        Ok(None) => {}
+                        Err(message) => error = Some(message),
+                    }
+                }
+            }
+        }
+        if let Some(message) = error {
+            // No fallback launch in another directory, and no process spawned
+            // just to replace it with an error a moment later.
+            PaneEntry {
+                content: PaneContent::Error(message),
+                view: TerminalView::new(self.config.font.size),
+                workspace: crate::workspace::Workspace::default(),
+                start_cwd: state.cwd.clone(),
+                profile_id: profile.id.clone(),
+                profile_name: profile.name.clone(),
+                title: String::new(),
+                exited: false,
+                claude: None,
+                claude_mtime: None,
+                has_claude: false,
+            }
+        } else {
+            self.spawn_entry(id, &selected, state.cwd.clone())
+        }
+    }
+
     fn tab_state(&self, tab: &Tab) -> TabState {
         let describe = |id: PaneId| {
             tab.pane(id)
                 .map(|entry| PaneState {
                     profile_id: entry.profile_id.clone(),
-                    cwd: entry.cwd(),
+                    agent: entry
+                        .live()
+                        .filter(|_| !entry.exited)
+                        .and_then(|_| self.running_agents.get(&id))
+                        .filter(|name| crate::agents::continue_args(name).is_some())
+                        .cloned(),
+                    cwd: entry.cwd().or_else(|| entry.start_cwd.clone()),
                     workspace_open: entry.workspace.open,
                     workspace_width: Some(entry.workspace.width),
                     workspace_tab: Some(entry.workspace.tab.as_str().to_owned()),
                 })
                 .unwrap_or(PaneState {
                     profile_id: String::new(),
+                    agent: None,
                     cwd: None,
                     workspace_open: false,
                     workspace_width: None,
@@ -1816,6 +1926,7 @@ impl AnvilApp {
         TabState {
             layout: crate::session::SavedNode::from_node(tab.tree.root(), &describe),
             focused,
+            maximized: tab.maximized.and_then(|id| order.iter().position(|pane| *pane == id)),
             custom_title: tab.custom_title.clone(),
             color: tab.color,
             collapsed,
@@ -2041,6 +2152,7 @@ impl AnvilApp {
         }
         if let Err(e) = self.session.save(&SessionState::path()) {
             log::warn!("cannot save the session: {e}");
+            self.mark_session_dirty();
         }
     }
 
@@ -2197,11 +2309,15 @@ impl AnvilApp {
                     });
                 }
             }
-            self.ai_commands.clear();
+            let previous_agents = adopted.then(|| std::mem::take(&mut self.running_agents));
+            if adopted {
+                self.ai_commands.clear();
+            }
+            let processes = crate::procs::ProcessIndex::new(&self.proc_snapshot);
             for tab in &mut self.tabs {
                 for (id, entry) in &mut tab.panes {
                     let Some(pane) = entry.live() else { continue };
-                    let names = crate::procs::detected_cli_names(&self.proc_snapshot, pane.shell_pid);
+                    let names = processes.cli_names(pane.shell_pid);
                     let has_claude = names.contains("claude");
                     if let Some(command) = ["claude", "opencode", "codex", "gemini", "aider"]
                         .into_iter()
@@ -2209,8 +2325,17 @@ impl AnvilApp {
                     {
                         self.ai_commands.insert(*id, command.to_owned());
                     }
+                    if let Some(agent) = processes
+                        .primary_cli(pane.shell_pid)
+                        .filter(|name| crate::agents::continue_args(name).is_some())
+                    {
+                        self.running_agents.insert(*id, agent.to_owned());
+                    }
                     entry.has_claude = has_claude;
                 }
+            }
+            if previous_agents.as_ref().is_some_and(|previous| *previous != self.running_agents) {
+                self.mark_session_dirty();
             }
         }
         let status_dir = self.status_dir.clone();
@@ -2384,6 +2509,7 @@ impl AnvilApp {
                 }
             }
             dialogs::DialogOutcome::Accept => match dialog {
+                DialogState::CloseSessions { panes, whole_window, .. } => self.finish_close(panes, whole_window),
                 DialogState::Paste { pane_id, text } => self.paste_text(pane_id, text, true),
                 DialogState::ClaudeInstall { path, expected, ours, keep_previous, .. } => {
                     if self.config.claude_status.enabled {
@@ -2423,8 +2549,8 @@ fn cursor_style(cursor: &CursorConfig) -> CursorStyle {
 
 pub fn scheme_palette(config: &Config) -> Palette {
     match config.color_scheme.as_str() {
-        strings::SCHEME_LIGHT => Palette::light(),
-        strings::SCHEME_DARK => Palette::dark(),
+        strings::SCHEME_LIGHT | "Light" | "light" => Palette::light(),
+        strings::SCHEME_DARK | "Dark" | "dark" => Palette::dark(),
         name => config
             .custom_color_schemes
             .iter()
@@ -2442,7 +2568,10 @@ pub fn scheme_palette(config: &Config) -> Palette {
                     }
                 }
             })
-            .unwrap_or_else(Palette::dark),
+            .unwrap_or_else(|| {
+                log::warn!("unknown or invalid colour scheme `{name}`, drawing dark");
+                Palette::dark()
+            }),
     }
 }
 
@@ -3081,5 +3210,77 @@ mod tests {
         drop(tx);
         assert_eq!(take_ready(&mut slot), None);
         assert!(slot.is_none(), "nothing more can arrive: the slot is finished");
+    }
+
+    #[test]
+    fn closing_a_live_session_requires_consent_and_cancel_preserves_its_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bare_app(dir.path());
+        app.repaint = Some(Arc::new(|| {}));
+        let profile = app.default_profile();
+        let id = app.alloc_pane_id();
+        let entry = app.spawn_entry(id, &profile, Some(dir.path().into()));
+        let pid = entry.live().expect("live fixture").shell_pid;
+        app.tabs.push(Tab::new(SplitTree::new(id), HashMap::from([(id, entry)]), id));
+        assert!(!app.request_window_close());
+        assert!(matches!(app.ui.dialog, Some(DialogState::CloseSessions { whole_window: true, running: 1, .. })));
+        assert_eq!(app.tabs[0].panes[&id].live().unwrap().shell_pid, pid);
+        app.ui.dialog = None; // Cancel never changes ownership.
+        assert_eq!(app.tabs[0].panes[&id].live().unwrap().shell_pid, pid);
+        assert!(app.confirm_sessions(vec![id], false));
+        app.ui.dialog = None;
+        app.finish_close(vec![id], false);
+        assert!(app.tabs.iter().all(|tab| !tab.panes.contains_key(&id)));
+        assert_eq!(app.closed_tabs.len(), 1);
+    }
+
+    #[test]
+    fn agent_detection_persists_changes_without_rewriting_an_unchanged_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bare_app(dir.path());
+        app.repaint = Some(Arc::new(|| {}));
+        let profile = app.default_profile();
+        let id = app.alloc_pane_id();
+        let entry = app.spawn_entry(id, &profile, Some(dir.path().into()));
+        let pid = entry.live().unwrap().shell_pid;
+        app.tabs.push(Tab::new(SplitTree::new(id), HashMap::from([(id, entry)]), id));
+        for changed in [true, false] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            tx.send(Some(vec![crate::procs::ProcInfo { pid, ppid: 0, name: "omp.exe".into(), command_line: None }]))
+                .unwrap();
+            app.proc_results = Some(rx);
+            app.proc_requested = Some(SystemTime::now());
+            app.session_dirty = None;
+            app.last_status_poll = Instant::now() - Duration::from_secs(2);
+            app.poll_statuses();
+            assert_eq!(app.running_agents.get(&id).map(String::as_str), Some("omp"));
+            assert_eq!(app.session_dirty.is_some(), changed);
+        }
+    }
+
+    #[test]
+    fn saved_agents_have_no_command_line_and_disabled_restore_starts_a_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bare_app(dir.path());
+        app.repaint = Some(Arc::new(|| {}));
+        let profile = app.default_profile();
+        let id = app.alloc_pane_id();
+        let entry = app.spawn_entry(id, &profile, Some(dir.path().into()));
+        app.running_agents.insert(id, "omp".into());
+        let mut tab = Tab::new(SplitTree::new(id), HashMap::from([(id, entry)]), id);
+        tab.maximized = Some(id);
+        let state = app.tab_state(&tab);
+        assert_eq!(state.maximized, Some(0));
+        let session::SavedNode::Pane(pane) = &state.layout else { panic!("one pane") };
+        assert_eq!(pane.agent.as_deref(), Some("omp"));
+        assert_eq!(pane.cwd.as_deref(), Some(dir.path()));
+        let restored = app.restore_tab(&state).unwrap();
+        assert_eq!(restored.maximized, Some(restored.focused));
+        assert!(!app.running_agents.contains_key(&restored.focused), "disabled by default");
+        app.config.restore_agents = true;
+        let mut invalid = pane.clone();
+        invalid.cwd = Some(dir.path().join("missing"));
+        let id = app.alloc_pane_id();
+        assert!(matches!(app.restore_entry(id, &profile, &invalid).content, PaneContent::Error(_)));
     }
 }

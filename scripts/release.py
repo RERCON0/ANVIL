@@ -334,6 +334,8 @@ def main() -> None:
         keygen(args.private_key, args.public_key)
         return
     if args.command == "verify":
+        tool = str(Path(openssl()).resolve())
+        print("Signature verifier:", tool, run([tool, "version"]).decode("ascii").strip())
         manifest = verify_package(args.archive, args.public_key)
     else:
         manifest = build(args.output, args.private_key)

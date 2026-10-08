@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod hooks;
+
 /// One changed file, as `git status --porcelain=v2` reports it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Change {
@@ -128,7 +130,15 @@ fn base_git_command(root: &Path, executable: &Path) -> Command {
         // Command-line config wins over the repository's: a repo-local
         // fsmonitor hook or signature verifier must not run on a refresh,
         // and quotePath must not C-quote non-ASCII names in diff headers.
-        .args(["-c", "core.fsmonitor=false", "-c", "core.quotePath=false", "-c", "log.showSignature=false"])
+        .args([
+            "--no-pager",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.quotePath=false",
+            "-c",
+            "log.showSignature=false",
+        ])
         .current_dir(root)
         // Never let git ask a human: no terminal prompts, no GUI helpers, and
         // treat every path we pass as a literal, not a pathspec pattern.
@@ -320,17 +330,30 @@ struct ConfigSource {
     /// Length and mtime of the file when the digest was computed; `None` when
     /// it did not exist then.
     state: Option<(u64, Option<std::time::SystemTime>)>,
+    /// Path-bearing metadata/config files are also checked byte-for-byte.
+    /// Timestamps are attacker-controlled in a repository supplied as an archive.
+    content: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 impl ConfigSource {
-    fn read(path: &Path) -> ConfigSource {
+    fn read(path: &Path) -> Result<ConfigSource, String> {
         let resolved = local_path(path);
         let state = resolved
             .as_ref()
             .ok()
             .and_then(|path| std::fs::metadata(path).ok().map(|meta| (meta.len(), meta.modified().ok())));
-        let resolved = resolved.unwrap_or_else(|_| path.to_path_buf());
-        ConfigSource { path: resolved, aliases: std::collections::HashSet::from([path.to_path_buf()]), state }
+        let resolved = resolved?;
+        let content = match crate::fsutil::read_limited(&resolved, 1024 * 1024) {
+            Ok(bytes) => Some(std::sync::Arc::new(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(config_refusal()),
+        };
+        Ok(ConfigSource {
+            path: resolved,
+            aliases: std::collections::HashSet::from([path.to_path_buf()]),
+            state,
+            content,
+        })
     }
 
     fn is_current(&self, walk: &mut Walk) -> bool {
@@ -340,6 +363,9 @@ impl ConfigSource {
             .iter()
             .all(|alias| local_path_in(alias, walk).is_ok_and(|resolved| same_path(&resolved, &self.path)))
             && std::fs::metadata(&self.path).ok().map(|meta| (meta.len(), meta.modified().ok())) == self.state
+            && self.content.as_ref().is_none_or(|expected| {
+                crate::fsutil::read_limited(&self.path, 1024 * 1024).is_ok_and(|bytes| bytes == **expected)
+            })
     }
 }
 
@@ -418,6 +444,7 @@ pub struct RepositoryStamp {
     /// Files whose stat invalidates a cached digest.
     sources: std::sync::Arc<Vec<ConfigSource>>,
     source_index: std::sync::Arc<HashMap<PathBuf, usize>>,
+    hooks: std::sync::Arc<Vec<hooks::HookSource>>,
 }
 
 impl PartialEq for RepositoryStamp {
@@ -446,7 +473,7 @@ impl RepositoryStamp {
 
     /// Whether the files behind this digest still look untouched.
     fn is_current(&self) -> bool {
-        all_current(&self.sources)
+        all_current(&self.sources) && hooks::all_current(&self.hooks)
     }
 }
 
@@ -528,11 +555,11 @@ fn read_stamp(root: &Path) -> Result<RepositoryStamp, String> {
                 }
                 alias_count += 1;
                 source_index.insert(origin.clone(), sources.len());
-                sources.push(ConfigSource::read(&origin));
+                sources.push(ConfigSource::read(&origin)?);
             }
             snapshots.push((repository, config));
         }
-        if !all_current(&sources) {
+        if !all_current(&sources) || !hooks::all_current(&checked.hooks) {
             continue;
         }
         // An origin discovered only from Git needs a second read under its
@@ -552,7 +579,7 @@ fn read_stamp(root: &Path) -> Result<RepositoryStamp, String> {
                     break;
                 }
             }
-            if changed || !all_current(&sources) {
+            if changed || !all_current(&sources) || !hooks::all_current(&checked.hooks) {
                 continue;
             }
         }
@@ -561,6 +588,7 @@ fn read_stamp(root: &Path) -> Result<RepositoryStamp, String> {
             let child = digest_of(&config, &repository.root, Default::default());
             merge_repository_digest(&mut combined, repository, &child);
         }
+        hooks::merge(&mut combined, &checked.hooks);
         return Ok(combined);
     }
     Err(config_refusal())
@@ -651,6 +679,7 @@ fn digest_of(config: &[u8], root: &Path, sources: std::sync::Arc<Vec<ConfigSourc
             sources.iter().enumerate().map(|(index, source)| (source.path.clone(), index)).collect(),
         ),
         sources,
+        hooks: Default::default(),
     }
 }
 
@@ -965,6 +994,7 @@ struct Preflight {
     repositories: Vec<RepositoryPaths>,
     sources: std::sync::Arc<Vec<ConfigSource>>,
     executable: PathBuf,
+    hooks: std::sync::Arc<Vec<hooks::HookSource>>,
 }
 
 struct ConfigScan {
@@ -984,6 +1014,9 @@ struct ConfigScan {
     worktree_override: bool,
     git_dir: PathBuf,
     walk: Walk,
+    hook_paths: HashMap<PathBuf, std::collections::HashSet<PathBuf>>,
+    hooks: Vec<hooks::HookSource>,
+    hook_budget: hooks::Budget,
 }
 
 impl ConfigScan {
@@ -1005,6 +1038,9 @@ impl ConfigScan {
             metadata_entries: 0,
             global_paths: Default::default(),
             walk: Walk::default(),
+            hook_paths: Default::default(),
+            hooks: Vec::new(),
+            hook_budget: Default::default(),
         }
     }
 
@@ -1030,6 +1066,7 @@ impl ConfigScan {
                 path: resolved.clone(),
                 aliases: std::collections::HashSet::from([path.to_path_buf()]),
                 state,
+                content: None,
             });
             self.source_index.insert(resolved.clone(), index);
             index
@@ -1063,6 +1100,11 @@ impl ConfigScan {
         if text.len() > 1024 * 1024 {
             return Err(config_refusal());
         }
+        let index = self.alias_index[path];
+        if self.sources[index].content.as_ref().is_some_and(|old| old.as_slice() != text.as_bytes()) {
+            return Err(config_refusal());
+        }
+        self.sources[index].content = Some(std::sync::Arc::new(text.as_bytes().to_vec()));
         Ok(Some(text))
     }
 
@@ -1102,6 +1144,9 @@ impl ConfigScan {
                 &self.cwd
             };
             let target = config_path(&value, parent, &self.cwd)?;
+            if key == "core.hookspath" {
+                self.hook_paths.entry(self.cwd.clone()).or_default().insert(target.clone());
+            }
             if !key.starts_with("include") {
                 self.source(&target)?;
             } else {
@@ -1224,12 +1269,13 @@ fn config_paths(text: &str) -> Result<Vec<(String, String)>, String> {
                 | "core.attributesfile"
                 | "core.excludesfile"
                 | "core.worktree"
+                | "core.hookspath"
                 | "submodule.path"
         ) {
             if value.is_empty() {
                 // An empty include target is nonsense; an empty `core.*`
                 // path or submodule path means the key is unset.
-                if key.starts_with("include") {
+                if key.starts_with("include") || key == "core.hookspath" {
                     return Err(config_refusal());
                 }
                 continue;
@@ -1659,6 +1705,14 @@ fn inspect_metadata(repository: &RepositoryPaths, scan: &mut ConfigScan, depth: 
     }
     scan.config(&repository.common_dir.join("config"), 0)?;
     scan.config(&repository.git_dir.join("config.worktree"), 0)?;
+    // Normal hooks live in the common directory, including linked worktrees.
+    // Conservatively inspect all configured candidates, including conditional
+    // includes; Git itself decides which one is effective after this preflight.
+    let mut hook_paths = scan.hook_paths.get(&repository.root).cloned().unwrap_or_default();
+    hook_paths.insert(repository.common_dir.join("hooks"));
+    for path in hook_paths {
+        scan.hooks.push(hooks::HookSource::read(repository, &path, &mut scan.hook_budget)?);
+    }
     // Watch HEAD as well: includeIf.onbranch can change its selected source
     // without changing a config file.
     inspect_symbolic_head(repository, scan)?;
@@ -1760,7 +1814,7 @@ fn preflight(cwd: &Path) -> Result<std::sync::Arc<Preflight>, String> {
     let cached =
         PREFLIGHT_CACHE.lock().ok().and_then(|cache| cache.as_ref().and_then(|cache| cache.get(&cwd)).cloned());
     if let Some((previous, checked)) = cached {
-        if previous == environment && all_current(&checked.sources) {
+        if previous == environment && all_current(&checked.sources) && hooks::all_current(&checked.hooks) {
             return Ok(checked);
         }
     }
@@ -1788,7 +1842,7 @@ fn preflight(cwd: &Path) -> Result<std::sync::Arc<Preflight>, String> {
         if let Some(repository) = &repository {
             inspect_metadata(repository, &mut scan, 0)?;
         }
-        if !all_current(&scan.sources) {
+        if !all_current(&scan.sources) || !hooks::all_current(&scan.hooks) {
             continue;
         }
         if scan.worktree_override {
@@ -1800,18 +1854,34 @@ fn preflight(cwd: &Path) -> Result<std::sync::Arc<Preflight>, String> {
             }
             let actual = PathBuf::from(String::from_utf8(stdout).map_err(|_| config_refusal())?.trim());
             if let Some(repository) = &mut repository {
-                repository.root = local_path(&actual)?;
-                if let Some(first) = scan.repositories.first_mut() {
-                    first.root = repository.root.clone();
+                let actual = local_path(&actual)?;
+                if !same_path(&repository.root, &actual) {
+                    repository.root = actual;
+                    // Relative include/hook paths depend on the effective
+                    // worktree. Keep the old watches, then inspect again in
+                    // the new context before caching or granting approval.
+                    scan.visited.clear();
+                    scan.repository_keys.clear();
+                    scan.repositories.clear();
+                    scan.hook_paths.clear();
+                    scan.hooks.clear();
+                    scan.hook_budget = Default::default();
+                    scan.metadata_dirs.clear();
+                    scan.alternate_stores.clear();
+                    scan.metadata_entries = 0;
+                    scan.bytes = 0;
+                    scan.walk = Walk::default();
+                    inspect_metadata(repository, &mut scan, 0)?;
                 }
             }
         }
-        if all_current(&scan.sources) {
+        if all_current(&scan.sources) && hooks::all_current(&scan.hooks) {
             let checked = std::sync::Arc::new(Preflight {
                 repository,
                 repositories: scan.repositories,
                 sources: std::sync::Arc::new(scan.sources),
                 executable,
+                hooks: std::sync::Arc::new(scan.hooks),
             });
             if let Ok(mut cache) = PREFLIGHT_CACHE.lock() {
                 let cache = cache.get_or_insert_with(HashMap::new);
@@ -2168,7 +2238,7 @@ pub fn log(root: &Path) -> Result<CommitLog, String> {
         }
         None => (rev_list_set(root, &["HEAD"]), Default::default()),
     };
-    let format = "%H\x1f%h\x1f%P\x1f%an\x1f%ct\x1f%D\x1f%s\x1e".to_owned();
+    let format = "%H%x00%h%x00%P%x00%an%x00%ct%x00%D%x00%s";
     let revs: Vec<&str> = match &upstream {
         Some(upstream) => vec!["HEAD", upstream],
         None => vec!["HEAD"],
@@ -2177,7 +2247,8 @@ pub fn log(root: &Path) -> Result<CommitLog, String> {
         "log".to_owned(),
         format!("--max-count={}", MAX_COMMITS + 1),
         "--topo-order".to_owned(),
-        format!("--pretty=format:{format}"),
+        "-z".to_owned(),
+        format!("--pretty=tformat:{format}"),
     ];
     // Every option precedes `--end-of-options`: git rejects options after it.
     args.push("--end-of-options".to_owned());
@@ -2190,23 +2261,17 @@ pub fn log(root: &Path) -> Result<CommitLog, String> {
     Ok(CommitLog { commits, upstream, truncated })
 }
 
-/// Parses `git log` records into commits. A commit subject may itself contain
-/// the record/field separators; only records whose hash is a real object id are
-/// trusted, so a crafted subject cannot inject a "hash" that later reaches git
-/// as an option.
+/// Git's NUL-delimited fixed seven-field records preserve separator-like
+/// characters in subjects. Only object IDs may later be passed as revisions.
 fn parse_log(
     text: &str,
     outgoing: &std::collections::HashSet<String>,
     incoming: &std::collections::HashSet<String>,
 ) -> Vec<Commit> {
     let mut commits = Vec::new();
-    for record in text.split('\u{1e}') {
-        let record = record.trim_start_matches(['\n', '\r']);
-        if record.is_empty() {
-            continue;
-        }
-        let fields: Vec<&str> = record.split('\u{1f}').collect();
-        if fields.len() < 7 || !is_object_hash(fields[0]) || fields.iter().any(|field| field.contains(NUL)) {
+    let fields: Vec<_> = text.split(NUL).collect();
+    for fields in fields.as_chunks::<7>().0 {
+        if !is_object_hash(fields[0]) {
             continue;
         }
         let hash = fields[0].to_owned();
@@ -2216,7 +2281,9 @@ fn parse_log(
             parents: fields[2].split(' ').filter(|p| !p.is_empty()).map(str::to_owned).collect(),
             author: fields[3].to_owned(),
             time: fields[4].parse().unwrap_or(0),
-            refs: fields[5].split(',').map(|r| r.trim().to_owned()).filter(|r| !r.is_empty()).collect(),
+            // Git separates decorations with comma-space; spaces are illegal
+            // in ref names, but a bare comma is a valid part of a branch name.
+            refs: fields[5].split(", ").map(|r| r.trim().to_owned()).filter(|r| !r.is_empty()).collect(),
             subject: fields[6].to_owned(),
             section: if outgoing.contains(&hash) {
                 Section::Outgoing
@@ -2465,6 +2532,16 @@ fn ai_cli_command(program: &str) -> Command {
         return command;
     }
     Command::new(program)
+}
+
+/// Resolve only an allowlisted installed CLI, with no current-directory lookup.
+pub(crate) fn installed_cli_command(name: &str) -> Option<Command> {
+    crate::agents::continue_args(name)?;
+    let command = ai_cli_command(name);
+    if Path::new(command.get_program()).is_absolute() {
+        return Some(command);
+    }
+    find_on_path(&format!("{name}.exe")).map(Command::new)
 }
 
 /// The command an npm shim stands for, or `None` when the name resolves to a
@@ -2834,6 +2911,15 @@ pub fn sweep_stale_ai_state() {
 /// Every invocation owns a fresh private directory, removed on success/error.
 /// Explicit unknown custom executables remain user code, not safe profiles.
 pub fn ai_commit_message(command: Option<&str>, prompt: &str, timeout: std::time::Duration) -> Result<String, String> {
+    ai_commit_message_with_login(command, prompt, timeout, false)
+}
+
+pub(crate) fn ai_commit_message_with_login(
+    command: Option<&str>,
+    prompt: &str,
+    timeout: std::time::Duration,
+    codex_chatgpt_login: bool,
+) -> Result<String, String> {
     use ai_commit::Backend;
     let ai_commit::Invocation { program, directory: _directory, backend, model } =
         ai_commit::prepare(command.unwrap_or(""))?;
@@ -2862,11 +2948,23 @@ pub fn ai_commit_message(command: Option<&str>, prompt: &str, timeout: std::time
             } else {
                 ai_commit::response(backend, &output).err().unwrap_or_else(|| format!("{label}: {}", output.trim()))
             };
-            return Err(ai_commit::redact(&reason, &secrets));
+            let reason = ai_commit::redact(&reason, &secrets);
+            return Err(
+                if backend == Backend::Claude
+                    && (reason.contains("unknown option") || reason.contains("unrecognized option"))
+                {
+                    format!("{reason}\n{}", crate::strings::pick(
+                    "ANVIL commit generation requires Claude Code 2.1.248 or newer; update Claude Code. Unsafe fallback is disabled.",
+                    "Генерация коммитов ANVIL требует Claude Code 2.1.248 или новее; обновите Claude Code. Небезопасный откат отключён.",
+                ))
+                } else {
+                    reason
+                },
+            );
         }
         ai_commit::response(backend, &output).map_err(|error| ai_commit::redact(&error, &secrets))?
     } else {
-        ai_commit::codex_generate(model.as_deref(), prompt, timeout)?
+        ai_commit::codex_generate(model.as_deref(), prompt, timeout, codex_chatgpt_login)?
     };
     let message = clean_ai_message(&text);
     if message.is_empty() {
@@ -2900,7 +2998,7 @@ pub fn ls_files(root: &Path) -> Result<Vec<String>, String> {
     Ok(files)
 }
 
-/// Reads a repository file (UTF-8, lossy) up to `max_bytes`; the bool reports
+/// Reads a repository text file (valid UTF-8) up to `max_bytes`; the bool reports
 /// truncation. The path is validated first and the cap is applied while
 /// reading, so a huge file cannot be allocated to memory.
 pub fn read_file(root: &Path, path: &str, max_bytes: usize) -> Result<(String, bool), String> {
@@ -2911,7 +3009,22 @@ pub fn read_file(root: &Path, path: &str, max_bytes: usize) -> Result<(String, b
     file.by_ref().take(max_bytes as u64 + 1).read_to_end(&mut buffer).map_err(|e| format!("{path}: {e}"))?;
     let truncated = buffer.len() > max_bytes;
     buffer.truncate(max_bytes);
-    Ok((String::from_utf8_lossy(&buffer).into_owned(), truncated))
+    let not_text = || {
+        crate::strings::pick(
+            "This file is not UTF-8 text; use Reveal in Explorer.",
+            "Это не текст UTF-8; используйте показ файла в Проводнике.",
+        )
+        .to_owned()
+    };
+    if buffer.contains(&0) || buffer.starts_with(b"MZ") || buffer.starts_with(b"\x7fELF") {
+        return Err(not_text());
+    }
+    match std::str::from_utf8(&buffer) {
+        Ok(_) => {}
+        Err(error) if truncated && error.error_len().is_none() => buffer.truncate(error.valid_up_to()),
+        Err(_) => return Err(not_text()),
+    }
+    Ok((String::from_utf8(buffer).map_err(|_| not_text())?, truncated))
 }
 
 /// One hunk of a unified diff.
@@ -3364,22 +3477,31 @@ index 111..222 100644\n\
 
     #[test]
     fn log_rejects_records_whose_hash_is_not_an_object_id() {
-        // A subject carrying the record separator would otherwise inject a
-        // second, attacker-chosen "commit" whose hash reaches git show.
-        let mut raw = Vec::new();
-        for record in [
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{1f}a\u{1f}\u{1f}me\u{1f}1\u{1f}\u{1f}ok",
-            "subj\u{1e}--output=C:/pwn\u{1f}x\u{1f}\u{1f}m\u{1f}1\u{1f}\u{1f}evil",
-        ] {
-            raw.extend_from_slice(record.as_bytes());
-            raw.push(0x1e);
-        }
-        let text = String::from_utf8(raw).unwrap();
+        let text = [
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "a",
+            "",
+            "me",
+            "1",
+            "main, feat/a,b",
+            "ok\u{1e}\u{1f}still here",
+            "invalid-object-id",
+            "x",
+            "",
+            "m",
+            "1",
+            "",
+            "invalid",
+            "",
+        ]
+        .join("\0");
         let commits = parse_log(&text, &std::collections::HashSet::new(), &std::collections::HashSet::new());
         assert_eq!(
             commits.iter().map(|commit| commit.hash.as_str()).collect::<Vec<_>>(),
             vec!["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
         );
+        assert_eq!(commits[0].subject, "ok\u{1e}\u{1f}still here");
+        assert_eq!(commits[0].refs, ["main", "feat/a,b"]);
     }
 
     #[test]
@@ -4162,7 +4284,7 @@ index 111..222 100644\n\
         let before = digest_of(
             &config_records(&[("local", "file:config", "filter.x.clean", "one")]),
             root,
-            std::sync::Arc::new(vec![ConfigSource::read(&config)]),
+            std::sync::Arc::new(vec![ConfigSource::read(&config).unwrap()]),
         );
         assert!(before.is_current());
         std::fs::write(&config, b"[branch]\nextra = 1\n").unwrap();
@@ -4301,5 +4423,36 @@ index 111..222 100644\n\
             false
         ));
         assert!(!ai_commit::policy_is_executable(&serde_json::json!({"permissions": {"deny": ["Read(./x)"]}}), true));
+    }
+
+    #[test]
+    fn file_preview_rejects_binary_and_keeps_truncated_utf8_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for bytes in [b"abc\0def".as_slice(), b"MZpretend text", b"\xff\xfeinvalid"] {
+            std::fs::write(root.join("file.txt"), bytes).unwrap();
+            assert!(read_file(root, "file.txt", 64).is_err());
+        }
+        std::fs::write(root.join("file.txt"), "aЖz").unwrap();
+        assert_eq!(read_file(root, "file.txt", 2).unwrap(), ("a".into(), true));
+        assert_eq!(read_file(root, "file.txt", 3).unwrap(), ("aЖ".into(), true));
+        assert_eq!(read_file(root, "file.txt", 64).unwrap(), ("aЖz".into(), false));
+    }
+
+    #[test]
+    fn control_file_content_is_checked_even_when_size_and_timestamp_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        std::fs::write(&path, b"[core]\n hooksPath = first\n").unwrap();
+        let source = ConfigSource::read(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, b"[core]\n hooksPath = other\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(!source.is_current(&mut Walk::default()), "mtime is not a content fingerprint");
     }
 }

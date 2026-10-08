@@ -17,7 +17,7 @@ pub fn show(ctx: &egui::Context, picker: &mut PickerState, profiles: &[(String, 
         .enumerate()
         .filter_map(|(index, (_, name))| fuzzy_score(&picker.filter, name).map(|score| (score, index)))
         .collect();
-    matches.sort_by(|a, b| b.0.cmp(&a.0));
+    matches.sort_by_key(|a| std::cmp::Reverse(a.0));
     if !matches.is_empty() {
         picker.selected = picker.selected.min(matches.len() - 1);
     }

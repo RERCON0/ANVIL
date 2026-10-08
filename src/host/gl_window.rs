@@ -3,7 +3,7 @@
 use std::num::NonZeroU32;
 
 use winit::event_loop::ActiveEventLoop;
-use winit::raw_window_handle::HasWindowHandle;
+use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{Window, WindowAttributes};
 
 pub struct GlWindow {
@@ -16,49 +16,50 @@ pub struct GlWindow {
 impl GlWindow {
     /// # Safety
     /// Must be called on the event-loop thread; the GL context is made current here.
-    pub unsafe fn new(event_loop: &ActiveEventLoop, attributes: WindowAttributes) -> GlWindow {
+    pub unsafe fn new(event_loop: &ActiveEventLoop, attributes: WindowAttributes) -> Result<GlWindow, String> {
         use glutin::context::NotCurrentGlContext;
-        use glutin::display::{GetGlDisplay, GlDisplay};
+        use glutin::display::{Display, DisplayApiPreference, GlDisplay};
         use glutin::prelude::GlSurface;
 
+        // Create the window first for WGL extension discovery. Selecting the
+        // config directly lets an empty iterator return an error, rather than
+        // panicking inside DisplayBuilder's infallible picker callback.
+        let window = event_loop.create_window(attributes).map_err(|e| format!("Window: {e}"))?;
+        let raw = window.window_handle().map_err(|e| format!("Window handle: {e}"))?.as_raw();
+        let display_handle = event_loop.display_handle().map_err(|e| format!("Display handle: {e}"))?.as_raw();
+        let gl_display = unsafe { Display::new(display_handle, DisplayApiPreference::WglThenEgl(Some(raw))) }
+            .map_err(|e| format!("Graphics display: {e}"))?;
         let template = glutin::config::ConfigTemplateBuilder::new()
             .prefer_hardware_accelerated(None)
             .with_depth_size(0)
             .with_stencil_size(0)
-            .with_transparency(false);
-        let (mut window, gl_config) = glutin_winit::DisplayBuilder::new()
-            .with_preference(glutin_winit::ApiPreference::FallbackEgl)
-            .with_window_attributes(Some(attributes.clone()))
-            .build(event_loop, template, |mut configs| configs.next().expect("no OpenGL config"))
-            .expect("failed to create an OpenGL config");
-        let gl_display = gl_config.display();
-        let raw = window.as_ref().map(|w| w.window_handle().expect("window handle").as_raw());
-        let attrs = glutin::context::ContextAttributesBuilder::new().build(raw);
+            .with_transparency(false)
+            .compatible_with_native_window(raw)
+            .build();
+        let gl_config = unsafe { gl_display.find_configs(template) }
+            .map_err(|e| format!("OpenGL configuration: {e}"))?
+            .next()
+            .ok_or_else(|| "No compatible OpenGL configuration".to_owned())?;
+        let attrs = glutin::context::ContextAttributesBuilder::new()
+            .with_context_api(glutin::context::ContextApi::OpenGl(Some(glutin::context::Version::new(2, 1))))
+            .build(Some(raw));
         let gles = glutin::context::ContextAttributesBuilder::new()
             .with_context_api(glutin::context::ContextApi::Gles(None))
-            .build(raw);
-        // SAFETY: the display and config come from the same DisplayBuilder.
+            .build(Some(raw));
+        // SAFETY: the config was obtained from this display and the window is alive.
         let not_current = unsafe {
-            gl_display
-                .create_context(&gl_config, &attrs)
-                .unwrap_or_else(|_| gl_display.create_context(&gl_config, &gles).expect("OpenGL context"))
-        };
-        let window = window.take().unwrap_or_else(|| {
-            glutin_winit::finalize_window(event_loop, attributes, &gl_config).expect("failed to create the window")
-        });
+            gl_display.create_context(&gl_config, &attrs).or_else(|_| gl_display.create_context(&gl_config, &gles))
+        }
+        .map_err(|e| format!("OpenGL context: {e}"))?;
         let (w, h): (u32, u32) = window.inner_size().into();
         let surface_attributes = glutin::surface::SurfaceAttributesBuilder::<glutin::surface::WindowSurface>::new()
-            .build(
-                window.window_handle().expect("window handle").as_raw(),
-                NonZeroU32::new(w).unwrap_or(NonZeroU32::MIN),
-                NonZeroU32::new(h).unwrap_or(NonZeroU32::MIN),
-            );
+            .build(raw, NonZeroU32::new(w).unwrap_or(NonZeroU32::MIN), NonZeroU32::new(h).unwrap_or(NonZeroU32::MIN));
         // SAFETY: the raw handle belongs to `window`, which outlives the surface.
-        let gl_surface =
-            unsafe { gl_display.create_window_surface(&gl_config, &surface_attributes).expect("GL surface") };
-        let gl_context = not_current.make_current(&gl_surface).expect("make GL context current");
+        let gl_surface = unsafe { gl_display.create_window_surface(&gl_config, &surface_attributes) }
+            .map_err(|e| format!("OpenGL surface: {e}"))?;
+        let gl_context = not_current.make_current(&gl_surface).map_err(|e| format!("OpenGL activation: {e}"))?;
         let _ = gl_surface.set_swap_interval(&gl_context, glutin::surface::SwapInterval::Wait(NonZeroU32::MIN));
-        GlWindow { window, gl_context, gl_display, gl_surface }
+        Ok(GlWindow { window, gl_context, gl_display, gl_surface })
     }
 
     pub fn resize(&self, size: winit::dpi::PhysicalSize<u32>) {

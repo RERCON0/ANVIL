@@ -3,7 +3,8 @@
 ANVIL itself is licensed **GPL-3.0-or-later** (see `LICENSE`).
 
 The released binaries embed or ship the following third-party assets. Full
-licence texts are kept in the repository and are staged into `LICENSES/` of the
+licence texts in `fonts/`, `vendor/conpty/` and `LICENSES/egui-default-fonts/`
+are staged into `LICENSES/` of the
 distribution zip.
 
 | Asset | Where it comes from | Licence | Notice |
@@ -29,3 +30,5 @@ publishes no licence file is listed with its SPDX identifier and repository URL.
 
 `scripts/gen_seti_icons.py` regenerates the Seti icon table; its inputs are
 vendored under `vendor/seti/` with provenance and a pinned `fontTools` version.
+
+`LICENSES/CascadiaMono-OFL.txt` is a historical duplicate notice, not a staged licence. The package uses `fonts/OFL-notice.txt` and `fonts/OFL-1.1.txt`. Seti keeps both its vendored source notice and the generated font notice; generation copies them together.

@@ -9,6 +9,10 @@ use anvil::claude_status::{format_line_with, git_branch, Payload, StatusRecord, 
 use anvil::config::Config;
 
 fn main() {
+    if let Err(error) = anvil::secure_dll_search() {
+        eprintln!("ANVIL status helper: cannot secure DLL search: {error}");
+        std::process::exit(1);
+    }
     let Some(payload) = read_payload(std::io::stdin()) else { return };
     // The fields chosen in ANVIL's settings; an absent or unreadable config.json
     // (never quarantined from here) means every field, as before.

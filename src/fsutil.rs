@@ -5,6 +5,21 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+thread_local! { static UI_IO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+/// Sharing violations on the UI thread return immediately. Pending writes and
+/// reloads retry on a later frame instead of sleeping in the drawing path.
+pub(crate) fn ui_io<T>(operation: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UI_IO.with(|flag| flag.set(self.0));
+        }
+    }
+    let _restore = Restore(UI_IO.with(|flag| flag.replace(true)));
+    operation()
+}
+
 /// Limit the read itself, not just a metadata check that can race a writer.
 pub fn read_limited(path: &Path, cap: usize) -> io::Result<Vec<u8>> {
     let file = retry_file_sharing(|| fs::File::open(path))?;
@@ -28,6 +43,23 @@ fn bounded_reads_accept_the_exact_cap_and_reject_more() {
     assert_eq!(read_limited(&path, 4).unwrap(), b"1234");
     assert!(read_limited(&path, 3).is_err());
     assert!(read_limited(dir.path(), 4).is_err());
+}
+
+#[cfg(test)]
+#[test]
+fn ui_sharing_errors_do_not_sleep_or_retry_and_the_scope_restores_itself() {
+    let mut attempts = 0;
+    let result: io::Result<()> = ui_io(|| {
+        retry_file_sharing(|| {
+            attempts += 1;
+            Err(io::Error::from_raw_os_error(32))
+        })
+    });
+    assert!(result.is_err());
+    assert_eq!(attempts, 1);
+    assert!(!UI_IO.with(std::cell::Cell::get));
+    let _ = std::panic::catch_unwind(|| ui_io(|| panic!("test scope cleanup")));
+    assert!(!UI_IO.with(std::cell::Cell::get));
 }
 
 /// Writes `bytes` to `path` via a uniquely named sibling temp file and a
@@ -73,6 +105,9 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// access/sharing/lock errors, with one short deadline; never delete the target
 /// as a fallback or retry writes that could have partially modified a file.
 fn retry_file_sharing<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    if UI_IO.with(std::cell::Cell::get) {
+        return operation();
+    }
     #[cfg(windows)]
     {
         use std::time::{Duration, Instant};
@@ -120,6 +155,80 @@ pub fn recycle_path(path: &Path) -> Result<(), String> {
     {
         let _ = path;
         Err("Recycle Bin operations are only supported on Windows".to_owned())
+    }
+}
+
+/// Select an item by Shell identity, not Explorer's comma-delimited argv.
+pub fn reveal_path(path: &Path) -> Result<(), String> {
+    shell_reveal::reveal(path)
+}
+
+#[cfg(windows)]
+mod shell_reveal {
+    use std::path::Path;
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Com::{
+        CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx, COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{Common::ITEMIDLIST, SHOpenFolderAndSelectItems, SHParseDisplayName};
+
+    struct Apartment;
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            unsafe {
+                CoUninitialize();
+            }
+        }
+    }
+    struct Item(*mut ITEMIDLIST);
+    impl Drop for Item {
+        fn drop(&mut self) {
+            unsafe {
+                CoTaskMemFree(Some(self.0.cast()));
+            }
+        }
+    }
+    fn apartment() -> Result<Apartment, String> {
+        // SAFETY: balanced on this thread, including the already initialized STA case.
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok() }.map_err(|e| e.to_string())?;
+        Ok(Apartment)
+    }
+    fn parse(path: &Path) -> Result<Item, String> {
+        use std::os::windows::ffi::OsStrExt;
+        if path.as_os_str().encode_wide().any(|unit| unit == 0) {
+            return Err("A Shell path cannot contain NUL".to_owned());
+        }
+        let path = std::path::absolute(path).map_err(|e| e.to_string())?;
+        let wide = super::recycling::shell_path(&path);
+        let mut item = Item(std::ptr::null_mut());
+        // SAFETY: owned NUL-terminated path, valid out pointer, no bind context.
+        unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>, &mut item.0, 0, None) }
+            .map_err(|e| e.to_string())?;
+        if item.0.is_null() {
+            return Err("The Shell returned no item".to_owned());
+        }
+        Ok(item)
+    }
+    pub(super) fn reveal(path: &Path) -> Result<(), String> {
+        let _apartment = apartment()?;
+        let item = parse(path)?;
+        // SAFETY: a fully qualified PIDL with zero child items opens the parent
+        // and selects this exact item, including commas/quotes/Unicode in its name.
+        unsafe { SHOpenFolderAndSelectItems(item.0, None, 0) }.map_err(|e| e.to_string())
+    }
+    #[cfg(test)]
+    #[test]
+    fn shell_identity_preserves_commas_spaces_and_unicode_without_opening_a_window() {
+        use windows::Win32::UI::Shell::{SHGetPathFromIDListEx, GPFIDL_DEFAULT};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one, two — файл.txt");
+        std::fs::write(&path, b"text").unwrap();
+        let _apartment = apartment().unwrap();
+        let item = parse(&path).unwrap();
+        let mut wide = vec![0u16; 32768];
+        assert!(unsafe { SHGetPathFromIDListEx(item.0, &mut wide, GPFIDL_DEFAULT) }.as_bool());
+        let end = wide.iter().position(|unit| *unit == 0).unwrap();
+        assert_eq!(std::path::PathBuf::from(String::from_utf16(&wide[..end]).unwrap()), path);
     }
 }
 

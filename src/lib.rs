@@ -24,3 +24,18 @@ pub mod tabs;
 pub mod term;
 pub mod theme;
 pub mod workspace;
+
+/// Apply before any runtime DLL load in either distributed executable.
+/// Working directories and PATH are not library search locations.
+pub fn secure_dll_search() -> std::io::Result<()> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
+    // SAFETY: the caller applies this process-wide policy before spawning threads.
+    if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+mod agents;

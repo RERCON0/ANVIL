@@ -39,7 +39,7 @@ pub fn title_bar(
         theme::title_font(12.5),
         theme::colors().title_text,
     );
-    painter.hline(rect.x_range(), rect.max.y - 0.5, Stroke::new(1.0, theme::colors().border));
+    painter.hline(rect.x_range(), rect.max.y - 0.5, Stroke::new(1.0_f32, theme::colors().border));
 
     let language_rect = Rect::from_min_max(
         Pos2::new(rect.max.x - buttons_width - 42.0, rect.min.y),

@@ -110,14 +110,27 @@ impl Engine {
     /// data any window wrote (None: there is none), so a window that becomes
     /// leader does not re-poll what another one fetched a minute ago.
     pub fn due(&mut self, now: i64, snapshot_age: Option<i64>, manual: bool) -> bool {
+        // Wall-clock corrections must not stall this process until the old
+        // timestamp catches up. Reset in-memory scheduling, not just disk data.
+        let clock_reset = self.last_cycle.is_some_and(|at| now < at);
+        if clock_reset {
+            self.last_cycle = None;
+            for memory in self.memory.values_mut() {
+                memory.paused_until = memory.paused_until.min(now);
+            }
+        }
+        if self.last_manual.is_some_and(|at| now < at) {
+            self.last_manual = None;
+        }
         self.manual_pending |= manual;
-        if self.manual_pending && self.last_manual.is_none_or(|at| now - at >= MANUAL_GAP) {
+        if self.manual_pending && self.last_manual.is_none_or(|at| now.saturating_sub(at) >= MANUAL_GAP) {
             return true;
         }
-        match self.last_cycle {
-            Some(at) => now - at >= INTERVAL,
-            None => snapshot_age.is_none_or(|age| age >= INTERVAL),
-        }
+        clock_reset
+            || match self.last_cycle {
+                Some(at) => now.saturating_sub(at) >= INTERVAL,
+                None => snapshot_age.is_none_or(|age| age >= INTERVAL),
+            }
     }
 
     pub fn cycle(
@@ -768,5 +781,15 @@ mod tests {
         assert_eq!(engine.manual_wait(300), MANUAL_GAP);
         assert_eq!(engine.manual_wait(320), 10);
         assert_eq!(engine.manual_wait(340), 0);
+    }
+
+    #[test]
+    fn a_backwards_clock_step_restarts_polling_even_with_a_fresh_snapshot() {
+        let mut engine = Engine { last_cycle: Some(2000), last_manual: Some(2000), ..Default::default() };
+        assert!(engine.due(1000, Some(0), false));
+        assert_eq!(engine.last_manual, None);
+        engine.last_cycle = Some(1000);
+        assert!(!engine.due(1001, Some(1), false));
+        assert!(engine.due(1030, Some(30), false));
     }
 }

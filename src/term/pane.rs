@@ -309,7 +309,7 @@ impl Pane {
         // to schedule the next one, including for panes not currently rendered.
         self.shared.wake_pending.store(false, Ordering::Relaxed);
         let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        events.events.drain(..).collect()
+        std::mem::take(&mut events.events)
     }
 
     /// True once since the last call if the process printed anything.

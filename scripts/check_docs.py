@@ -6,8 +6,9 @@ from urllib.parse import unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 DOCUMENTS = [
     "README.md", "README.ru.md", "SECURITY.md", "THIRD-PARTY.md", "docs/REFERENCE.md",
-    "docs/RELEASING.md", "docs/AUDIT.md",
-    "icons/README.md", "vendor/conpty/README.md",
+    "docs/RELEASING.md", "docs/AUDIT.md", "docs/REFERENCE.en.md",
+    "docs/AUDIT-REVIEW.md", "docs/DEPENDENCIES.md",
+    "icons/README.md", "vendor/conpty/README.md", "vendor/seti/README.md",
 ]
 
 

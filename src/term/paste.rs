@@ -80,10 +80,10 @@ mod tests {
 
     #[test]
     fn dropped_paths_are_quoted_for_the_shell() {
-        let dir = r"C:\Users\rerco\Desktop\24";
-        assert_eq!(quote_path(dir, PathQuoting::PowerShell), r"'C:\Users\rerco\Desktop\24' ");
-        assert_eq!(quote_path(dir, PathQuoting::Cmd), r#""C:\Users\rerco\Desktop\24" "#);
-        assert_eq!(quote_path(dir, PathQuoting::Unix), r"'C:\Users\rerco\Desktop\24' ");
+        let dir = r"C:\Users\dev\project";
+        assert_eq!(quote_path(dir, PathQuoting::PowerShell), r"'C:\Users\dev\project' ");
+        assert_eq!(quote_path(dir, PathQuoting::Cmd), r#""C:\Users\dev\project" "#);
+        assert_eq!(quote_path(dir, PathQuoting::Unix), r"'C:\Users\dev\project' ");
         assert_eq!(quote_path(r"C:\it's", PathQuoting::Unix), r"'C:\it'\''s' ");
         assert_eq!(quote_path("C:\\it\u{2019}s", PathQuoting::PowerShell), "'C:\\it\u{2019}\u{2019}s' ");
         assert_eq!(quote_path(r"C:\100%^!", PathQuoting::Cmd), r#""C:\100%^!" "#, "cmd takes these literally");

@@ -362,11 +362,12 @@ pub(super) fn codex_generate(
     model: Option<&str>,
     prompt: &str,
     timeout: std::time::Duration,
+    codex_chatgpt_login: bool,
 ) -> Result<String, String> {
     let home = config_home().ok_or_else(|| {
         crate::strings::pick("Codex: ~/.codex directory not found", "Codex: не найден каталог ~/.codex").to_owned()
     })?;
-    ai_codex::generate(&home, model, prompt, timeout).map(|text| plain_message(&text))
+    ai_codex::generate(&home, model, prompt, timeout, codex_chatgpt_login).map(|text| plain_message(&text))
 }
 
 /// The shape a Codex request has: URL, headers, body, and the token carried in
@@ -376,7 +377,7 @@ pub(super) type CodexRequest = (String, Vec<(String, String)>, serde_json::Value
 
 #[cfg(test)]
 pub(super) fn codex_request_for_tests(home: &Path, model: Option<&str>, prompt: &str) -> Result<CodexRequest, String> {
-    let request = ai_codex::request(home, model, prompt)?;
+    let request = ai_codex::request(home, model, prompt, true)?;
     Ok((
         request.url(),
         request.headers.into_iter().map(|(name, value)| (name.to_owned(), value)).collect(),
@@ -456,7 +457,7 @@ fn claude_settings(source: &serde_json::Value, with_user_settings: bool) -> (ser
     (settings, environment)
 }
 
-/// Credential copies (Gemini OAuth files, aider API keys) live inside
+/// Credential copies (Gemini OAuth files) live inside
 /// `anvil-ai-*` directories. Normal completion removes them, but a crash, a
 /// kill or a child still holding a file leaves one behind, so directories older
 /// than this are swept before the next generation starts — and once at startup,

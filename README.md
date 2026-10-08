@@ -15,9 +15,9 @@
 
 <p align="center"><a href="README.ru.md">Русский</a> · <a href="https://github.com/RERCON0/ANVIL/releases">Download</a> · <a href="#features">Features</a> · <a href="#build">Build</a> · <a href="#keyboard-shortcuts">Shortcuts</a> · <a href="docs/RELEASING.md">Release verification</a></p>
 
-![ANVIL with Codex, Claude Code, OpenCode, OMP, project tabs, Git history and AI quotas](assets/workspace.png)
+![ANVIL with Codex, Claude Code, OpenCode, OMP, project tabs, Git history and AI quotas](assets/workspace-demo.gif)
 
-<p align="center"><sub>Real CLI sessions in a sample workspace. Git history, staging and commit controls stay next to the agents.</sub></p>
+<p align="center"><sub>Ten seconds of a real workspace: project tabs, four CLI agents, Git and moving a live pane. Agents are prestarted for recording; this is not a startup benchmark. <a href="assets/workspace.png">Full screenshot</a>.</sub></p>
 
 ## Why ANVIL
 
@@ -29,6 +29,16 @@ from the adjacent Git panel, without switching to a separate IDE.
 ANVIL focuses on a small native application, rich terminal functionality and
 quick access to the work. The interface uses Rust, egui and OpenGL; shells run
 through ConPTY from Windows Terminal.
+
+### Compared with Windows Terminal and WezTerm
+
+[Windows Terminal](https://learn.microsoft.com/en-us/windows/terminal/panes) already
+has tabs and split panes. [WezTerm](https://wezterm.org/features.html) also offers
+cross-platform terminals, remote workspaces and multiplexing. ANVIL adds an
+integrated Git/file panel, hunk staging, editable AI commit messages and provider
+quotas to a Windows workspace built around several CLI agents. Choose it when
+those controls save you repeated trips to another application; it does not
+replace remote multiplexing or a complete IDE.
 
 ## Features
 
@@ -44,7 +54,7 @@ through ConPTY from Windows Terminal.
 | Saved workspace | Restore tabs, folders, splits and panel state; choose English or Russian in the title bar |
 
 > [!IMPORTANT]
-> Layouts are restored; shells start again. Live CLI processes and terminal scrollback are not saved between application launches.
+> Layouts are restored; processes start again. Enable **Settings → Terminal → Restore CLI agents and continue the last conversation** to reopen Codex, Claude Code, OpenCode and OMP with their native resume command in the saved folder. This is off by default. Running tasks and terminal scrollback are not restored. The CLI chooses its most recent conversation in that folder; multiple panes of the same agent in one folder can choose the same conversation.
 
 AI commit messages support Codex, Claude, OpenCode, Gemini and Aider. External
 backends require their CLI installations. The generated message remains editable.
@@ -56,7 +66,9 @@ backends require their CLI installations. The generated message remains editable
 
 Requires **Windows 10/11 x64**, an OpenGL 2.1-capable graphics driver and a shell.
 Install Git for Windows for the Git panel, and your preferred external AI CLIs
-separately. Codex commit messages can use an existing Codex login or an API key.
+separately. Claude commit generation requires Claude Code **2.1.248+**.
+Codex commit messages use an API key by default. Using a ChatGPT login for
+commit generation is a separate experimental opt-in; see [the reference](docs/REFERENCE.en.md#ai-commit-messages).
 
 1. Download the ZIP from [Releases](https://github.com/RERCON0/ANVIL/releases).
 2. Extract the whole archive and run `anvil.exe`. Keep the runtime and helper files beside it.
@@ -72,7 +84,8 @@ separately. Codex commit messages can use an existing Codex login or an API key.
 ## Security built into the workflow
 
 Git settings that can execute programs require explicit trust; that approval
-expires when the relevant configuration changes. Git and AI jobs in the panel
+expires when hazardous settings or hook content changes. Default `.git/hooks`,
+custom hooks and initialized submodules are included in that check. Git and AI jobs in the panel
 have deadlines, bounded output and process-tree cleanup. Credential reads,
 file previews and metadata traversal are bounded; AI diagnostics redact known
 secrets. Quota keys use Windows Credential Manager, and DLL lookup is restricted
@@ -94,7 +107,8 @@ cargo build --locked --release --bin anvil --bin anvil-claude-status
 .\target\release\anvil.exe
 ```
 
-For an unsigned development package with runtime files, licences and build
+The Cargo command is a developer build. For release-shaped binaries with build-path
+remapping, deterministic linker flags, runtime files, licences and build
 provenance, install Python 3.13 and run:
 
 ```powershell
@@ -133,7 +147,9 @@ python -B scripts/check_docs.py
 | Copy / paste | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
 | Settings / fullscreen | `Ctrl+,` / `F11` |
 
-Shortcuts use physical keys and work across keyboard layouts. Rebind them in Settings.
+These are selected shortcuts. The [reference](docs/REFERENCE.en.md#keyboard-shortcuts)
+lists the other defaults, and Settings shows the complete rebindable list.
+Shortcuts use physical keys and work across keyboard layouts.
 
 ## Data and documentation
 
@@ -143,7 +159,10 @@ Shortcuts use physical keys and work across keyboard layouts. Rebind them in Set
 | `%LOCALAPPDATA%\anvil` | Shared quota cache, polling schedule and temporary Claude statuses |
 | Windows Credential Manager | Quota API keys: `anvil/quota/<provider>` |
 
-- [Detailed feature and configuration reference (Russian)](docs/REFERENCE.md)
+- [Detailed feature and configuration reference](docs/REFERENCE.en.md)
+- [Russian reference](docs/REFERENCE.md)
+- [Audit report review](docs/AUDIT-REVIEW.md)
+- [Dependency upgrade plan](docs/DEPENDENCIES.md)
 - [Security policy and limitations](SECURITY.md)
 - [Release signing and verification](docs/RELEASING.md)
 - [Audit findings and checks](docs/AUDIT.md)

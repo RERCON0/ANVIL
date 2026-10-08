@@ -65,7 +65,7 @@ pub fn pane_env(
 
 /// Names printed by `wsl.exe -l -q` (UTF-16LE, possibly with a BOM).
 pub fn parse_wsl_list(bytes: &[u8]) -> Vec<String> {
-    let units: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
     String::from_utf16_lossy(&units)
         .trim_start_matches('\u{feff}')
         .lines()

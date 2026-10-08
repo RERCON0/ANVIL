@@ -48,8 +48,8 @@ pub fn pick<'a>(english: &'a str, russian: &'a str) -> &'a str {
 pub use ru::{APP_TITLE, SCHEME_DARK, SCHEME_LIGHT};
 pub fn scheme_label(name: &str) -> &str {
     match name {
-        SCHEME_DARK => pick("Dark", SCHEME_DARK),
-        SCHEME_LIGHT => pick("Light", SCHEME_LIGHT),
+        SCHEME_DARK | "Dark" | "dark" => pick("Dark", SCHEME_DARK),
+        SCHEME_LIGHT | "Light" | "light" => pick("Light", SCHEME_LIGHT),
         _ => name,
     }
 }

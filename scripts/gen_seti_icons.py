@@ -13,9 +13,8 @@
 # The outputs are committed, so a normal build never needs this script.
 # Edit the hand-written part of src/file_icons.rs in RUST_TAIL below, not in the
 # generated file. test_gen_seti_icons.py compares a fresh generation with the
-# committed fonts/seti.ttf, but it needs fontTools and CI does not install it:
-# the test is skipped there, so run it locally after any change to this script
-# or vendor/seti/. The Rust tail is covered by the ordinary `cargo test`.
+# committed fonts/seti.ttf. CI installs hash-pinned fontTools and runs the test.
+# The Rust tail is covered by the ordinary `cargo test`.
 
 import re
 import shutil

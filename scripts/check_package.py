@@ -98,7 +98,7 @@ if __name__ == "__main__":
     parser.add_argument("package", type=Path, help="the package .zip, or the directory that holds exactly one")
     path = parser.parse_args().package
     if path.is_dir():
-        candidates = list(path.glob("anvil-*-x64.zip"))
+        candidates = list(path.glob("anvil-[0-9]*-x64.zip"))
         if len(candidates) != 1:
             raise ValueError("Expected exactly one CI package")
         path = candidates[0]

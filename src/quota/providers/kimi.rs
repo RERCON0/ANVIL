@@ -19,7 +19,7 @@ fn used_pct(record: &Value) -> Option<f64> {
 }
 
 fn reset(record: &Value, now: i64) -> Option<i64> {
-    for key in ["reset_at", "resetAt", "reset_time", "resetTime"] {
+    for key in ["reset_at", "resetAt", "resets_at", "resetsAt", "reset_time", "resetTime"] {
         if let Some(at) = record.get(key).and_then(epoch_from_json) {
             return Some(at);
         }

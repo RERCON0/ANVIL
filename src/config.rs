@@ -26,6 +26,8 @@ pub struct Config {
     pub claude_status: ClaudeStatusConfig,
     pub quota: QuotaConfig,
     pub restore_session: bool,
+    /// Start known CLI agents with their native continue flag on session restore.
+    pub restore_agents: bool,
     pub workspace: WorkspaceConfig,
 }
 
@@ -37,6 +39,8 @@ pub struct WorkspaceConfig {
     pub ai_commit_command: Option<String>,
     /// OpenCode `provider/model` for commit messages. None: the CLI default.
     pub ai_commit_model: Option<String>,
+    /// Explicit opt-in to the undocumented ChatGPT subscription inference endpoint.
+    pub codex_chatgpt_login: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -272,6 +276,7 @@ impl Default for Config {
             claude_status: ClaudeStatusConfig::default(),
             quota: QuotaConfig::default(),
             restore_session: true,
+            restore_agents: false,
             workspace: WorkspaceConfig::default(),
         }
     }
@@ -694,4 +699,16 @@ fn language_defaults_and_saved_selection_are_backward_compatible() {
         serde_json::from_str::<Config>(r#"{"language":"fr"}"#).unwrap().language,
         crate::strings::Language::English
     );
+}
+
+#[cfg(test)]
+#[test]
+fn agent_restore_and_subscription_inference_are_explicit_opt_ins() {
+    let old: Config = serde_json::from_str(r#"{"restoreSession":true}"#).unwrap();
+    assert!(!old.restore_agents && !old.workspace.codex_chatgpt_login);
+    let enabled: Config =
+        serde_json::from_str(r#"{"restoreAgents":true,"workspace":{"codexChatgptLogin":true}}"#).unwrap();
+    let minimal = enabled.to_minimal_json();
+    assert_eq!(minimal["restoreAgents"], true);
+    assert_eq!(minimal["workspace"]["codexChatgptLogin"], true);
 }

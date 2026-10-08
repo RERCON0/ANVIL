@@ -16,3 +16,13 @@ through unchanged.
 `alacritty_terminal` loads it with `LoadLibraryW("conpty.dll")`, which looks in
 the executable's directory first. `OpenConsole.exe` must sit next to
 `conpty.dll`.
+
+The files were independently re-derived from
+`https://registry.npmjs.org/node-pty/-/node-pty-1.2.0-beta.8.tgz` on 2026-10-08.
+Its SHA-256 is
+`f4832644b8fe9a8b53d4e3114ff13e56b0d8c7311d66eeda05f5fc91898f7f12`;
+both members are byte-identical to the vendored files. `publisher.json` records
+this source and the reviewed Microsoft signer. Windows CI and packaging run
+`scripts/check_conpty_signatures.ps1`, which requires a **valid cryptographic
+Authenticode signature** and the pinned Microsoft certificate, in addition to
+the per-file SHA-256 check. Reading a certificate subject alone is insufficient.

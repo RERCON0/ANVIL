@@ -180,7 +180,7 @@ pub fn show(ui: &mut egui::Ui, rect: Rect, cx: &mut SettingsContext, state: &mut
                         ui.painter().rect_stroke(
                             row,
                             0.0,
-                            Stroke::new(1.0, theme::colors().line),
+                            Stroke::new(1.0_f32, theme::colors().line),
                             egui::StrokeKind::Middle,
                         );
                     } else if response.hovered() {
@@ -286,7 +286,7 @@ fn section_appearance(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut
             });
         let palette = crate::app::scheme_palette(cx.config);
         let (response, painter) = ui.allocate_painter(Vec2::new(16.0 * 15.0 + 2.0, 15.0), Sense::hover());
-        painter.rect_stroke(response.rect, 0.0, Stroke::new(1.0, theme::colors().line), egui::StrokeKind::Middle);
+        painter.rect_stroke(response.rect, 0.0, Stroke::new(1.0_f32, theme::colors().line), egui::StrokeKind::Middle);
         for (index, color) in palette.ansi.iter().enumerate() {
             let cell = Rect::from_min_size(
                 response.rect.min + Vec2::new(1.0 + index as f32 * 15.0, 1.0),
@@ -299,6 +299,30 @@ fn section_appearance(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut
 
 fn section_terminal(ui: &mut egui::Ui, cx: &mut SettingsContext, outcome: &mut SettingsOutcome) {
     theme::section(ui, strings::SETTINGS_TERMINAL());
+    if theme::choice(
+        ui,
+        strings::pick("Restore tabs and layout", "Восстанавливать вкладки и раскладку"),
+        cx.config.restore_session,
+    )
+    .clicked()
+    {
+        cx.config.restore_session = !cx.config.restore_session;
+        outcome.changed = true;
+    }
+    if theme::choice(
+        ui,
+        strings::pick(
+            "Restore CLI agents and continue the last conversation",
+            "Восстанавливать CLI-агентов и продолжать последнюю беседу",
+        ),
+        cx.config.restore_agents,
+    )
+    .clicked()
+    {
+        cx.config.restore_agents = !cx.config.restore_agents;
+        outcome.changed = true;
+    }
+    ui.label(RichText::new(strings::pick("Requires layout restore. Codex, Claude Code, OpenCode and OMP use their own saved conversation in each folder. A running task is not resumed.", "Требуется восстановление раскладки. Codex, Claude Code, OpenCode и OMP открывают свою сохранённую беседу в каждой папке. Выполнявшаяся задача не возобновляется.")).font(theme::font(11.5)).color(theme::colors().faint));
     theme::tag(ui, strings::SETTINGS_SCROLLBACK());
     outcome.changed |= theme::stepper(ui, &mut cx.config.terminal.scrollback, 0, crate::config::MAX_SCROLLBACK, 1000);
     theme::tag(ui, strings::SETTINGS_CURSOR());
@@ -493,6 +517,18 @@ fn section_git(ui: &mut egui::Ui, cx: &mut SettingsContext, state: &mut Settings
     }
     keep_buffer(ui, id, &response, ai);
     ui.label(RichText::new(strings::SETTINGS_AI_HINT()).color(theme::colors().faint).font(theme::font(11.5)));
+    ui.add_space(8.0);
+    ui.checkbox(
+        &mut cx.config.workspace.codex_chatgpt_login,
+        strings::pick(
+            "Use the saved Codex ChatGPT login for commit messages (experimental)",
+            "Использовать вход Codex через ChatGPT для сообщений коммита (экспериментально)",
+        ),
+    );
+    ui.label(RichText::new(strings::pick(
+        "Off by default. This sends the staged diff through an undocumented subscription endpoint. OpenAI can change or reject it. API keys use the supported OpenAI API with separate billing.",
+        "По умолчанию выключено. Staged-diff отправляется через недокументированный endpoint подписки. OpenAI может изменить или отклонить запрос. API-ключ использует официальный API с отдельной оплатой.",
+    )).color(theme::colors().faint).font(theme::font(11.5)));
     ui.add_space(14.0);
     theme::tag(ui, strings::SETTINGS_AI_MODEL());
     ui.label(RichText::new(strings::SETTINGS_AI_MODEL_HINT()).color(theme::colors().faint).font(theme::font(11.5)));
@@ -922,7 +958,7 @@ fn profile_editor(
     ui.painter().rect_stroke(
         ui.max_rect().shrink(1.0),
         0.0,
-        Stroke::new(1.0, theme::colors().line),
+        Stroke::new(1.0_f32, theme::colors().line),
         egui::StrokeKind::Middle,
     );
     ui.add_space(4.0);

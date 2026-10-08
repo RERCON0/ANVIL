@@ -3,6 +3,140 @@
 use super::*;
 use crate::layout::split_tree::Node;
 
+/// Owns prewarmed real sessions while the demo introduces them one at a time.
+/// It is a development fixture, not a launcher or a persisted user workspace.
+pub(crate) struct ReadmeDemo {
+    ids: Vec<PaneId>,
+    pids: HashMap<PaneId, u32>,
+    pending: HashMap<PaneId, PaneEntry>,
+    tabs: std::collections::VecDeque<Tab>,
+    last_step: Option<usize>,
+    drag: Option<(egui::Pos2, egui::Pos2)>,
+    pub cursor: Option<egui::Pos2>,
+}
+
+impl ReadmeDemo {
+    pub fn prepare(app: &mut AnvilApp) -> Self {
+        assert!(app.readme_root.is_some(), "demo must use an isolated README scene");
+        let tabs = app.tabs.drain(1..).collect();
+        let tab = &mut app.tabs[0];
+        let ids = tab.tree.panes();
+        assert_eq!(ids.len(), 4);
+        let mut pids = HashMap::new();
+        for id in &ids {
+            let entry = &mut tab.panes.get_mut(id).unwrap();
+            let pane = entry.live().expect("the demo requires real CLI processes");
+            assert!(!entry.exited);
+            pids.insert(*id, pane.shell_pid);
+            let text: String = pane.term.lock().renderable_content().display_iter.map(|c| c.cell.c).collect();
+            assert!(
+                !text.contains("No, exit") && !text.contains("Trust and continue"),
+                "CLI trust must be accepted first"
+            );
+            entry.workspace.open = false;
+        }
+        let pending = ids.iter().skip(1).map(|id| (*id, tab.panes.remove(id).unwrap())).collect();
+        tab.tree = SplitTree::new(ids[0]);
+        tab.set_focus(ids[0]);
+        app.active = 0;
+        Self { ids, pids, pending, tabs, last_step: None, drag: None, cursor: None }
+    }
+
+    pub fn step(&mut self, app: &mut AnvilApp, input: &mut egui::RawInput, ctx: &egui::Context, frame: usize) {
+        let fresh = self.last_step != Some(frame);
+        if fresh {
+            self.last_step = Some(frame);
+            match frame {
+                15 | 25 => {
+                    app.tabs.push(self.tabs.pop_front().unwrap());
+                    app.active = app.tabs.len() - 1;
+                }
+                35 => app.active = 0,
+                40 | 50 | 60 => {
+                    let index = (frame - 30) / 10;
+                    let id = self.ids[index];
+                    let entry = self.pending.remove(&id).unwrap();
+                    let tab = &mut app.tabs[0];
+                    let (target, dir) = match index {
+                        1 => (self.ids[0], Dir::Column),
+                        2 => (self.ids[0], Dir::Row),
+                        _ => (self.ids[2], Dir::Column),
+                    };
+                    assert!(tab.tree.insert(target, id, dir, true));
+                    if index == 2 {
+                        assert!(tab.tree.relocate(id, None, Dir::Row, true));
+                    }
+                    tab.panes.insert(id, entry);
+                    tab.set_focus(id);
+                }
+                70 => {
+                    app.focus_pane(self.ids[1]);
+                    app.tabs[0].panes.get_mut(&self.ids[1]).unwrap().workspace.open = true;
+                }
+                _ => {}
+            }
+        }
+        input.focused = true;
+        // Program-owned input targets only this disposable egui instance.
+        input.events.retain(|e| {
+            !matches!(e, egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } | egui::Event::PointerGone)
+        });
+        input.modifiers = if (80..=104).contains(&frame) {
+            egui::Modifiers { ctrl: true, shift: true, command: true, ..Default::default() }
+        } else {
+            egui::Modifiers::default()
+        };
+        if frame == 80 && self.drag.is_none() {
+            let area = app.last_tab_area;
+            let rects = app.tabs[0].tree.layout(
+                crate::layout::split_tree::Rect::new(area.min.x, area.min.y, area.width(), area.height()),
+                theme::DIVIDER_WIDTH,
+            );
+            let source = rects.iter().find(|(id, _)| *id == self.ids[2]).unwrap().1;
+            let target = rects.iter().find(|(id, _)| *id == self.ids[3]).unwrap().1;
+            self.drag = Some((
+                egui::pos2(source.x + source.w / 2.0, source.y + source.h / 2.0),
+                egui::pos2(target.x + target.w / 2.0, target.bottom() - 60.0),
+            ));
+        }
+        if let Some((from, to)) = self.drag.filter(|_| (80..=104).contains(&frame)) {
+            let share = ((frame.saturating_sub(82)) as f32 / 18.0).clamp(0.0, 1.0);
+            let point = from + (to - from) * share;
+            self.cursor = Some(point);
+            input.events.push(egui::Event::PointerMoved(point));
+            if fresh && (frame == 81 || frame == 104) {
+                input.events.push(egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: frame == 81,
+                    modifiers: input.modifiers,
+                });
+            }
+        } else {
+            self.cursor = None;
+            input.events.push(egui::Event::PointerGone);
+        }
+        ctx.request_repaint();
+    }
+
+    pub fn verify(&self, app: &AnvilApp) {
+        assert_eq!(
+            app.tabs[0].tree.panes(),
+            vec![self.ids[0], self.ids[1], self.ids[3], self.ids[2]],
+            "the real drag must reorder the panes"
+        );
+        assert!(self.pending.is_empty() && self.tabs.is_empty());
+        for (id, pid) in &self.pids {
+            let entry = &app.tabs[0].panes[id];
+            assert!(
+                !entry.exited && entry.live().unwrap().shell_pid == *pid,
+                "moving a pane must keep its live process"
+            );
+        }
+        println!("Verified real drag-and-drop and unchanged CLI process IDs");
+    }
+}
+
 fn installed(name: &str) -> String {
     for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
         let file = dir.join(format!("{name}.exe"));

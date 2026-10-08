@@ -261,10 +261,8 @@ pub fn parse_cwd(payload: &[u8]) -> Option<PathBuf> {
         p.to_owned()
     } else if let Some(url) = text.strip_prefix("7;") {
         file_url_path(url)?
-    } else if let Some(p) = text.strip_prefix("9;9;") {
-        p.trim_matches('"').to_owned()
     } else {
-        return None;
+        text.strip_prefix("9;9;")?.trim_matches('"').to_owned()
     };
     local_drive_path(&path).map(PathBuf::from)
 }

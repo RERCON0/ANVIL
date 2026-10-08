@@ -13,7 +13,7 @@ use egui::{Color32, FontId, Painter, Pos2, Rect, Stroke, TextFormat, Vec2};
 
 use crate::fonts::TermFonts;
 use crate::term::glyphs::{self, Face};
-use crate::term::style::{bg_spans_into, cell_style, Palette, RenderCell, Underline};
+use crate::term::style::{bg_spans_into, Palette, RenderCell, Underline};
 
 pub const SELECTION: Color32 = Color32::from_rgba_premultiplied(77, 77, 77, 77);
 pub const MATCH: Color32 = Color32::from_rgba_premultiplied(89, 53, 11, 89);
@@ -94,6 +94,7 @@ const MAX_KNOWN_GLYPHS: usize = 4096;
 #[derive(Default)]
 pub struct GlyphCache {
     known: HashMap<char, bool>,
+    styles: crate::term::style::StyleCache,
 }
 
 /// True for the Block Elements range (U+2580..=U+259F), which is drawn as
@@ -324,6 +325,7 @@ pub fn snapshot_reusing<L: EventListener>(
     let content = term.renderable_content();
     let offset = content.display_offset as i32;
     let colors = content.colors;
+    glyphs.styles.prepare(colors, palette);
     let mut previous = previous.unwrap_or_default();
     let mut rows = std::mem::take(&mut previous.rows);
     rows.resize_with(lines, || Vec::with_capacity(columns));
@@ -346,7 +348,7 @@ pub fn snapshot_reusing<L: EventListener>(
                 .zerowidth()
                 .filter(|marks| !marks.is_empty())
                 .map(|marks| usable_marks(marks).into_boxed_str()),
-            style: cell_style(cell.c, cell.fg, cell.bg, flags, colors, palette),
+            style: glyphs.styles.get(cell.c, cell.fg, cell.bg, flags, colors, palette),
             wide: flags.contains(Flags::WIDE_CHAR),
             spacer: flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
             in_primary_font: if (is_block_element(cell.c) || is_braille(cell.c))
@@ -472,9 +474,10 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
     // One buffer for the whole frame: `text_runs` allocated a Vec and a String
     // per run, for every row, on every frame.
     let mut runs_buffer: Vec<crate::term::style::TextRun> = Vec::new();
+    let mut run_strings = Vec::new();
     let mut glyph_buffer: Vec<(usize, crate::term::glyphs::Glyph)> = Vec::new();
     for (r, row) in frame.rows.iter().enumerate() {
-        crate::term::style::text_runs_into(row, &mut runs_buffer);
+        crate::term::style::text_runs_into_pooled(row, &mut runs_buffer, &mut run_strings);
         for run in &runs_buffer {
             let s = run.style;
             let font = opt.fonts.for_style(s.bold, s.italic).clone();
@@ -560,7 +563,7 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
                     font_id: font,
                     color: s.fg,
                     extra_letter_spacing: cw - advance(s.bold, s.italic),
-                    strikethrough: if s.strike { Stroke::new(1.0, s.fg) } else { Stroke::NONE },
+                    strikethrough: if s.strike { Stroke::new(1.0_f32, s.fg) } else { Stroke::NONE },
                     ..Default::default()
                 };
                 let galley = painter.layout_job(LayoutJob::single_section(run.text.clone(), format));
@@ -618,7 +621,7 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
                 );
             }
             CursorShape::HollowBlock => {
-                painter.rect_stroke(rect.shrink(0.5), 0.0, Stroke::new(1.0, color), egui::StrokeKind::Middle);
+                painter.rect_stroke(rect.shrink(0.5), 0.0, Stroke::new(1.0_f32, color), egui::StrokeKind::Middle);
             }
             CursorShape::Hidden => {}
         }
@@ -626,7 +629,7 @@ pub fn paint(painter: &Painter, origin: Pos2, frame: &Frame, opt: &PaintOptions)
 }
 
 fn paint_underline(painter: &Painter, span: Rect, kind: Underline, color: Color32) {
-    let stroke = Stroke::new(1.0, color);
+    let stroke = Stroke::new(1.0_f32, color);
     let y = span.max.y - 2.0;
     let line = |y: f32| {
         painter.line_segment([Pos2::new(span.min.x, y), Pos2::new(span.max.x, y)], stroke);
@@ -1089,7 +1092,7 @@ mod tests {
         let mut quads = 0;
         for primitive in ctx.tessellate(output.shapes, ppp) {
             let egui::epaint::Primitive::Mesh(mesh) = &primitive.primitive else { continue };
-            for quad in mesh.indices.chunks_exact(6) {
+            for quad in mesh.indices.as_chunks::<6>().0 {
                 let verts: Vec<&egui::epaint::Vertex> = quad.iter().map(|&i| &mesh.vertices[i as usize]).collect();
                 let white = verts.iter().all(|v| (v.uv - egui::epaint::WHITE_UV).length() < 1e-6);
                 if mesh.texture_id == egui::TextureId::default() && white {

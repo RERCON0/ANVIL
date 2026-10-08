@@ -266,6 +266,61 @@ pub fn cell_style(ch: char, fg: Color, bg: Color, flags: Flags, colors: &Colors,
     }
 }
 
+/// Bound all cache state and invalidate both scheme and OSC colour changes.
+#[derive(Default)]
+pub(crate) struct StyleCache {
+    palette: Option<Palette>,
+    colors: Option<[Option<alacritty_terminal::vte::ansi::Rgb>; alacritty_terminal::term::color::COUNT]>,
+    entries: std::collections::HashMap<(u32, u32, u32, bool), CellStyle>,
+    last: Option<((u32, u32, u32, bool), CellStyle)>,
+}
+
+impl StyleCache {
+    pub(crate) fn prepare(&mut self, colors: &Colors, palette: &Palette) {
+        let signature = std::array::from_fn(|index| colors[index]);
+        if self.palette.as_ref() != Some(palette) || self.colors.as_ref() != Some(&signature) {
+            self.entries.clear();
+            self.last = None;
+            self.palette = Some(palette.clone());
+            self.colors = Some(signature);
+        }
+    }
+
+    pub(crate) fn get(
+        &mut self,
+        ch: char,
+        fg: Color,
+        bg: Color,
+        flags: Flags,
+        colors: &Colors,
+        palette: &Palette,
+    ) -> CellStyle {
+        let encode = |color| match color {
+            Color::Named(name) => 0x1000000 | name as u32,
+            Color::Indexed(index) => 0x2000000 | index as u32,
+            Color::Spec(rgb) => (rgb.r as u32) << 16 | (rgb.g as u32) << 8 | rgb.b as u32,
+        };
+        let key = (encode(fg), encode(bg), flags.bits() as u32, contrast_exempt(ch));
+        if let Some((previous, style)) = self.last {
+            if previous == key {
+                return style;
+            }
+        }
+        let style = if let Some(style) = self.entries.get(&key) {
+            *style
+        } else {
+            let style = cell_style(ch, fg, bg, flags, colors, palette);
+            if self.entries.len() >= 512 {
+                self.entries.clear();
+            }
+            self.entries.insert(key, style);
+            style
+        };
+        self.last = Some((key, style));
+        style
+    }
+}
+
 /// One cell after colour resolution, ready for layout.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RenderCell {
@@ -304,13 +359,21 @@ pub fn text_runs(row: &[RenderCell]) -> Vec<TextRun> {
     runs
 }
 
-/// The same runs, appended to a buffer the caller keeps. Per row per frame this
-/// was one `Vec` and one `String` allocation per run; reusing both is the
-/// difference between hundreds of allocations and a handful.
+/// Reuses the outer run buffer. The paint loop also keeps the String pool
+/// across rows through `text_runs_into_pooled`.
 pub fn text_runs_into(row: &[RenderCell], out: &mut Vec<TextRun>) {
-    out.clear();
+    text_runs_into_pooled(row, out, &mut Vec::new());
+}
+
+pub(crate) fn text_runs_into_pooled(row: &[RenderCell], out: &mut Vec<TextRun>, pool: &mut Vec<String>) {
+    pool.extend(out.drain(..).map(|run| run.text));
+    let string = |pool: &mut Vec<String>| {
+        let mut value = pool.pop().unwrap_or_default();
+        value.clear();
+        value
+    };
     let mut current: Option<TextRun> = None;
-    let flush = |current: &mut Option<TextRun>, runs: &mut Vec<TextRun>| {
+    let flush = |current: &mut Option<TextRun>, runs: &mut Vec<TextRun>, pool: &mut Vec<String>| {
         if let Some(mut run) = current.take() {
             if run.style.underline == Underline::None && !run.style.strike {
                 let trimmed = run.text.trim_end_matches(' ').len();
@@ -319,6 +382,8 @@ pub fn text_runs_into(row: &[RenderCell], out: &mut Vec<TextRun>) {
             }
             if !run.text.is_empty() {
                 runs.push(run);
+            } else {
+                pool.push(run.text);
             }
         }
     };
@@ -332,8 +397,9 @@ pub fn text_runs_into(row: &[RenderCell], out: &mut Vec<TextRun>) {
             || crate::term::render::is_block_element(cell.ch)
             || crate::term::render::is_braille(cell.ch);
         if standalone {
-            flush(&mut current, out);
-            let mut text = cell.ch.to_string();
+            flush(&mut current, out, pool);
+            let mut text = string(pool);
+            text.push(cell.ch);
             if let Some(extra) = &cell.combining {
                 text.push_str(extra);
             }
@@ -350,17 +416,17 @@ pub fn text_runs_into(row: &[RenderCell], out: &mut Vec<TextRun>) {
         }
         let continues = matches!(&current, Some(run) if run.style == cell.style && run.col + run.cells == col);
         if !continues {
-            flush(&mut current, out);
+            flush(&mut current, out, pool);
             if cell.ch == ' ' && cell.style.underline == Underline::None && !cell.style.strike {
                 continue;
             }
-            current = Some(TextRun { col, text: String::new(), style: cell.style, cells: 0, standalone: false });
+            current = Some(TextRun { col, text: string(pool), style: cell.style, cells: 0, standalone: false });
         }
         let run = current.as_mut().expect("run started");
         run.text.push(cell.ch);
         run.cells += 1;
     }
-    flush(&mut current, out);
+    flush(&mut current, out, pool);
 }
 
 /// Spans of cells whose background differs from the default: (col, len, colour).
@@ -504,6 +570,20 @@ mod tests {
     }
 
     #[test]
+    fn run_strings_survive_blank_rows_without_leaking_previous_text() {
+        let s = style(Color32::WHITE);
+        let mut runs = Vec::new();
+        let mut pool = Vec::new();
+        text_runs_into_pooled(&row("old text with spare capacity", s), &mut runs, &mut pool);
+        let pointer = runs[0].text.as_ptr();
+        text_runs_into_pooled(&row("     ", s), &mut runs, &mut pool);
+        assert!(runs.is_empty());
+        text_runs_into_pooled(&row("new", s), &mut runs, &mut pool);
+        assert_eq!(runs[0].text, "new");
+        assert_eq!(runs[0].text.as_ptr(), pointer, "reuse the allocation across rows");
+    }
+
+    #[test]
     fn leading_spaces_do_not_start_a_run() {
         let runs = text_runs(&row("   $ ls", style(Color32::WHITE)));
         assert_eq!((runs[0].col, runs[0].text.as_str()), (3, "$ ls"));
@@ -555,5 +635,34 @@ mod tests {
         r[2].style.bg = Color32::RED;
         r[3].style.bg = Color32::BLUE;
         assert_eq!(bg_spans(&r, Color32::BLACK), vec![(1, 2, Color32::RED), (3, 1, Color32::BLUE)]);
+    }
+
+    #[test]
+    fn cached_styles_follow_scheme_osc_colors_flags_and_graphics_classes() {
+        let mut cache = StyleCache::default();
+        let mut colors = Colors::default();
+        for palette in [Palette::dark(), Palette::light()] {
+            for override_color in [None, Some(alacritty_terminal::vte::ansi::Rgb { r: 123, g: 91, b: 47 })] {
+                colors[NamedColor::Red] = override_color;
+                cache.prepare(&colors, &palette);
+                for ch in ['a', 'b', '\u{2500}', '\u{e0b0}'] {
+                    for flags in
+                        [Flags::empty(), Flags::BOLD, Flags::DIM | Flags::INVERSE, Flags::HIDDEN | Flags::UNDERLINE]
+                    {
+                        let fg = Color::Named(NamedColor::Red);
+                        let bg = Color::Named(NamedColor::Background);
+                        assert_eq!(
+                            cache.get(ch, fg, bg, flags, &colors, &palette),
+                            cell_style(ch, fg, bg, flags, &colors, &palette)
+                        );
+                    }
+                }
+                for i in 0..1200 {
+                    let fg = Color::Spec(alacritty_terminal::vte::ansi::Rgb { r: (i >> 8) as u8, g: i as u8, b: 0 });
+                    cache.get('a', fg, Color::Indexed(0), Flags::empty(), &colors, &palette);
+                    assert!(cache.entries.len() <= 512);
+                }
+            }
+        }
     }
 }

@@ -244,6 +244,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wal_without_shm_reads_latest_committed_data_without_modifying_database_bytes() {
+        let sqlite = Sqlite::load().expect("Windows ships winsqlite3.dll");
+        let source = tempfile::tempdir().unwrap();
+        let source_path = source.path().join("live.db");
+        let writer = sqlite.open(&source_path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE).unwrap();
+        let sql = CString::new("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('newest');").unwrap();
+        // SAFETY: live test connection and NUL-terminated SQL; no callbacks.
+        let rc = unsafe {
+            (sqlite.api.exec)(writer.raw, sql.as_ptr(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(rc, SQLITE_OK);
+        let snapshot = tempfile::tempdir().unwrap();
+        let path = snapshot.path().join("crashed.db");
+        let wal = path.with_file_name("crashed.db-wal");
+        std::fs::copy(&source_path, &path).unwrap();
+        std::fs::copy(source_path.with_file_name("live.db-wal"), &wal).unwrap();
+        let before = (std::fs::read(&path).unwrap(), std::fs::read(&wal).unwrap());
+        assert!(!before.1.is_empty());
+        assert!(!path.with_file_name("crashed.db-shm").exists());
+        assert_eq!(sqlite.query(&path, "SELECT v FROM t WHERE v = ?1", "newest", 1).unwrap(), vec![vec!["newest"]]);
+        assert_eq!((std::fs::read(path).unwrap(), std::fs::read(wal).unwrap()), before);
+    }
+
+    #[test]
     fn reads_rows_through_a_read_only_connection() {
         let Some(sqlite) = Sqlite::load() else {
             eprintln!("winsqlite3.dll is not available; skipping");

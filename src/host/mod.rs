@@ -1,5 +1,8 @@
+#[cfg(debug_assertions)]
+mod capture;
 pub mod event_loop;
 pub mod gl_window;
+mod gui;
 pub mod keys;
 pub mod route;
 

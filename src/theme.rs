@@ -5,7 +5,7 @@
 
 use std::sync::RwLock;
 
-use egui::{Align, Button, Color32, FontId, Layout, Response, RichText, Sense, Stroke, Vec2};
+use egui::{Button, Color32, FontId, Response, RichText, Sense, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
 
 use crate::term::style::{ensure_contrast, Palette, MIN_CONTRAST};
@@ -252,20 +252,28 @@ pub const DIVIDER_WIDTH: f32 = 6.0;
 pub const WINDOW_BUTTON_WIDTH: f32 = 46.0;
 
 pub fn font(size: f32) -> FontId {
-    FontId::new(size, egui::FontFamily::Name("ui".into()))
+    static FAMILY: std::sync::LazyLock<egui::FontFamily> =
+        std::sync::LazyLock::new(|| egui::FontFamily::Name("ui".into()));
+    FontId::new(size, FAMILY.clone())
 }
 
 pub fn field_font(size: f32) -> FontId {
-    FontId::new(size, egui::FontFamily::Name("ui-tight".into()))
+    static FAMILY: std::sync::LazyLock<egui::FontFamily> =
+        std::sync::LazyLock::new(|| egui::FontFamily::Name("ui-tight".into()));
+    FontId::new(size, FAMILY.clone())
 }
 
 pub fn title_font(size: f32) -> FontId {
-    FontId::new(size, egui::FontFamily::Name("ui-title".into()))
+    static FAMILY: std::sync::LazyLock<egui::FontFamily> =
+        std::sync::LazyLock::new(|| egui::FontFamily::Name("ui-title".into()));
+    FontId::new(size, FAMILY.clone())
 }
 
 /// File-type icon glyphs (Seti).
 pub fn icon_font(size: f32) -> FontId {
-    FontId::new(size, egui::FontFamily::Name("icons".into()))
+    static FAMILY: std::sync::LazyLock<egui::FontFamily> =
+        std::sync::LazyLock::new(|| egui::FontFamily::Name("icons".into()));
+    FontId::new(size, FAMILY.clone())
 }
 
 /// Control visuals of the current scheme, written into both egui style
@@ -276,7 +284,7 @@ fn visuals() -> egui::Visuals {
     v.window_corner_radius = egui::CornerRadius::ZERO;
     v.menu_corner_radius = egui::CornerRadius::ZERO;
     v.window_fill = c.lift;
-    v.window_stroke = Stroke::new(1.0, c.line);
+    v.window_stroke = Stroke::new(1.0_f32, c.line);
     v.window_shadow = egui::Shadow::NONE;
     v.popup_shadow = egui::Shadow::NONE;
     v.panel_fill = c.chrome_bg;
@@ -287,7 +295,7 @@ fn visuals() -> egui::Visuals {
     v.warn_fg_color = c.status_yellow;
     v.error_fg_color = c.status_red;
     v.selection.bg_fill = Color32::from_rgba_unmultiplied(c.accent.r(), c.accent.g(), c.accent.b(), 45);
-    v.selection.stroke = Stroke::new(1.0, c.accent);
+    v.selection.stroke = Stroke::new(1.0_f32, c.accent);
     v.widgets.noninteractive.corner_radius = egui::CornerRadius::ZERO;
     v.widgets.inactive.corner_radius = egui::CornerRadius::ZERO;
     v.widgets.hovered.corner_radius = egui::CornerRadius::ZERO;
@@ -306,20 +314,20 @@ fn visuals() -> egui::Visuals {
         w.expansion = 0.0;
     }
     v.widgets.noninteractive.weak_bg_fill = c.chrome_bg;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, c.line);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, c.dim);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, c.line);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, c.dim);
     v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, c.line);
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, c.dim);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, c.line);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, c.dim);
     v.widgets.hovered.weak_bg_fill = Color32::TRANSPARENT;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, c.line_bright);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, c.text);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, c.line_bright);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, c.text);
     v.widgets.active.weak_bg_fill = c.field;
-    v.widgets.active.bg_stroke = Stroke::new(1.0, c.accent);
-    v.widgets.active.fg_stroke = Stroke::new(1.0, c.text);
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, c.accent);
+    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, c.text);
     v.widgets.open.weak_bg_fill = Color32::TRANSPARENT;
-    v.widgets.open.bg_stroke = Stroke::new(1.0, c.line_bright);
-    v.widgets.open.fg_stroke = Stroke::new(1.0, c.text);
+    v.widgets.open.bg_stroke = Stroke::new(1.0_f32, c.line_bright);
+    v.widgets.open.fg_stroke = Stroke::new(1.0_f32, c.text);
     v
 }
 
@@ -361,7 +369,7 @@ pub fn section(ui: &mut egui::Ui, title: &str) {
 /// 1px rule across the available width.
 pub fn hairline(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
-    ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0, colors().line));
+    ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0_f32, colors().line));
 }
 
 /// `› label` above its control (SNATCH's `label.tag`).
@@ -383,16 +391,6 @@ pub fn choice(ui: &mut egui::Ui, label: &str, selected: bool) -> Response {
     ui.add(Button::new(job).frame(false))
 }
 
-/// `label` left, value right, on one hairline-separated row.
-pub fn kv_row(ui: &mut egui::Ui, label: &str, value: &str, value_color: Color32) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).color(colors().dim).font(font(12.5)));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new(value).color(value_color).font(field_font(12.5)));
-        });
-    });
-}
-
 /// Border-only button: hairline stroke, no fill (see `visuals`).
 pub fn ghost_button(text: impl Into<String>) -> Button<'static> {
     Button::new(RichText::new(text.into()).color(colors().text).font(field_font(12.5)))
@@ -401,7 +399,7 @@ pub fn ghost_button(text: impl Into<String>) -> Button<'static> {
 /// The primary action: accent text and stroke, transparent fill.
 pub fn accent_button(text: impl Into<String>) -> Button<'static> {
     Button::new(RichText::new(text.into()).color(colors().accent).font(field_font(12.5)))
-        .stroke(Stroke::new(1.0, colors().accent))
+        .stroke(Stroke::new(1.0_f32, colors().accent))
         .fill(Color32::TRANSPARENT)
 }
 

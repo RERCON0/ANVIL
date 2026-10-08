@@ -61,6 +61,7 @@ pub enum Request {
     },
     AiMessage {
         command: Option<String>,
+        codex_chatgpt_login: bool,
     },
     Log,
     CommitDetail {
@@ -272,6 +273,9 @@ pub struct Workspace {
     pub busy: bool,
     pub last_poll: Instant,
     pub log: CommitLog,
+    commit_sections: Vec<git::Section>,
+    commit_rows_cache: Vec<CommitRow>,
+    commit_rows_language: Option<crate::strings::Language>,
     pub graph: Vec<graph::Row>,
     pub detail: Option<(String, git::CommitDetail)>,
     detail_file: Option<CommitFile>,
@@ -298,6 +302,7 @@ pub struct Workspace {
     preview_wrapped: WrappedRows,
     markdown: MarkdownCache,
     ai_command: Option<String>,
+    pub codex_chatgpt_login: bool,
     ai_generating: bool,
     /// A commit request is on its way and has not been answered: the button is
     /// off, so a second click cannot send a second `git commit`.
@@ -337,6 +342,9 @@ impl Default for Workspace {
             busy: false,
             last_poll: Instant::now() - POLL_INTERVAL,
             log: CommitLog::default(),
+            commit_sections: Vec::new(),
+            commit_rows_cache: Vec::new(),
+            commit_rows_language: None,
             graph: Vec::new(),
             detail: None,
             detail_file: None,
@@ -360,6 +368,7 @@ impl Default for Workspace {
             preview_wrapped: WrappedRows::default(),
             markdown: MarkdownCache::default(),
             ai_command: None,
+            codex_chatgpt_login: false,
             ai_generating: false,
             committing: false,
             trust_required: false,
@@ -802,7 +811,7 @@ impl Workspace {
         let mut actions = Vec::new();
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, theme::colors().lift);
-        painter.vline(rect.min.x + 0.5, rect.y_range(), Stroke::new(1.0, theme::colors().line));
+        painter.vline(rect.min.x + 0.5, rect.y_range(), Stroke::new(1.0_f32, theme::colors().line));
         let inner = rect.shrink2(Vec2::new(10.0, 8.0));
         // Every pane has its own panel with its own widgets: without the pane
         // in the salt two panels share one id, and egui paints a clash overlay
@@ -1012,7 +1021,10 @@ impl Workspace {
                 self.ai_generating = true;
                 self.busy = true;
                 self.notice = None;
-                self.request(Request::AiMessage { command: self.ai_command.clone() });
+                self.request(Request::AiMessage {
+                    command: self.ai_command.clone(),
+                    codex_chatgpt_login: self.codex_chatgpt_login,
+                });
                 ui.ctx().request_repaint();
             }
         });
@@ -1065,7 +1077,17 @@ impl Workspace {
     fn commit_rows(&mut self, ui: &mut egui::Ui) {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
         const ROW_HEIGHT: f32 = 22.0;
-        let rows = commit_rows_of(&self.log);
+        let language = crate::strings::language();
+        if self.commit_rows_language != Some(language)
+            || self.commit_sections.len() != self.log.commits.len()
+            || self.commit_sections.iter().zip(&self.log.commits).any(|(section, commit)| *section != commit.section)
+        {
+            self.commit_rows_cache = commit_rows_of(&self.log);
+            self.commit_sections.clear();
+            self.commit_sections.extend(self.log.commits.iter().map(|commit| commit.section));
+            self.commit_rows_language = Some(language);
+        }
+        let rows = std::mem::take(&mut self.commit_rows_cache);
         let width = ui.available_width();
         let mut opened: Option<String> = None;
         // A single viewport fills the remaining column. Nesting two default
@@ -1099,6 +1121,7 @@ impl Workspace {
                 }
             }
         });
+        self.commit_rows_cache = rows;
         if let Some(hash) = opened {
             self.busy = true;
             self.request(Request::CommitDetail { hash });
@@ -1121,7 +1144,7 @@ impl Workspace {
             let lane_x = |lane: usize| rect.min.x + lane as f32 * LANE_WIDTH + LANE_WIDTH / 2.0;
             let mid = rect.center().y;
             for segment in &row.segments {
-                let stroke = Stroke::new(1.5, section_color(commit.section));
+                let stroke = Stroke::new(1.5_f32, section_color(commit.section));
                 let (from, to) = (lane_x(segment.from_lane), lane_x(segment.to_lane));
                 match segment.kind {
                     graph::Kind::Through => {
@@ -1306,14 +1329,16 @@ impl Workspace {
     /// Stage buttons, the change tree and (when a file is picked) its diff.
     fn change_rows(&mut self, ui: &mut egui::Ui) {
         let has_selection = !self.selected.is_empty();
+        let selected_staged = unstage_paths(self.status.changes.iter().filter(|c| self.selected.contains(&c.path)));
         ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(has_selection, theme::ghost_button(strings::WORKSPACE_STAGE())).clicked() {
                 let paths: Vec<String> = self.selected.iter().cloned().collect();
                 self.busy = true;
                 self.request(Request::Stage { paths, staged: true });
             }
-            if ui.add_enabled(has_selection, theme::ghost_button(strings::WORKSPACE_UNSTAGE())).clicked() {
-                let paths = unstage_paths(self.status.changes.iter().filter(|c| self.selected.contains(&c.path)));
+            if ui.add_enabled(!selected_staged.is_empty(), theme::ghost_button(strings::WORKSPACE_UNSTAGE())).clicked()
+            {
+                let paths = selected_staged;
                 self.busy = true;
                 self.request(Request::Stage { paths, staged: false });
             }
@@ -1849,7 +1874,7 @@ impl Workspace {
                 opened = Some(row.path.clone());
             }
         }
-        let path = row.path.clone();
+        let path = &row.path;
         response.context_menu(|ui| {
             if ui.button(strings::WORKSPACE_OPEN_EXTERNAL()).clicked() {
                 self.request(Request::OpenExternal { path: path.clone() });
@@ -2517,7 +2542,11 @@ impl MarkdownCache {
                         }
                     }
                     if row.rule {
-                        ui.painter().hline(rect.x_range(), rect.max.y - 1.0, Stroke::new(1.0, theme::colors().line));
+                        ui.painter().hline(
+                            rect.x_range(),
+                            rect.max.y - 1.0,
+                            Stroke::new(1.0_f32, theme::colors().line),
+                        );
                     }
                 }
             });
@@ -2905,14 +2934,9 @@ fn diff_hunk_bytes(diff: &[u8], staged: bool) -> Vec<Vec<u8>> {
 }
 
 fn reveal_resolved(full: &Path) {
-    let mut command = std::process::Command::new("explorer.exe");
-    command.arg(format!("/select,{}", full.display()));
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0800_0000);
+    if let Err(error) = crate::fsutil::reveal_path(full) {
+        log::warn!("Cannot reveal item in Explorer: {error}");
     }
-    let _ = command.spawn();
 }
 
 /// The actual AI path reads only index content and index file/status context.
@@ -3061,7 +3085,7 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                     Some(root) => send(Response::Committed(git::commit(root, message))),
                     None => send(Response::Committed(Err(strings::WORKSPACE_NO_REPO().to_owned()))),
                 },
-                Request::AiMessage { command } => {
+                Request::AiMessage { command, codex_chatgpt_login } => {
                     if root.is_none() {
                         send(Response::AiMessage(Err(strings::WORKSPACE_NO_REPO().to_owned())));
                         continue;
@@ -3069,7 +3093,12 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                     let result =
                         root.as_ref().ok_or_else(|| strings::WORKSPACE_NO_REPO().to_owned()).and_then(|root| {
                             let prompt = staged_ai_prompt(root)?;
-                            git::ai_commit_message(command.as_deref(), &prompt, git::AI_TIMEOUT)
+                            git::ai_commit_message_with_login(
+                                command.as_deref(),
+                                &prompt,
+                                git::AI_TIMEOUT,
+                                codex_chatgpt_login,
+                            )
                         });
                     // An AI subprocess can outlive a configuration change; never
                     // publish its result using approval for the old digest.
@@ -3308,6 +3337,9 @@ fn delete_path(root: &Path, path: &str) -> Result<(), String> {
 fn unstage_paths<'a>(changes: impl Iterator<Item = &'a Change>) -> Vec<String> {
     let mut paths = Vec::new();
     for change in changes {
+        if !change.staged() {
+            continue;
+        }
         paths.push(change.path.clone());
         if change.index == 'R' {
             paths.extend(change.original_path.clone());
@@ -3655,7 +3687,7 @@ mod tests {
         );
     }
 
-    fn git(dir: &Path, args: &[&str]) -> bool {
+    pub(super) fn git(dir: &Path, args: &[&str]) -> bool {
         let mut command = std::process::Command::new("git");
         command.args(args).current_dir(dir);
         #[cfg(windows)]
@@ -4679,7 +4711,11 @@ mod tests {
         let (tx, rx) = spawn_worker();
         tx.send((None, Request::Refresh { cwd: root.to_owned() })).unwrap();
         let shown = approve_worker(&tx, &rx);
-        tx.send((shown, Request::AiMessage { command: Some("nonexistent-ai-command".to_owned()) })).unwrap();
+        tx.send((
+            shown,
+            Request::AiMessage { command: Some("nonexistent-ai-command".to_owned()), codex_chatgpt_login: false },
+        ))
+        .unwrap();
         let Response::AiMessage(Err(message)) = rx.recv_timeout(Duration::from_secs(20)).unwrap() else {
             panic!("empty index must reject generation")
         };
@@ -5159,6 +5195,7 @@ mod tests {
 
 #[cfg(test)]
 mod preview_close_tests {
+    use super::tests::git;
     use super::*;
     #[test]
     fn closing_preview_keeps_panel_and_draft_but_rejects_late_reads() {
@@ -5226,5 +5263,52 @@ mod preview_close_tests {
         assert_eq!(workspace.diff_rows.capacity(), 0);
         assert_eq!(workspace.diff_text.capacity(), 0);
         assert_eq!(workspace.diff_hunks.capacity(), 0);
+    }
+
+    #[test]
+    fn default_hooks_require_trust_before_stage_commit_or_fetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        if !git(root, &["init", "--quiet"]) {
+            return;
+        }
+        assert!(git(root, &["config", "user.email", "anvil@test"]));
+        assert!(git(root, &["config", "user.name", "ANVIL test"]));
+        std::fs::write(root.join("file.txt"), "original\n").unwrap();
+        assert!(git(root, &["add", "."]));
+        assert!(git(root, &["commit", "--quiet", "-m", "initial"]));
+        std::fs::write(root.join(".git/hooks/post-index-change"), b"#!/bin/sh\nprintf requested > hook-marker\n")
+            .unwrap();
+        std::fs::write(root.join("file.txt"), "changed\n").unwrap();
+        let (tx, rx) = spawn_worker();
+        let wait = || rx.recv_timeout(Duration::from_secs(20)).expect("worker response");
+        tx.send((None, Request::Refresh { cwd: root.to_owned() })).unwrap();
+        let identity = match wait() {
+            Response::TrustRequired { identity: Some(identity), .. } => identity,
+            _ => panic!("default hooks require approval"),
+        };
+        let shown = Some(identity.root.clone());
+        tx.send((shown.clone(), Request::Stage { paths: vec!["file.txt".into()], staged: true })).unwrap();
+        assert!(matches!(wait(), Response::TrustRequired { .. }));
+        assert!(!root.join("hook-marker").exists());
+        tx.send((shown.clone(), Request::Commit { message: "must remain gated".into() })).unwrap();
+        assert!(matches!(wait(), Response::TrustRequired { .. }));
+        tx.send((shown.clone(), Request::Fetch)).unwrap();
+        assert!(matches!(wait(), Response::TrustRequired { .. }));
+        tx.send((shown.clone(), Request::Approve { identity: identity.clone() })).unwrap();
+        assert!(matches!(wait(), Response::Trusted(_)));
+        assert!(matches!(wait(), Response::Status(_, _)));
+        tx.send((shown.clone(), Request::Stage { paths: vec!["file.txt".into()], staged: true })).unwrap();
+        assert!(matches!(wait(), Response::Refreshed));
+        assert!(root.join("hook-marker").exists(), "approved hooks work normally");
+        std::fs::remove_file(root.join("hook-marker")).unwrap();
+        std::fs::write(
+            root.join(".git/hooks/post-index-change"),
+            b"#!/bin/sh\nprintf requested > hook-marker\n# changed\n",
+        )
+        .unwrap();
+        tx.send((shown, Request::Approve { identity })).unwrap();
+        assert!(matches!(wait(), Response::TrustRequired { .. }));
+        assert!(!root.join("hook-marker").exists(), "stale approval cannot run updated hooks");
     }
 }

@@ -1,0 +1,6 @@
+{
+  "subject": "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
+  "thumbprint": "3F56A45111684D454E231CFDC4DA5C8D370F9816",
+  "upstream_url": "https://registry.npmjs.org/node-pty/-/node-pty-1.2.0-beta.8.tgz",
+  "upstream_sha256": "f4832644b8fe9a8b53d4e3114ff13e56b0d8c7311d66eeda05f5fc91898f7f12"
+}

@@ -3,7 +3,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 fn main() {
-    if let Err(error) = secure_dll_search() {
+    if let Err(error) = anvil::secure_dll_search() {
         show_fatal(&anvil::tr_format!(
             "Could not secure DLL search: {error}",
             "Не удалось защитить поиск DLL: {error}"
@@ -37,21 +37,6 @@ fn main() {
         log::info!("cannot start the AI state sweep: {error}");
     }
     anvil::host::run(anvil::app::AnvilApp::new());
-}
-
-/// Never search the working directory or PATH for implicitly loaded libraries.
-/// The bundled ConPTY may load only beside ANVIL; missing bundles fall back to
-/// the Windows pseudoconsole API, not a repository's conpty.dll.
-fn secure_dll_search() -> std::io::Result<()> {
-    use windows_sys::Win32::System::LibraryLoader::{
-        SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
-    };
-    // SAFETY: process-wide loader policy is set before spawning threads or panes.
-    if unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32) } == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
 }
 
 /// Modal error box for fatal startup failures (no console in this subsystem).

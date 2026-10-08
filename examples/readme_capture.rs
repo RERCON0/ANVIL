@@ -1,5 +1,6 @@
 //! Generate the README screenshot using real CLI agents in an isolated sample Git workspace.
 //! cargo run --locked --example readme_capture -- assets/workspace.png
+//! Add --demo to capture a 10-second PNG sequence in a new output directory.
 #[cfg(debug_assertions)]
 fn main() {
     use std::path::Path;
@@ -61,7 +62,12 @@ fn main() {
     }
     let output = std::env::args_os().nth(1).map(std::path::PathBuf::from).expect("output PNG path");
     std::fs::create_dir_all(output.parent().unwrap()).unwrap();
-    anvil::host::event_loop::run_capture(anvil::app::AnvilApp::readme_scene(root.to_owned()), output);
+    let app = anvil::app::AnvilApp::readme_scene(root.to_owned());
+    if std::env::args().nth(2).as_deref() == Some("--demo") {
+        anvil::host::event_loop::run_demo(app, output);
+    } else {
+        anvil::host::event_loop::run_capture(app, output);
+    }
 }
 
 #[cfg(not(debug_assertions))]

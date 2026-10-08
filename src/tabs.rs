@@ -10,6 +10,22 @@ use crate::claude_status::StatusRecord;
 use crate::config::RightClick;
 use crate::layout::split_tree::{Anchor, Dir, PaneId, SplitTree};
 use crate::strings;
+
+/// A panel that cannot fit is temporarily hidden, retaining its saved state.
+/// This keeps the live terminal usable while a split is narrow and restores
+/// the panel automatically when the pane is widened.
+fn workspace_rects(pane: Rect, open: bool, desired_width: f32) -> (Rect, Option<Rect>) {
+    let available = (pane.width() - 140.0).max(0.0);
+    if !open || available < crate::workspace::MIN_WIDTH {
+        return (pane, None);
+    }
+    let width = crate::workspace::clamp_width(desired_width).min(available);
+    let split = pane.max.x - width;
+    (
+        Rect::from_min_max(pane.min, Pos2::new(split, pane.max.y)),
+        Some(Rect::from_min_max(Pos2::new(split, pane.min.y), pane.max)),
+    )
+}
 use crate::term::pane::Pane;
 use crate::term::style::Palette;
 use crate::term::view::{PaneCommand, TerminalView, ViewInput};
@@ -72,6 +88,7 @@ pub struct FrameEnv<'a> {
     pub fallbacks_loaded: bool,
     /// CLI for the AI commit message (config or auto-detected), if any.
     pub ai_command: Option<String>,
+    pub codex_chatgpt_login: bool,
     /// The pointer is on a window resize border: the press belongs to the
     /// window, so panes must not start a selection under it.
     pub window_edge: bool,
@@ -311,17 +328,8 @@ impl Tab {
                         // Only the open panel needs the directory, so the shell's cwd query and
                         // its PathBuf are not paid for a closed panel every frame.
                         let cwd = entry.workspace.open.then(|| pane.current_dir());
-                        let (terminal_rect, panel_rect) = if entry.workspace.open {
-                            let width = crate::workspace::clamp_width(entry.workspace.width)
-                                .min((pane_rect.width() - 140.0).max(crate::workspace::MIN_WIDTH));
-                            let split = pane_rect.max.x - width;
-                            (
-                                Rect::from_min_max(pane_rect.min, Pos2::new(split, pane_rect.max.y)),
-                                Some(Rect::from_min_max(Pos2::new(split, pane_rect.min.y), pane_rect.max)),
-                            )
-                        } else {
-                            (*pane_rect, None)
-                        };
+                        let (terminal_rect, panel_rect) =
+                            workspace_rects(*pane_rect, entry.workspace.open, entry.workspace.width);
                         self.terminal_rects.push((*id, terminal_rect));
                         let output = entry.view.show(ui, terminal_rect, pane, &input);
                         if focused == *id {
@@ -367,6 +375,7 @@ impl Tab {
                                     ui.ctx().request_repaint();
                                 }
                             }
+                            entry.workspace.codex_chatgpt_login = env.codex_chatgpt_login;
                             let actions = entry.workspace.show(ui, panel_rect, *id, env.ai_command.as_deref());
                             for action in actions {
                                 match action {
@@ -436,7 +445,7 @@ impl Tab {
                     let divider_rect = egui_rect(divider.rect);
                     let response = ui.interact(
                         divider_rect,
-                        ui.id().with(("divider", divider.path.clone(), divider.index)),
+                        ui.id().with(("divider", &divider.path, divider.index)),
                         Sense::click_and_drag(),
                     );
                     let color = if response.hovered() || response.dragged() {
@@ -496,7 +505,12 @@ impl Tab {
                         0.0,
                         if response.hovered() || dragging { c.field } else { c.chrome_bg },
                     );
-                    ui.painter().rect_stroke(label, 0.0, egui::Stroke::new(1.0, c.accent), egui::StrokeKind::Inside);
+                    ui.painter().rect_stroke(
+                        label,
+                        0.0,
+                        egui::Stroke::new(1.0_f32, c.accent),
+                        egui::StrokeKind::Inside,
+                    );
                     let title = self.panes.get(id).map(PaneEntry::title_text).unwrap_or_default();
                     ui.painter_at(label.shrink(6.0)).text(
                         label.center(),
@@ -526,7 +540,7 @@ impl Tab {
             let painter =
                 ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, ui.id().with("pane-drop-preview")));
             painter.rect_filled(drop.preview, 0.0, c.accent.gamma_multiply(0.18));
-            painter.rect_stroke(drop.preview, 0.0, egui::Stroke::new(2.0, c.accent), egui::StrokeKind::Inside);
+            painter.rect_stroke(drop.preview, 0.0, egui::Stroke::new(2.0_f32, c.accent), egui::StrokeKind::Inside);
         }
         if ui.input(|i| i.pointer.primary_released()) {
             if let Some(drop) = drop {
@@ -626,6 +640,23 @@ fn egui_rect(rect: crate::layout::split_tree::Rect) -> Rect {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_narrow_split_never_inverts_the_terminal_or_overdraws_its_neighbor() {
+        for width in [72.0, 209.0, 300.0, 439.0, 440.0, 600.0, 1920.0] {
+            let pane = Rect::from_min_size(Pos2::new(300.0, 10.0), Vec2::new(width, 600.0));
+            let (terminal, panel) = workspace_rects(pane, true, 800.0);
+            assert!(terminal.width() > 0.0 && pane.contains_rect(terminal));
+            match panel {
+                Some(panel) => {
+                    assert!(pane.contains_rect(panel));
+                    assert!(terminal.width() >= 140.0);
+                    assert_eq!(terminal.right(), panel.left());
+                }
+                None => assert_eq!(terminal, pane),
+            }
+        }
+    }
+
     fn entry() -> PaneEntry {
         PaneEntry {
             content: PaneContent::Error(String::new()),
@@ -710,6 +741,7 @@ mod tests {
             min_pane_height: 60.0,
             fallbacks_loaded: true,
             ai_command: None,
+            codex_chatgpt_login: false,
             window_edge: false,
         };
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 600.0));

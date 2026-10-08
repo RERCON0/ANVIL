@@ -22,6 +22,7 @@ foreach ($line in Get-Content -LiteralPath 'vendor/conpty/checksums.sha256') {
     }
 }
 if ($seenRuntimeNames.Count -ne 2) { throw 'Incomplete ConPTY checksum manifest' }
+& (Join-Path $PSScriptRoot 'check_conpty_signatures.ps1')
 
 # Honour CARGO_TARGET_DIR / CARGO_BUILD_TARGET so the staged files always come
 # from the build we just ran.

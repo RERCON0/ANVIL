@@ -26,12 +26,13 @@ pub enum UserEvent {
 struct Host {
     proxy: EventLoopProxy<UserEvent>,
     gl: Option<GlWindow>,
-    egui: Option<egui_glow::EguiGlow>,
+    egui: Option<super::gui::Gui>,
     app: AnvilApp,
     modifiers: ModifiersState,
     repaint_at: Option<Instant>,
+    last_redraw: Option<Instant>,
     #[cfg(debug_assertions)]
-    capture: Option<(std::path::PathBuf, Instant)>,
+    capture: Option<super::capture::Capture>,
 }
 
 pub fn run(app: AnvilApp) {
@@ -44,6 +45,7 @@ pub fn run(app: AnvilApp) {
         app,
         modifiers: ModifiersState::empty(),
         repaint_at: None,
+        last_redraw: None,
         #[cfg(debug_assertions)]
         capture: None,
     };
@@ -56,6 +58,17 @@ pub fn run(app: AnvilApp) {
 /// This entry point and its fixtures are absent from release binaries.
 #[cfg(debug_assertions)]
 pub fn run_capture(app: AnvilApp, output: std::path::PathBuf) {
+    run_with_capture(app, super::capture::Capture::still(output));
+}
+
+/// Record live sessions and real pane drag input, exclusively in a debug fixture.
+#[cfg(debug_assertions)]
+pub fn run_demo(app: AnvilApp, directory: std::path::PathBuf) {
+    run_with_capture(app, super::capture::Capture::demo(directory));
+}
+
+#[cfg(debug_assertions)]
+fn run_with_capture(app: AnvilApp, capture: super::capture::Capture) {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");
     let proxy = event_loop.create_proxy();
     let mut host = Host {
@@ -65,7 +78,8 @@ pub fn run_capture(app: AnvilApp, output: std::path::PathBuf) {
         app,
         modifiers: ModifiersState::empty(),
         repaint_at: None,
-        capture: Some((output, Instant::now() + Duration::from_secs(30))),
+        last_redraw: None,
+        capture: Some(capture),
     };
     event_loop.run_app(&mut host).expect("capture event loop");
 }
@@ -109,11 +123,26 @@ fn drop_point(_window: &winit::window::Window, _pixels_per_point: f32) -> Option
 
 impl Host {
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        let started = Instant::now();
+        self.last_redraw = Some(started);
         let Host { gl, egui, app, .. } = self;
         let (Some(gl), Some(egui)) = (gl.as_ref(), egui.as_mut()) else { return };
         let maximized = gl.window.is_maximized();
         let mut commands = Vec::new();
-        egui.run(&gl.window, |ui| commands = app.frame(ui, maximized));
+        #[cfg(debug_assertions)]
+        if let Some(capture) = self.capture.as_mut() {
+            let ctx = egui.egui_ctx.clone();
+            capture.before_frame(app, egui.egui_winit.egui_input_mut(), &ctx);
+        }
+        #[cfg(debug_assertions)]
+        let demo_cursor = self.capture.as_ref().and_then(super::capture::Capture::cursor);
+        egui.run(&gl.window, |ui| {
+            commands = app.frame(ui, maximized);
+            #[cfg(debug_assertions)]
+            if let Some(pos) = demo_cursor {
+                super::capture::Capture::paint_cursor(ui, pos);
+            }
+        });
         if let Some(area) = app.ime_area() {
             gl.window.set_ime_cursor_area(
                 winit::dpi::LogicalPosition::new(area.min.x, area.min.y),
@@ -128,33 +157,14 @@ impl Host {
             egui.painter.gl().clear(glow::COLOR_BUFFER_BIT);
         }
         egui.paint(&gl.window);
+        app.host_frame_finished(started.elapsed());
         #[cfg(debug_assertions)]
-        if let Some((output, deadline)) = &self.capture {
-            if Instant::now() >= *deadline {
-                use glow::HasContext;
-                let size = gl.window.inner_size();
-                let mut pixels = vec![0; size.width as usize * size.height as usize * 4];
-                // SAFETY: current GL context, RGBA storage matches the window's dimensions.
-                unsafe {
-                    let context = egui.painter.gl();
-                    context.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
-                    context.read_pixels(
-                        0,
-                        0,
-                        size.width as i32,
-                        size.height as i32,
-                        glow::RGBA,
-                        glow::UNSIGNED_BYTE,
-                        glow::PixelPackData::Slice(Some(&mut pixels)),
-                    );
-                }
-                let mut image = image::RgbaImage::from_raw(size.width, size.height, pixels).expect("capture pixels");
-                image::imageops::flip_vertical_in_place(&mut image);
-                image.save(output).expect("save screenshot");
+        if let Some(capture) = self.capture.as_mut() {
+            if capture.after_frame(app, egui.painter.gl(), gl.window.inner_size()) {
                 event_loop.exit();
                 return;
             }
-            egui.egui_ctx.request_repaint_after(Duration::from_millis(100));
+            egui.egui_ctx.request_repaint_after(Duration::from_millis(16));
         }
         gl.swap_buffers();
         gl.window.set_visible(true);
@@ -178,6 +188,10 @@ impl Host {
                     w.set_fullscreen(if w.fullscreen().is_some() { None } else { Some(Fullscreen::Borderless(None)) })
                 }
                 WindowCommand::Close => {
+                    if !self.app.request_window_close() {
+                        w.request_redraw();
+                        continue;
+                    }
                     self.app.on_exit(Some(w));
                     event_loop.exit();
                     return;
@@ -201,16 +215,30 @@ impl ApplicationHandler<UserEvent> for Host {
             })
             .collect();
         // SAFETY: called on the event-loop thread.
-        let gl = unsafe { GlWindow::new(event_loop, self.app.window_attributes(&screens)) };
+        let gl = match unsafe { GlWindow::new(event_loop, self.app.window_attributes(&screens)) } {
+            Ok(gl) => gl,
+            Err(error) => {
+                super::gui::show_initialization_error(&error);
+                event_loop.exit();
+                return;
+            }
+        };
         let glow = Arc::new(gl.glow_context());
-        let egui = egui_glow::EguiGlow::new(event_loop, glow, None, Some(gl.window.scale_factor() as f32), true);
+        let egui = match super::gui::Gui::new(event_loop, glow, gl.window.scale_factor() as f32) {
+            Ok(egui) => egui,
+            Err(error) => {
+                super::gui::show_initialization_error(&error);
+                event_loop.exit();
+                return;
+            }
+        };
         let proxy = egui::mutex::Mutex::new(self.proxy.clone());
         egui.egui_ctx.set_request_repaint_callback(move |info| {
             let _ = proxy.lock().send_event(UserEvent::Repaint(info.delay));
         });
         egui.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         // Fonts first: the style below references the "ui" families they install.
-        self.app.on_start(&egui.egui_ctx);
+        crate::fsutil::ui_io(|| self.app.on_start(&egui.egui_ctx));
         theme::apply(&egui.egui_ctx);
         gl.window.set_ime_allowed(true);
         self.gl = Some(gl);
@@ -226,8 +254,7 @@ impl ApplicationHandler<UserEvent> for Host {
         }
         match &event {
             WindowEvent::CloseRequested => {
-                self.app.on_exit(self.gl.as_ref().map(|g| &g.window));
-                event_loop.exit();
+                self.execute(event_loop, vec![WindowCommand::Close]);
                 return;
             }
             WindowEvent::RedrawRequested => {
@@ -293,7 +320,19 @@ impl ApplicationHandler<UserEvent> for Host {
         let gl = self.gl.as_ref().expect("window");
         let response = self.egui.as_mut().expect("egui").on_window_event(&gl.window, &event);
         if response.repaint {
-            gl.window.request_redraw();
+            if matches!(event, WindowEvent::CursorMoved { .. }) {
+                if let Some(at) = self
+                    .last_redraw
+                    .and_then(|at| at.checked_add(Duration::from_millis(16)))
+                    .filter(|at| *at > Instant::now())
+                {
+                    self.repaint_at = Some(self.repaint_at.map_or(at, |previous| previous.min(at)));
+                } else {
+                    gl.window.request_redraw();
+                }
+            } else {
+                gl.window.request_redraw();
+            }
         }
     }
 

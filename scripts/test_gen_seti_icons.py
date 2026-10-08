@@ -1,13 +1,12 @@
 """Regression test for gen_seti_icons.py: the generated font must be reproducible.
 
-It needs fontTools, which CI does not install (everything installed there is pinned and
-hash-checked), so GitHub Actions only reports this test as skipped. It really runs on a
-developer machine with `pip install "fontTools==4.63.0"`; run it after touching the
-generator or vendored font:
+CI installs the hash-pinned fontTools wheel from scripts/requirements-icons.txt.
+Run it after touching the generator or vendored font:
 
     python -B -m unittest discover -s scripts -p "test_*.py"
 """
 import shutil
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -22,8 +21,16 @@ except ImportError:
     fontTools = None
 
 
-@unittest.skipIf(fontTools is None, "fontTools is not installed (CI skips this test)")
+@unittest.skipIf(fontTools is None, "fontTools is not installed; install scripts/requirements-icons.txt")
 class GenSetiIcons(unittest.TestCase):
+    def test_vendored_inputs_match_reviewed_checksums(self):
+        vendor = ROOT / "vendor" / "seti"
+        entries = [line.split("  ", 1) for line in (vendor / "checksums.sha256").read_text().splitlines()]
+        self.assertEqual({name for _, name in entries}, {"seti.woff", "setiIconMap.ts", "seti-LICENSE.txt"})
+        self.assertEqual(len(entries), 3)
+        for expected, name in entries:
+            self.assertEqual(hashlib.sha256((vendor / name).read_bytes()).hexdigest(), expected)
+
     def generate(self, work):
         subprocess.run([sys.executable, "-B", str(work / "scripts" / "gen_seti_icons.py")], check=True, capture_output=True)
 
@@ -42,6 +49,9 @@ class GenSetiIcons(unittest.TestCase):
 
             self.assertEqual(first, (ROOT / "fonts" / "seti.ttf").read_bytes(),
                              "fonts/seti.ttf differs: run python scripts/gen_seti_icons.py")
+            self.assertEqual((work / "src" / "file_icons.rs").read_bytes(),
+                             (ROOT / "src" / "file_icons.rs").read_bytes(),
+                             "src/file_icons.rs differs: run python scripts/gen_seti_icons.py")
 
 
 if __name__ == "__main__":

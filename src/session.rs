@@ -61,6 +61,9 @@ pub struct TabState {
     /// Index of the focused pane in reading order.
     #[serde(default)]
     pub focused: usize,
+    /// Index of a maximized visible pane; absent in older sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximized: Option<usize>,
     #[serde(default)]
     pub custom_title: Option<String>,
     /// The tab's colour mark; absent in sessions saved before it existed.
@@ -103,6 +106,9 @@ pub enum SavedNode {
 #[serde(rename_all = "camelCase")]
 pub struct PaneState {
     pub profile_id: String,
+    /// Canonical agent name only, never a shell command or its original argv.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     #[serde(default)]
     pub cwd: Option<PathBuf>,
     /// Workspace (git) panel of this pane.
@@ -235,12 +241,14 @@ mod tests {
             tabs: vec![TabState {
                 layout: SavedNode::Pane(PaneState {
                     profile_id: "pwsh".into(),
+                    agent: None,
                     cwd: None,
                     workspace_open: false,
                     workspace_width: None,
                     workspace_tab: None,
                 }),
                 focused: 0,
+                maximized: None,
                 custom_title: None,
                 color: None,
                 collapsed: Vec::new(),
@@ -267,6 +275,7 @@ mod tests {
     fn pane(profile: &str, cwd: Option<&str>) -> PaneState {
         PaneState {
             profile_id: profile.into(),
+            agent: None,
             cwd: cwd.map(PathBuf::from),
             workspace_open: false,
             workspace_width: None,
@@ -282,6 +291,7 @@ mod tests {
                 TabState {
                     layout: SavedNode::Pane(pane("git-bash", Some("C:\\work"))),
                     focused: 0,
+                    maximized: None,
                     custom_title: None,
                     color: Some(crate::theme::TabColor::Green),
                     collapsed: Vec::new(),
@@ -295,6 +305,7 @@ mod tests {
                         ],
                     },
                     focused: 1,
+                    maximized: Some(1),
                     custom_title: Some("сервер".into()),
                     color: None,
                     collapsed: vec![CollapsedPane {
