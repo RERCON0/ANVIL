@@ -67,6 +67,7 @@ separate tested migration, described in [DEPENDENCIES](DEPENDENCIES.md).
 - Fresh RustSec database: 1,295 advisories checked against 337 dependencies; no findings with yanked/unsound denied.
 - Gitleaks over all history and the current non-ignored source tree; the existing exact synthetic-token exception remains narrow.
 - Real graphics startup/framebuffer capture and recorded drag verification with unchanged CLI process IDs.
+- Release-memory stress run: 20 live panes in four tabs, 18 writers completing 2.16 million Unicode/truecolor lines; history reduction released roughly 1 GiB. Counter definitions, separate agent RAM and measured baseline are in [PERFORMANCE](PERFORMANCE.md).
 
 Signed release preparation additionally requires a clean committed source tree,
 a fresh build target directory, PE/import/payload checks and independent Ed25519

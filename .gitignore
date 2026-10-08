@@ -7,6 +7,7 @@
 !/docs/REFERENCE.en.md
 !/docs/AUDIT-REVIEW.md
 !/docs/DEPENDENCIES.md
+!/docs/PERFORMANCE.md
 __pycache__/
 *.py[cod]
 .env

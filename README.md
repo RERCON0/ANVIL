@@ -30,6 +30,18 @@ ANVIL focuses on a small native application, rich terminal functionality and
 quick access to the work. The interface uses Rust, egui and OpenGL; shells run
 through ConPTY from Windows Terminal.
 
+### Inspired by Tabby
+
+Thanks to [Tabby](https://github.com/Eugeny/tabby) and its contributors: ANVIL's
+visual design, multiple panes inside each tab and many default shortcuts were
+inspired by their work. ANVIL brings these ideas to a native Rust/egui workspace,
+adding an integrated Git panel and AI quotas along the bottom, with a focus on
+working tools such as OpenCode, Codex and Claude Code.
+
+Tabby's [README](https://github.com/Eugeny/tabby#what-tabby-is-and-isnt) explicitly
+says it is not lightweight. ANVIL prioritises a small Windows workspace;
+measured memory use depends on pane count, output history and font fallback.
+
 ### Compared with Windows Terminal and WezTerm
 
 [Windows Terminal](https://learn.microsoft.com/en-us/windows/terminal/panes) already
@@ -39,6 +51,16 @@ integrated Git/file panel, hunk staging, editable AI commit messages and provide
 quotas to a Windows workspace built around several CLI agents. Choose it when
 those controls save you repeated trips to another application; it does not
 replace remote multiplexing or a complete IDE.
+
+### Measured memory
+
+A local Windows release test measured about **36 MiB** of private working set
+with one idle shell and **135 MiB** with Codex, OpenCode and one Git panel.
+A stress run with four tabs, 20 panes and 2.16 million colour/Unicode lines
+peaked at **1.31 GiB** with the default history. Reducing scrollback from 25,000
+to 1,000 rows per pane brought it to **261 MiB**. These figures cover ANVIL;
+external agents use additional memory. See the [conditions, counters and
+reproduction script](docs/PERFORMANCE.md).
 
 ## Features
 
@@ -163,6 +185,7 @@ Shortcuts use physical keys and work across keyboard layouts.
 - [Russian reference](docs/REFERENCE.md)
 - [Audit report review](docs/AUDIT-REVIEW.md)
 - [Dependency upgrade plan](docs/DEPENDENCIES.md)
+- [Memory measurements and stress test](docs/PERFORMANCE.md)
 - [Security policy and limitations](SECURITY.md)
 - [Release signing and verification](docs/RELEASING.md)
 - [Audit findings and checks](docs/AUDIT.md)
