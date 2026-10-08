@@ -31,6 +31,7 @@ struct Host {
     modifiers: ModifiersState,
     repaint_at: Option<Instant>,
     last_redraw: Option<Instant>,
+    maintenance_at: Instant,
     #[cfg(debug_assertions)]
     capture: Option<super::capture::Capture>,
 }
@@ -46,6 +47,7 @@ pub fn run(app: AnvilApp) {
         modifiers: ModifiersState::empty(),
         repaint_at: None,
         last_redraw: None,
+        maintenance_at: Instant::now(),
         #[cfg(debug_assertions)]
         capture: None,
     };
@@ -57,14 +59,17 @@ pub fn run(app: AnvilApp) {
 /// Capture the actual OpenGL window from an isolated development scene.
 /// This entry point and its fixtures are absent from release binaries.
 #[cfg(debug_assertions)]
-pub fn run_capture(app: AnvilApp, output: std::path::PathBuf) {
-    run_with_capture(app, super::capture::Capture::still(output));
+pub type CaptureWriter = fn(&std::path::Path, u32, u32, Vec<u8>) -> Result<(), String>;
+
+#[cfg(debug_assertions)]
+pub fn run_capture(app: AnvilApp, output: std::path::PathBuf, writer: CaptureWriter) {
+    run_with_capture(app, super::capture::Capture::still(output, writer));
 }
 
 /// Record live sessions and real pane drag input, exclusively in a debug fixture.
 #[cfg(debug_assertions)]
-pub fn run_demo(app: AnvilApp, directory: std::path::PathBuf) {
-    run_with_capture(app, super::capture::Capture::demo(directory));
+pub fn run_demo(app: AnvilApp, directory: std::path::PathBuf, writer: CaptureWriter) {
+    run_with_capture(app, super::capture::Capture::demo(directory, writer));
 }
 
 #[cfg(debug_assertions)]
@@ -79,6 +84,7 @@ fn run_with_capture(app: AnvilApp, capture: super::capture::Capture) {
         modifiers: ModifiersState::empty(),
         repaint_at: None,
         last_redraw: None,
+        maintenance_at: Instant::now(),
         capture: Some(capture),
     };
     event_loop.run_app(&mut host).expect("capture event loop");
@@ -347,9 +353,16 @@ impl ApplicationHandler<UserEvent> for Host {
         }
     }
 
-    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
-        if let StartCause::ResumeTimeReached { .. } = cause {
-            self.repaint_at = None;
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, _cause: StartCause) {
+        let now = Instant::now();
+        if now >= self.maintenance_at {
+            self.maintenance_at = now + Duration::from_secs(1);
+            if let Some(egui) = &self.egui {
+                self.app.maintenance(&egui.egui_ctx);
+            }
+        }
+        // A maintenance wake must not consume a later animation/pointer deadline.
+        if take_due_repaint(&mut self.repaint_at, now) {
             if let Some(gl) = &self.gl {
                 gl.window.request_redraw();
             }
@@ -357,15 +370,40 @@ impl ApplicationHandler<UserEvent> for Host {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        event_loop.set_control_flow(match self.repaint_at {
-            Some(at) => ControlFlow::WaitUntil(at),
-            None => ControlFlow::Wait,
-        });
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            self.repaint_at.map_or(self.maintenance_at, |at| at.min(self.maintenance_at)),
+        ));
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(egui) = self.egui.as_mut() {
             egui.destroy();
         }
+    }
+}
+
+fn take_due_repaint(at: &mut Option<Instant>, now: Instant) -> bool {
+    if at.is_some_and(|deadline| deadline <= now) {
+        *at = None;
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maintenance_wake_does_not_consume_a_later_blink_or_pointer_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(530);
+        let mut at = Some(deadline);
+        assert!(!take_due_repaint(&mut at, now + Duration::from_millis(100)));
+        assert_eq!(at, Some(deadline));
+        assert!(take_due_repaint(&mut at, deadline));
+        assert!(at.is_none());
+        assert!(!take_due_repaint(&mut at, deadline));
     }
 }

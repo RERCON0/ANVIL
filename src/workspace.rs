@@ -1212,9 +1212,10 @@ impl Workspace {
             );
             let mut badge_x = text_x;
             for reference in &commit.refs {
-                let name = display(reference.strip_prefix("HEAD -> ").unwrap_or(reference), 40);
+                let name = display_cow(reference.strip_prefix("HEAD -> ").unwrap_or(reference), 40);
                 let colour = ref_color(&name);
-                let galley = painter.layout_no_wrap(name, theme::field_font(10.0), theme::colors().chrome_bg);
+                let galley =
+                    painter.layout_no_wrap(name.into_owned(), theme::field_font(10.0), theme::colors().chrome_bg);
                 let badge =
                     Rect::from_min_size(egui::Pos2::new(badge_x, mid - 7.0), Vec2::new(galley.size().x + 10.0, 14.0));
                 // A chip is only worth drawing while the subject keeps room to
@@ -1232,14 +1233,15 @@ impl Workspace {
             }
             let subject_limit = rect.max.x - right_width - 8.0 - badge_x;
             if subject_limit > 16.0 {
-                let subject = elide(&painter, &display(&commit.subject, 200), theme::font(12.0), subject_limit);
-                painter.text(
-                    egui::Pos2::new(badge_x, mid),
-                    Align2::LEFT_CENTER,
-                    subject,
+                let subject = crate::chrome::text::elide_galley(
+                    &painter,
+                    &display_cow(&commit.subject, 200),
                     theme::font(12.0),
+                    subject_limit,
                     theme::colors().text,
+                    false,
                 );
+                painter.galley(egui::Pos2::new(badge_x, mid - subject.size().y / 2.0), subject, theme::colors().text);
             }
             if response.hovered() {
                 let tooltip = format!(
@@ -1449,12 +1451,17 @@ impl Workspace {
                                 letter_galley,
                                 status_color(letter),
                             );
-                            let mut stat = String::new();
+                            use std::fmt::Write as _;
+                            let mut stat = String::with_capacity(if change.additions == 0 && change.deletions == 0 {
+                                0
+                            } else {
+                                48
+                            });
                             if change.additions > 0 {
-                                stat.push_str(&format!("+{} ", change.additions));
+                                let _ = write!(&mut stat, "+{} ", change.additions);
                             }
                             if change.deletions > 0 {
-                                stat.push_str(&format!("−{}", change.deletions));
+                                let _ = write!(&mut stat, "−{}", change.deletions);
                             }
                             painter.text(
                                 egui::Pos2::new(rect.max.x - letter_width - 8.0, rect.center().y),
@@ -1824,12 +1831,17 @@ impl Workspace {
                 theme::icon_font(13.0),
                 FOLDER_ICON.1,
             );
-            let name = elide(&painter, &row.name, theme::font(11.5), (rect.width() - indent - 38.0).max(24.0));
-            painter.text(
-                egui::Pos2::new(rect.min.x + 34.0 + indent, rect.center().y),
-                Align2::LEFT_CENTER,
-                name,
+            let name = crate::chrome::text::elide_galley(
+                &painter,
+                &row.name,
                 theme::font(11.5),
+                (rect.width() - indent - 38.0).max(24.0),
+                theme::colors().text,
+                false,
+            );
+            painter.galley(
+                egui::Pos2::new(rect.min.x + 34.0 + indent, rect.center().y - name.size().y / 2.0),
+                name,
                 theme::colors().text,
             );
             if response.clicked() {
@@ -1848,13 +1860,26 @@ impl Workspace {
             // and elide the folders in front of it.
             let mut x = rect.min.x + 20.0 + indent;
             let limit = (rect.width() - indent - 24.0).max(24.0);
-            let name = elide(&painter, &row.name, theme::font(11.5), limit);
-            let name_width = painter.layout_no_wrap(name.clone(), theme::font(11.5), theme::colors().text).size().x;
+            let name = crate::chrome::text::elide_galley(
+                &painter,
+                &row.name,
+                theme::font(11.5),
+                limit,
+                theme::colors().text,
+                false,
+            );
+            let name_width = name.size().x;
             if let Some(dir) = &row.dir {
                 let dir_limit = (limit - name_width).max(0.0);
                 if dir_limit > 10.0 {
-                    let dir = elide_front(&painter, dir, theme::font(11.0), dir_limit);
-                    let galley = painter.layout_no_wrap(dir, theme::font(11.0), theme::colors().faint);
+                    let galley = crate::chrome::text::elide_galley(
+                        &painter,
+                        dir,
+                        theme::font(11.0),
+                        dir_limit,
+                        theme::colors().faint,
+                        true,
+                    );
                     painter.galley(
                         egui::Pos2::new(x, rect.center().y - galley.size().y / 2.0),
                         galley.clone(),
@@ -1863,13 +1888,7 @@ impl Workspace {
                     x += galley.size().x;
                 }
             }
-            painter.text(
-                egui::Pos2::new(x, rect.center().y),
-                Align2::LEFT_CENTER,
-                name,
-                theme::font(11.5),
-                theme::colors().text,
-            );
+            painter.galley(egui::Pos2::new(x, rect.center().y - name.size().y / 2.0), name, theme::colors().text);
             if response.clicked() {
                 opened = Some(row.path.clone());
             }
@@ -2765,6 +2784,15 @@ fn display(text: &str, max_chars: usize) -> String {
     out
 }
 
+fn display_cow(text: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
+    for (count, ch) in text.chars().enumerate() {
+        if count >= max_chars || ch.is_control() || is_format_control(ch) {
+            return std::borrow::Cow::Owned(display(text, max_chars));
+        }
+    }
+    std::borrow::Cow::Borrowed(text)
+}
+
 /// Like `display`, but keeps line breaks: commit bodies and patches are prose
 /// whose line structure carries meaning.
 fn display_multiline(text: &str, max_chars: usize) -> String {
@@ -2812,44 +2840,9 @@ fn is_format_control(ch: char) -> bool {
     matches!(ch, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
 }
 
-/// Truncates text to `max_width` with an ellipsis. The single implementation
-/// lives in `chrome::tabbar`: this panel and the tab bar must not hold two
-/// copies that can drift into showing different text.
-///
-/// The cut point is found by binary search over char boundaries, so the cost is
-/// a handful of layouts rather than one per character. Width grows monotonically
-/// with the prefix, which is what makes the search valid.
-fn elide(painter: &egui::Painter, text: &str, font: egui::FontId, max_width: f32) -> String {
-    crate::chrome::tabbar::elide(painter, text, font, max_width)
-}
-
-/// Elides the *front* of a path so the folder closest to the file stays
-/// readable: `…/egui-default-fonts/`.
+#[cfg(test)]
 fn elide_front(painter: &egui::Painter, text: &str, font: egui::FontId, max_width: f32) -> String {
-    let measure = |value: &str| painter.layout_no_wrap(value.to_owned(), font.clone(), egui::Color32::WHITE).size().x;
-    if measure(text) <= max_width {
-        return text.to_owned();
-    }
-    let chars: Vec<char> = text.chars().collect();
-    let fits = |count: usize| {
-        let kept: String = chars[chars.len() - count..].iter().collect();
-        measure(&format!("…{kept}")) <= max_width
-    };
-    let mut low = 0;
-    let mut high = chars.len();
-    while low < high {
-        let mid = low + (high - low) / 2;
-        if fits(mid) {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    // `low` is the first suffix count that does NOT fit, not the last that
-    // does, so keeping `low` characters overflows `max_width` by one — the
-    // off-by-one `chrome::tabbar::elide` was fixed for.
-    let kept: String = chars[chars.len() - low.saturating_sub(1)..].iter().collect();
-    format!("…{kept}")
+    crate::chrome::text::elide_galley(painter, text, font, max_width, egui::Color32::WHITE, true).text().to_owned()
 }
 
 /// VS Code's ref colours: local branch (charts.blue), remote (charts.purple).

@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -57,6 +57,7 @@ struct Shared {
     size: Mutex<WindowSize>,
     palette: RwLock<Palette>,
     output: AtomicBool,
+    generation: AtomicU64,
     exited: AtomicBool,
     wake_pending: AtomicBool,
 }
@@ -122,6 +123,7 @@ impl EventListener for Listener {
                 self.shared.send(format(size).into_bytes());
             }
             Event::Wakeup => {
+                self.shared.generation.fetch_add(1, Ordering::Relaxed);
                 self.shared.output.store(true, Ordering::Relaxed);
                 self.wake();
             }
@@ -220,6 +222,7 @@ impl Pane {
             size: Mutex::new(size),
             palette: RwLock::new(opts.palette),
             output: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
             exited: AtomicBool::new(false),
             wake_pending: AtomicBool::new(false),
         });
@@ -278,6 +281,7 @@ impl Pane {
         *self.shared.size.lock().unwrap_or_else(|e| e.into_inner()) = size;
         self.term.lock().resize(GridSize { columns: size.num_cols as usize, lines: size.num_lines as usize });
         self.notifier.on_resize(size);
+        self.invalidate_search();
     }
 
     pub fn set_palette(&self, palette: Palette) {
@@ -302,6 +306,7 @@ impl Pane {
         config.semantic_escape_chars = word_separators.to_owned();
         config.osc52 = osc52_policy(allow_osc52);
         self.term.lock().set_options(config.clone());
+        self.invalidate_search();
     }
 
     pub fn drain_events(&self) -> Vec<PaneEvent> {
@@ -315,6 +320,15 @@ impl Pane {
     /// True once since the last call if the process printed anything.
     pub fn take_output_flag(&self) -> bool {
         self.shared.output.swap(false, Ordering::Relaxed)
+    }
+
+    /// Independent of the activity flag, which the app consumes every frame.
+    pub fn output_generation(&self) -> u64 {
+        self.shared.generation.load(Ordering::Relaxed)
+    }
+
+    pub fn invalidate_search(&self) {
+        self.shared.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn current_dir(&self) -> Option<PathBuf> {
@@ -362,6 +376,31 @@ fn osc52_policy(allowed: bool) -> Osc52 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_generation_survives_consuming_activity_and_coalesced_wakes() {
+        let shared = Arc::new(Shared {
+            sender: OnceLock::new(),
+            size: Mutex::new(WindowSize { num_lines: 24, num_cols: 80, cell_width: 9, cell_height: 18 }),
+            palette: RwLock::new(Palette::dark()),
+            output: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            exited: AtomicBool::new(false),
+            wake_pending: AtomicBool::new(false),
+        });
+        let listener = Listener {
+            events: Arc::new(Mutex::new(PendingEvents::default())),
+            shared: shared.clone(),
+            repaint: Arc::new(|| {}),
+        };
+        listener.send_event(Event::Wakeup);
+        assert_eq!(shared.generation.load(Ordering::Relaxed), 1);
+        assert!(shared.output.swap(false, Ordering::Relaxed));
+        listener.send_event(Event::Wakeup); // wake_pending is still latched.
+        assert_eq!(shared.generation.load(Ordering::Relaxed), 2);
+        assert!(shared.output.swap(false, Ordering::Relaxed));
+        assert_eq!(shared.generation.load(Ordering::Relaxed), 2);
+    }
 
     /// Titles come from any program's output: a megabyte title was cloned and
     /// laid out in full on every frame.

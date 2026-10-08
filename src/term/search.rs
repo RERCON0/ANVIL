@@ -7,15 +7,59 @@ use alacritty_terminal::term::search::RegexSearch;
 #[derive(Default)]
 pub struct RegexCache {
     entry: Option<(String, Option<RegexSearch>)>,
+    query: Option<(String, bool, bool)>,
+    generation: u64,
 }
 
 impl RegexCache {
     /// The search for `pattern`, compiled once; None when it does not compile.
     pub fn get(&mut self, pattern: &str) -> Option<&mut RegexSearch> {
+        self.query = None;
         if self.entry.as_ref().is_none_or(|(key, _)| key != pattern) {
             self.entry = Some((pattern.to_owned(), RegexSearch::new(pattern).ok()));
         }
         self.entry.as_mut().and_then(|(_, regex)| regex.as_mut())
+    }
+
+    /// Pattern allocation and compilation happen on edits, not cursor-blink frames.
+    pub fn for_query(&mut self, query: &str, regex: bool, case_sensitive: bool) -> (u64, Option<&mut RegexSearch>) {
+        if self.query.as_ref().is_none_or(|(old, re, case)| old != query || *re != regex || *case != case_sensitive) {
+            let pattern = search_pattern(query, regex, case_sensitive);
+            self.entry = Some((pattern.clone(), RegexSearch::new(&pattern).ok()));
+            self.query = Some((query.to_owned(), regex, case_sensitive));
+            self.generation = self.generation.wrapping_add(1);
+        }
+        (self.generation, self.entry.as_mut().and_then(|(_, regex)| regex.as_mut()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct MatchKey {
+    pub query: u64,
+    pub output: u64,
+    pub offset: usize,
+    pub lines: usize,
+    pub columns: usize,
+    pub history: usize,
+}
+
+#[derive(Default)]
+pub(super) struct VisibleMatches {
+    key: Option<MatchKey>,
+    matches: Vec<(usize, usize, usize)>,
+}
+
+impl VisibleMatches {
+    pub fn get(
+        &mut self,
+        key: MatchKey,
+        scan: impl FnOnce() -> Vec<(usize, usize, usize)>,
+    ) -> &[(usize, usize, usize)] {
+        if self.key != Some(key) {
+            self.matches = scan();
+            self.key = Some(key);
+        }
+        &self.matches
     }
 }
 
@@ -45,6 +89,20 @@ pub fn escape_regex(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unchanged_query_reuses_pattern_but_flags_and_invalid_patterns_change_generation() {
+        let mut cache = RegexCache::default();
+        let (first, compiled) = cache.for_query("a.b", false, false);
+        assert!(compiled.is_some());
+        assert_eq!(cache.for_query("a.b", false, false).0, first);
+        let (changed, compiled) = cache.for_query("a.b", false, true);
+        assert!(changed != first && compiled.is_some());
+        let (invalid, compiled) = cache.for_query("(", true, true);
+        assert!(invalid != changed && compiled.is_none());
+        assert_eq!(cache.for_query("(", true, true).0, invalid);
+        assert!(cache.for_query("(", false, true).1.is_some());
+    }
 
     #[test]
     fn a_pattern_is_compiled_once() {

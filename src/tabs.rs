@@ -47,6 +47,7 @@ pub struct PaneEntry {
     pub exited: bool,
     pub claude: Option<StatusRecord>,
     pub claude_mtime: Option<SystemTime>,
+    pub claude_path: Option<PathBuf>,
     pub has_claude: bool,
 }
 
@@ -669,6 +670,7 @@ mod tests {
             exited: false,
             claude: None,
             claude_mtime: None,
+            claude_path: None,
             has_claude: false,
         }
     }

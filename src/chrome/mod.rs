@@ -4,4 +4,5 @@ pub mod edges;
 pub mod profile_picker;
 pub mod quota_bar;
 pub mod tabbar;
+pub(crate) mod text;
 pub mod titlebar;

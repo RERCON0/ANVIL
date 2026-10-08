@@ -40,7 +40,6 @@ serde_yaml_ng = "0.10"
 json5 = "0.4"
 toml = "1"
 log = "0.4"
-image = { version = "0.25", default-features = false, features = ["png"] }
 tempfile = "3"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
@@ -81,6 +80,9 @@ image = { version = "0.25", default-features = false, features = ["png", "ico"] 
 
 [build-dependencies]
 embed-resource = "3"
+# Decode the window icon at build time. egui's clipboard stack still uses image
+# transitively; this only removes ANVIL's runtime icon decode and direct dependency.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [profile.release]
 strip = true

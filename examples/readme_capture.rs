@@ -64,10 +64,17 @@ fn main() {
     std::fs::create_dir_all(output.parent().unwrap()).unwrap();
     let app = anvil::app::AnvilApp::readme_scene(root.to_owned());
     if std::env::args().nth(2).as_deref() == Some("--demo") {
-        anvil::host::event_loop::run_demo(app, output);
+        anvil::host::event_loop::run_demo(app, output, write_frame);
     } else {
-        anvil::host::event_loop::run_capture(app, output);
+        anvil::host::event_loop::run_capture(app, output, write_frame);
     }
+}
+
+#[cfg(debug_assertions)]
+fn write_frame(path: &std::path::Path, width: u32, height: u32, pixels: Vec<u8>) -> Result<(), String> {
+    let mut image = image::RgbaImage::from_raw(width, height, pixels).ok_or("invalid framebuffer size")?;
+    image::imageops::flip_vertical_in_place(&mut image);
+    image.save(path).map_err(|error| error.to_string())
 }
 
 #[cfg(not(debug_assertions))]

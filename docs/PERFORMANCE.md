@@ -1,4 +1,4 @@
-# Memory measurements — 2026-10-08
+# Memory and idle CPU measurements — 2026-10-08
 
 These are local measurements of the ANVIL 0.1.1 release build at
 `2d4f8585ce8b8a555848faf9d8ad06c56bec88d5`, not a fixed memory promise or a
@@ -93,6 +93,52 @@ all three scenarios take about four minutes.
 
 Raw test configuration contains local installation/project paths. Keep that
 scratch output local; the aggregate results above contain no credentials.
+
+## Additional performance-audit idle samples
+
+The benchmark now records ANVIL's kernel plus user CPU time through
+`GetProcessTimes`. CPU below uses the difference between the first and last
+sample divided by elapsed time, with a second column normalized to this
+machine's 32 logical processors. It excludes child-process CPU.
+
+| Plain PowerShell, 30-second warm-up + 60-second idle sample | One logical processor | Whole machine | Median private working set |
+|---|---:|---:|---:|
+| Before additional performance fixes, executable from `51de931` | 0.682% | 0.021% | 35.3 MiB |
+| Development release candidate, first run | 0.784% | 0.025% | 42.0 MiB |
+| Same candidate, repeat without concurrent build/test work | 1.101% | 0.034% | 40.1 MiB |
+
+These samples **do not demonstrate an idle CPU improvement**. In particular,
+they do not support the static audit's estimated 1–5% CPU saving. Foreground
+window ownership, CPU frequency and graphics-driver activity were not pinned,
+so the small absolute differences are not an isolated causal benchmark. The
+candidate also retains additional bounded text caches and embeds raw icon
+pixels; the measured working set increased in these runs. The original stress
+results above remain measurements of their explicitly identified older binary,
+not refreshed results for this candidate.
+
+The changed scheduling separates one-second discovery from drawing: an
+unchanged maintenance tick does not request a terminal frame. Blink, terminal
+output, an open Git panel, pending saves and user input can still request frames.
+Cursor blink is disabled in the default configuration, although terminal
+applications can request it. No new claim about frame-time p95, startup savings
+or Git polling cost is inferred from these idle samples.
+
+Development candidate executable SHA-256:
+
+```text
+b3aca51f2a337387085df7814aaad86bc62a493d22bf78d5de1bee46768c135b
+```
+
+It was built with `cargo build --locked --release --bin anvil
+--bin anvil-claude-status` using Rust 1.92.0 and the tracked release profile;
+it is not the final signed-package benchmark. Repeat the idle sample with:
+
+```powershell
+python -B scripts\bench_load.py --scenario one-shell --idle-seconds 60 --output D:\Bench\ANVIL-idle-1
+```
+
+Finding-by-finding conclusions and rejected recommendations are in
+[OPTIMIZATION-REVIEW](OPTIMIZATION-REVIEW.md).
 
 ## По-русски
 

@@ -80,6 +80,8 @@ def win_api():
         ("SetInformationJobObject", [w.HANDLE, c.c_int, c.c_void_p, w.DWORD], w.BOOL),
         ("AssignProcessToJobObject", [w.HANDLE, w.HANDLE], w.BOOL),
         ("OpenProcess", [w.DWORD, w.BOOL, w.DWORD], w.HANDLE),
+        ("GetProcessTimes", [w.HANDLE, c.POINTER(w.FILETIME), c.POINTER(w.FILETIME),
+                             c.POINTER(w.FILETIME), c.POINTER(w.FILETIME)], w.BOOL),
         ("CloseHandle", [w.HANDLE], w.BOOL),
         ("CreateToolhelp32Snapshot", [w.DWORD, w.DWORD], w.HANDLE),
         ("Process32FirstW", [w.HANDLE, c.POINTER(Process)], w.BOOL),
@@ -117,7 +119,13 @@ def counters(kernel, psapi, pid):
         data = Memory(cb=c.sizeof(Memory))
         if not psapi.GetProcessMemoryInfo(handle, c.byref(data), data.cb):
             raise c.WinError(c.get_last_error())
-        return {key: getattr(data, key) for key in ["ws", "private_ws", "private_commit", "peak_ws"]}
+        stamps = [w.FILETIME() for _ in range(4)]
+        if not kernel.GetProcessTimes(handle, *(c.byref(stamp) for stamp in stamps)):
+            raise c.WinError(c.get_last_error())
+        result = {key: getattr(data, key) for key in ["ws", "private_ws", "private_commit", "peak_ws"]}
+        result["cpu_seconds"] = sum((stamp.dwHighDateTime << 32) | stamp.dwLowDateTime
+                                    for stamp in stamps[2:]) / 10_000_000
+        return result
     finally:
         kernel.CloseHandle(handle)
 
@@ -144,9 +152,12 @@ def main():
     parser.add_argument("--exe", type=Path, default=ROOT / "target/release/anvil.exe")
     parser.add_argument("--project", type=Path, default=ROOT)
     parser.add_argument("--scenario", choices=["all", "one-shell", "two-agents-git", "heavy-output"], default="all")
+    parser.add_argument("--idle-seconds", type=int, default=30)
     args = parser.parse_args()
     if os.name != "nt":
         parser.error("Windows is required")
+    if not 2 <= args.idle_seconds <= 300:
+        parser.error("--idle-seconds must be between 2 and 300")
     output = args.output.resolve()
     if output.is_relative_to(ROOT) or output.exists():
         parser.error("Use a new output directory outside the checkout")
@@ -239,7 +250,7 @@ def main():
                 raise RuntimeError("Cannot resume benchmark process")
             print(f"{scenario}: warming up 30 s, PID {app.pid}", flush=True)
             time.sleep(30)
-            phases = [("idle", 30)] if scenario != "heavy-output" else [
+            phases = [("idle", args.idle_seconds)] if scenario != "heavy-output" else [
                 ("output", 65), ("retained-history", 20), ("history-reduced-to-1000", 20)]
             for phase, seconds in phases:
                 if phase == "output":
@@ -286,6 +297,11 @@ def main():
             row[key] = {"median_mib": round(statistics.median(values), 1), "peak_mib": round(max(values), 1),
                         "last_mib": round(values[-1], 1)}
         row["children_private_ws_median_mib"] = round(statistics.median(s["tree_private_ws"] for s in group) / 1024**2, 1)
+        elapsed = group[-1]["second"] - group[0]["second"]
+        if elapsed > 0:
+            core_pct = 100 * (group[-1]["app"]["cpu_seconds"] - group[0]["app"]["cpu_seconds"]) / elapsed
+            row["cpu_one_core_pct"] = round(core_pct, 3)
+            row["cpu_machine_pct"] = round(core_pct / (os.cpu_count() or 1), 3)
         summary["scenarios"].append(row)
     (output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)

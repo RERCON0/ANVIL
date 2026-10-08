@@ -482,17 +482,30 @@ impl AnvilApp {
         self.frame_ms = elapsed.as_secs_f32() * 1000.0;
     }
 
+    /// Periodic discovery must run without forcing a full terminal frame.
+    /// Keep the existing one-second freshness and wake drawing only on change.
+    pub(crate) fn maintenance(&mut self, ctx: &egui::Context) {
+        crate::fsutil::ui_io(|| {
+            self.check_config(ctx);
+            let profiles_changed = self.absorb_wsl_profiles();
+            let statuses_changed = self.poll_statuses();
+            let settings_changed = self.settings_open && self.refresh_claude_line();
+            let quota_time_changed =
+                self.quota.is_some() && self.quota_segments.minute != crate::quota::time::now_unix() / 60;
+            if profiles_changed || statuses_changed || settings_changed || quota_time_changed {
+                ctx.request_repaint();
+            }
+        });
+    }
+
     fn frame_inner(&mut self, ui: &mut egui::Ui, maximized: bool) -> Vec<WindowCommand> {
         let ctx = ui.ctx().clone();
         let started = Instant::now();
         let mut commands = Vec::new();
         let mut refresh_quota = false;
-        self.check_config(&ctx);
-        self.absorb_wsl_profiles();
         self.poll_panes(&ctx);
         #[cfg(debug_assertions)]
         self.readme_startup_keys();
-        self.poll_statuses();
         self.expire_toasts();
         // On a border the press belongs to the window resize, not to the pane
         // under it: the flag is threaded down so a drag there does not also
@@ -590,9 +603,8 @@ impl AnvilApp {
         if refresh_quota {
             self.request_quota_refresh();
         }
-        // The config watcher and the Claude status poll are periodic: keep a
-        // 1 Hz tick alive so they run even when nothing else asks for a frame.
-        ctx.request_repaint_after(Duration::from_millis(1000));
+        // Config/status discovery is the host's cheap maintenance timer.
+        // Visible animations and pending saves schedule their own frames.
         self.frame_ms = started.elapsed().as_secs_f32() * 1000.0;
         if !self.first_frame_logged {
             self.first_frame_logged = true;
@@ -760,26 +772,29 @@ impl AnvilApp {
         &cache.segments
     }
 
-    /// Re-reads Claude Code's user settings when they changed (one stat per
-    /// frame, only while the settings page is open).
-    fn refresh_claude_line(&mut self) {
+    /// Re-reads Claude settings once per maintenance tick, while settings are open.
+    fn refresh_claude_line(&mut self) -> bool {
         let claude_dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from);
         let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
-        let Some(path) = claude_setup::settings_path(claude_dir.as_deref(), home.as_deref()) else { return };
+        let Some(path) = claude_setup::settings_path(claude_dir.as_deref(), home.as_deref()) else { return false };
         let mtime = file_mtime(&path);
         if mtime.is_some() && mtime == self.claude_line.0 {
-            return;
+            return false;
         }
         let state = match claude_setup::read_settings(&path) {
             Ok(text) => claude_setup::describe(Some(&text)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => claude_setup::LineState::Missing,
             Err(error) => claude_setup::LineState::Broken(error.to_string()),
         };
+        let changed = self.claude_line != (mtime, state.clone());
         self.claude_line = (mtime, state);
+        changed
     }
 
     fn show_settings(&mut self, ui: &mut egui::Ui, rect: Rect) {
-        self.refresh_claude_line();
+        if !self.config_page_open {
+            self.refresh_claude_line();
+        }
         let quota_snapshot = self.quota.as_ref().map(|q| q.snapshot());
         let rows = self.keymap.describe();
         // Keep the applied config intact until apply_config compares the two:
@@ -1550,6 +1565,7 @@ impl AnvilApp {
         let Some(pane) = self.pane(id) else { return };
         let mut term = pane.term.lock();
         term.grid_mut().clear_history();
+        pane.invalidate_search();
         let mut processor: alacritty_terminal::vte::ansi::Processor<alacritty_terminal::vte::ansi::StdSyncHandler> =
             alacritty_terminal::vte::ansi::Processor::new();
         processor.advance(&mut *term, b"\x1b[2J\x1b[H");
@@ -1614,6 +1630,7 @@ impl AnvilApp {
             exited: false,
             claude: None,
             claude_mtime: None,
+            claude_path: None,
             has_claude: false,
         };
         match Pane::spawn(options, repaint) {
@@ -1878,6 +1895,7 @@ impl AnvilApp {
                 exited: false,
                 claude: None,
                 claude_mtime: None,
+                claude_path: None,
                 has_claude: false,
             }
         } else {
@@ -2058,8 +2076,8 @@ impl AnvilApp {
         }
     }
 
-    fn absorb_wsl_profiles(&mut self) {
-        let Some(rx) = &self.wsl_results else { return };
+    fn absorb_wsl_profiles(&mut self) -> bool {
+        let Some(rx) = &self.wsl_results else { return false };
         match rx.try_recv() {
             Ok(found) => {
                 for profile in found {
@@ -2069,10 +2087,12 @@ impl AnvilApp {
                 }
                 self.wsl_results = None;
                 self.profiles = self.build_profiles();
+                return true;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.wsl_results = None,
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
+        false
     }
 
     /// Adopts a finished process enumeration and answers whether one was
@@ -2283,11 +2303,12 @@ impl AnvilApp {
         }
     }
 
-    fn poll_statuses(&mut self) {
+    fn poll_statuses(&mut self) -> bool {
         if self.last_status_poll.elapsed() < Duration::from_secs(1) {
-            return;
+            return false;
         }
         self.last_status_poll = Instant::now();
+        let mut changed = false;
         // A finished enumeration is adopted first, so the pane walk below reads
         // the snapshot the `polled_processes` branch then annotates.
         let adopted = self.absorb_proc_snapshot();
@@ -2310,9 +2331,7 @@ impl AnvilApp {
                 }
             }
             let previous_agents = adopted.then(|| std::mem::take(&mut self.running_agents));
-            if adopted {
-                self.ai_commands.clear();
-            }
+            let previous_commands = adopted.then(|| std::mem::take(&mut self.ai_commands));
             let processes = crate::procs::ProcessIndex::new(&self.proc_snapshot);
             for tab in &mut self.tabs {
                 for (id, entry) in &mut tab.panes {
@@ -2331,28 +2350,34 @@ impl AnvilApp {
                     {
                         self.running_agents.insert(*id, agent.to_owned());
                     }
+                    changed |= entry.has_claude != has_claude;
                     entry.has_claude = has_claude;
                 }
             }
             if previous_agents.as_ref().is_some_and(|previous| *previous != self.running_agents) {
                 self.mark_session_dirty();
+                changed = true;
             }
+            changed |= previous_commands.as_ref().is_some_and(|previous| *previous != self.ai_commands);
         }
-        let status_dir = self.status_dir.clone();
+        let status_dir = &self.status_dir;
         for tab in &mut self.tabs {
             for entry in tab.panes.values_mut() {
                 let pane_id = match &entry.content {
                     PaneContent::Live(pane) => pane.id,
                     PaneContent::Error(_) => continue,
                 };
-                let path = StatusRecord::file_path(&status_dir, &pane_id.to_string());
-                let mtime = file_mtime(&path);
+                let path =
+                    entry.claude_path.get_or_insert_with(|| StatusRecord::file_path(status_dir, &pane_id.to_string()));
+                let mtime = file_mtime(path);
                 match (mtime, entry.claude_mtime) {
                     (Some(mtime), current) if Some(mtime) != current => {
-                        entry.claude = StatusRecord::read(&path);
+                        entry.claude = StatusRecord::read(path);
                         entry.claude_mtime = Some(mtime);
+                        changed = true;
                     }
                     (None, _) => {
+                        changed |= entry.claude.is_some();
                         entry.claude = None;
                         entry.claude_mtime = None;
                     }
@@ -2362,9 +2387,11 @@ impl AnvilApp {
                     entry.claude = None;
                     entry.claude_mtime = None;
                     let _ = std::fs::remove_file(&path);
+                    changed = true;
                 }
             }
         }
+        changed
     }
 
     // ---- overlays --------------------------------------------------------
@@ -2601,10 +2628,8 @@ fn font_families(entries: &[(String, String)]) -> Vec<String> {
 }
 
 fn window_icon() -> Option<winit::window::Icon> {
-    let bytes: &[u8] = include_bytes!("../icons/anvil-256.png");
-    let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png).ok()?.into_rgba8();
-    let (width, height) = image.dimensions();
-    winit::window::Icon::from_rgba(image.into_raw(), width, height).ok()
+    let rgba = include_bytes!(concat!(env!("OUT_DIR"), "/anvil-icon.rgba"));
+    winit::window::Icon::from_rgba(rgba.to_vec(), 256, 256).ok()
 }
 
 fn file_mtime(path: &Path) -> Option<SystemTime> {
@@ -2711,6 +2736,38 @@ fn remove_owned_status_dir(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoded_window_icon_matches_the_source_png_exactly() {
+        let decoded =
+            image::load_from_memory_with_format(include_bytes!("../icons/anvil-256.png"), image::ImageFormat::Png)
+                .unwrap()
+                .into_rgba8();
+        assert_eq!(decoded.dimensions(), (256, 256));
+        assert_eq!(decoded.as_raw().as_slice(), include_bytes!(concat!(env!("OUT_DIR"), "/anvil-icon.rgba")));
+        assert!(window_icon().is_some());
+    }
+
+    #[test]
+    fn maintenance_reloads_external_config_without_a_terminal_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bare_app(dir.path());
+        let ctx = egui::Context::default();
+        app.config.save(&app.config_path).unwrap();
+        app.config_mtime = file_mtime(&app.config_path);
+        let mut edited = app.config.clone();
+        edited.font.size = 23.0;
+        edited.terminal.cursor.blink = true;
+        // Force a distinct observed version even on filesystems with coarse mtimes.
+        edited.save(&app.config_path).unwrap();
+        app.config_mtime = None;
+        app.config_checked = Instant::now() - Duration::from_secs(2);
+        app.maintenance(&ctx);
+        assert_eq!(app.config.font.size, 23.0);
+        assert!(app.config.terminal.cursor.blink);
+        assert_eq!(app.config_mtime, file_mtime(&app.config_path));
+        assert!(!app.first_frame_logged, "no drawing occurred");
+    }
 
     #[test]
     fn stale_run_cleanup_preserves_foreign_and_unexpected_contents() {
@@ -2897,10 +2954,11 @@ mod tests {
         let poll = |app: &mut AnvilApp, since_process_poll: u64| {
             app.last_status_poll = Instant::now() - Duration::from_secs(5);
             app.last_proc_poll = Instant::now() - Duration::from_secs(since_process_poll);
-            app.poll_statuses();
+            app.poll_statuses()
         };
-        poll(&mut app, 0);
+        assert!(poll(&mut app, 0), "changed status asks for drawing");
         assert!(app.tabs[0].panes[&id].claude.is_some(), "the record is read");
+        assert!(!poll(&mut app, 0), "an unchanged badge does not force a frame");
         poll(&mut app, 10);
         assert!(path.exists(), "a poll without a fresh snapshot must keep the record");
         assert!(app.tabs[0].panes[&id].claude.is_some());

@@ -1,7 +1,9 @@
 //! Vertical tab list on the left: numbers, titles, the Claude badge, activity
 //! dots, drag & drop, rename in place and the buttons under the list.
 
-use egui::{Align2, Color32, FontId, Pos2, Rect, ScrollArea, Sense, Stroke, Vec2};
+#[cfg(test)]
+use egui::Color32;
+use egui::{Align2, FontId, Pos2, Rect, ScrollArea, Sense, Stroke, Vec2};
 
 use crate::claude_status::{clamp_pct, js_round, StatusRecord};
 use crate::strings;
@@ -12,6 +14,30 @@ pub struct TabbarState {
     pub rename: Option<RenameEdit>,
     drag_from: Option<usize>,
     hover_index: Option<usize>,
+    badges: Vec<BadgeCache>,
+}
+
+#[derive(Default)]
+struct BadgeCache {
+    record: Option<StatusRecord>,
+    fields: ClaudeBadgeFields,
+    parts: Vec<(String, Option<f64>)>,
+}
+
+impl BadgeCache {
+    fn get(&mut self, record: &StatusRecord, fields: &ClaudeBadgeFields) -> &[(String, Option<f64>)] {
+        if self.record.as_ref() != Some(record) || self.fields != *fields {
+            self.parts = badge_parts(record, fields);
+            for (index, (text, _)) in self.parts.iter_mut().enumerate() {
+                if index > 0 {
+                    text.insert_str(0, " · ");
+                }
+            }
+            self.record = Some(record.clone());
+            self.fields = *fields;
+        }
+        &self.parts
+    }
 }
 
 impl TabbarState {
@@ -111,6 +137,7 @@ pub fn show(
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme::colors().chrome_bg);
     state.hover_index = None;
+    state.badges.resize_with(tabs.len(), BadgeCache::default);
 
     // More tabs than fit must stay reachable: the list scrolls, so a tab past
     // the fold can be clicked, renamed, dragged and closed like any other.
@@ -296,16 +323,17 @@ fn tab_row(
         Vec2::new(row.width() - 58.0, theme::TAB_ROW_HEIGHT),
     );
     let title_font = theme::font(12.5);
-    let title = elide(painter, &tab.title, title_font.clone(), title_rect.width());
-    painter.with_clip_rect(title_rect).text(
-        Pos2::new(title_rect.min.x, title_rect.center().y),
-        Align2::LEFT_CENTER,
+    let title =
+        crate::chrome::text::elide_galley(painter, &tab.title, title_font, title_rect.width(), text_color, false);
+    painter.with_clip_rect(title_rect).galley(
+        Pos2::new(title_rect.min.x, title_rect.center().y - title.size().y / 2.0),
         title,
-        title_font,
         text_color,
     );
     if let Some(record) = &tab.claude {
-        paint_claude_line(painter, row, record, badge_fields);
+        paint_claude_line(painter, row, state.badges[index].get(record, badge_fields));
+    } else if state.badges[index].record.is_some() {
+        state.badges[index] = BadgeCache::default();
     }
 
     // Close button: the row's own response owns the click (a nested widget
@@ -407,29 +435,9 @@ fn color_item(ui: &mut egui::Ui, selected: bool, color: Option<theme::TabColor>)
 /// One implementation for both callers: a byte-identical copy of this drifted
 /// from the workspace panel's. Binary search over char boundaries keeps it at a
 /// handful of layouts instead of one per character.
-pub(crate) fn elide(painter: &egui::Painter, text: &str, font: FontId, max_width: f32) -> String {
-    let measure = |s: &str| painter.layout_no_wrap(s.to_owned(), font.clone(), Color32::WHITE).size().x;
-    if measure(text) <= max_width {
-        return text.to_owned();
-    }
-    let chars: Vec<(usize, char)> = text.char_indices().collect();
-    let fits = |count: usize| {
-        let cut = chars.get(count).map_or(text.len(), |(offset, _)| *offset);
-        measure(&format!("{}…", &text[..cut])) <= max_width
-    };
-    let mut low = 0;
-    let mut high = chars.len();
-    while low < high {
-        let mid = low + (high - low) / 2;
-        if fits(mid) {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    // `low` is the first prefix that does NOT fit, not the last fitting one.
-    let cut = chars.get(low.saturating_sub(1)).map_or(0, |(offset, _)| *offset);
-    format!("{}…", &text[..cut])
+#[cfg(test)]
+fn elide(painter: &egui::Painter, text: &str, font: FontId, max_width: f32) -> String {
+    crate::chrome::text::elide_galley(painter, text, font, max_width, Color32::WHITE, false).text().to_owned()
 }
 
 use crate::config::ClaudeBadgeFields;
@@ -460,15 +468,14 @@ fn badge_parts(record: &StatusRecord, fields: &ClaudeBadgeFields) -> Vec<(String
 
 /// The Claude badge line: `Opus 5 · ▓▓▓▓░░░░░░ 37% · 5h 17 · 7d 64` with the
 /// percentage colours of the dark scheme, limited to the chosen pieces.
-fn paint_claude_line(painter: &egui::Painter, row: Rect, record: &StatusRecord, fields: &ClaudeBadgeFields) {
+fn paint_claude_line(painter: &egui::Painter, row: Rect, parts: &[(String, Option<f64>)]) {
     let mut x = row.min.x + 36.0;
     let y = row.min.y + theme::TAB_ROW_HEIGHT + theme::CLAUDE_ROW_HEIGHT / 2.0;
     let font = FontId::proportional(11.0);
     let limit = row.max.x - 10.0;
-    for (index, (text, pct)) in badge_parts(record, fields).into_iter().enumerate() {
+    for (text, pct) in parts {
         let color = pct.map(theme::threshold_color).unwrap_or(theme::colors().tab_text);
-        let prefix = if index == 0 { "" } else { " · " };
-        let galley = painter.layout_no_wrap(format!("{prefix}{text}"), font.clone(), color);
+        let galley = crate::chrome::text::elide_galley(painter, text, font.clone(), f32::INFINITY, color, false);
         let width = galley.size().x;
         if x + width > limit {
             break;
@@ -481,6 +488,23 @@ fn paint_claude_line(painter: &egui::Painter, row: Rect, record: &StatusRecord, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn badge_cache_follows_status_and_field_changes_instead_of_tab_indices() {
+        let mut cache = BadgeCache::default();
+        let mut record = StatusRecord { model: Some("Opus".into()), context_pct: Some(25.0), ..Default::default() };
+        let mut fields = ClaudeBadgeFields::default();
+        assert!(cache.get(&record, &fields)[1].0.contains("25%"));
+        let address = cache.parts[0].0.as_ptr();
+        cache.get(&record, &fields);
+        assert_eq!(address, cache.parts[0].0.as_ptr());
+        record.context_pct = Some(75.0);
+        assert!(cache.get(&record, &fields)[1].0.contains("75%"));
+        fields.context = false;
+        assert_eq!(cache.get(&record, &fields).len(), 1);
+        record.model = Some("another tab".into());
+        assert_eq!(cache.get(&record, &fields)[0].0, "another tab");
+    }
 
     fn list_frame(
         ctx: &egui::Context,
@@ -666,6 +690,7 @@ mod tests {
                         rename: Some(RenameEdit { tab: slot, text: "test".into(), focus: false }),
                         drag_from: Some(slot),
                         hover_index: Some(slot),
+                        ..Default::default()
                     };
                     state.tab_moved(from, to);
                     let expected = identities.iter().position(|id| *id == slot).unwrap();
@@ -804,6 +829,7 @@ mod tests {
             rename: Some(RenameEdit { tab: 3, text: "x".to_owned(), focus: false }),
             drag_from: Some(2),
             hover_index: Some(1),
+            ..Default::default()
         };
         state.tab_removed(0);
         assert_eq!(state.rename.as_ref().map(|r| r.tab), Some(2));

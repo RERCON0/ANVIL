@@ -5,6 +5,13 @@ fn main() {
     println!("cargo:rerun-if-changed=vendor/conpty/x64/OpenConsole.exe");
     println!("cargo:rerun-if-changed=icons/anvil.rc");
     println!("cargo:rerun-if-changed=icons/anvil.ico");
+    println!("cargo:rerun-if-changed=icons/anvil-256.png");
+    let image = image::load_from_memory_with_format(include_bytes!("icons/anvil-256.png"), image::ImageFormat::Png)
+        .expect("valid window icon")
+        .into_rgba8();
+    assert_eq!(image.dimensions(), (256, 256));
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
+    std::fs::write(out.join("anvil-icon.rgba"), image.as_raw()).expect("write decoded icon");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         // Only x64 has a vendored ConPTY; other architectures would silently
         // fall back to the system one and reintroduce the documented input bugs.

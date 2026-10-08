@@ -22,7 +22,7 @@ use crate::term::pane::Pane;
 use crate::term::render::{
     cell_metrics, paint, snapshot_reusing, CellMetrics, Frame, GlyphCache, Highlight, PaintOptions,
 };
-use crate::term::search::{search_pattern, RegexCache};
+use crate::term::search::{MatchKey, RegexCache, VisibleMatches};
 use crate::term::style::Palette;
 use crate::theme;
 
@@ -57,6 +57,7 @@ pub struct SearchState {
     pub current: Option<(usize, usize, usize)>,
     pub focus_requested: bool,
     compiled: RegexCache,
+    matches: VisibleMatches,
 }
 
 pub struct TerminalView {
@@ -425,14 +426,26 @@ impl TerminalView {
             let term = pane.term.lock_unfair();
             let mut highlights: Vec<Highlight> = Vec::new();
             if self.search.open && !self.search.query.is_empty() {
-                let pattern = search_pattern(&self.search.query, self.search.regex, self.search.case_sensitive);
-                match self.search.compiled.get(&pattern) {
+                let (query, compiled) =
+                    self.search.compiled.for_query(&self.search.query, self.search.regex, self.search.case_sensitive);
+                match compiled {
                     Some(regex) => {
                         self.search.error = false;
-                        let found = collect_matches(&*term, regex, lines as usize, columns as usize, display_offset);
+                        let key = MatchKey {
+                            query,
+                            output: pane.output_generation(),
+                            offset: term.grid().display_offset(),
+                            lines: lines as usize,
+                            columns: columns as usize,
+                            history: term.grid().history_size(),
+                        };
+                        let found = self
+                            .search
+                            .matches
+                            .get(key, || collect_matches(&*term, regex, key.lines, key.columns, key.offset));
                         let current = self.search.current.filter(|c| found.contains(c));
                         self.search.current = current;
-                        for (row, start, end) in found {
+                        for &(row, start, end) in found {
                             let is_current = self.search.current == Some((row, start, end));
                             highlights.push((row, start, end, is_current));
                         }
@@ -487,7 +500,7 @@ impl TerminalView {
             self.last_links = link_runs(&frame.rows);
         }
 
-        let cursor_on = if (input.cursor_blink || self.app_blink) && input.focused {
+        let cursor_on = if (input.cursor_blink || self.app_blink) && input.focused && ui.input(|i| i.focused) {
             let elapsed = self.blink_epoch.elapsed().as_millis();
             let left = BLINK_MS - elapsed % BLINK_MS;
             ctx.request_repaint_after(Duration::from_millis(left as u64));
@@ -668,8 +681,9 @@ impl TerminalView {
         if self.search.query.is_empty() {
             return;
         }
-        let pattern = search_pattern(&self.search.query, self.search.regex, self.search.case_sensitive);
-        let Some(regex) = self.search.compiled.get(&pattern) else {
+        let (_, compiled) =
+            self.search.compiled.for_query(&self.search.query, self.search.regex, self.search.case_sensitive);
+        let Some(regex) = compiled else {
             self.search.error = true;
             return;
         };
@@ -926,6 +940,56 @@ pub fn link_runs(rows: &[Vec<crate::term::style::RenderCell>]) -> Vec<(usize, us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_cache_refreshes_on_output_scroll_resize_and_query_edits() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::Config;
+        use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+        let mut term =
+            Term::new(Config::default(), &crate::term::pane::GridSize { columns: 20, lines: 3 }, VoidListener);
+        let mut parser = Processor::<StdSyncHandler>::new();
+        parser.advance(&mut term, b"old old");
+        let mut regex = RegexSearch::new("old").unwrap();
+        let mut cache = VisibleMatches::default();
+        let key = |term: &Term<VoidListener>, query, output| MatchKey {
+            query,
+            output,
+            offset: term.grid().display_offset(),
+            lines: term.screen_lines(),
+            columns: term.columns(),
+            history: term.grid().history_size(),
+        };
+        let first = key(&term, 1, 1);
+        assert_eq!(
+            cache.get(first, || collect_matches(&term, &mut regex, first.lines, first.columns, first.offset)).len(),
+            2
+        );
+        assert_eq!(cache.get(first, || panic!("blink cannot rescan unchanged output")).len(), 2);
+        parser.advance(&mut term, b"\x1b[2J\x1b[Hnew");
+        let output = key(&term, 1, 2);
+        assert!(cache
+            .get(output, || collect_matches(&term, &mut regex, output.lines, output.columns, output.offset))
+            .is_empty());
+        parser.advance(&mut term, b"\r\nold\r\nold\r\nold\r\nold");
+        term.scroll_display(Scroll::Top);
+        let scrolled = key(&term, 1, 3);
+        assert!(!cache
+            .get(scrolled, || collect_matches(&term, &mut regex, scrolled.lines, scrolled.columns, scrolled.offset))
+            .is_empty());
+        term.resize(crate::term::pane::GridSize { columns: 8, lines: 2 });
+        let resized = key(&term, 1, 3);
+        let uncached = collect_matches(&term, &mut regex, resized.lines, resized.columns, resized.offset);
+        assert_eq!(
+            cache.get(resized, || collect_matches(&term, &mut regex, resized.lines, resized.columns, resized.offset)),
+            uncached
+        );
+        regex = RegexSearch::new("missing").unwrap();
+        let edited = key(&term, 2, 3);
+        assert!(cache
+            .get(edited, || collect_matches(&term, &mut regex, edited.lines, edited.columns, edited.offset))
+            .is_empty());
+    }
     use crate::term::style::{CellStyle, RenderCell, Underline};
     use alacritty_terminal::term::cell::Hyperlink;
     use egui::Color32;

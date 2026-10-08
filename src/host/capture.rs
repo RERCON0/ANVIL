@@ -6,6 +6,7 @@ use crate::app::{AnvilApp, ReadmeDemo};
 
 pub(super) struct Capture {
     output: PathBuf,
+    writer: super::event_loop::CaptureWriter,
     animation: bool,
     next: Instant,
     frame: usize,
@@ -15,9 +16,10 @@ pub(super) struct Capture {
 }
 
 impl Capture {
-    pub fn still(output: PathBuf) -> Self {
+    pub fn still(output: PathBuf, writer: super::event_loop::CaptureWriter) -> Self {
         Self {
             output,
+            writer,
             animation: false,
             next: Instant::now() + Duration::from_secs(30),
             frame: 0,
@@ -27,10 +29,10 @@ impl Capture {
         }
     }
 
-    pub fn demo(directory: PathBuf) -> Self {
+    pub fn demo(directory: PathBuf, writer: super::event_loop::CaptureWriter) -> Self {
         // Refuse to overwrite an existing sequence or unrelated directory.
         std::fs::create_dir(&directory).expect("use a new demo output directory");
-        Self { animation: true, ..Self::still(directory) }
+        Self { animation: true, ..Self::still(directory, writer) }
     }
 
     pub fn before_frame(&mut self, app: &mut AnvilApp, input: &mut egui::RawInput, ctx: &egui::Context) {
@@ -79,11 +81,9 @@ impl Capture {
                 glow::PixelPackData::Slice(Some(&mut pixels)),
             );
         }
-        let mut image = image::RgbaImage::from_raw(size.width, size.height, pixels).expect("framebuffer pixels");
-        image::imageops::flip_vertical_in_place(&mut image);
         let path =
             if self.animation { self.output.join(format!("{:04}.png", self.frame)) } else { self.output.clone() };
-        image.save(path).expect("save captured frame");
+        (self.writer)(&path, size.width, size.height, pixels).expect("save captured frame");
         self.frame += 1;
         self.next = Instant::now() + Duration::from_millis(80);
         if !self.animation || self.frame == 125 {

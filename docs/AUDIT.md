@@ -27,6 +27,7 @@ Provider parsing was exercised with fixtures; no paid model task was submitted.
 | UI retries slept during transient file locks | Config/session saves could pause drawing for 500 ms | UI reads/writes make one attempt; failed saves remain pending. Worker retries remain bounded; synchronous OS I/O is still a boundary. |
 | Per-frame repeated work and stale CI coverage | Style resolution, process indexing and run strings were recomputed; Seti regeneration was skipped | Bounded theme/OSC-aware colour cache, pooled strings across rows, one process index per snapshot, interned font names and paced pointer redraws. Hash-pinned fontTools now verifies both generated outputs. |
 | Native asset provenance relied only on repository hashes | Packaging did not authenticate the vendored ConPTY publisher | Independently matched the upstream archive and require valid pinned Microsoft Authenticode signatures in Windows packaging/CI. |
+| Periodic discovery forced terminal drawing and search rescans | An unchanged idle/search frame repeated maintenance, regex scanning and text layout work | Independent maintenance deadline, generation-keyed visible-search cache, bounded font/DPI-aware galleys and record-keyed Claude badges. Regressions cover output/scroll/resize invalidation, unchanged badges, config reload without drawing and cache bounds. |
 
 ## Usability and release preparation
 
@@ -57,10 +58,13 @@ a separate experimental opt-in and identifies the client as ANVIL.
 The complete finding-by-finding triage and rejected recommendations are in
 [AUDIT-REVIEW](AUDIT-REVIEW.md). Major dependency updates in PR #2 remain a
 separate tested migration, described in [DEPENDENCIES](DEPENDENCIES.md).
+The additional static performance report is reviewed separately in
+[OPTIMIZATION-REVIEW](OPTIMIZATION-REVIEW.md), including rejected recommendations
+and limits on what the idle CPU measurements demonstrate.
 
 ## Verification
 
-- `cargo test --locked --all-targets`: 589 passed (549 library, 1 helper, 10 ConPTY, 29 Git); one manual flood benchmark ignored.
+- `cargo test --locked --all-targets`: 598 passed (558 library, 1 helper, 10 ConPTY, 29 Git); one manual flood benchmark ignored.
 - Formatting and Clippy with warnings denied on pinned Rust 1.92.0; Clippy also passes on Rust 1.99.0.
 - Python: 19 script tests and 3 Aider helper tests, including real OpenSSL Ed25519 verification; no skipped icon-generation test.
 - Pinned ConPTY hashes and valid Microsoft signatures, generated Seti font/Rust parity, documentation links and actionlint.
