@@ -41,7 +41,7 @@ json5 = "0.4"
 toml = "1"
 log = "0.4"
 tempfile = "3"
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Networking_WinHttp",
     "Win32_Security",
@@ -72,7 +72,7 @@ windows = { version = "0.58", features = [
     "Win32_UI_Shell_Common",
 ] }
 # The implement macro emits references to windows_core.
-windows-core = "0.58"
+windows-core = "0.100"
 
 [dev-dependencies]
 # Examples only: the icon generator writes PNG and ICO files.
