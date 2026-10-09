@@ -3001,6 +3001,74 @@ pub fn ls_files(root: &Path) -> Result<Vec<String>, String> {
     Ok(files)
 }
 
+/// Depth and entry bounds for `ls_folder`: with no index to page through, the
+/// walk itself has to stay bounded.
+const MAX_LIST_DEPTH: usize = 32;
+const MAX_LIST_ENTRIES: usize = 100_000;
+
+/// Whether one directory entry is a link or junction, read from the entry
+/// itself. `DirEntry::file_type` already reports a junction as `is_symlink()`
+/// (probed on Windows 11), so `is_directory` alone would refuse to descend;
+/// asking the reparse attribute as well keeps the refusal independent of that
+/// report, the way `inspect_metadata_tree` treats a link-shaped entry. Neither
+/// question asks about a target, so nothing outside the folder is touched.
+fn is_reparse(entry: &std::fs::DirEntry) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // DirEntry::metadata does not follow Windows reparse points.
+        entry.metadata().map_or(true, |meta| meta.file_attributes() & 0x400 != 0)
+    }
+    #[cfg(not(windows))]
+    {
+        entry.file_type().is_ok_and(|kind| kind.is_symlink())
+    }
+}
+
+fn is_directory(entry: &std::fs::DirEntry) -> bool {
+    entry.file_type().is_ok_and(|kind| kind.is_dir())
+}
+
+/// The folder's own files when it is not a repository — what `ls_files` reports
+/// for tracked-and-untracked, without an index to ask. Paths are relative and
+/// `/`-separated exactly as `ls_files` returns them, sorted and deduplicated.
+///
+/// The walk never follows a link or junction: one is listed as a row but never
+/// descended into, so a shortcut out of the folder cannot pull its target into
+/// the list. `.git` is the repository's own storage and never part of the
+/// folder's content. There is no ignore filtering here: without an index there
+/// is no `git check-ignore` to ask, and a folder that is not a repository has
+/// no ignore rules to apply.
+pub fn ls_folder(root: &Path) -> Result<Vec<String>, String> {
+    let mut files = Vec::new();
+    let mut queue = vec![(local_path(root)?, String::new(), 0_usize)];
+    // The cap ends the whole walk, not just one directory: `break` alone would
+    // leave the rest of the queue to be drained into a longer list.
+    'walk: while let Some((directory, prefix, depth)) = queue.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else { continue };
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            if files.len() >= MAX_LIST_ENTRIES {
+                break 'walk;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == ".git" {
+                continue;
+            }
+            let relative = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+            let descend = depth < MAX_LIST_DEPTH && !is_reparse(&entry) && is_directory(&entry);
+            if descend {
+                queue.push((entry.path(), relative, depth + 1));
+            } else {
+                files.push(relative);
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
 /// Reads a repository text file (valid UTF-8) up to `max_bytes`; the bool reports
 /// truncation. The path is validated first and the cap is applied while
 /// reading, so a huge file cannot be allocated to memory.
@@ -3737,6 +3805,48 @@ index 111..222 100644\n\
         // the root itself.
         assert_eq!(resolve_path(root, "new.txt"), Ok(root.join("new.txt")));
         assert_eq!(resolve_path(root, "new/deeper.txt"), Ok(root.join("new").join("deeper.txt")));
+    }
+
+    /// The listing the Files tab falls back to outside a repository: paths are
+    /// relative and `/`-separated like `ls_files`, `.git` is never content, and
+    /// a link is listed but not walked into.
+    #[test]
+    fn ls_folder_lists_relative_paths_and_never_follows_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main").unwrap();
+        std::fs::create_dir_all(root.join("docs/deep")).unwrap();
+        std::fs::write(root.join("top.txt"), "x").unwrap();
+        std::fs::write(root.join("docs/deep/nested.md"), "x").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "x").unwrap();
+
+        assert_eq!(
+            ls_folder(root).unwrap(),
+            vec!["docs/deep/nested.md".to_owned(), "top.txt".to_owned()],
+            "sorted, `/`-separated and without `.git`"
+        );
+
+        // A junction needs no privilege on Windows, a symlink does: the walk must
+        // refuse both, so the fixture uses whichever the platform allows here.
+        // The target holds a file that only a walk into the link would reach.
+        let link = root.join("escape");
+        #[cfg(windows)]
+        junction(&link, outside.path());
+        #[cfg(not(windows))]
+        if !metadata_link(outside.path(), &link, true) {
+            return;
+        }
+        let listed = ls_folder(root).unwrap();
+        // The link is a row of its own, exactly as a folder is, so the tree
+        // stays navigable — but its contents are never pulled in through it.
+        assert!(listed.contains(&"escape".to_owned()), "the link itself is listed: {listed:?}");
+        assert!(!listed.iter().any(|path| path.starts_with("escape/")), "a link is never walked into: {listed:?}");
+        assert!(
+            std::fs::read_dir(&link).is_ok_and(|entries| entries.count() > 0),
+            "the fixture is real: the target does hold a file the list must not show"
+        );
     }
 
     /// Windows devices are reserved in every component, in any case and with any

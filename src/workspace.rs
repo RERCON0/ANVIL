@@ -768,7 +768,13 @@ impl Workspace {
                     if commit_state_changed && self.root.is_some() {
                         self.request(Request::Log);
                     }
-                    if inventory_changed || (self.tab == PanelTab::Files && !self.files_loaded) {
+                    // Without a repository the status is the same empty value on
+                    // every poll, so `inventory_changed` never fires and the
+                    // list would freeze after its first (empty) read. There is
+                    // no git signal to wait for, so the browser is re-read on
+                    // every status while its tab is open.
+                    let browsing_folder = self.root.is_none() && self.tab == PanelTab::Files;
+                    if inventory_changed || (self.tab == PanelTab::Files && (!self.files_loaded || browsing_folder)) {
                         self.request(Request::Files);
                     }
                 }
@@ -3298,6 +3304,15 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                     continue;
                 }
             }
+            // The file browser and the operations that act on its rows read
+            // the repository when there is one, and the pane's own folder when
+            // there is not: without this a plain folder showed an empty list
+            // and refused every action with "не репозиторий". `git` itself is
+            // still gated on `root` above.
+            let browse_root = root.as_deref().or(cwd.as_deref());
+            // Whether the browser's root is a repository (git answers) or the
+            // bare pane folder (the disk answers).
+            let in_repo = root.is_some();
             match request {
                 Request::Refresh { .. } | Request::Approve { .. } => match &root {
                     Some(root) => match git::status(root) {
@@ -3425,40 +3440,44 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                     };
                     send(Response::CommitDiff { hash, path, patch });
                 }
-                Request::Files => match &root {
-                    Some(root) => match git::ls_files(root) {
-                        Ok(files) => send(Response::Files(files)),
-                        Err(e) => send(Response::Error(e)),
-                    },
+                Request::Files => match browse_root {
+                    Some(root) => send(Response::Files(if in_repo {
+                        git::ls_files(root).unwrap_or_default()
+                    } else {
+                        git::ls_folder(root).unwrap_or_default()
+                    })),
                     None => send(Response::Files(Vec::new())),
                 },
-                Request::CountLines => match &root {
-                    Some(root) => match git::ls_files(root) {
-                        Ok(files) => {
-                            let mut lines = 0u64;
-                            let mut counted = 0usize;
-                            let resolver = git::PathResolver::new(root);
-                            for path in &files {
-                                let Ok(resolver) = &resolver else { break };
-                                let Ok(full) = resolver.resolve(path) else { continue };
-                                let Ok(meta) = std::fs::metadata(&full) else { continue };
-                                // Huge and binary files would only slow the walk down.
-                                if !meta.is_file() || meta.len() > MAX_COUNTED_FILE {
-                                    continue;
+                Request::CountLines => match browse_root {
+                    Some(root) => {
+                        let listed = if in_repo { git::ls_files(root) } else { git::ls_folder(root) };
+                        match listed {
+                            Ok(files) => {
+                                let mut lines = 0u64;
+                                let mut counted = 0usize;
+                                let resolver = git::PathResolver::new(root);
+                                for path in &files {
+                                    let Ok(resolver) = &resolver else { break };
+                                    let Ok(full) = resolver.resolve(path) else { continue };
+                                    let Ok(meta) = std::fs::metadata(&full) else { continue };
+                                    // Huge and binary files would only slow the walk down.
+                                    if !meta.is_file() || meta.len() > MAX_COUNTED_FILE {
+                                        continue;
+                                    }
+                                    let Ok(file) = std::fs::File::open(full) else { continue };
+                                    if let Ok(Some(count)) = count_text_lines(file, MAX_COUNTED_FILE) {
+                                        lines += count;
+                                        counted += 1;
+                                    }
                                 }
-                                let Ok(file) = std::fs::File::open(full) else { continue };
-                                if let Ok(Some(count)) = count_text_lines(file, MAX_COUNTED_FILE) {
-                                    lines += count;
-                                    counted += 1;
-                                }
+                                send(Response::LineCount { files: counted, lines });
                             }
-                            send(Response::LineCount { files: counted, lines });
+                            Err(e) => send(Response::Error(e)),
                         }
-                        Err(e) => send(Response::Error(e)),
-                    },
+                    }
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO().to_owned())),
                 },
-                Request::ReadFile { path, generation } => match &root {
+                Request::ReadFile { path, generation } => match browse_root {
                     Some(root) => match git::read_file(root, &path, MAX_PREVIEW_BYTES) {
                         Ok((text, truncated)) => {
                             // Markdown is laid out by `MarkdownCache`, which
@@ -3496,10 +3515,10 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO().to_owned())),
                 },
                 Request::OpenExternal { path } => {
-                    send(Response::Launch(root.as_deref().and_then(|root| external_launch(root, &path, false).ok())));
+                    send(Response::Launch(browse_root.and_then(|root| external_launch(root, &path, false).ok())));
                 }
                 Request::Reveal { path } => {
-                    send(Response::Launch(root.as_deref().and_then(|root| external_launch(root, &path, true).ok())));
+                    send(Response::Launch(browse_root.and_then(|root| external_launch(root, &path, true).ok())));
                 }
                 Request::Fetch => match &root {
                     Some(root) => match git::fetch(root) {
@@ -3530,21 +3549,21 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                     Some(root) => send(Response::CheckedOut(git::create_branch(root, &name))),
                     None => send(Response::CheckedOut(Err(strings::WORKSPACE_NO_REPO().to_owned()))),
                 },
-                Request::WritePath { path, folder } => match &root {
+                Request::WritePath { path, folder } => match browse_root {
                     Some(root) => match write_path(root, &path, folder) {
                         Ok(()) => send(Response::Applied),
                         Err(e) => send(Response::Error(e)),
                     },
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO().to_owned())),
                 },
-                Request::RenamePath { from, to } => match &root {
+                Request::RenamePath { from, to } => match browse_root {
                     Some(root) => match rename_path(root, &from, &to) {
                         Ok(()) => send(Response::Applied),
                         Err(e) => send(Response::Error(e)),
                     },
                     None => send(Response::Error(strings::WORKSPACE_NO_REPO().to_owned())),
                 },
-                Request::DeletePath { path } => match &root {
+                Request::DeletePath { path } => match browse_root {
                     Some(root) => match delete_path(root, &path) {
                         Ok(()) => send(Response::Applied),
                         Err(e) => send(Response::Error(e)),
@@ -5599,6 +5618,108 @@ mod tests {
         assert!(git(root, &["update-ref", remote, "HEAD~1"]));
         assert_eq!(apply_status(&mut workspace), 1, "external upstream changes invalidate history");
         assert_eq!(apply_status(&mut workspace), 0);
+    }
+
+    /// A folder that is not a repository answers every poll with the same empty
+    /// `Status` and the same `None` root, so nothing in it ever looks changed:
+    /// the panel read the (empty) file list once and never asked again, leaving
+    /// files that appeared later invisible.
+    #[test]
+    fn files_added_to_a_folder_without_a_repository_are_still_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let (request_tx, request_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+        let mut workspace =
+            Workspace { tab: PanelTab::Files, tx: Some(request_tx), rx: Some(response_rx), ..Default::default() };
+        let files_asked = || request_rx.try_iter().filter(|(_, request)| matches!(request, Request::Files)).count();
+
+        response_tx.send(Response::Status(Status::default(), None)).unwrap();
+        workspace.absorb();
+        assert_eq!(files_asked(), 1, "the Files tab reads the folder once when it opens");
+        response_tx.send(Response::Files(Vec::new())).unwrap();
+        workspace.absorb();
+        assert!(workspace.files_loaded);
+        assert_eq!(files_asked(), 0);
+
+        std::fs::write(dir.path().join("notes.md"), "hello\n").unwrap();
+        response_tx.send(Response::Status(Status::default(), None)).unwrap();
+        workspace.absorb();
+        assert_eq!(files_asked(), 1, "a new file outside a repository must still be looked for");
+    }
+
+    /// The reported bug end to end on the panel side: ANVIL and the git panel
+    /// are opened in an empty folder, files appear there afterwards, and the
+    /// Files tab lists them. The status never changes here, so a panel that
+    /// only re-reads on an inventory change freezes on the first empty answer.
+    ///
+    /// The answers are fed in rather than produced by the worker, because the
+    /// worker half of this (which folder it lists) is `git::ls_folder`, tested
+    /// there. Going through a real worker here would also make this test depend
+    /// on the shared configuration preflight, which refuses under a parallel run.
+    #[test]
+    fn the_files_tab_lists_a_folder_that_got_files_after_it_was_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let (request_tx, _request_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+        let mut workspace =
+            Workspace { tab: PanelTab::Files, tx: Some(request_tx), rx: Some(response_rx), ..Default::default() };
+
+        // The panel opens on the still-empty folder.
+        response_tx.send(Response::Status(Status::default(), None)).unwrap();
+        workspace.absorb();
+        assert_eq!(workspace.files, Vec::<String>::new(), "nothing is listed yet");
+
+        // Files show up while the panel is open, as they do when an editor or a
+        // shell creates them.
+        std::fs::write(dir.path().join("notes.md"), "hello\n").unwrap();
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs/guide.md"), "guide\n").unwrap();
+        let on_disk = git::ls_folder(dir.path()).unwrap();
+
+        // The next poll is indistinguishable from the first one, and the list
+        // still has to be read again.
+        response_tx.send(Response::Status(Status::default(), None)).unwrap();
+        workspace.absorb();
+        response_tx.send(Response::Files(on_disk)).unwrap();
+        workspace.absorb();
+        assert_eq!(workspace.files, vec!["docs/guide.md".to_owned(), "notes.md".to_owned()]);
+        workspace.update_file_rows();
+        assert_eq!(
+            workspace.file_rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
+            vec!["docs", "notes.md"],
+            "the tree folds the folder and shows the file beside it"
+        );
+    }
+
+    /// The operations that act on the listed rows resolve their paths against
+    /// the folder the browser showed. Without a repository they used to answer
+    /// "не репозиторий" for every one of them, which would leave a browser that
+    /// lists files it cannot create, rename, delete or preview.
+    ///
+    /// These run against a real folder and no worker: the worker half of this
+    /// is only the choice of root, and driving it would tie this test to the
+    /// shared configuration preflight, which refuses under a parallel run.
+    #[test]
+    fn file_operations_work_against_a_folder_without_a_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+
+        write_path(&root, "docs/note.md", false).unwrap();
+        assert!(root.join("docs").join("note.md").exists(), "a file is created, subfolder and all");
+
+        let (text, truncated) = git::read_file(&root, "docs/note.md", MAX_PREVIEW_BYTES).unwrap();
+        assert!(!truncated && text.is_empty(), "a listed file can be previewed");
+
+        rename_path(&root, "docs/note.md", "docs/renamed.md").unwrap();
+        assert!(root.join("docs").join("renamed.md").exists());
+
+        delete_path(&root, "docs/renamed.md").unwrap();
+        assert!(!root.join("docs").join("renamed.md").exists());
+
+        // The same containment that protects a repository protects this folder:
+        // nothing above it is reachable through a listed row.
+        assert!(git::resolve_path(&root, "../outside.txt").is_err());
+        assert!(git::resolve_path(&root, "docs/../../outside.txt").is_err());
     }
 }
 

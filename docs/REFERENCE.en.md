@@ -137,6 +137,14 @@ Its state is retained and it reappears when the pane is widened.
 - The Files tab has a collapsible tree and fuzzy filter, text/Markdown previews,
   project line counting, create/rename and confirmed Recycle Bin deletion.
   Markdown renders headings, lists, quotes, code, tables and inline formatting.
+- In a folder that is not a Git repository the tree shows the pane's own folder,
+  and creating files and folders, renaming, deleting, previewing and line
+  counting all work against it. The list is re-read on every poll instead of
+  freezing on the first empty answer, because there is no status to notice a
+  change with. The walk is bounded to 32 levels and 100,000 entries, never lists
+  `.git`, and lists a symlink or junction without descending into it. Ignore
+  rules are not applied here: without an index there is no `git check-ignore`
+  to ask.
 - Preview reads are capped at 8 MiB. Binary or invalid UTF-8 content is refused;
   a truncated multibyte character is omitted rather than replaced with garbage.
   Truncation is visible. Rows are virtualised and wrapping/Markdown is cached,
