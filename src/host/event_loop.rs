@@ -194,10 +194,6 @@ impl Host {
                     w.set_fullscreen(if w.fullscreen().is_some() { None } else { Some(Fullscreen::Borderless(None)) })
                 }
                 WindowCommand::Close => {
-                    if !self.app.request_window_close() {
-                        w.request_redraw();
-                        continue;
-                    }
                     self.app.on_exit(Some(w));
                     event_loop.exit();
                     return;

@@ -74,6 +74,46 @@ fn wait_exit(pane: &Pane) -> Option<i32> {
     code.flatten()
 }
 
+/// `cx` is a shell alias, not the process name. Use a harmless native fixture
+/// so this tests real Git Bash/ConPTY discovery without a Codex login or task.
+#[test]
+fn codex_launched_through_a_bash_alias_is_detected_by_its_real_process() {
+    let bash = anvil::profiles::detect_builtin()
+        .into_iter()
+        .find(|profile| profile.kind == anvil::profiles::ProfileKind::GitBash)
+        .expect("Git Bash is required for the alias fixture");
+    let dir = tempfile::tempdir().unwrap();
+    let executable = dir.path().join("codex.exe");
+    std::fs::copy(env!("CARGO_BIN_EXE_anvil-probe"), &executable).unwrap();
+    let quote = |text: &str| anvil::term::paste::quote_path(text, anvil::term::paste::PathQuoting::Unix);
+    let output = dir.path().join("stdin.bin");
+    let command = format!(
+        "{}stdin {}--fixture-flag",
+        quote(&executable.to_string_lossy().replace('\\', "/")),
+        quote(&output.to_string_lossy().replace('\\', "/")),
+    );
+    let script = format!("shopt -s expand_aliases\nalias cx={}\ncx\n:", quote(&command));
+    let pane = spawn(&bash.command, &["-c", &script]);
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            anvil::procs::snapshot()
+                .is_some_and(|processes| anvil::procs::detected_cli_names(&processes, pane.shell_pid).contains("codex"))
+        }),
+        "the native agent under cx must be visible to session restoration"
+    );
+    assert!(wait_until(Duration::from_secs(10), || screen_text(&pane).contains("READY")));
+    // End the fixture cooperatively: an idle native sleeper need not react
+    // immediately to the console closing while Bash is being torn down.
+    pane.write(b"q".to_vec());
+    assert_eq!(wait_exit(&pane), Some(0));
+    assert_eq!(std::fs::read(&output).unwrap(), b"q");
+    drop(pane);
+    // Pane teardown is asynchronous; wait for ConPTY to release the copied
+    // executable rather than letting TempDir silently leave a locked file.
+    assert!(wait_until(Duration::from_secs(10), || std::fs::remove_file(&executable).is_ok()));
+    dir.close().unwrap();
+}
+
 fn out_file(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("anvil-conpty-tests-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

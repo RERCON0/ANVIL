@@ -267,6 +267,29 @@ pub fn wsl_profile(distro: &str) -> Profile {
     }
 }
 
+/// Shell profiles can be reopened after a restored agent exits. A custom
+/// agent profile must not be relaunched as its own fallback. Custom shells
+/// with startup commands also use a built-in fallback: `bash -c opencode`
+/// and `cmd /k codex` are agent launchers, not interactive-shell profiles.
+pub(crate) fn is_shell(profile: &Profile) -> bool {
+    match profile.kind {
+        ProfileKind::GitBash | ProfileKind::PowerShell | ProfileKind::Cmd => true,
+        ProfileKind::Wsl => false,
+        ProfileKind::Custom => {
+            Path::new(&profile.command).file_stem().and_then(|stem| stem.to_str()).is_some_and(|stem| {
+                let flags: &[&str] = match stem.to_ascii_lowercase().as_str() {
+                    "bash" | "zsh" | "fish" => &["-i", "-l", "-il", "-li", "--login", "--noprofile", "--norc"],
+                    "pwsh" | "powershell" => &["-nologo", "-noprofile", "-noexit", "-interactive", "-login"],
+                    "cmd" => &["/d", "/q", "/k"],
+                    "nu" => &["-l", "--login", "--no-config-file"],
+                    _ => return false,
+                };
+                profile.args.iter().all(|arg| flags.iter().any(|flag| arg.eq_ignore_ascii_case(flag)))
+            })
+        }
+    }
+}
+
 /// How a path dropped on a pane of `profile` is quoted. A custom profile is
 /// judged by its program (`pwsh`, `powershell`, `cmd`); anything else gets
 /// POSIX quoting, as in Helm.
@@ -292,6 +315,44 @@ pub fn path_quoting(profile: &Profile) -> PathQuoting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_custom_agent_is_not_a_shell_to_restart_after_it_exits() {
+        let custom = |command: &str| Profile {
+            id: "fixture".into(),
+            name: "fixture".into(),
+            command: command.into(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+            kind: ProfileKind::Custom,
+        };
+        for command in ["cmd.exe", r"C:\Program Files\PowerShell\7\pwsh.exe", "bash.exe"] {
+            assert!(is_shell(&custom(command)), "{command}");
+        }
+        for command in ["opencode.exe", "codex.exe", "node.exe", "unknown-wrapper.cmd"] {
+            assert!(!is_shell(&custom(command)), "{command}");
+        }
+        let wsl = Profile { kind: ProfileKind::Wsl, ..custom("wsl.exe") };
+        assert!(!is_shell(&wsl));
+        for (command, args) in [
+            ("bash.exe", vec!["--login", "-i"]),
+            ("pwsh.exe", vec!["-NoLogo", "-NoProfile"]),
+            ("cmd.exe", vec!["/d", "/k"]),
+        ] {
+            let shell = Profile { args: args.into_iter().map(str::to_owned).collect(), ..custom(command) };
+            assert!(is_shell(&shell), "{shell:?}");
+        }
+        for (command, args) in [
+            ("bash.exe", vec!["-lc", "opencode"]),
+            ("pwsh.exe", vec!["-NoExit", "-Command", "codex"]),
+            ("pwsh.exe", vec!["-File", "start-agent.ps1"]),
+            ("cmd.exe", vec!["/d", "/k", "codex"]),
+        ] {
+            let launcher = Profile { args: args.into_iter().map(str::to_owned).collect(), ..custom(command) };
+            assert!(!is_shell(&launcher), "{launcher:?}");
+        }
+    }
 
     #[test]
     fn dropped_paths_follow_the_profile_shell() {

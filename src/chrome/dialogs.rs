@@ -6,7 +6,6 @@ use std::path::PathBuf;
 pub enum DialogState {
     ClaudeInstall { path: PathBuf, expected: Option<String>, ours: String, current: String, keep_previous: bool },
     Paste { pane_id: u64, text: String },
-    CloseSessions { panes: Vec<u64>, whole_window: bool, running: usize },
 }
 
 pub enum DialogOutcome {
@@ -16,13 +15,8 @@ pub enum DialogOutcome {
 }
 
 pub fn show(ctx: &egui::Context, dialog: &DialogState) -> DialogOutcome {
-    let enter_cancels =
-        matches!(dialog, DialogState::CloseSessions { .. }) && ctx.input(|i| i.key_pressed(egui::Key::Enter));
-    let mut outcome = if enter_cancels || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        DialogOutcome::Cancel
-    } else {
-        DialogOutcome::None
-    };
+    let mut outcome =
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) { DialogOutcome::Cancel } else { DialogOutcome::None };
     egui::Window::new(crate::strings::APP_TITLE)
         .id(egui::Id::new("anvil-consent-dialog"))
         .collapsible(false)
@@ -55,17 +49,6 @@ pub fn show(ctx: &egui::Context, dialog: &DialogState) -> DialogOutcome {
                     });
                     strings::PASTE_ACCEPT()
                 }
-                DialogState::CloseSessions { running, .. } => {
-                    ui.label(match strings::language() {
-                        strings::Language::English => format!("Close {running} running terminal session(s)?"),
-                        strings::Language::Russian => format!("Закрыть работающие сессии терминала: {running}?"),
-                    });
-                    ui.label(strings::pick(
-                        "Agents and shells in these panes will stop. Restoring a closed tab brings back its layout, not the running processes or unsaved work. Enter and Escape cancel.",
-                        "Агенты и оболочки в этих панелях завершатся. Возврат вкладки восстановит раскладку, но не процессы и несохранённую работу. Enter и Escape отменяют закрытие.",
-                    ));
-                    strings::pick("Stop sessions and close", "Завершить сессии и закрыть")
-                }
             };
             ui.add_space(12.0);
             ui.horizontal(|ui| {
@@ -76,7 +59,7 @@ pub fn show(ctx: &egui::Context, dialog: &DialogState) -> DialogOutcome {
                 if !ctx.memory(|m| m.focused().is_some()) {
                     cancel.request_focus();
                 }
-                if ui.add(crate::theme::accent_button(accept)).clicked() && !enter_cancels {
+                if ui.add(crate::theme::accent_button(accept)).clicked() {
                     outcome = DialogOutcome::Accept;
                 }
             });

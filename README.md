@@ -78,6 +78,8 @@ reproduction script](docs/PERFORMANCE.md).
 > [!IMPORTANT]
 > Layouts are restored; processes start again. Enable **Settings → Terminal → Restore CLI agents and continue the last conversation** to reopen Codex, Claude Code, OpenCode and OMP with their native resume command in the saved folder. This is off by default. Running tasks and terminal scrollback are not restored. The CLI chooses its most recent conversation in that folder; multiple panes of the same agent in one folder can choose the same conversation.
 
+Shell aliases are detected through the actual agent process; their flags are not replayed. Exiting a restored agent opens a shell in the same pane. Panes, tabs and the window close without an extra confirmation.
+
 AI commit messages support Codex, Claude, OpenCode, Gemini and Aider. External
 backends require their CLI installations. The generated message remains editable.
 

@@ -214,7 +214,6 @@ impl ReloadLog {
     }
 }
 
-mod close;
 #[cfg(debug_assertions)]
 mod readme;
 #[cfg(debug_assertions)]
@@ -225,7 +224,6 @@ pub struct AnvilApp {
     readme_root: Option<PathBuf>,
     #[cfg(debug_assertions)]
     readme_keys: HashMap<(PaneId, u8), Instant>,
-    approved_close_window: bool,
     config: Config,
     config_path: PathBuf,
     config_mtime: Option<SystemTime>,
@@ -337,7 +335,6 @@ impl AnvilApp {
             readme_root: None,
             #[cfg(debug_assertions)]
             readme_keys: HashMap::new(),
-            approved_close_window: false,
             config,
             config_path,
             config_mtime,
@@ -578,9 +575,6 @@ impl AnvilApp {
         self.show_picker(&ctx);
         self.show_collapsed_list(&ctx);
         self.show_dialog(&ctx);
-        if self.approved_close_window {
-            commands.push(WindowCommand::Close);
-        }
         self.flush_config_if_due(&ctx);
         if let Some(at) = self.session_dirty {
             if at.elapsed() >= Duration::from_secs(1) {
@@ -648,6 +642,7 @@ impl AnvilApp {
     fn poll_panes(&mut self, ctx: &egui::Context) {
         let active = self.active;
         let mut close: Vec<PaneId> = Vec::new();
+        let mut shells = Vec::new();
         let mut bells = 0usize;
         for (index, tab) in self.tabs.iter_mut().enumerate() {
             for (id, entry) in tab.panes.iter_mut() {
@@ -667,16 +662,20 @@ impl AnvilApp {
                             // steady cursor does not start blinking forever.
                             entry.view.app_blink = pane.term.lock().cursor_style().blinking;
                         }
-                        PaneEvent::Exited(code) => match code {
-                            Some(0) => close.push(*id),
-                            other => {
-                                let message = format!("\r\n\x1b[90m{}\x1b[0m\r\n", strings::process_exited(other));
+                        PaneEvent::Exited(code) => {
+                            entry.exited = true;
+                            if let Some(shell) = entry.restore_shell.take() {
+                                let cwd = pane.current_dir().or_else(|| entry.start_cwd.clone());
+                                shells.push((*id, shell, cwd, code));
+                            } else if code == Some(0) {
+                                close.push(*id);
+                            } else {
+                                let message = format!("\r\n\x1b[90m{}\x1b[0m\r\n", strings::process_exited(code));
                                 let mut term = pane.term.lock();
                                 let mut processor: Processor<StdSyncHandler> = Processor::new();
                                 processor.advance(&mut *term, message.as_bytes());
-                                entry.exited = true;
                             }
-                        },
+                        }
                     }
                 }
                 // Drain on its own line, for every pane including the active
@@ -693,10 +692,39 @@ impl AnvilApp {
         if bells > 0 && self.config.terminal.bell == Bell::Visual {
             self.toast(strings::BELL().to_owned());
         }
+        for (id, shell, cwd, code) in shells {
+            self.return_to_shell(id, &shell, cwd, code);
+        }
         // By id: closing one tab shifts the indices of the tabs after it.
         for id in close {
             self.close_pane_anywhere(id);
         }
+    }
+
+    /// Exiting a restored agent is not a request to close its pane. Reuse the
+    /// pane ID/layout/workspace, with the original shell and no resume marker.
+    fn return_to_shell(&mut self, id: PaneId, shell: &Profile, cwd: Option<PathBuf>, code: Option<i32>) {
+        let Some(index) = self.tabs.iter().position(|tab| tab.panes.contains_key(&id)) else { return };
+        // The pane ID is retained, but consent to paste into the old process
+        // must not become permission to execute that text in the new shell.
+        if matches!(self.ui.dialog, Some(DialogState::Paste { pane_id, .. }) if pane_id == id) {
+            self.ui.dialog = None;
+        }
+        let mut replacement = self.spawn_entry(id, shell, cwd);
+        if code != Some(0) {
+            if let Some(pane) = replacement.live() {
+                let message = format!("\r\n\x1b[90m{}\x1b[0m\r\n", strings::process_exited(code));
+                let mut processor: Processor<StdSyncHandler> = Processor::new();
+                processor.advance(&mut *pane.term.lock(), message.as_bytes());
+            }
+        }
+        let entry = self.tabs[index].panes.get_mut(&id).expect("pane still exists");
+        replacement.view.font_size = entry.view.font_size;
+        replacement.workspace = std::mem::take(&mut entry.workspace);
+        *entry = replacement;
+        self.running_agents.remove(&id);
+        self.ai_commands.remove(&id);
+        self.mark_session_dirty();
     }
 
     fn show_active_tab(&mut self, ui: &mut egui::Ui, rect: Rect, ctx: &egui::Context, window_edge: bool) {
@@ -1286,6 +1314,12 @@ impl AnvilApp {
         if let Some(window) = window {
             self.window_geometry(window.inner_size(), window.outer_position().ok(), window.is_maximized());
         }
+        if self.config.restore_session && self.config.restore_agents {
+            // A CLI started (including through an alias) since the three-second
+            // background poll must still be saved. Enumerate before ConPTYs
+            // are dropped, not from the stale cached snapshot or terminal text.
+            self.refresh_agents_for_exit(crate::procs::snapshot());
+        }
         self.save_session();
         for tab in &mut self.tabs {
             tab.panes.clear();
@@ -1403,16 +1437,9 @@ impl AnvilApp {
     }
 
     fn close_pane_in(&mut self, index: usize, id: PaneId) {
-        if self.confirm_sessions(vec![id], false) {
-            return;
-        }
-        self.close_pane_in_unchecked(index, id);
-    }
-
-    fn close_pane_in_unchecked(&mut self, index: usize, id: PaneId) {
         let Some(tab) = self.tabs.get_mut(index) else { return };
         if tab.remove_pane(id) {
-            self.close_tab_unchecked(index);
+            self.close_tab(index);
             return;
         }
         self.mark_session_dirty();
@@ -1629,6 +1656,7 @@ impl AnvilApp {
         let start_cwd = options.cwd.clone();
         let base = PaneEntry {
             content: PaneContent::Error(String::new()),
+            restore_shell: None,
             view,
             workspace: crate::workspace::Workspace::default(),
             start_cwd,
@@ -1667,14 +1695,6 @@ impl AnvilApp {
     }
 
     fn close_tab(&mut self, index: usize) {
-        let Some(tab) = self.tabs.get(index) else { return };
-        if self.confirm_sessions(tab.panes.keys().copied().collect(), false) {
-            return;
-        }
-        self.close_tab_unchecked(index);
-    }
-
-    fn close_tab_unchecked(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
         }
@@ -1700,23 +1720,6 @@ impl AnvilApp {
     }
 
     fn close_other_tabs(&mut self, index: usize) {
-        if index >= self.tabs.len() {
-            return;
-        }
-        let panes = self
-            .tabs
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != index)
-            .flat_map(|(_, tab)| tab.panes.keys().copied())
-            .collect();
-        if self.confirm_sessions(panes, false) {
-            return;
-        }
-        self.close_other_tabs_unchecked(index);
-    }
-
-    fn close_other_tabs_unchecked(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
         }
@@ -1867,6 +1870,7 @@ impl AnvilApp {
     fn restore_entry(&mut self, id: PaneId, profile: &Profile, state: &PaneState) -> PaneEntry {
         let mut selected = profile.clone();
         let mut error = None;
+        let mut restored_agent = false;
         if self.config.restore_agents {
             if let Some(agent) = state.agent.as_deref().filter(|name| crate::agents::continue_args(name).is_some()) {
                 if session::usable_cwd(state.cwd.as_deref()).is_none() {
@@ -1882,6 +1886,7 @@ impl AnvilApp {
                         Ok(Some(resumed)) => {
                             selected = resumed;
                             self.running_agents.insert(id, agent.to_owned());
+                            restored_agent = true;
                         }
                         Ok(None) => {}
                         Err(message) => error = Some(message),
@@ -1894,6 +1899,7 @@ impl AnvilApp {
             // just to replace it with an error a moment later.
             PaneEntry {
                 content: PaneContent::Error(message),
+                restore_shell: None,
                 view: TerminalView::new(self.config.font.size),
                 workspace: crate::workspace::Workspace::default(),
                 start_cwd: state.cwd.clone(),
@@ -1907,7 +1913,21 @@ impl AnvilApp {
                 has_claude: false,
             }
         } else {
-            self.spawn_entry(id, &selected, state.cwd.clone())
+            let mut entry = self.spawn_entry(id, &selected, state.cwd.clone());
+            if restored_agent && entry.live().is_some() {
+                // A direct-agent custom profile cannot be its own shell.
+                entry.restore_shell = if profiles::is_shell(profile) {
+                    Some(profile.clone())
+                } else {
+                    let default = self.default_profile();
+                    if profiles::is_shell(&default) {
+                        Some(default)
+                    } else {
+                        self.builtin_profiles.iter().find(|profile| profiles::is_shell(profile)).cloned()
+                    }
+                };
+            }
+            entry
         }
     }
 
@@ -2115,6 +2135,51 @@ impl AnvilApp {
             }
             _ => false,
         }
+    }
+
+    fn refresh_agents_for_exit(&mut self, found: Option<Vec<crate::procs::ProcInfo>>) {
+        if let Some(found) = found {
+            self.proc_snapshot = found;
+            self.update_process_agents(true);
+        }
+        // Enumeration failure is not evidence that all agents have exited.
+    }
+
+    /// One detection path for background polling and the final session save.
+    /// Only a successfully adopted snapshot can remove previously seen agents.
+    fn update_process_agents(&mut self, fresh: bool) -> bool {
+        let previous_agents = fresh.then(|| std::mem::take(&mut self.running_agents));
+        let previous_commands = fresh.then(|| std::mem::take(&mut self.ai_commands));
+        let processes = crate::procs::ProcessIndex::new(&self.proc_snapshot);
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            for (id, entry) in &mut tab.panes {
+                let Some(pane) = entry.live().filter(|_| !entry.exited) else {
+                    changed |= entry.has_claude;
+                    entry.has_claude = false;
+                    continue;
+                };
+                let names = processes.cli_names(pane.shell_pid);
+                let has_claude = names.contains("claude");
+                if let Some(command) =
+                    ["claude", "opencode", "codex", "gemini", "aider"].into_iter().find(|name| names.contains(*name))
+                {
+                    self.ai_commands.insert(*id, command.to_owned());
+                }
+                if let Some(agent) =
+                    processes.primary_cli(pane.shell_pid).filter(|name| crate::agents::continue_args(name).is_some())
+                {
+                    self.running_agents.insert(*id, agent.to_owned());
+                }
+                changed |= entry.has_claude != has_claude;
+                entry.has_claude = has_claude;
+            }
+        }
+        if previous_agents.as_ref().is_some_and(|previous| *previous != self.running_agents) {
+            self.mark_session_dirty();
+            changed = true;
+        }
+        changed | previous_commands.as_ref().is_some_and(|previous| *previous != self.ai_commands)
     }
 
     fn build_profiles(&self) -> Vec<Profile> {
@@ -2338,35 +2403,7 @@ impl AnvilApp {
                     });
                 }
             }
-            let previous_agents = adopted.then(|| std::mem::take(&mut self.running_agents));
-            let previous_commands = adopted.then(|| std::mem::take(&mut self.ai_commands));
-            let processes = crate::procs::ProcessIndex::new(&self.proc_snapshot);
-            for tab in &mut self.tabs {
-                for (id, entry) in &mut tab.panes {
-                    let Some(pane) = entry.live() else { continue };
-                    let names = processes.cli_names(pane.shell_pid);
-                    let has_claude = names.contains("claude");
-                    if let Some(command) = ["claude", "opencode", "codex", "gemini", "aider"]
-                        .into_iter()
-                        .find(|name| names.contains(*name))
-                    {
-                        self.ai_commands.insert(*id, command.to_owned());
-                    }
-                    if let Some(agent) = processes
-                        .primary_cli(pane.shell_pid)
-                        .filter(|name| crate::agents::continue_args(name).is_some())
-                    {
-                        self.running_agents.insert(*id, agent.to_owned());
-                    }
-                    changed |= entry.has_claude != has_claude;
-                    entry.has_claude = has_claude;
-                }
-            }
-            if previous_agents.as_ref().is_some_and(|previous| *previous != self.running_agents) {
-                self.mark_session_dirty();
-                changed = true;
-            }
-            changed |= previous_commands.as_ref().is_some_and(|previous| *previous != self.ai_commands);
+            changed |= self.update_process_agents(adopted);
         }
         let status_dir = &self.status_dir;
         for tab in &mut self.tabs {
@@ -2544,7 +2581,6 @@ impl AnvilApp {
                 }
             }
             dialogs::DialogOutcome::Accept => match dialog {
-                DialogState::CloseSessions { panes, whole_window, .. } => self.finish_close(panes, whole_window),
                 DialogState::Paste { pane_id, text } => self.paste_text(pane_id, text, true),
                 DialogState::ClaudeInstall { path, expected, ours, keep_previous, .. } => {
                     if self.config.claude_status.enabled {
@@ -3279,24 +3315,213 @@ mod tests {
     }
 
     #[test]
-    fn closing_a_live_session_requires_consent_and_cancel_preserves_its_process() {
+    fn closing_live_panes_tabs_and_other_tabs_never_opens_a_dialog() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = bare_app(dir.path());
         app.repaint = Some(Arc::new(|| {}));
         let profile = app.default_profile();
-        let id = app.alloc_pane_id();
-        let entry = app.spawn_entry(id, &profile, Some(dir.path().into()));
-        let pid = entry.live().expect("live fixture").shell_pid;
-        app.tabs.push(Tab::new(SplitTree::new(id), HashMap::from([(id, entry)]), id));
-        assert!(!app.request_window_close());
-        assert!(matches!(app.ui.dialog, Some(DialogState::CloseSessions { whole_window: true, running: 1, .. })));
-        assert_eq!(app.tabs[0].panes[&id].live().unwrap().shell_pid, pid);
-        app.ui.dialog = None; // Cancel never changes ownership.
-        assert_eq!(app.tabs[0].panes[&id].live().unwrap().shell_pid, pid);
-        assert!(app.confirm_sessions(vec![id], false));
-        app.ui.dialog = None;
-        app.finish_close(vec![id], false);
-        assert!(app.tabs.iter().all(|tab| !tab.panes.contains_key(&id)));
+        for _ in 0..3 {
+            let tab = app.new_tab(&profile, Some(dir.path().into()));
+            assert!(tab.focused_entry().unwrap().live().is_some());
+            app.tabs.push(tab);
+        }
+        let first = app.tabs[0].focused;
+        app.close_pane_in(0, first);
+        assert!(!app.tabs.iter().any(|tab| tab.panes.contains_key(&first)));
+        assert!(app.ui.dialog.is_none());
+        let second = app.tabs[0].focused;
+        app.close_tab(0);
+        assert!(!app.tabs.iter().any(|tab| tab.panes.contains_key(&second)));
+        assert!(app.ui.dialog.is_none());
+        let keep = app.tabs[0].focused;
+        let other = app.new_tab(&profile, Some(dir.path().into()));
+        app.tabs.push(other);
+        app.close_other_tabs(0);
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].focused, keep);
+        assert!(app.ui.dialog.is_none());
+        assert_eq!(app.closed_tabs.len(), 3);
+    }
+
+    #[test]
+    fn the_final_snapshot_saves_an_alias_launched_agent_without_replaying_its_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bare_app(dir.path());
+        app.repaint = Some(Arc::new(|| {}));
+        let profile = app.default_profile();
+        let tab = app.new_tab(&profile, Some(dir.path().into()));
+        let id = tab.focused;
+        let root = tab.panes[&id].live().unwrap().shell_pid;
+        app.tabs.push(tab);
+        let saved_agent = |app: &AnvilApp| {
+            let session::SavedNode::Pane(pane) = app.tab_state(&app.tabs[0]).layout else { panic!("one pane") };
+            pane.agent
+        };
+        assert_eq!(saved_agent(&app), None, "the previous poll missed the newly launched agent");
+        let proc = |pid, ppid, name: &str| crate::procs::ProcInfo { pid, ppid, name: name.into(), command_line: None };
+        let wrapper = root.wrapping_add(1);
+        let agent = root.wrapping_add(2);
+        // An alias itself is not a process. Only its real descendants matter.
+        app.refresh_agents_for_exit(Some(vec![
+            proc(root, 0, "bash.exe"),
+            proc(wrapper, root, "cmd.exe"),
+            crate::procs::ProcInfo {
+                command_line: Some("codex.exe --dangerously-bypass-approvals-and-sandbox secret-prompt".into()),
+                ..proc(agent, wrapper, "codex.exe")
+            },
+        ]));
+        assert_eq!(saved_agent(&app).as_deref(), Some("codex"));
+        let text = serde_json::to_string(&app.tab_state(&app.tabs[0])).unwrap();
+        assert!(!text.contains("secret-prompt") && !text.contains("--dangerously"));
+        assert_eq!(crate::agents::continue_args("codex"), Some(["resume", "--last"].as_slice()));
+        app.refresh_agents_for_exit(Some(vec![
+            proc(root, 0, "bash.exe"),
+            crate::procs::ProcInfo {
+                command_line: Some(
+                    r#"node.exe "C:\fixture\node_modules\@openai\codex\bin\codex.js" --fixture-flag"#.into(),
+                ),
+                ..proc(agent, root, "node.exe")
+            },
+        ]));
+        assert_eq!(saved_agent(&app).as_deref(), Some("codex"), "an npm alias has the same canonical identity");
+        app.refresh_agents_for_exit(None);
+        assert_eq!(saved_agent(&app).as_deref(), Some("codex"), "a failed enumeration must preserve the detection");
+        app.refresh_agents_for_exit(Some(vec![proc(root, 0, "bash.exe")]));
+        assert_eq!(saved_agent(&app), None, "an agent that exited before closing must not be restored");
+    }
+
+    #[test]
+    fn exiting_a_restored_agent_starts_a_shell_in_the_same_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        for code in [0, 130] {
+            let mut app = bare_app(dir.path());
+            app.repaint = Some(Arc::new(|| {}));
+            let shell = Profile {
+                id: "fixture-cmd".into(),
+                name: "cmd fixture".into(),
+                command: "cmd.exe".into(),
+                args: vec!["/d".into(), "/k".into()],
+                cwd: None,
+                env: Default::default(),
+                kind: profiles::ProfileKind::Cmd,
+            };
+            let exiting = Profile { args: vec!["/d".into(), "/c".into(), format!("exit {code}")], ..shell.clone() };
+            let id = app.alloc_pane_id();
+            let mut entry = app.spawn_entry(id, &exiting, Some(dir.path().into()));
+            let old_pid = entry.live().unwrap().shell_pid;
+            entry.restore_shell = Some(shell.clone());
+            entry.view.font_size = 22.0;
+            entry.workspace.open = true;
+            entry.workspace.tab = crate::workspace::PanelTab::Files;
+            let mut tab = Tab::new(SplitTree::new(id), HashMap::from([(id, entry)]), id);
+            tab.maximized = Some(id);
+            app.tabs.push(tab);
+            app.running_agents.insert(id, "opencode".into());
+            app.ai_commands.insert(id, "opencode".into());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                app.poll_panes(&ctx);
+                if app.tabs[0].panes.get(&id).and_then(PaneEntry::live).is_some_and(|pane| pane.shell_pid != old_pid) {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "the agent never returned to a shell (exit {code})");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(app.tabs.len(), 1);
+            assert_eq!(app.tabs[0].maximized, Some(id));
+            assert_eq!(app.tabs[0].focused, id);
+            let entry = &app.tabs[0].panes[&id];
+            assert!(!entry.exited && entry.restore_shell.is_none());
+            assert_eq!(entry.profile_id, shell.id);
+            assert_eq!(entry.view.font_size, 22.0, "returning to a shell must retain the pane's zoom");
+            assert_eq!(entry.start_cwd.as_deref(), Some(dir.path()));
+            assert!(entry.workspace.open);
+            assert_eq!(entry.workspace.tab, crate::workspace::PanelTab::Files);
+            assert!(app.closed_tabs.is_empty() && app.ui.dialog.is_none());
+            assert!(!app.running_agents.contains_key(&id) && !app.ai_commands.contains_key(&id));
+        }
+    }
+
+    #[test]
+    fn returning_to_shell_cancels_only_a_paste_for_the_replaced_process() {
+        let dir = tempfile::tempdir().unwrap();
+        for dialog_kind in 0..3 {
+            let mut app = bare_app(dir.path());
+            app.repaint = Some(Arc::new(|| {}));
+            let profile = app.default_profile();
+            let tab = app.new_tab(&profile, Some(dir.path().into()));
+            let id = tab.focused;
+            app.tabs.push(tab);
+            app.ui.dialog = Some(match dialog_kind {
+                0 | 1 => DialogState::Paste { pane_id: id + dialog_kind, text: "first command\nsecond command".into() },
+                _ => DialogState::ClaudeInstall {
+                    path: dir.path().join("settings.json"),
+                    expected: None,
+                    ours: "fixture".into(),
+                    current: String::new(),
+                    keep_previous: false,
+                },
+            });
+            app.return_to_shell(id, &profile, Some(dir.path().into()), Some(0));
+            match dialog_kind {
+                0 => assert!(app.ui.dialog.is_none(), "a pending paste must not execute in the replacement shell"),
+                1 => assert!(matches!(app.ui.dialog, Some(DialogState::Paste { pane_id, .. }) if pane_id == id + 1)),
+                _ => assert!(matches!(app.ui.dialog, Some(DialogState::ClaudeInstall { .. }))),
+            }
+        }
+    }
+
+    #[test]
+    fn an_exited_pane_does_not_keep_its_claude_badge_from_a_stale_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bare_app(dir.path());
+        app.repaint = Some(Arc::new(|| {}));
+        let profile = app.default_profile();
+        let mut tab = app.new_tab(&profile, Some(dir.path().into()));
+        let id = tab.focused;
+        let entry = tab.panes.get_mut(&id).unwrap();
+        let pid = entry.live().unwrap().shell_pid;
+        entry.has_claude = true;
+        entry.exited = true;
+        app.tabs.push(tab);
+        app.running_agents.insert(id, "claude".into());
+        app.ai_commands.insert(id, "claude".into());
+        // An enumeration started before the exit can still include its PID.
+        app.proc_snapshot =
+            vec![crate::procs::ProcInfo { pid, ppid: 0, name: "claude.exe".into(), command_line: None }];
+        assert!(app.update_process_agents(true));
+        assert!(!app.tabs[0].panes[&id].has_claude, "a known exit is stronger evidence than an older process list");
+        assert!(!app.running_agents.contains_key(&id) && !app.ai_commands.contains_key(&id));
+    }
+
+    #[test]
+    fn an_ordinary_shell_exit_closes_only_its_pane_without_a_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bare_app(dir.path());
+        app.repaint = Some(Arc::new(|| {}));
+        let shell = app.default_profile();
+        let keep = app.new_tab(&shell, Some(dir.path().into()));
+        let keep_id = keep.focused;
+        let exiting = Profile {
+            command: "cmd.exe".into(),
+            args: vec!["/d".into(), "/c".into(), "exit 0".into()],
+            kind: profiles::ProfileKind::Cmd,
+            ..shell
+        };
+        let closing = app.new_tab(&exiting, Some(dir.path().into()));
+        let closing_id = closing.focused;
+        app.tabs.extend([keep, closing]);
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.tabs.iter().any(|tab| tab.panes.contains_key(&closing_id)) {
+            app.poll_panes(&ctx);
+            assert!(Instant::now() < deadline, "a finished shell must close without waiting for confirmation");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs[0].focused, keep_id);
+        assert!(app.ui.dialog.is_none());
         assert_eq!(app.closed_tabs.len(), 1);
     }
 
@@ -3343,6 +3568,7 @@ mod tests {
         let restored = app.restore_tab(&state).unwrap();
         assert_eq!(restored.maximized, Some(restored.focused));
         assert!(!app.running_agents.contains_key(&restored.focused), "disabled by default");
+        assert!(restored.panes[&restored.focused].restore_shell.is_none());
         app.config.restore_agents = true;
         let mut invalid = pane.clone();
         invalid.cwd = Some(dir.path().join("missing"));

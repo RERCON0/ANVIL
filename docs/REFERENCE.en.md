@@ -25,9 +25,9 @@ applications control their own language.
 - The tab list scrolls separately from its new-tab/profile buttons and Settings.
 - A new window (`Ctrl+Shift+N`) is a separate process with a fresh tab. It does
   not clone live sessions or overwrite the main window's saved layout.
-- Closing live panes, tabs or the window requires explicit confirmation.
-  Enter and Escape cancel the dialog. Restoring a closed layout starts new
-  processes; it cannot resurrect work that was executing in a terminated agent.
+- Panes, tabs and the window close immediately, without an extra confirmation.
+  Their processes stop. Restoring a closed layout starts new processes; it
+  cannot resurrect work that was executing in a terminated agent.
 
 ## Restoring CLI agents
 
@@ -46,12 +46,22 @@ and folder; it does not replay a prompt, arbitrary command line or permission
 bypass flag. Unknown names are ignored. A missing CLI or unavailable folder
 shows an error rather than resuming from another directory.
 
+Shell aliases such as `cx` are detected through the actual agent process, not
+the typed command. The process list is refreshed before saving on window exit,
+to avoid missing an agent launched since the last background poll. A failed
+enumeration keeps the last known detection. Alias arguments and
+permission-bypass flags are not replayed.
+
 The CLI chooses its most recent conversation for that folder. Two panes using
 the same agent in the same folder can therefore select the same conversation.
 No active task or terminal scrollback is restored. The old program's dynamic
 OSC title is not assigned to a fresh process. WSL agents are not identified by
 Windows process discovery and are not automatically restored. Exiting a
-restored agent ends that pane's process; open a new pane for a shell.
+restored agent starts the original shell in the same pane and folder, retaining
+its layout and Git panel. Custom profiles that launch an agent directly or
+through a shell startup command return to an available interactive shell
+instead of relaunching the agent. The shell gets a fresh terminal buffer;
+pane zoom is retained, and a pending paste for the old process is cancelled.
 
 ## Terminal
 

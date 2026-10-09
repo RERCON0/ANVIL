@@ -35,6 +35,9 @@ const COLLAPSED_STRIP_HEIGHT: f32 = 24.0;
 
 pub struct PaneEntry {
     pub content: PaneContent,
+    /// A restored CLI owns the ConPTY until it exits, then this shell starts
+    /// in the same pane. Ordinary shell/CLI profiles do not auto-restart.
+    pub restore_shell: Option<crate::profiles::Profile>,
     pub view: TerminalView,
     pub workspace: crate::workspace::Workspace,
     /// Folder the pane was started in; the workspace panel uses it until the
@@ -671,6 +674,7 @@ mod tests {
     fn entry() -> PaneEntry {
         PaneEntry {
             content: PaneContent::Error(String::new()),
+            restore_shell: None,
             view: TerminalView::new(14.0),
             workspace: crate::workspace::Workspace::default(),
             start_cwd: None,
