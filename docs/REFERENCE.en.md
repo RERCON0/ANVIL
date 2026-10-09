@@ -15,6 +15,10 @@ applications control their own language.
 - Split right or down; navigate, maximise, collapse or close individual panes.
   Collapsed panes keep their live processes. Restoring one places it beside its
   previous neighbour, or the focused pane if that neighbour no longer exists.
+- Drag a divider to resize its neighbours. Double-click it with the left mouse
+  button to give those two neighbours equal width (vertical divider) or height
+  (horizontal divider). Other panes, focus and running processes are unchanged;
+  the new sizes are saved with the layout.
 - Hold **Ctrl+Shift**, grab the pane label, and drag it to another pane edge or
   the outer tab edge. The green target shows the insertion location. Release
   the mouse before the modifiers; releasing the modifiers first cancels.
@@ -51,6 +55,16 @@ the typed command. The process list is refreshed before saving on window exit,
 to avoid missing an agent launched since the last background poll. A failed
 enumeration keeps the last known detection. Alias arguments and
 permission-bypass flags are not replayed.
+
+Git Bash (including interactive custom Bash profiles) restores agents through
+the same shell startup files as a manual launch. The canonical executable is
+resolved using Bash's resulting `PATH`, `HOME` and `XDG_*` environment, not
+ANVIL's separate Windows/npm CLI lookup. The saved folder is selected after
+initialisation using the built-in `cd` (not a user's alias/function), with no
+folder text interpolated into shell commands. Bash
+aliases and functions are bypassed; only the fixed continuation arguments above
+are used. Other profiles still use direct Windows CLI lookup. If Bash cannot
+find the CLI, it reports the error and the pane returns to an interactive shell.
 
 The CLI chooses its most recent conversation for that folder. Two panes using
 the same agent in the same folder can therefore select the same conversation.

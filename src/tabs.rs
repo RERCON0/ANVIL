@@ -35,8 +35,8 @@ const COLLAPSED_STRIP_HEIGHT: f32 = 24.0;
 
 pub struct PaneEntry {
     pub content: PaneContent,
-    /// A restored CLI owns the ConPTY until it exits, then this shell starts
-    /// in the same pane. Ordinary shell/CLI profiles do not auto-restart.
+    /// A restored CLI (possibly under Bash) owns the ConPTY until it exits,
+    /// then this shell starts in the same pane. Ordinary profiles do not auto-restart.
     pub restore_shell: Option<crate::profiles::Profile>,
     pub view: TerminalView,
     pub workspace: crate::workspace::Workspace,
@@ -113,6 +113,8 @@ pub enum TabAction {
     },
     Collapse(PaneId),
     RestoreCollapsed(PaneId),
+    /// Divider resizing changed the saved split fractions.
+    LayoutChanged,
     Clipboard(String),
     Pane(PaneId, PaneCommand),
     Bell,
@@ -474,7 +476,12 @@ impl Tab {
                             Dir::Column => egui::CursorIcon::ResizeVertical,
                         });
                     }
-                    if response.dragged() {
+                    if response.double_clicked() {
+                        if self.tree.equalize_divider(&divider) {
+                            actions.push(TabAction::LayoutChanged);
+                            ui.ctx().request_repaint();
+                        }
+                    } else if response.dragged() {
                         let delta = match divider.dir {
                             Dir::Row => response.drag_delta().x,
                             Dir::Column => response.drag_delta().y,
@@ -484,6 +491,9 @@ impl Tab {
                             Dir::Column => env.min_pane_height,
                         };
                         self.tree.drag_divider(tree_rect(layout_rect), theme::DIVIDER_WIDTH, &divider, delta, min);
+                        if delta != 0.0 {
+                            actions.push(TabAction::LayoutChanged);
+                        }
                     }
                 }
             }
@@ -693,6 +703,88 @@ mod tests {
         let mut tree = SplitTree::new(1);
         assert!(tree.insert(1, 2, Dir::Row, true));
         Tab::new(tree, HashMap::from([(1, entry()), (2, entry())]), 1)
+    }
+
+    #[test]
+    fn double_clicking_a_divider_equalizes_its_panes_without_changing_focus() {
+        for dir in [Dir::Row, Dir::Column] {
+            let ctx = egui::Context::default();
+            crate::fonts::install(&ctx, "Test", &[], false);
+            let mut tree = SplitTree::new(1);
+            tree.insert_with_fraction(1, 2, dir, true, 0.25);
+            let mut tab = Tab::new(tree, HashMap::from([(1, entry()), (2, entry())]), 2);
+            let palette = Palette::dark();
+            let env = FrameEnv {
+                palette: &palette,
+                active: true,
+                cursor_blink: false,
+                right_click: RightClick::Menu,
+                paste_on_middle: false,
+                copy_on_select: false,
+                min_pane_width: 80.0,
+                min_pane_height: 60.0,
+                fallbacks_loaded: true,
+                ai_command: None,
+                codex_chatgpt_login: false,
+                window_edge: false,
+            };
+            let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 600.0));
+            let divider = tab.tree.dividers(tree_rect(rect), theme::DIVIDER_WIDTH).remove(0);
+            let pos = egui_rect(divider.rect).center();
+            let before = tab.tree.clone();
+            let mut layout_changed = 0;
+            let mut frame = |time, events| {
+                let _ = ctx.run_ui(
+                    egui::RawInput { screen_rect: Some(rect), time: Some(time), events, ..Default::default() },
+                    |ui| {
+                        layout_changed += tab
+                            .show(ui, rect, &env)
+                            .iter()
+                            .filter(|action| matches!(action, TabAction::LayoutChanged))
+                            .count();
+                    },
+                );
+                tab.tree.clone()
+            };
+            frame(0.0, Vec::new());
+            frame(0.05, vec![egui::Event::PointerMoved(pos)]);
+            for (i, pressed) in [true, false, true, false].into_iter().enumerate() {
+                let tree = frame(
+                    0.1 + i as f64 * 0.05,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: Default::default(),
+                    }],
+                );
+                assert_eq!(tree, before, "right-button double clicks do not resize panes");
+            }
+            for (i, pressed) in [true, false, true, false].into_iter().enumerate() {
+                let tree = frame(
+                    1.0 + i as f64 * 0.05,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    }],
+                );
+                if i < 3 {
+                    assert_eq!(tree, before, "a single click must not resize panes");
+                }
+            }
+            let panes = tab.tree.layout(tree_rect(rect), theme::DIVIDER_WIDTH);
+            let size = |r: crate::layout::split_tree::Rect| match dir {
+                Dir::Row => r.w,
+                Dir::Column => r.h,
+            };
+            assert_eq!(size(panes[0].1), size(panes[1].1), "double click must center the {dir:?} divider");
+            assert_eq!(tab.focused, 2);
+            assert_eq!(tab.tree.panes(), [1, 2]);
+            assert_eq!(tab.panes.len(), 2);
+            assert_eq!(layout_changed, 1, "the new fractions must be persisted, not just painted");
+        }
     }
 
     /// Uneven panes, so a restore that quietly redistributes the

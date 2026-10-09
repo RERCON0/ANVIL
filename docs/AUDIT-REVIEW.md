@@ -116,3 +116,38 @@ The functional/security reviewers traced behaviour well; performance/dead-code
 reports mixed real overhead with unmeasured severity, API misunderstandings and
 style preferences. Those observations are closed with reasons here rather than
 silently treated as proven vulnerabilities.
+
+## 0.1.2 self-review — 2026-10-09
+
+Scope: Bash agent restoration and divider equalisation, plus regression coverage
+for the already-reviewed pane lifecycle and immediate-close policy. This is not
+a fresh full-codebase audit.
+
+- **Confirmed and fixed:** a user-defined `cd` function could intercept the
+  saved-folder switch after Bash startup and launch the agent in the wrong
+  project. The real Git Bash/ConPTY regression failed with a no-op `cd` function
+  before the fix and passes with `builtin cd`. Startup files still initialise
+  `PATH`, `HOME` and `XDG_DATA_HOME`; folder text remains quoted environment data.
+- Agent commands and continuation arguments remain allowlisted. Saved aliases,
+  prompts and permission-bypass flags are not replayed. WSL restoration remains
+  unsupported; non-Bash profiles retain direct Windows CLI lookup.
+- Runtime fixtures cover login and implicit-interactive custom Bash, matching
+  manual-launch environment/storage, exit codes 0/130 and an unavailable CLI.
+  They do not launch an authenticated OpenCode server or consume provider quota.
+  The owner separately confirmed the preceding local fix in their installation.
+- Divider tests exercise real egui pointer frames for both split axes. A primary
+  double click equalises only the two neighbours, retains focus/pane IDs, and
+  requests persistence. Single and secondary clicks do not resize. Nested splits,
+  unrelated siblings, stale paths/indices and an already-equal pair are covered.
+- Existing regressions retain pane zoom/workspace on shell return, cancel stale
+  paste consent, clear exited-agent badges, refresh shutdown detection, and keep
+  pane/tab/window closure free of the removed confirmation.
+- A pre-existing process-resource test failed twice in the full parallel suite
+  at its successful fixture's three-second deadline, but passed in isolation.
+  Its per-launch allowance is now ten seconds; the fastest successful sample
+  must still be below three seconds, the 600 ms timeout/400 ms slack remain,
+  and descendant, handle and thread assertions are unchanged. Production
+  subprocess deadlines were not modified.
+
+Release verification is recorded with the published 0.1.2 notes; no static test
+count or CI success is assumed here before the final run.

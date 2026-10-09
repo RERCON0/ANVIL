@@ -1014,6 +1014,7 @@ impl AnvilApp {
             }
             TabAction::Collapse(id) => self.collapse_pane(id),
             TabAction::RestoreCollapsed(id) => self.restore_collapsed(id),
+            TabAction::LayoutChanged => ctx.request_repaint(),
             TabAction::Clipboard(text) => ctx.copy_text(text),
             TabAction::Pane(id, command) => self.apply_pane_command(id, command, ctx),
             TabAction::Bell => {
@@ -1873,16 +1874,8 @@ impl AnvilApp {
         let mut restored_agent = false;
         if self.config.restore_agents {
             if let Some(agent) = state.agent.as_deref().filter(|name| crate::agents::continue_args(name).is_some()) {
-                if session::usable_cwd(state.cwd.as_deref()).is_none() {
-                    error = Some(
-                        strings::pick(
-                            "Cannot restore the agent: its saved folder is unavailable.",
-                            "Не удалось восстановить агента: сохранённая папка недоступна.",
-                        )
-                        .to_owned(),
-                    );
-                } else {
-                    match crate::agents::resumed_profile(profile, agent) {
+                if let Some(cwd) = session::usable_cwd(state.cwd.as_deref()) {
+                    match crate::agents::resumed_profile(profile, agent, &cwd) {
                         Ok(Some(resumed)) => {
                             selected = resumed;
                             self.running_agents.insert(id, agent.to_owned());
@@ -1891,6 +1884,14 @@ impl AnvilApp {
                         Ok(None) => {}
                         Err(message) => error = Some(message),
                     }
+                } else {
+                    error = Some(
+                        strings::pick(
+                            "Cannot restore the agent: its saved folder is unavailable.",
+                            "Не удалось восстановить агента: сохранённая папка недоступна.",
+                        )
+                        .to_owned(),
+                    );
                 }
             }
         }
@@ -3470,6 +3471,150 @@ mod tests {
                 _ => assert!(matches!(app.ui.dialog, Some(DialogState::ClaudeInstall { .. }))),
             }
         }
+    }
+
+    /// Real Git Bash + ConPTY, but no real OpenCode, credentials or server.
+    /// The login files switch PATH/HOME/data and even cd away from the project.
+    #[test]
+    fn restored_bash_agent_uses_the_manual_launch_environment_and_returns_to_a_shell() {
+        let bash = profiles::detect_builtin().into_iter().find(|p| p.kind == profiles::ProfileKind::GitBash).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let shell_home = dir.path().join("shell home");
+        let data_home = dir.path().join("agent data");
+        let bin = dir.path().join("shell cli");
+        let project = dir.path().join("project '$; & ()");
+        let result = dir.path().join("launch.txt");
+        for folder in [&shell_home, &bin, &project, &data_home.join("opencode")] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        let unix = |path: &Path| path.to_string_lossy().replace('\\', "/");
+        std::fs::write(data_home.join("opencode/sessions.txt"), "fixture-sessions\n").unwrap();
+        std::fs::write(shell_home.join(".bash_profile"), ". \"$HOME/.bashrc\"\nbuiltin cd -- \"$HOME\"\n").unwrap();
+        std::fs::write(
+            shell_home.join(".bashrc"),
+            r#"
+export PATH="$(cygpath -u "$ANVIL_TEST_BIN"):/usr/bin:/bin"
+export HOME="$ANVIL_TEST_DATA"
+export XDG_DATA_HOME="$ANVIL_TEST_DATA"
+# A common shell customisation must not intercept ANVIL's saved-folder switch.
+cd() { return 0; }
+PS1='FIXTURE_SHELL_READY> '
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            bin.join("opencode"),
+            r#"#!/bin/bash
+printf '%s\n' "$HOME" "$XDG_DATA_HOME" "$(cygpath -w "$PWD")" "$@" > "$ANVIL_TEST_RESULT"
+cat "$XDG_DATA_HOME/opencode/sessions.txt" >> "$ANVIL_TEST_RESULT"
+printf '\033]1337;CurrentDir=%s\007' "$(cygpath -w "$PWD")"
+exit "$ANVIL_TEST_EXIT"
+"#,
+        )
+        .unwrap();
+        for (kind, code) in [
+            (profiles::ProfileKind::GitBash, 0),
+            (profiles::ProfileKind::GitBash, 130),
+            (profiles::ProfileKind::Custom, 0),
+            (profiles::ProfileKind::GitBash, 127),
+        ] {
+            let mut profile = bash.clone();
+            profile.kind = kind;
+            if kind == profiles::ProfileKind::Custom {
+                profile.args.clear(); // Implicitly interactive without ANVIL's -c.
+            }
+            if code == 127 {
+                std::fs::remove_file(bin.join("opencode")).unwrap();
+            }
+            profile.env.extend([
+                ("HOME".into(), unix(&shell_home)),
+                ("ANVIL_TEST_BIN".into(), unix(&bin)),
+                ("ANVIL_TEST_DATA".into(), unix(&data_home)),
+                ("ANVIL_TEST_RESULT".into(), unix(&result)),
+                ("ANVIL_TEST_EXIT".into(), code.to_string()),
+            ]);
+            // A broken implementation must fail here, never launch a real CLI.
+            let launch = crate::agents::resumed_profile(&profile, "opencode", &project).unwrap().unwrap();
+            assert_eq!(launch.command, bash.command);
+            let mut app = bare_app(dir.path());
+            app.config.restore_agents = true;
+            app.repaint = Some(Arc::new(|| {}));
+            let id = app.alloc_pane_id();
+            let state = PaneState {
+                profile_id: profile.id.clone(),
+                cwd: Some(project.clone()),
+                agent: Some("opencode".into()),
+                workspace_open: false,
+                workspace_width: None,
+                workspace_tab: None,
+            };
+            let entry = app.restore_entry(id, &profile, &state);
+            assert!(entry.live().is_some() && entry.restore_shell.is_some());
+            app.tabs.push(Tab::new(SplitTree::new(id), HashMap::from([(id, entry)]), id));
+            let ctx = egui::Context::default();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut transcript = String::new();
+            while Instant::now() < deadline && app.tabs[0].panes[&id].restore_shell.is_some() {
+                transcript = app.tabs[0].panes[&id]
+                    .live()
+                    .unwrap()
+                    .term
+                    .lock()
+                    .renderable_content()
+                    .display_iter
+                    .map(|cell| cell.c)
+                    .collect();
+                app.poll_panes(&ctx);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let entry = &app.tabs[0].panes[&id];
+            assert!(entry.restore_shell.is_none() && !entry.exited, "agent exit {code} must return to a shell");
+            assert_eq!(entry.start_cwd.as_deref(), Some(project.as_path()));
+            assert!(!app.running_agents.contains_key(&id));
+            if code == 127 {
+                assert!(!result.exists(), "a missing CLI must not switch to another installation");
+                assert!(transcript.contains("command not found"), "the launch error must be visible: {transcript}");
+                continue;
+            }
+            let restored = std::fs::read_to_string(&result)
+                .unwrap_or_else(|e| panic!("fixture result missing: {e}; terminal: {transcript}"));
+            let lines: Vec<_> = restored.lines().collect();
+            assert_eq!(
+                lines,
+                [
+                    unix(&data_home),
+                    unix(&data_home),
+                    project.to_string_lossy().into_owned(),
+                    "--continue".into(),
+                    "fixture-sessions".into()
+                ]
+            );
+            std::fs::remove_file(&result).unwrap();
+            let quoted = paste::quote_path(&unix(&project), paste::PathQuoting::Unix);
+            entry.live().unwrap().write(format!("builtin cd -- {quoted} && opencode --continue\r").into_bytes());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline && std::fs::read_to_string(&result).ok().as_deref() != Some(&restored) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(
+                std::fs::read_to_string(&result).unwrap(),
+                restored,
+                "manual launch must see the same CLI, data and folder"
+            );
+            app.poll_panes(&ctx);
+            assert_eq!(app.tabs.len(), 1);
+            assert!(!app.tabs[0].panes[&id].exited, "manually exiting the child CLI keeps the shell open");
+            std::fs::remove_file(&result).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_divider_change_marks_the_session_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = bare_app(dir.path());
+        assert!(app.session_dirty.is_none());
+        app.apply_tab_action(TabAction::LayoutChanged, &egui::Context::default());
+        assert!(app.session_dirty.is_some());
     }
 
     #[test]

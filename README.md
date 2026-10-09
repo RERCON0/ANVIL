@@ -67,7 +67,7 @@ reproduction script](docs/PERFORMANCE.md).
 | Workspace | What you can do |
 |---|---|
 | Project tabs | Name, colour, reorder and switch between projects |
-| Split panes | Split right/down, move running sessions, navigate with the keyboard, maximise or collapse |
+| Split panes | Split right/down, move running sessions, double-click dividers to equalise sizes, navigate with the keyboard, maximise or collapse |
 | Git panel | Inspect changes and history, stage files or individual hunks, switch and create branches, edit AI-assisted commit messages, commit, fetch and push |
 | File browser | Filter files, preview text and Markdown, create, rename and send files to the Recycle Bin |
 | AI quotas | View usage windows, reset times, balances or spending for 19 providers; windows share one polling worker |
@@ -79,6 +79,8 @@ reproduction script](docs/PERFORMANCE.md).
 > Layouts are restored; processes start again. Enable **Settings → Terminal → Restore CLI agents and continue the last conversation** to reopen Codex, Claude Code, OpenCode and OMP with their native resume command in the saved folder. This is off by default. Running tasks and terminal scrollback are not restored. The CLI chooses its most recent conversation in that folder; multiple panes of the same agent in one folder can choose the same conversation.
 
 Shell aliases are detected through the actual agent process; their flags are not replayed. Exiting a restored agent opens a shell in the same pane. Panes, tabs and the window close without an extra confirmation.
+
+Git Bash restoration loads the shell's startup files before resolving the canonical agent command, retaining its `PATH`, `HOME` and session-storage environment.
 
 AI commit messages support Codex, Claude, OpenCode, Gemini and Aider. External
 backends require their CLI installations. The generated message remains editable.

@@ -262,6 +262,24 @@ impl SplitTree {
         children[divider.index + 1].0 = (b - d) / avail;
     }
 
+    /// Centers this divider between its two neighbours. Other siblings and
+    /// nested layouts keep their shares; no pane or running process is replaced.
+    pub fn equalize_divider(&mut self, divider: &Divider) -> bool {
+        let Some(Node::Split { dir, children }) = node_at_mut(&mut self.root, &divider.path) else { return false };
+        if *dir != divider.dir {
+            return false;
+        }
+        let Some(end) = divider.index.checked_add(2) else { return false };
+        let Some(pair) = children.get_mut(divider.index..end) else { return false };
+        if pair[0].0 == pair[1].0 {
+            return false;
+        }
+        let half = (pair[0].0 + pair[1].0) / 2.0;
+        pair[0].0 = half;
+        pair[1].0 = half;
+        true
+    }
+
     /// The nearest pane in `dir` that overlaps `from` on the other axis; ties
     /// go to the pane whose centre is closest, then to reading order.
     pub fn navigate(&self, from: PaneId, dir: NavDir, area: Rect, gap: f32) -> Option<PaneId> {
@@ -828,6 +846,34 @@ mod tests {
         assert!(close(t.layout(area, GAP)[1].1.w, 30.0));
         t.drag_divider(area, GAP, &d, -500.0, 30.0);
         assert!(close(t.layout(area, GAP)[0].1.w, 30.0));
+    }
+
+    #[test]
+    fn equalizing_a_divider_preserves_other_siblings_and_nested_splits() {
+        let nested = col(vec![(0.2, leaf(2)), (0.8, leaf(3))]);
+        let mut tree = SplitTree::from_root(row(vec![(0.5, leaf(1)), (0.3, nested.clone()), (0.2, leaf(4))]));
+        let dividers = tree.dividers(AREA, GAP);
+        let outer = dividers.iter().find(|d| d.path.is_empty() && d.index == 1).unwrap();
+        assert!(tree.equalize_divider(outer));
+        assert_eq!(tree.root(), &row(vec![(0.5, leaf(1)), (0.25, nested), (0.25, leaf(4))]));
+        assert!(!tree.equalize_divider(outer), "already centered is a no-op");
+        let inner = dividers.iter().find(|d| d.path == [1]).unwrap();
+        assert!(tree.equalize_divider(inner));
+        assert_eq!(
+            tree.root(),
+            &row(vec![(0.5, leaf(1)), (0.25, col(vec![(0.5, leaf(2)), (0.5, leaf(3))])), (0.25, leaf(4))])
+        );
+        for invalid in [
+            Divider { path: vec![99], ..outer.clone() },
+            Divider { path: vec![0], ..outer.clone() },
+            Divider { index: 2, ..outer.clone() },
+            Divider { index: usize::MAX, ..outer.clone() },
+            Divider { dir: Dir::Column, ..outer.clone() },
+        ] {
+            let before = tree.clone();
+            assert!(!tree.equalize_divider(&invalid));
+            assert_eq!(tree, before);
+        }
     }
 
     #[test]
