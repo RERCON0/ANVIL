@@ -119,6 +119,19 @@ Its state is retained and it reappears when the pane is widened.
   branch labels and distinct outgoing/incoming/history sections. Commit details
   show the full message and files. Selecting a file opens only its patch; Back
   returns to the previous position, and Copy patch copies that selected file.
+- **Edit message** appears for commits of the outgoing section only. It opens
+  the whole message in a field (Ctrl+Enter saves, Esc or Cancel discards) and
+  rewrites the commit and the commits above it as copies with the same trees,
+  authors and dates, so the index and working files are never touched and the
+  previous tip stays in `git reflog`. Git decides at that moment that the
+  commit is unpushed; the rewrite is refused during a rebase, merge,
+  cherry-pick or revert, when a commit that would be replayed is signed (its
+  signature would be lost) and when HEAD moved meanwhile. The commit hooks
+  (`pre-commit`, `commit-msg`, `post-commit`, `post-rewrite`) do not run, so a
+  `commit-msg` check does not see the new text; moving the branch makes git call
+  the repository's `reference-transaction` hook, as for any ref update (it is
+  among the programs the repository trust covers). Other branches or tags that
+  point at the old commits are not moved.
 - Fetch and push update history. External HEAD/upstream changes are detected by
   background polling. First push considers `branch.<name>.pushRemote`,
   `remote.pushDefault`, then `branch.<name>.remote`, with `origin` as fallback.

@@ -59,6 +59,11 @@ pub enum Request {
     Commit {
         message: String,
     },
+    /// Replaces the message of an unpushed commit (and replays what is above it).
+    Reword {
+        hash: String,
+        message: String,
+    },
     AiMessage {
         command: Option<String>,
         codex_chatgpt_login: bool,
@@ -153,6 +158,8 @@ enum Response {
     Refreshed,
     /// The short hash, or why git refused. Exactly one answer per commit request.
     Committed(Result<String, String>),
+    /// The id the edited commit has now, or why git refused.
+    Reworded(Result<String, String>),
     /// What the UI thread starts now (None: nothing to start).
     Launch(Option<Launch>),
     AiMessage(Result<String, String>),
@@ -265,6 +272,23 @@ struct CommitFile {
     wrapped: WrappedRows,
 }
 
+/// A history rewrite of the open commit that has not finished.
+enum Rewording {
+    /// Sent and not answered: the hash is the commit being edited.
+    Saving(String),
+    /// Git answered: the commit that replaced it (this hash) is being loaded,
+    /// and until it is, the view holds a hash the log no longer has.
+    Reloading(String),
+}
+
+/// The new message of an unpushed commit, typed in the commit view.
+struct RewordEdit {
+    /// The commit the text belongs to: another commit's view never shows it.
+    hash: String,
+    text: String,
+    focus: bool,
+}
+
 pub struct Workspace {
     pub open: bool,
     pub width: f32,
@@ -292,6 +316,11 @@ pub struct Workspace {
     pub graph: Vec<graph::Row>,
     pub detail: Option<(String, git::CommitDetail)>,
     detail_file: Option<CommitFile>,
+    /// The message being edited in the commit view, if any.
+    reword: Option<RewordEdit>,
+    /// The rewrite in progress: the editor is off meanwhile, so a second click
+    /// cannot send a second one.
+    rewording: Option<Rewording>,
     pub files: Vec<String>,
     /// Local and remote branches the picker shows; loaded when it opens.
     pub branches: Vec<git::Branch>,
@@ -373,6 +402,8 @@ impl Default for Workspace {
             graph: Vec::new(),
             detail: None,
             detail_file: None,
+            reword: None,
+            rewording: None,
             files: Vec::new(),
             branches: Vec::new(),
             branch_picker: false,
@@ -497,6 +528,8 @@ impl Workspace {
         self.close_diff();
         self.detail = None;
         self.detail_file = None;
+        self.reword = None;
+        self.rewording = None;
         self.files.clear();
         self.files_loaded = false;
         self.close_branch_picker();
@@ -531,6 +564,21 @@ impl Workspace {
         self.busy = true;
         self.notice = None;
         self.request(Request::Commit { message: self.commit_message.clone() });
+    }
+
+    /// Sends the edited message of the open commit, once: until git answers, the
+    /// editor is off and a second click or Ctrl+Enter sends nothing.
+    fn start_reword(&mut self) {
+        let Some(edit) = self.reword.as_ref() else { return };
+        // Without a worker nothing would answer, and the buttons would stay off.
+        if self.rewording.is_some() || self.tx.is_none() {
+            return;
+        }
+        let (hash, message) = (edit.hash.clone(), edit.text.clone());
+        self.rewording = Some(Rewording::Saving(hash.clone()));
+        self.busy = true;
+        self.notice = None;
+        self.request(Request::Reword { hash, message });
     }
 
     /// The branch chip: opens the picker and loads the branch list again; a
@@ -600,6 +648,7 @@ impl Workspace {
         self.close_diff();
         self.detail = None;
         self.detail_file = None;
+        self.reword = None;
         self.files.clear();
         self.files_loaded = false;
         self.file_expanded.clear();
@@ -828,6 +877,38 @@ impl Workspace {
                         Err(message) => self.notice = Some((notice_text(&message), true)),
                     }
                 }
+                Response::Reworded(result) => {
+                    self.busy = false;
+                    let sent = match self.rewording.take() {
+                        Some(Rewording::Saving(hash)) => Some(hash),
+                        other => {
+                            self.rewording = other;
+                            None
+                        }
+                    };
+                    match result {
+                        Ok(hash) => {
+                            self.reword = None;
+                            self.notice = Some((
+                                notice_text(&strings::workspace_reworded(hash.get(..7).unwrap_or(&hash))),
+                                false,
+                            ));
+                            self.request(Request::Log);
+                            self.last_poll = Instant::now() - POLL_INTERVAL;
+                            // The hash changed with the message: the commit view
+                            // that is still open follows it. One the user has
+                            // closed meanwhile stays closed.
+                            if self.detail.as_ref().is_some_and(|(open, _)| Some(open) == sent.as_ref()) {
+                                self.busy = true;
+                                // The old hash is gone from the log: no edit is offered
+                                // for the view until the commit that replaced it arrives.
+                                self.rewording = Some(Rewording::Reloading(hash.clone()));
+                                self.request(Request::CommitDetail { hash });
+                            }
+                        }
+                        Err(message) => self.notice = Some((notice_text(&message), true)),
+                    }
+                }
                 Response::Launch(launch) => match launch {
                     Some(Launch::Open(full)) => crate::settings_ui::open_path(&full),
                     Some(Launch::Reveal(full)) => reveal_resolved(&full),
@@ -848,6 +929,9 @@ impl Workspace {
                 }
                 Response::CommitDetail { hash, detail } => {
                     self.busy = false;
+                    if matches!(&self.rewording, Some(Rewording::Reloading(waited)) if *waited == hash) {
+                        self.rewording = None;
+                    }
                     self.detail = Some((hash, detail));
                     self.detail_file = None;
                 }
@@ -934,6 +1018,10 @@ impl Workspace {
                 Response::Error(message) => {
                     self.busy = false;
                     self.switching = false;
+                    // A failed reload must not leave the buttons off for good.
+                    if matches!(self.rewording, Some(Rewording::Reloading(_))) {
+                        self.rewording = None;
+                    }
                     self.notice = Some((notice_text(&message), true));
                 }
             }
@@ -1872,8 +1960,20 @@ impl Workspace {
     /// Commit detail replaces the column while open.
     fn detail_view(&mut self, ui: &mut egui::Ui) -> bool {
         let Some((hash, detail)) = self.detail.take() else { return false };
-        let action = commit_detail_view(ui, &hash, &detail, self.detail_file.as_mut());
+        let outgoing =
+            self.log.commits.iter().any(|commit| commit.hash == hash && commit.section == git::Section::Outgoing);
+        let saving = self.rewording.is_some();
+        let reword = match self.reword.as_mut().filter(|edit| edit.hash == hash) {
+            Some(edit) => RewordView::Editing { text: &mut edit.text, focus: &mut edit.focus, saving },
+            None if outgoing && !saving => RewordView::Available,
+            None => RewordView::Unavailable,
+        };
+        let action = commit_detail_view(ui, &hash, &detail, self.detail_file.as_mut(), reword);
         if matches!(action, Some(CommitDetailAction::Back)) && self.detail_file.is_none() {
+            // A draft git is still working on survives: a refusal can be retried.
+            if self.rewording.is_none() {
+                self.reword = None;
+            }
             return true;
         }
         match action {
@@ -1888,6 +1988,11 @@ impl Workspace {
                 self.busy = true;
                 self.request(Request::CommitDiff { hash: hash.clone(), path });
             }
+            Some(CommitDetailAction::Reword) => {
+                self.reword = Some(RewordEdit { hash: hash.clone(), text: detail.message.clone(), focus: true });
+            }
+            Some(CommitDetailAction::SaveReword) => self.start_reword(),
+            Some(CommitDetailAction::CancelReword) => self.reword = None,
             None => {}
         }
         self.detail = Some((hash, detail));
@@ -1898,6 +2003,71 @@ impl Workspace {
 enum CommitDetailAction {
     Back,
     OpenFile(String),
+    /// Open the editor for the message.
+    Reword,
+    SaveReword,
+    CancelReword,
+}
+
+/// What the commit view offers for the message of the commit it shows.
+enum RewordView<'a> {
+    /// A pushed or incoming commit keeps its history.
+    Unavailable,
+    /// An unpushed commit: the header has a button that opens the editor.
+    Available,
+    /// The editor is open; `saving` while git is rewriting.
+    Editing { text: &'a mut String, focus: &'a mut bool, saving: bool },
+}
+
+/// The multi-line field for a new message with its buttons. Ctrl+Enter saves
+/// and Esc cancels while the field has the keyboard.
+fn reword_editor(ui: &mut egui::Ui, text: &mut String, focus: &mut bool, saving: bool) -> Option<CommitDetailAction> {
+    let editable = !saving;
+    let editor = egui::Frame::NONE
+        .fill(ui.visuals().extreme_bg_color)
+        .inner_margin(egui::Margin::symmetric(4, 2))
+        .show(ui, |ui| {
+            ui.add_enabled(
+                editable,
+                egui::TextEdit::multiline(text)
+                    .frame(egui::Frame::NONE)
+                    .margin(egui::Margin::same(0))
+                    .font(theme::field_font(12.0))
+                    .desired_rows(8)
+                    .desired_width(f32::INFINITY)
+                    .interactive(editable),
+            )
+        });
+    let field = editor.inner;
+    if *focus {
+        field.request_focus();
+        *focus = false;
+    }
+    // A disabled editor must not keep consuming keystrokes.
+    if !editable && field.has_focus() {
+        field.surrender_focus();
+    }
+    let visuals = ui.style().interact(&field);
+    let stroke = if field.has_focus() { ui.visuals().selection.stroke } else { visuals.bg_stroke };
+    ui.painter().rect_stroke(editor.response.rect, visuals.corner_radius, stroke, egui::StrokeKind::Middle);
+    let keyed = field.has_focus() || field.lost_focus();
+    let ctrl_enter = keyed && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter));
+    let escape = keyed && ui.input(|i| i.key_pressed(egui::Key::Escape));
+    let can_save = editable && !text.trim().is_empty();
+    let mut action = None;
+    ui.horizontal(|ui| {
+        if ui.add_enabled(can_save, theme::accent_button(strings::WORKSPACE_REWORD_SAVE())).clicked()
+            || (can_save && ctrl_enter)
+        {
+            action = Some(CommitDetailAction::SaveReword);
+        }
+        if ui.add_enabled(editable, theme::ghost_button(strings::WORKSPACE_REWORD_CANCEL())).clicked()
+            || (editable && escape)
+        {
+            action = Some(CommitDetailAction::CancelReword);
+        }
+    });
+    action
 }
 
 /// The commit overview or one selected file; navigation stays outside the scroll.
@@ -1906,6 +2076,7 @@ fn commit_detail_view(
     hash: &str,
     detail: &git::CommitDetail,
     mut file: Option<&mut CommitFile>,
+    mut reword: RewordView<'_>,
 ) -> Option<CommitDetailAction> {
     let mut action = None;
     ui.horizontal(|ui| {
@@ -1922,6 +2093,10 @@ fn commit_detail_view(
                     copy_to_clipboard(patch);
                 }
             }
+        } else if matches!(reword, RewordView::Available)
+            && ui.add(theme::ghost_button(strings::WORKSPACE_REWORD())).clicked()
+        {
+            action = Some(CommitDetailAction::Reword);
         }
     });
     if let Some(file) = file.as_mut() {
@@ -1967,14 +2142,21 @@ fn commit_detail_view(
         let body = fields.next().unwrap_or("").trim();
         let subject = display(subject, subject.len());
         let body = display_multiline(body, body.len());
-        ui.label(RichText::new(subject).color(theme::colors().text).font(theme::font(12.5)));
+        let editing = matches!(reword, RewordView::Editing { .. });
+        if let RewordView::Editing { text, focus, saving } = &mut reword {
+            if let Some(edited) = reword_editor(ui, text, focus, *saving) {
+                action = Some(edited);
+            }
+        } else {
+            ui.label(RichText::new(subject).color(theme::colors().text).font(theme::font(12.5)));
+        }
         ui.label(
             RichText::new(format!("{} · {}", display(author, 80), display(date, 40)))
                 .color(theme::colors().faint)
                 .font(theme::font(10.5)),
         );
         ui.label(RichText::new(full_hash).color(theme::colors().faint).font(theme::field_font(10.5)));
-        if !body.is_empty() {
+        if !editing && !body.is_empty() {
             ui.label(RichText::new(body).color(theme::colors().dim).font(theme::font(11.0)));
         }
         theme::hairline(ui);
@@ -3248,6 +3430,7 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                 send(match request {
                     Request::AiMessage { .. } => Response::AiMessage(Err(error)),
                     Request::Commit { .. } => Response::Committed(Err(error)),
+                    Request::Reword { .. } => Response::Reworded(Err(error)),
                     Request::Checkout { .. } | Request::NewBranch { .. } => Response::CheckedOut(Err(error)),
                     Request::OpenExternal { .. } | Request::Reveal { .. } => Response::Launch(None),
                     _ => Response::Error(error),
@@ -3374,6 +3557,10 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
                 Request::Commit { message } => match &root {
                     Some(root) => send(Response::Committed(git::commit(root, message))),
                     None => send(Response::Committed(Err(strings::WORKSPACE_NO_REPO().to_owned()))),
+                },
+                Request::Reword { hash, message } => match &root {
+                    Some(root) => send(Response::Reworded(git::reword(root, &hash, &message))),
+                    None => send(Response::Reworded(Err(strings::WORKSPACE_NO_REPO().to_owned()))),
                 },
                 Request::AiMessage { command, codex_chatgpt_login } => {
                     if root.is_none() {
@@ -3967,7 +4154,7 @@ mod tests {
             },
             files: vec!["old.txt".to_owned()],
             file_preview: Some(("old.txt".to_owned(), "text".to_owned(), false)),
-            detail: Some(("0123456789".to_owned(), git::CommitDetail { files: Vec::new(), header: String::new() })),
+            detail: Some(("0123456789".to_owned(), git::CommitDetail::default())),
             ..Default::default()
         };
         workspace.selected.insert("old.txt".to_owned());
@@ -5165,7 +5352,7 @@ mod tests {
         workspace.absorb();
         assert!(!workspace.busy && workspace.detail.is_none());
         workspace.busy = true;
-        workspace.detail = Some(("new".to_owned(), git::CommitDetail { files: Vec::new(), header: String::new() }));
+        workspace.detail = Some(("new".to_owned(), git::CommitDetail::default()));
         workspace.detail_file = Some(CommitFile {
             path: "new.txt".to_owned(),
             patch: None,
@@ -5481,6 +5668,412 @@ mod tests {
         let requests: Vec<_> = request_rx.try_iter().collect();
         assert_eq!(requests.len(), 1);
         assert!(matches!(requests[0].1, Request::Commit { .. }));
+    }
+
+    const REWORD_HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+    const REWORDED_HASH: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+    /// A panel showing the commit view of one unpushed commit with a draft of
+    /// its new message, and the channels to follow its requests and answer them.
+    fn reword_panel() -> (Workspace, Receiver<Envelope>, Sender<Response>) {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+        // The header folds a wrapped first paragraph into one line; the message is what is stored.
+        let header = format!("{REWORD_HASH}\ntester <t@x>\n2020-01-01 00:00:00 +0000\nsubject second line\nbody");
+        let message = "subject\nsecond line\n\n    indented body".to_owned();
+        let workspace = Workspace {
+            tx: Some(request_tx),
+            rx: Some(response_rx),
+            log: CommitLog { commits: vec![commit(REWORD_HASH, git::Section::Outgoing)], ..Default::default() },
+            detail: Some((REWORD_HASH.to_owned(), git::CommitDetail { files: Vec::new(), header, message })),
+            reword: Some(RewordEdit { hash: REWORD_HASH.to_owned(), text: "new subject".to_owned(), focus: false }),
+            ..Default::default()
+        };
+        (workspace, request_rx, response_tx)
+    }
+
+    fn requests_of(request_rx: &Receiver<Envelope>) -> Vec<Request> {
+        request_rx.try_iter().map(|(_, request)| request).collect()
+    }
+
+    /// A double click used to send the same history rewrite twice.
+    #[test]
+    fn a_second_save_click_while_the_reword_is_pending_sends_nothing() {
+        let (mut workspace, request_rx, _answers) = reword_panel();
+        workspace.start_reword();
+        workspace.start_reword();
+        let requests = requests_of(&request_rx);
+        assert_eq!(requests.len(), 1, "one request for two clicks");
+        assert!(
+            matches!(&requests[0], Request::Reword { hash, message } if hash == REWORD_HASH && message == "new subject")
+        );
+    }
+
+    /// The hash changes with the message, so the open commit view follows it.
+    #[test]
+    fn a_reworded_commit_is_shown_again_under_its_new_hash() {
+        let (mut workspace, request_rx, answers) = reword_panel();
+        workspace.start_reword();
+        requests_of(&request_rx);
+        answers.send(Response::Reworded(Ok(REWORDED_HASH.to_owned()))).unwrap();
+        workspace.absorb();
+        assert!(workspace.reword.is_none(), "the edit is over");
+        assert!(
+            matches!(&workspace.rewording, Some(Rewording::Reloading(hash)) if hash == REWORDED_HASH),
+            "until the new commit has loaded"
+        );
+        assert_eq!(workspace.notice, Some((strings::workspace_reworded(&REWORDED_HASH[..7]), false)));
+        let requests = requests_of(&request_rx);
+        assert!(requests.iter().any(|request| matches!(request, Request::Log)), "the list is read again");
+        assert!(
+            requests.iter().any(|request| matches!(request, Request::CommitDetail { hash } if hash == REWORDED_HASH)),
+            "the view reloads the commit that replaced the old one"
+        );
+    }
+
+    /// Between git's answer and the reloaded commit the view still holds the old
+    /// hash, which no longer exists: no button may offer to edit it.
+    #[test]
+    fn the_replaced_commit_offers_no_edit_until_the_new_one_has_loaded() {
+        let (mut workspace, request_rx, answers) = reword_panel();
+        workspace.start_reword();
+        requests_of(&request_rx);
+        answers.send(Response::Reworded(Ok(REWORDED_HASH.to_owned()))).unwrap();
+        workspace.absorb();
+        let ctx = detail_ctx();
+        let shapes = detail_frame(&mut workspace, &ctx, Vec::new());
+        assert!(painted_point(&shapes, strings::WORKSPACE_REWORD()).is_none(), "the old hash is gone");
+
+        answers
+            .send(Response::CommitDetail { hash: REWORDED_HASH.to_owned(), detail: git::CommitDetail::default() })
+            .unwrap();
+        workspace.absorb();
+        assert!(workspace.rewording.is_none(), "the view is current again");
+        assert_eq!(workspace.detail.as_ref().map(|(hash, _)| hash.as_str()), Some(REWORDED_HASH));
+
+        // A reload that fails must not leave the buttons off for good.
+        let (mut workspace, request_rx, answers) = reword_panel();
+        workspace.start_reword();
+        requests_of(&request_rx);
+        answers.send(Response::Reworded(Ok(REWORDED_HASH.to_owned()))).unwrap();
+        workspace.absorb();
+        answers.send(Response::Error("could not load".to_owned())).unwrap();
+        workspace.absorb();
+        assert!(workspace.rewording.is_none());
+    }
+
+    /// Going back while git works must not cost the typed message: a refusal
+    /// that arrives later can still be retried.
+    #[test]
+    fn going_back_during_the_save_keeps_the_draft_but_going_back_otherwise_drops_it() {
+        let (mut workspace, request_rx, answers) = reword_panel();
+        let ctx = detail_ctx();
+        workspace.start_reword();
+        requests_of(&request_rx);
+        let shapes = detail_frame(&mut workspace, &ctx, Vec::new());
+        let back = painted_point(&shapes, strings::WORKSPACE_BACK()).expect("Back is painted");
+        detail_frame(&mut workspace, &ctx, click_at(back));
+        assert!(workspace.detail.is_none(), "the view is closed");
+        answers.send(Response::Reworded(Err(strings::WORKSPACE_REWORD_BUSY().to_owned()))).unwrap();
+        workspace.absorb();
+        assert_eq!(workspace.reword.as_ref().map(|edit| edit.text.as_str()), Some("new subject"));
+
+        let (mut workspace, _requests, _answers) = reword_panel();
+        let ctx = detail_ctx();
+        let shapes = detail_frame(&mut workspace, &ctx, Vec::new());
+        let back = painted_point(&shapes, strings::WORKSPACE_BACK()).expect("Back is painted");
+        detail_frame(&mut workspace, &ctx, click_at(back));
+        assert!(workspace.detail.is_none() && workspace.reword.is_none(), "leaving the view drops an idle draft");
+    }
+
+    /// An error that belongs to some other request must not switch the buttons
+    /// back on while git is still rewriting.
+    #[test]
+    fn an_unrelated_error_does_not_end_a_save_in_progress() {
+        let (mut workspace, request_rx, answers) = reword_panel();
+        workspace.start_reword();
+        requests_of(&request_rx);
+        answers.send(Response::Error("status failed".to_owned())).unwrap();
+        workspace.absorb();
+        assert!(matches!(workspace.rewording, Some(Rewording::Saving(_))));
+        workspace.start_reword();
+        assert!(requests_of(&request_rx).is_empty(), "still one rewrite at a time");
+    }
+
+    #[test]
+    fn a_refused_reword_keeps_the_draft_for_another_try() {
+        let (mut workspace, request_rx, answers) = reword_panel();
+        workspace.start_reword();
+        requests_of(&request_rx);
+        let reason = strings::WORKSPACE_REWORD_PUSHED().to_owned();
+        answers.send(Response::Reworded(Err(reason.clone()))).unwrap();
+        workspace.absorb();
+        assert_eq!(workspace.notice, Some((reason, true)));
+        assert_eq!(workspace.reword.as_ref().map(|edit| edit.text.as_str()), Some("new subject"));
+        assert!(workspace.rewording.is_none(), "the buttons are back");
+        assert!(requests_of(&request_rx).is_empty(), "a refusal changes nothing else");
+    }
+
+    /// Pressing back while git works must not throw the commit view up again.
+    #[test]
+    fn a_reword_answered_after_the_commit_view_was_closed_does_not_reopen_it() {
+        let (mut workspace, request_rx, answers) = reword_panel();
+        workspace.start_reword();
+        requests_of(&request_rx);
+        workspace.detail = None;
+        answers.send(Response::Reworded(Ok(REWORDED_HASH.to_owned()))).unwrap();
+        workspace.absorb();
+        let requests = requests_of(&request_rx);
+        assert!(requests.iter().any(|request| matches!(request, Request::Log)));
+        assert!(!requests.iter().any(|request| matches!(request, Request::CommitDetail { .. })));
+    }
+
+    /// One headless frame of the commit view.
+    fn detail_frame(
+        workspace: &mut Workspace,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        // The held modifiers are the integration's to report, as egui-winit does.
+        let modifiers = events
+            .iter()
+            .find_map(|event| match event {
+                egui::Event::Key { modifiers, .. } => Some(*modifiers),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let input = egui::RawInput {
+            // The panel's default width: what overflows here overflows for the user.
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(380.0, 520.0))),
+            modifiers,
+            events,
+            ..Default::default()
+        };
+        ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                workspace.detail_view(ui);
+            });
+        })
+        .shapes
+    }
+
+    fn painted_point(shapes: &[egui::epaint::ClippedShape], value: &str) -> Option<Pos2> {
+        shapes.iter().find_map(|clipped| match &clipped.shape {
+            egui::Shape::Text(text) if text.galley.text() == value => Some(text.visual_bounding_rect().center()),
+            _ => None,
+        })
+    }
+
+    fn click_at(point: Pos2) -> Vec<egui::Event> {
+        let button = |pressed| egui::Event::PointerButton {
+            pos: point,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        vec![egui::Event::PointerMoved(point), button(true), button(false)]
+    }
+
+    fn key(key: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
+        vec![egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers }]
+    }
+
+    fn detail_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
+        ctx
+    }
+
+    #[test]
+    fn only_an_unpushed_commit_offers_to_edit_its_message() {
+        let (mut workspace, request_rx, _answers) = reword_panel();
+        workspace.reword = None;
+        let ctx = detail_ctx();
+        let shapes = detail_frame(&mut workspace, &ctx, Vec::new());
+        let edit = painted_point(&shapes, strings::WORKSPACE_REWORD()).expect("the button is painted");
+
+        detail_frame(&mut workspace, &ctx, click_at(edit));
+        let draft = workspace.reword.as_ref().expect("the click opens the editor");
+        assert_eq!(
+            (draft.hash.as_str(), draft.text.as_str()),
+            (REWORD_HASH, "subject\nsecond line\n\n    indented body"),
+            "the message as stored, not the folded header"
+        );
+        assert!(requests_of(&request_rx).is_empty(), "opening the editor asks git for nothing");
+
+        // The same commit once it is on the remote, and one from the incoming list.
+        for section in [git::Section::History, git::Section::Incoming] {
+            let (mut workspace, _requests, _answers) = reword_panel();
+            workspace.reword = None;
+            workspace.log.commits[0].section = section;
+            let shapes = detail_frame(&mut workspace, &detail_ctx(), Vec::new());
+            assert!(painted_point(&shapes, strings::WORKSPACE_REWORD()).is_none(), "{section:?} is not editable");
+        }
+    }
+
+    /// The header row has to hold its three buttons at the panel's default
+    /// width in both languages: `horizontal` clips what does not fit.
+    #[test]
+    fn the_header_buttons_share_one_row_of_a_default_panel_in_both_languages() {
+        for language in [strings::Language::Russian, strings::Language::English] {
+            strings::set_language(language);
+            let (mut workspace, _requests, _answers) = reword_panel();
+            workspace.reword = None;
+            let shapes = detail_frame(&mut workspace, &detail_ctx(), Vec::new());
+            let buttons: Vec<Rect> =
+                [strings::WORKSPACE_BACK(), strings::WORKSPACE_COPY_HASH(), strings::WORKSPACE_REWORD()]
+                    .iter()
+                    .map(|label| {
+                        shapes
+                            .iter()
+                            .find_map(|clipped| match &clipped.shape {
+                                egui::Shape::Text(text) if text.galley.text() == *label => {
+                                    Some(text.visual_bounding_rect())
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| panic!("{label} is painted in {language:?}"))
+                    })
+                    .collect();
+            let row = buttons[0].center().y;
+            // Glyph boxes differ by a pixel or two between labels; a wrapped button is a line lower.
+            assert!(buttons.iter().all(|rect| (rect.center().y - row).abs() < 4.0), "{language:?}: {buttons:?}");
+            assert!(buttons[2].max.x < 380.0 - 8.0, "{language:?}: the last button ends at {}", buttons[2].max.x);
+        }
+        strings::set_language(strings::Language::Russian);
+    }
+
+    #[test]
+    fn save_sends_the_edited_text_once_and_cancel_sends_nothing() {
+        let (mut workspace, request_rx, _answers) = reword_panel();
+        workspace.reword.as_mut().unwrap().text = "edited subject\n\nedited body".to_owned();
+        let ctx = detail_ctx();
+        let shapes = detail_frame(&mut workspace, &ctx, Vec::new());
+        let save = painted_point(&shapes, strings::WORKSPACE_REWORD_SAVE()).expect("Save is painted");
+        let cancel = painted_point(&shapes, strings::WORKSPACE_REWORD_CANCEL()).expect("Cancel is painted");
+        assert!(painted_point(&shapes, strings::WORKSPACE_REWORD()).is_none(), "the edit button gives way");
+
+        detail_frame(&mut workspace, &ctx, click_at(save));
+        let shapes = detail_frame(&mut workspace, &ctx, Vec::new());
+        detail_frame(&mut workspace, &ctx, click_at(save));
+        let requests = requests_of(&request_rx);
+        assert_eq!(requests.len(), 1, "a second click while git works sends nothing");
+        assert!(matches!(&requests[0], Request::Reword { message, .. } if message == "edited subject\n\nedited body"));
+        assert!(painted_point(&shapes, "edited subject\n\nedited body").is_some(), "the draft stays on screen");
+
+        let (mut workspace, request_rx, _answers) = reword_panel();
+        let ctx = detail_ctx();
+        detail_frame(&mut workspace, &ctx, Vec::new());
+        detail_frame(&mut workspace, &ctx, click_at(cancel));
+        assert!(workspace.reword.is_none(), "Cancel drops the draft");
+        assert!(requests_of(&request_rx).is_empty());
+    }
+
+    #[test]
+    fn an_empty_message_cannot_be_saved() {
+        let (mut workspace, request_rx, _answers) = reword_panel();
+        let edit = workspace.reword.as_mut().unwrap();
+        edit.text = "  \n ".to_owned();
+        edit.focus = true;
+        let ctx = detail_ctx();
+        let shapes = detail_frame(&mut workspace, &ctx, Vec::new());
+        let save = painted_point(&shapes, strings::WORKSPACE_REWORD_SAVE()).expect("Save is painted");
+        detail_frame(&mut workspace, &ctx, click_at(save));
+        detail_frame(&mut workspace, &ctx, key(egui::Key::Enter, egui::Modifiers::CTRL));
+        assert!(requests_of(&request_rx).is_empty(), "neither the button nor Ctrl+Enter sends a blank message");
+        assert!(workspace.rewording.is_none());
+    }
+
+    #[test]
+    fn ctrl_enter_saves_and_escape_cancels_from_the_editor() {
+        let (mut workspace, request_rx, _answers) = reword_panel();
+        workspace.reword.as_mut().unwrap().focus = true;
+        let ctx = detail_ctx();
+        detail_frame(&mut workspace, &ctx, Vec::new());
+        assert!(ctx.memory(|memory| memory.focused().is_some()), "the editor takes the focus when it opens");
+        detail_frame(&mut workspace, &ctx, key(egui::Key::Enter, egui::Modifiers::CTRL));
+        let requests = requests_of(&request_rx);
+        assert!(matches!(requests.as_slice(), [Request::Reword { message, .. }] if message == "new subject"));
+
+        let (mut workspace, request_rx, _answers) = reword_panel();
+        workspace.reword.as_mut().unwrap().focus = true;
+        let ctx = detail_ctx();
+        detail_frame(&mut workspace, &ctx, Vec::new());
+        detail_frame(&mut workspace, &ctx, key(egui::Key::Escape, egui::Modifiers::NONE));
+        assert!(workspace.reword.is_none());
+        assert!(requests_of(&request_rx).is_empty());
+    }
+
+    /// Another commit's view never shows a draft that belongs to this one.
+    #[test]
+    fn a_draft_belongs_to_the_commit_it_was_opened_on() {
+        let (mut workspace, _requests, _answers) = reword_panel();
+        workspace.reword.as_mut().unwrap().hash = REWORDED_HASH.to_owned();
+        let shapes = detail_frame(&mut workspace, &detail_ctx(), Vec::new());
+        assert!(painted_point(&shapes, strings::WORKSPACE_REWORD_SAVE()).is_none());
+        assert!(painted_point(&shapes, strings::WORKSPACE_REWORD()).is_some(), "the commit itself is still editable");
+    }
+
+    /// The real worker against a real repository: the whole round trip the
+    /// panel makes, including reloading the commit under its new hash.
+    #[test]
+    fn the_worker_rewords_an_unpushed_commit_and_refuses_a_pushed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work");
+        let remote = dir.path().join("remote.git");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&remote).unwrap();
+        if !git(&root, &["init", "--quiet", "--initial-branch=main"]) {
+            eprintln!("git is not installed; skipping");
+            return;
+        }
+        assert!(git(&remote, &["init", "--quiet", "--bare", "--initial-branch=main"]));
+        assert!(
+            git(&root, &["config", "user.email", "anvil@test"]) && git(&root, &["config", "user.name", "ANVIL test"])
+        );
+        assert!(git(&root, &["remote", "add", "origin", remote.to_str().unwrap()]));
+        std::fs::write(root.join("file.txt"), "base\n").unwrap();
+        assert!(git(&root, &["add", "file.txt"]) && git(&root, &["commit", "--quiet", "-m", "base"]));
+        assert!(git(&root, &["push", "--quiet", "--set-upstream", "origin", "main"]));
+        std::fs::write(root.join("file.txt"), "base\nlocal\n").unwrap();
+        assert!(git(&root, &["add", "file.txt"]) && git(&root, &["commit", "--quiet", "-m", "typo in the mesage"]));
+        let pushed = git::run_git(&root, &["rev-parse", "HEAD~1"]).unwrap().trim().to_owned();
+        let local = git::run_git(&root, &["rev-parse", "HEAD"]).unwrap().trim().to_owned();
+
+        let (tx, rx) = spawn_worker();
+        tx.send((None, Request::Refresh { cwd: root.clone() })).unwrap();
+        let shown = approve_worker(&tx, &rx);
+        let answer = || rx.recv_timeout(Duration::from_secs(20)).expect("worker response");
+
+        tx.send((shown.clone(), Request::Reword { hash: local.clone(), message: "fix the message".to_owned() }))
+            .unwrap();
+        let Response::Reworded(Ok(new)) = answer() else { panic!("the unpushed commit is reworded") };
+        assert_ne!(new, local, "a new message is a new commit");
+        tx.send((shown.clone(), Request::CommitDetail { hash: new.clone() })).unwrap();
+        let Response::CommitDetail { hash, detail } = answer() else { panic!("the new commit can be opened") };
+        assert_eq!(hash, new);
+        assert_eq!(detail.message, "fix the message");
+
+        tx.send((shown.clone(), Request::Reword { hash: pushed, message: "rewrite history".to_owned() })).unwrap();
+        let Response::Reworded(Err(reason)) = answer() else { panic!("a pushed commit is refused") };
+        assert_eq!(reason, strings::WORKSPACE_REWORD_PUSHED());
+
+        tx.send((Some(dir.path().join("elsewhere")), Request::Reword { hash: new, message: "late".to_owned() }))
+            .unwrap();
+        let Response::Reworded(Err(reason)) = answer() else { panic!("another repository is refused") };
+        assert_eq!(reason, strings::WORKSPACE_REPO_CHANGED());
+    }
+
+    /// A panel that moved to another repository forgets the edit with the view.
+    #[test]
+    fn leaving_the_repository_forgets_the_edit() {
+        let (mut workspace, _requests, _answers) = reword_panel();
+        workspace.start_reword();
+        workspace.clear_repository_view();
+        assert!(workspace.reword.is_none() && workspace.rewording.is_none());
+        let (mut workspace, _requests, _answers) = reword_panel();
+        workspace.forget_branch_view();
+        assert!(workspace.reword.is_none());
     }
 
     /// What a click on a file launches is decided on the worker: it

@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod history;
 mod hooks;
+pub use history::reword;
 
 /// One changed file, as `git status --porcelain=v2` reports it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2178,6 +2180,10 @@ pub struct CommitLog {
 pub struct CommitDetail {
     pub files: Vec<(char, String, u32, u32)>,
     pub header: String,
+    /// The message as stored (`%B`, without its trailing newlines). The header
+    /// folds a wrapped first paragraph into one subject line, so a text to be
+    /// edited and saved back starts from this instead.
+    pub message: String,
 }
 
 /// Upstream ref of the current branch: the configured one, else `origin/<branch>`.
@@ -2213,19 +2219,47 @@ pub fn upstream(root: &Path) -> Option<String> {
 /// loads, only the "new here"/"new there" chips are missing, which is the
 /// lesser failure for a user reading history.
 fn rev_list_set(root: &Path, revs: &[&str]) -> std::collections::HashSet<String> {
+    rev_list_checked(root, revs).unwrap_or_else(|e| {
+        log::warn!("rev-list: {e}");
+        Default::default()
+    })
+}
+
+/// The same set, with git's failure as the error: an action that rewrites
+/// history must not take "could not ask" for "nothing is there".
+fn rev_list_checked(root: &Path, revs: &[&str]) -> Result<std::collections::HashSet<String>, String> {
     let mut full: Vec<&str> = vec!["rev-list", "--max-count=200"];
     if revs.iter().all(|rev| *rev == "HEAD") {
-        full.extend(["--not", "--remotes"]);
+        // `--not` reverses every revision after it, so the second one gives
+        // `HEAD` its own meaning back: HEAD without what any remote has.
+        full.extend(["--not", "--remotes", "--not"]);
     }
     full.push("--end-of-options");
     full.extend(revs.iter().copied());
-    match run_git(root, &full) {
-        Ok(text) => text.lines().map(|line| line.trim().to_owned()).filter(|line| !line.is_empty()).collect(),
-        Err(e) => {
-            log::warn!("rev-list: {e}");
-            Default::default()
+    let text = run_git(root, &full)?;
+    Ok(text.lines().map(|line| line.trim().to_owned()).filter(|line| !line.is_empty()).collect())
+}
+
+/// Commits of HEAD that are not pushed: those the upstream lacks, or, with no
+/// upstream, those no remote-tracking branch has.
+fn outgoing_set(root: &Path, upstream: Option<&str>) -> std::collections::HashSet<String> {
+    match upstream {
+        Some(upstream) => rev_list_set(root, &[&format!("{upstream}..HEAD")]),
+        None => rev_list_set(root, &["HEAD"]),
+    }
+}
+
+/// Whether `hash` is a commit of HEAD that no remote-tracking branch has and
+/// the upstream lacks. Stricter than the outgoing section, which only compares
+/// with the upstream: a branch that tracks `upstream/main` but was pushed to
+/// `origin/feat` still shows those commits as outgoing.
+fn is_unpushed(root: &Path, hash: &str) -> Result<bool, String> {
+    if let Some(upstream) = upstream(root) {
+        if !rev_list_checked(root, &[&format!("{upstream}..HEAD")])?.contains(hash) {
+            return Ok(false);
         }
     }
+    Ok(rev_list_checked(root, &["HEAD"])?.contains(hash))
 }
 
 /// Recent commits of HEAD (and the upstream), marked with their section.
@@ -2235,11 +2269,10 @@ pub fn log(root: &Path) -> Result<CommitLog, String> {
         return Ok(CommitLog::default());
     }
     let upstream = upstream(root);
-    let (outgoing, incoming) = match &upstream {
-        Some(upstream) => {
-            (rev_list_set(root, &[&format!("{upstream}..HEAD")]), rev_list_set(root, &[&format!("HEAD..{upstream}")]))
-        }
-        None => (rev_list_set(root, &["HEAD"]), Default::default()),
+    let outgoing = outgoing_set(root, upstream.as_deref());
+    let incoming = match &upstream {
+        Some(upstream) => rev_list_set(root, &[&format!("HEAD..{upstream}")]),
+        None => Default::default(),
     };
     let format = "%H%x00%h%x00%P%x00%an%x00%ct%x00%D%x00%s";
     let revs: Vec<&str> = match &upstream {
@@ -2370,7 +2403,8 @@ pub fn commit_detail(root: &Path, hash: &str) -> Result<CommitDetail, String> {
     // A failed `show` must not read as an empty commit message.
     let header =
         run_git(root, &["show", "--no-patch", "--format=%H%n%an <%ae>%n%ci%n%s%n%b", "--end-of-options", hash])?;
-    Ok(CommitDetail { files, header })
+    let message = run_git(root, &["show", "--no-patch", "--format=%B", "--end-of-options", hash])?;
+    Ok(CommitDetail { files, header, message: message.trim_end().to_owned() })
 }
 
 /// Load only the selected commit file; paths remain literal even with glob characters.

@@ -258,6 +258,13 @@ pub const WORKSPACE_SECTION_INCOMING: &str = "ВХОДЯЩИЕ";
 pub const WORKSPACE_SECTION_HISTORY: &str = "ИСТОРИЯ";
 pub const WORKSPACE_BACK: &str = "‹ назад";
 pub const WORKSPACE_COPY_HASH: &str = "Копировать хеш";
+pub const WORKSPACE_REWORD: &str = "Изменить описание";
+pub const WORKSPACE_REWORD_SAVE: &str = "Сохранить";
+pub const WORKSPACE_REWORD_CANCEL: &str = "Отмена";
+pub const WORKSPACE_REWORD_PUSHED: &str = "менять можно только коммиты, которые ещё не отправлены";
+pub const WORKSPACE_REWORD_EMPTY: &str = "описание коммита пустое";
+pub const WORKSPACE_REWORD_BUSY: &str = "сначала завершите начатый rebase, merge, cherry-pick или revert";
+pub const WORKSPACE_REWORD_UNEXPECTED: &str = "git ответил неожиданно: ничего не изменено";
 pub const WORKSPACE_COPY_PATCH: &str = "Копировать патч";
 pub const WORKSPACE_NEW_FILE: &str = "Новый файл";
 pub const WORKSPACE_NEW_FOLDER: &str = "Новая папка";
@@ -330,6 +337,14 @@ pub fn workspace_staged(staged: usize, unstaged: usize) -> String {
 
 pub fn workspace_committed(hash: &str) -> String {
     format!("Коммит {hash}")
+}
+
+pub fn workspace_reworded(hash: &str) -> String {
+    format!("Описание изменено · {hash}")
+}
+
+pub fn workspace_reword_signed(hash: &str) -> String {
+    format!("коммит {hash} подписан: после правки подпись пропала бы")
 }
 
 pub fn workspace_ai(command: &str) -> String {

@@ -213,6 +213,13 @@ pub const WORKSPACE_SECTION_INCOMING: &str = "INCOMING";
 pub const WORKSPACE_SECTION_HISTORY: &str = "HISTORY";
 pub const WORKSPACE_BACK: &str = "‹ back";
 pub const WORKSPACE_COPY_HASH: &str = "Copy hash";
+pub const WORKSPACE_REWORD: &str = "Edit message";
+pub const WORKSPACE_REWORD_SAVE: &str = "Save";
+pub const WORKSPACE_REWORD_CANCEL: &str = "Cancel";
+pub const WORKSPACE_REWORD_PUSHED: &str = "only commits that have not been pushed can be edited";
+pub const WORKSPACE_REWORD_EMPTY: &str = "the commit message is empty";
+pub const WORKSPACE_REWORD_BUSY: &str = "finish the rebase, merge, cherry-pick or revert in progress first";
+pub const WORKSPACE_REWORD_UNEXPECTED: &str = "git answered something unexpected: nothing was changed";
 pub const WORKSPACE_COPY_PATCH: &str = "Copy patch";
 pub const WORKSPACE_NEW_FILE: &str = "New file";
 pub const WORKSPACE_NEW_FOLDER: &str = "New folder";
@@ -303,6 +310,12 @@ pub fn workspace_staged(staged: usize, unstaged: usize) -> String {
 }
 pub fn workspace_committed(hash: &str) -> String {
     format!("Commit {hash}")
+}
+pub fn workspace_reworded(hash: &str) -> String {
+    format!("Message updated · {hash}")
+}
+pub fn workspace_reword_signed(hash: &str) -> String {
+    format!("commit {hash} is signed: editing it would drop the signature")
 }
 pub fn workspace_ai(command: &str) -> String {
     format!("AI: {command}")

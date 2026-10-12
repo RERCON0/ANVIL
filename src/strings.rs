@@ -274,6 +274,13 @@ texts! {
     WORKSPACE_SECTION_HISTORY,
     WORKSPACE_BACK,
     WORKSPACE_COPY_HASH,
+    WORKSPACE_REWORD,
+    WORKSPACE_REWORD_SAVE,
+    WORKSPACE_REWORD_CANCEL,
+    WORKSPACE_REWORD_PUSHED,
+    WORKSPACE_REWORD_EMPTY,
+    WORKSPACE_REWORD_BUSY,
+    WORKSPACE_REWORD_UNEXPECTED,
     WORKSPACE_COPY_PATCH,
     WORKSPACE_NEW_FILE,
     WORKSPACE_NEW_FOLDER,
@@ -381,6 +388,18 @@ pub fn workspace_ai(command: &str) -> String {
     match language() {
         Language::English => en::workspace_ai(command),
         Language::Russian => ru::workspace_ai(command),
+    }
+}
+pub fn workspace_reworded(hash: &str) -> String {
+    match language() {
+        Language::English => en::workspace_reworded(hash),
+        Language::Russian => ru::workspace_reworded(hash),
+    }
+}
+pub fn workspace_reword_signed(hash: &str) -> String {
+    match language() {
+        Language::English => en::workspace_reword_signed(hash),
+        Language::Russian => ru::workspace_reword_signed(hash),
     }
 }
 pub fn hotkey_label(action: &crate::hotkeys::Action) -> String {

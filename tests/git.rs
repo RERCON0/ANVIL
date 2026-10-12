@@ -1023,3 +1023,370 @@ fn switching_with_conflicting_local_changes_is_refused() {
     assert_eq!(git::status(&root).unwrap().branch, base, "the branch did not move");
     assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "uncommitted local edit\n");
 }
+
+// ---- rewording unpushed commits --------------------------------------------
+
+fn rev(dir: &Path, spec: &str) -> String {
+    String::from_utf8(output(dir, &["rev-parse", spec])).unwrap().trim().to_owned()
+}
+
+/// `main` pushed to a bare remote: every commit made after this is unpushed.
+fn pushed_repo() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
+    let dir = repo()?;
+    let remote = tempfile::tempdir().unwrap();
+    run(remote.path(), &["init", "--quiet", "--bare"]);
+    run(dir.path(), &["branch", "-M", "main"]);
+    run(dir.path(), &["remote", "add", "origin", remote.path().to_str().unwrap()]);
+    run(dir.path(), &["push", "--quiet", "-u", "origin", "main"]);
+    Some((dir, remote))
+}
+
+/// An allow-empty commit by another author on a fixed past date: a rewrite
+/// that touched author or dates would show.
+fn commit_as(dir: &Path, message: &str, date: &str) {
+    let mut command = Command::new("git");
+    command
+        .args(["commit", "--quiet", "--allow-empty", "-m", message])
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "Alice Author")
+        .env("GIT_AUTHOR_EMAIL", "alice@example.com")
+        .env("GIT_AUTHOR_DATE", date)
+        .env("GIT_COMMITTER_DATE", date);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    assert!(command.status().expect("git").success(), "git commit failed");
+}
+
+fn raw_commit(dir: &Path, spec: &str) -> String {
+    String::from_utf8(output(dir, &["cat-file", "commit", spec])).unwrap()
+}
+
+fn message_of(dir: &Path, spec: &str) -> String {
+    raw_commit(dir, spec).split_once("\n\n").expect("commit headers").1.to_owned()
+}
+
+/// Tree, author and committer lines: everything a message edit must keep.
+fn identity_of(dir: &Path, spec: &str) -> Vec<String> {
+    raw_commit(dir, spec)
+        .split_once("\n\n")
+        .expect("commit headers")
+        .0
+        .lines()
+        .filter(|line| ["tree ", "author ", "committer "].iter().any(|key| line.starts_with(key)))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn rewording_the_last_unpushed_commit_changes_only_its_message() {
+    let Some((dir, _remote)) = pushed_repo() else { return };
+    let root = dir.path();
+    std::fs::write(root.join("tracked.txt"), "one\ntwo\n").unwrap();
+    run(root, &["add", "tracked.txt"]);
+    commit_as(root, "fix: tipo", "2020-01-02T03:04:05+03:00");
+    // Work in progress, staged and not, must come out exactly as it went in.
+    std::fs::write(root.join("staged.txt"), "staged\n").unwrap();
+    run(root, &["add", "staged.txt"]);
+    std::fs::write(root.join("tracked.txt"), "one\ntwo\nthree\n").unwrap();
+    std::fs::write(root.join("fresh.txt"), "fresh\n").unwrap();
+    let before = rev(root, "HEAD");
+    let status = output(root, &["status", "--porcelain=v2", "-z"]);
+    let index = output(root, &["ls-files", "--stage"]);
+
+    let new = git::reword(root, &before, "fix: typo\n\nExplain it.   \n\n\n").expect("reword");
+
+    assert_ne!(new, before);
+    assert_eq!(rev(root, "HEAD"), new, "the branch moved to the rewritten commit");
+    assert_eq!(identity_of(root, "HEAD"), identity_of(root, &before), "tree, author and dates are kept");
+    assert_eq!(message_of(root, "HEAD"), "fix: typo\n\nExplain it.\n", "cleaned like `git commit -F`");
+    assert_eq!(rev(root, "HEAD^"), rev(root, &format!("{before}^")), "the parent is the same commit");
+    assert_eq!(output(root, &["status", "--porcelain=v2", "-z"]), status, "worktree and index are untouched");
+    assert_eq!(output(root, &["ls-files", "--stage"]), index);
+    assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "one\ntwo\nthree\n");
+    let reflog = String::from_utf8(output(root, &["reflog", "-1", "--format=%gs"])).unwrap();
+    assert!(reflog.contains("reword"), "the move is explained in the reflog: {reflog}");
+}
+
+#[test]
+fn rewording_a_middle_commit_replays_the_commits_above_it_unchanged() {
+    let Some((dir, _remote)) = pushed_repo() else { return };
+    let root = dir.path();
+    let base = rev(root, "HEAD");
+    for (day, name) in ["one", "two", "three"].iter().enumerate() {
+        std::fs::write(root.join(format!("{name}.txt")), format!("{name}\n")).unwrap();
+        run(root, &["add", "-A"]);
+        commit_as(root, &format!("feat: {name}\n\nbody of {name}"), &format!("2020-01-0{}T03:04:05+03:00", day + 1));
+    }
+    let [first, second, third] = ["HEAD~2", "HEAD~1", "HEAD"].map(|spec| rev(root, spec));
+
+    let new = git::reword(root, &second, "feat: two, reworded").expect("reword");
+
+    assert_eq!(rev(root, "HEAD~1"), new, "the answer is the rewritten commit");
+    assert_eq!(rev(root, "HEAD~2"), first, "commits below the target are not touched");
+    assert_eq!(rev(root, "HEAD~3"), base);
+    assert_ne!(rev(root, "HEAD"), third, "the commit above it is replayed on the new parent");
+    assert_eq!(message_of(root, "HEAD~1"), "feat: two, reworded\n");
+    assert_eq!(identity_of(root, "HEAD~1"), identity_of(root, &second));
+    assert_eq!(identity_of(root, "HEAD"), identity_of(root, &third));
+    assert_eq!(message_of(root, "HEAD"), message_of(root, &third), "the replayed message is byte for byte");
+    assert!(output(root, &["status", "--porcelain"]).is_empty(), "nothing in the worktree changed");
+}
+
+#[test]
+fn rewording_below_a_merge_keeps_both_parents_of_the_merge() {
+    let Some((dir, _remote)) = pushed_repo() else { return };
+    let root = dir.path();
+    commit_as(root, "target", "2020-01-01T03:04:05+03:00");
+    let target = rev(root, "HEAD");
+    run(root, &["switch", "--quiet", "-c", "feature"]);
+    commit_as(root, "on feature", "2020-01-02T03:04:05+03:00");
+    run(root, &["switch", "--quiet", "main"]);
+    commit_as(root, "on main", "2020-01-03T03:04:05+03:00");
+    run(root, &["merge", "--quiet", "--no-ff", "-m", "merge feature", "feature"]);
+    let merge = rev(root, "HEAD");
+    let [main_side, feature_side] = ["HEAD^1", "HEAD^2"].map(|spec| rev(root, spec));
+
+    let new = git::reword(root, &target, "target, reworded").expect("reword");
+
+    let tip = rev(root, "HEAD");
+    assert_ne!(tip, merge);
+    assert_eq!(rev(root, "HEAD^{tree}"), rev(root, &format!("{merge}^{{tree}}")));
+    assert_eq!(message_of(root, "HEAD"), "merge feature\n");
+    // Both sides of the merge sit on the rewritten commit now.
+    for (side, old) in [("HEAD^1", &main_side), ("HEAD^2", &feature_side)] {
+        assert_ne!(&rev(root, side), old, "{side} is replayed");
+        assert_eq!(rev(root, &format!("{side}^")), new, "{side} is built on the rewritten commit");
+    }
+    assert_eq!(message_of(root, "HEAD^2"), "on feature\n");
+    assert!(output(root, &["status", "--porcelain"]).is_empty());
+}
+
+/// The refusal text of `reword`, in the language the library speaks.
+fn refusal(result: Result<String, String>) -> String {
+    result.expect_err("the reword must be refused")
+}
+
+#[test]
+fn rewording_refuses_a_commit_that_is_already_pushed() {
+    let Some((dir, _remote)) = pushed_repo() else { return };
+    let root = dir.path();
+    let pushed = rev(root, "HEAD");
+    commit_as(root, "local", "2020-01-01T03:04:05+03:00");
+    let head = rev(root, "HEAD");
+
+    let error = refusal(git::reword(root, &pushed, "rewritten history"));
+
+    assert_eq!(error, anvil::strings::WORKSPACE_REWORD_PUSHED());
+    assert_eq!(rev(root, "HEAD"), head, "nothing moved");
+    assert_eq!(message_of(root, &pushed), "init: first\n");
+}
+
+#[test]
+fn rewording_refuses_a_commit_outside_the_current_history() {
+    let Some((dir, _remote)) = pushed_repo() else { return };
+    let root = dir.path();
+    run(root, &["switch", "--quiet", "-c", "elsewhere"]);
+    commit_as(root, "on another branch", "2020-01-01T03:04:05+03:00");
+    let elsewhere = rev(root, "HEAD");
+    run(root, &["switch", "--quiet", "main"]);
+    commit_as(root, "local", "2020-01-02T03:04:05+03:00");
+    let head = rev(root, "HEAD");
+
+    let error = refusal(git::reword(root, &elsewhere, "not mine"));
+
+    assert_eq!(error, anvil::strings::WORKSPACE_REWORD_PUSHED());
+    assert_eq!(rev(root, "HEAD"), head);
+}
+
+#[test]
+fn rewording_refuses_an_empty_message() {
+    let Some((dir, _remote)) = pushed_repo() else { return };
+    let root = dir.path();
+    commit_as(root, "keep me", "2020-01-01T03:04:05+03:00");
+    let head = rev(root, "HEAD");
+
+    for blank in ["", "   ", "\n\n", " \t\r\n \n"] {
+        assert_eq!(refusal(git::reword(root, &head, blank)), anvil::strings::WORKSPACE_REWORD_EMPTY(), "{blank:?}");
+    }
+    assert_eq!(rev(root, "HEAD"), head);
+    assert_eq!(message_of(root, "HEAD"), "keep me\n");
+}
+
+#[test]
+fn rewording_waits_for_a_rebase_merge_or_cherry_pick_in_progress() {
+    let Some((dir, _remote)) = pushed_repo() else { return };
+    let root = dir.path();
+    commit_as(root, "mid-operation", "2020-01-01T03:04:05+03:00");
+    let head = rev(root, "HEAD");
+    let git_dir = root.join(".git");
+    for marker in ["rebase-merge", "rebase-apply"] {
+        std::fs::create_dir(git_dir.join(marker)).unwrap();
+        assert_eq!(refusal(git::reword(root, &head, "x")), anvil::strings::WORKSPACE_REWORD_BUSY(), "{marker}");
+        std::fs::remove_dir(git_dir.join(marker)).unwrap();
+    }
+    for marker in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"] {
+        std::fs::write(git_dir.join(marker), format!("{head}\n")).unwrap();
+        assert_eq!(refusal(git::reword(root, &head, "x")), anvil::strings::WORKSPACE_REWORD_BUSY(), "{marker}");
+        std::fs::remove_file(git_dir.join(marker)).unwrap();
+    }
+    assert_eq!(rev(root, "HEAD"), head);
+    assert!(git::reword(root, &head, "now it is fine").is_ok(), "the markers were the only obstacle");
+}
+
+/// The same commit with a `gpgsig` header (a made-up one: nothing verifies it).
+fn signed_copy(dir: &Path, spec: &str) -> String {
+    let raw = raw_commit(dir, spec);
+    let (headers, message) = raw.split_once("\n\n").expect("commit headers");
+    let signed = format!(
+        "{headers}\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n made-up\n -----END PGP SIGNATURE-----\n\n{message}"
+    );
+    let mut command = Command::new("git");
+    command.args(["hash-object", "-t", "commit", "-w", "--stdin"]).current_dir(dir);
+    command.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let mut child = command.spawn().expect("git");
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), signed.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "hash-object refused the crafted commit");
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
+fn rewording_never_drops_a_signature_silently() {
+    let Some((dir, _remote)) = pushed_repo() else { return };
+    let root = dir.path();
+    commit_as(root, "unsigned", "2020-01-01T03:04:05+03:00");
+    let unsigned = rev(root, "HEAD");
+    commit_as(root, "signed", "2020-01-02T03:04:05+03:00");
+    let signed = signed_copy(root, "HEAD");
+    run(root, &["update-ref", "HEAD", &signed]);
+
+    // The commit above the target would lose its signature when replayed.
+    let above = refusal(git::reword(root, &unsigned, "new"));
+    assert!(above.contains(&signed[..7]), "the signed commit is named: {above}");
+    // The target itself would no longer match its signature.
+    let itself = refusal(git::reword(root, &signed, "new"));
+    assert!(itself.contains(&signed[..7]), "{itself}");
+    assert_eq!(rev(root, "HEAD"), signed, "nothing moved");
+}
+
+#[test]
+fn rewording_works_on_a_detached_head_and_keeps_the_old_commit_recoverable() {
+    let Some((dir, _remote)) = pushed_repo() else { return };
+    let root = dir.path();
+    commit_as(root, "typo", "2020-01-01T03:04:05+03:00");
+    let old = rev(root, "HEAD");
+    run(root, &["switch", "--quiet", "--detach"]);
+
+    let new = git::reword(root, &old, "no typo").expect("a detached HEAD has no upstream, only remotes");
+
+    assert_eq!(rev(root, "HEAD"), new);
+    assert_eq!(message_of(root, "HEAD"), "no typo\n");
+    let (alive, _) = attempt(root, &["cat-file", "-e", &old]);
+    assert!(alive, "the commit before the edit is still in the object store for `git reflog`");
+}
+
+/// A branch that was never pushed has no upstream: what no remote has is its
+/// outgoing work. `--not` reverses every revision after it, so `HEAD` listed
+/// behind `--not --remotes` was excluded together with them.
+#[test]
+fn commits_of_a_branch_without_an_upstream_are_outgoing() {
+    let Some((dir, _remote)) = pushed_repo() else { return };
+    let root = dir.path();
+    run(root, &["switch", "--quiet", "-c", "feature"]);
+    commit_as(root, "local one", "2020-01-01T03:04:05+03:00");
+    commit_as(root, "local two", "2020-01-02T03:04:05+03:00");
+    assert_eq!(git::upstream(root), None, "the premise: nothing tracks this branch");
+
+    let log = git::log(root).expect("log");
+
+    let sections: Vec<(&str, git::Section)> =
+        log.commits.iter().map(|commit| (commit.subject.as_str(), commit.section)).collect();
+    assert_eq!(
+        sections,
+        [
+            ("local two", git::Section::Outgoing),
+            ("local one", git::Section::Outgoing),
+            ("init: first", git::Section::History),
+        ]
+    );
+}
+
+/// A fork workflow: `feat` tracks `upstream/main` but is pushed to `origin/feat`.
+/// What `origin` has is pushed, whatever the upstream says.
+#[test]
+fn rewording_refuses_a_commit_that_another_remote_already_has() {
+    let Some((dir, upstream)) = pushed_repo() else { return };
+    let root = dir.path();
+    let origin = tempfile::tempdir().unwrap();
+    run(origin.path(), &["init", "--quiet", "--bare"]);
+    run(root, &["remote", "add", "fork", origin.path().to_str().unwrap()]);
+    run(root, &["switch", "--quiet", "-c", "feat"]);
+    run(root, &["branch", "--set-upstream-to=origin/main", "feat"]);
+    commit_as(root, "shared with the fork", "2020-01-01T03:04:05+03:00");
+    run(root, &["push", "--quiet", "fork", "feat"]);
+    commit_as(root, "still local", "2020-01-02T03:04:05+03:00");
+    let (shared, local, head) = (rev(root, "HEAD~1"), rev(root, "HEAD"), rev(root, "HEAD"));
+    assert!(
+        git::log(root)
+            .unwrap()
+            .commits
+            .iter()
+            .any(|commit| commit.hash == shared && commit.section == git::Section::Outgoing),
+        "the premise: against its upstream the pushed commit still reads as outgoing"
+    );
+
+    let error = refusal(git::reword(root, &shared, "rewritten after the push"));
+
+    assert_eq!(error, anvil::strings::WORKSPACE_REWORD_PUSHED());
+    assert_eq!(rev(root, "HEAD"), head, "nothing moved");
+    assert!(git::reword(root, &local, "only the local one").is_ok(), "what no remote has can still be edited");
+    drop(upstream);
+}
+
+/// What the editor starts from must be the stored message: `%s` folds a wrapped
+/// first paragraph into one line and the view trims a body's first indent.
+#[test]
+fn commit_detail_carries_the_message_exactly_as_stored() {
+    let Some((dir, _remote)) = pushed_repo() else { return };
+    let root = dir.path();
+    let message = "wrapped subject one\nline two of the same paragraph\n\n    indented block\n\nlast paragraph";
+    commit_as(root, message, "2020-01-01T03:04:05+03:00");
+
+    let detail = git::commit_detail(root, &rev(root, "HEAD")).expect("detail");
+
+    assert_eq!(detail.message, message);
+}
+
+#[test]
+fn rewording_the_bottom_of_a_long_chain_replays_every_commit_intact() {
+    let Some((dir, _remote)) = pushed_repo() else { return };
+    let root = dir.path();
+    for index in 0..40 {
+        commit_as(root, &format!("step {index}\n\nbody {index} 😀\n"), &format!("2020-01-01T03:{:02}:05+03:00", index));
+    }
+    let history = |dir: &Path| {
+        String::from_utf8(output(dir, &["log", "--reverse", "--format=%an|%ae|%aI|%cI|%B", "origin/main..HEAD"]))
+            .unwrap()
+    };
+    let before = history(root);
+    let oldest = rev(root, "HEAD~39");
+
+    git::reword(root, &oldest, "step 0, reworded").expect("reword");
+
+    let after = history(root);
+    let (first_old, rest_old) = before.split_once("step 1\n").expect("the second commit");
+    let (first_new, rest_new) = after.split_once("step 1\n").expect("the second commit");
+    assert!(first_old.contains("step 0") && first_new.contains("step 0, reworded"));
+    assert_eq!(rest_new, rest_old, "the 39 commits above keep authors, dates and messages byte for byte");
+    assert_eq!(output(root, &["rev-list", "--count", "origin/main..HEAD"]), b"40\n");
+    let (alive, problems) = attempt(root, &["fsck", "--strict", "--no-dangling"]);
+    assert!(alive, "the object store is sound: {problems}");
+}
