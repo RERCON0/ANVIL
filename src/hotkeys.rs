@@ -262,6 +262,12 @@ impl Action {
         )
     }
 
+    /// Actions that copy the selection (Ctrl+C also interrupts when nothing is
+    /// selected).
+    pub fn copies_selection(&self) -> bool {
+        matches!(self, Action::CtrlC | Action::Copy)
+    }
+
     /// Whether holding the key should keep running the action. Continuous
     /// operations the user holds (scrolling, zooming, moving and deleting by
     /// word, an interrupting Ctrl+C) repeat; anything that opens, closes or

@@ -14,7 +14,7 @@ use crate::app::AnvilApp;
 use crate::chrome::edges::Edge;
 use crate::host::gl_window::GlWindow;
 use crate::host::keys;
-use crate::host::route::{route_key_press, KeyRoute};
+use crate::host::route::{clear_egui_text_selection, route_key_press, KeyRoute};
 use crate::host::WindowCommand;
 use crate::theme;
 
@@ -32,6 +32,9 @@ struct Host {
     repaint_at: Option<Instant>,
     last_redraw: Option<Instant>,
     maintenance_at: Instant,
+    /// A copy key went to egui for selected panel text: deselect it once the
+    /// frame that copies it has run, as copying a terminal selection does.
+    drop_text_selection: bool,
     #[cfg(debug_assertions)]
     capture: Option<super::capture::Capture>,
 }
@@ -48,6 +51,7 @@ pub fn run(app: AnvilApp) {
         repaint_at: None,
         last_redraw: None,
         maintenance_at: Instant::now(),
+        drop_text_selection: false,
         #[cfg(debug_assertions)]
         capture: None,
     };
@@ -85,6 +89,7 @@ fn run_with_capture(app: AnvilApp, capture: super::capture::Capture) {
         repaint_at: None,
         last_redraw: None,
         maintenance_at: Instant::now(),
+        drop_text_selection: false,
         capture: Some(capture),
     };
     event_loop.run_app(&mut host).expect("capture event loop");
@@ -149,6 +154,9 @@ impl Host {
                 super::capture::Capture::paint_cursor(ui, pos);
             }
         });
+        if std::mem::take(&mut self.drop_text_selection) {
+            clear_egui_text_selection(&egui.egui_ctx);
+        }
         if let Some(area) = app.ime_area() {
             gl.window.set_ime_cursor_area(
                 winit::dpi::LogicalPosition::new(area.min.x, area.min.y),
@@ -298,6 +306,7 @@ impl ApplicationHandler<UserEvent> for Host {
                         ctx.request_repaint();
                         return;
                     }
+                    KeyRoute::EguiCopy => self.drop_text_selection = true,
                     KeyRoute::Egui => {}
                 }
             }

@@ -22,7 +22,7 @@ use crate::claude_setup::{self, Plan};
 use crate::claude_status::StatusRecord;
 use crate::config::{Bell, Config, CursorConfig, CursorShapeConfig};
 use crate::fonts;
-use crate::host::route::KeyFocus;
+use crate::host::route::{egui_text_selected, KeyFocus};
 use crate::host::WindowCommand;
 use crate::hotkeys::{Action, Keymap};
 use crate::layout::split_tree::{Anchor, Dir, PaneId, SplitTree};
@@ -623,6 +623,7 @@ impl AnvilApp {
         KeyFocus {
             egui_wants_keyboard: ctx.egui_wants_keyboard_input() || overlay,
             terminal_focused: !self.settings_open && self.tabs.get(self.active).is_some(),
+            egui_text_selected: egui_text_selected(ctx),
         }
     }
 
