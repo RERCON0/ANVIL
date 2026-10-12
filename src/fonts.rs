@@ -291,14 +291,30 @@ mod tests {
         let ctx = egui::Context::default();
         install(&ctx, "Consolas", &registry_font_entries(), false);
         // Fonts become available with the first frame.
-        let _ = ctx.run_ui(Default::default(), |_| {});
+        let _ = crate::test_ui(&ctx, Default::default(), |_| {});
         // Exactly the symbols src/strings.rs and the chrome paint.
         let used = "≡×↑↓▸▾◂⟳‹›·—…−─□»↺▓░";
         let missing: Vec<char> = used
             .chars()
-            .filter(|c| !ctx.fonts_mut(|fonts| fonts.has_glyph(&FontId::new(13.0, FontFamily::Name("ui".into())), *c)))
+            .filter(|c| {
+                !ctx.fonts_mut(|fonts| fonts.glyph_width(&FontId::new(13.0, FontFamily::Name("ui".into())), *c) > 0.0)
+            })
             .collect();
         assert!(missing.is_empty(), "glyphs missing from the ui family: {missing:?}");
+    }
+
+    #[test]
+    fn primary_glyph_detection_does_not_load_fallbacks_for_supported_text() {
+        let ctx = egui::Context::default();
+        install(&ctx, "Test", &[], false);
+        let _ = crate::test_ui(&ctx, Default::default(), |_| {});
+        let primary = FontId::new(13.0, FontFamily::Name("term-primary".into()));
+        ctx.fonts_mut(|fonts| {
+            for c in ['A', 'Ж', '─'] {
+                assert!(fonts.glyph_width(&primary, c) > 0.0, "supported glyph {c}");
+            }
+            assert_eq!(fonts.glyph_width(&primary, '\u{10ffff}'), 0.0, "missing glyph must request a fallback");
+        });
     }
 
     #[test]

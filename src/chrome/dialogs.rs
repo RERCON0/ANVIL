@@ -75,11 +75,11 @@ mod tests {
     fn enter_never_defaults_to_executable_paste_and_escape_cancels() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
-        let _ = ctx.run_ui(Default::default(), |_| {});
+        let _ = crate::test_ui(&ctx, Default::default(), |_| {});
         let dialog = DialogState::Paste { pane_id: 7, text: "echo first\necho second\n".to_owned() };
         let frame = |events| {
             let mut outcome = DialogOutcome::None;
-            let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+            let _ = crate::test_ui(&ctx, egui::RawInput { events, ..Default::default() }, |ui| {
                 outcome = show(ui.ctx(), &dialog);
             });
             outcome

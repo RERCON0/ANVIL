@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use egui::epaint::{AlphaFromCoverage, ColorImage};
+use egui::epaint::{ColorImage, FontColorTransferFunction};
 use egui::{Color32, Context, Id, Mesh, Pos2, Rect, TextureHandle, TextureId, TextureOptions, Vec2};
 
 use crate::fonts::TermFaces;
@@ -23,7 +23,7 @@ const MAX_CACHED_GLYPHS: usize = 16_384;
 
 // Coverage is 8-bit: evaluate the gamma transfer once, not per uploaded texel.
 static COVERAGE_COLORS: LazyLock<[Color32; 256]> = LazyLock::new(|| {
-    std::array::from_fn(|coverage| AlphaFromCoverage::Gamma(0.55).color_from_coverage(coverage as f32 / 255.0))
+    std::array::from_fn(|coverage| FontColorTransferFunction::Gamma(0.55).color_from_coverage(coverage as f32 / 255.0))
 });
 
 /// Ceiling on one glyph's coverage buffer. The atlas is `ATLAS` texels on a
@@ -285,8 +285,9 @@ mod dwrite {
     use std::os::windows::ffi::OsStrExt;
 
     use super::MAX_ATLAS_PIXELS;
+    use windows::core::BOOL;
     use windows::core::{Interface, Result, PCWSTR};
-    use windows::Win32::Foundation::{BOOL, DWRITE_E_FILEFORMAT};
+    use windows::Win32::Foundation::DWRITE_E_FILEFORMAT;
     use windows::Win32::Graphics::DirectWrite::{
         DWRITE_TEXTURE_ALIASED_1x1, DWriteCreateFactory, IDWriteFactory5, IDWriteFontFace, IDWriteFontFace3,
         IDWriteFontFile, IDWriteInMemoryFontFileLoader, IDWriteRenderingParams, DWRITE_FACTORY_TYPE_ISOLATED,

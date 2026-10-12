@@ -186,9 +186,12 @@ fn ctrl_click_on_a_link_reaches_a_mouse_tracking_app_instead_of_opening_the_brow
         window_edge: false,
     };
     let mut frame = |events| {
-        ctx.run_ui(egui::RawInput { screen_rect: Some(rect), events, modifiers, ..Default::default() }, |ui| {
+        let events = std::iter::once(Event::ModifiersChanged(modifiers)).chain(events).collect();
+        let mut output = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), events, ..Default::default() }, |ui| {
             view.show(ui, rect, &mut pane, &input);
-        })
+        });
+        output.textures_delta.clear();
+        output
     };
     let _ = frame(Vec::new());
     // The link is in the first terminal cell. This lies well inside that cell

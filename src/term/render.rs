@@ -761,7 +761,7 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(ppp);
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
-        let _ = ctx.run_ui(Default::default(), |_| {});
+        let _ = crate::test_ui(&ctx, Default::default(), |_| {});
         let fonts = TermFonts::new(14.0);
         let metrics = cell_metrics(&ctx, &fonts);
         let style = crate::term::style::CellStyle {
@@ -793,7 +793,7 @@ mod tests {
             default_bg: Color32::BLACK,
         };
         let origin = Pos2::new(4.0, 4.0);
-        let output = ctx.run_ui(Default::default(), |ui| {
+        let output = crate::test_ui(&ctx, Default::default(), |ui| {
             let painter = ui.ctx().layer_painter(egui::LayerId::background());
             let palette = Palette::dark();
             let opt = PaintOptions {
@@ -845,7 +845,7 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(ppp);
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
-        let _ = ctx.run_ui(Default::default(), |_| {});
+        let _ = crate::test_ui(&ctx, Default::default(), |_| {});
         let fonts = TermFonts::new(14.0);
         let metrics = cell_metrics(&ctx, &fonts);
         let style = |bg: Color32| crate::term::style::CellStyle {
@@ -881,7 +881,7 @@ mod tests {
             history_size: 0,
             default_bg: Color32::BLACK,
         };
-        let output = ctx.run_ui(Default::default(), |ui| {
+        let output = crate::test_ui(&ctx, Default::default(), |ui| {
             let painter = ui.ctx().layer_painter(egui::LayerId::background());
             let palette = Palette::dark();
             let opt = PaintOptions {
@@ -928,10 +928,10 @@ mod tests {
     fn paint_fallback_glyph(ch: char) -> (Rect, Rect, CellMetrics) {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), true);
-        let _ = ctx.run_ui(Default::default(), |_| {});
+        let _ = crate::test_ui(&ctx, Default::default(), |_| {});
         let fonts = TermFonts::new(14.0);
         let cell = cell_metrics(&ctx, &fonts);
-        let output = ctx.run_ui(Default::default(), |ui| {
+        let output = crate::test_ui(&ctx, Default::default(), |ui| {
             let painter = ui.ctx().layer_painter(egui::LayerId::background());
             let cells = vec![RenderCell {
                 ch,
@@ -1034,7 +1034,7 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_pixels_per_point(ppp);
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
-        let _ = ctx.run_ui(Default::default(), |_| {});
+        let _ = crate::test_ui(&ctx, Default::default(), |_| {});
         let fonts = TermFonts::new(15.0);
         let metrics = cell_metrics(&ctx, &fonts);
         let style = |bold: bool| crate::term::style::CellStyle {
@@ -1070,7 +1070,7 @@ mod tests {
             history_size: 0,
             default_bg: Color32::BLACK,
         };
-        let output = ctx.run_ui(Default::default(), |ui| {
+        let output = crate::test_ui(&ctx, Default::default(), |ui| {
             let painter = ui.ctx().layer_painter(egui::LayerId::background());
             let palette = Palette::dark();
             let opt = PaintOptions {

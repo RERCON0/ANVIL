@@ -39,3 +39,11 @@ pub fn secure_dll_search() -> std::io::Result<()> {
     }
 }
 mod agents;
+
+/// Headless test passes intentionally discard GPU updates after inspecting UI output.
+#[cfg(test)]
+pub(crate) fn test_ui(ctx: &egui::Context, input: egui::RawInput, draw: impl FnMut(&mut egui::Ui)) -> egui::FullOutput {
+    let mut output = ctx.run_ui(input, draw);
+    output.textures_delta.clear();
+    output
+}

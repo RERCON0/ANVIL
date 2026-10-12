@@ -1155,7 +1155,7 @@ mod tests {
     fn a_quota_switch_remembers_off_and_returns_to_automatic() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
-        let _ = ctx.run_ui(Default::default(), |_| {});
+        let _ = crate::test_ui(&ctx, Default::default(), |_| {});
         let mut config = crate::config::Config::default();
         let snapshot = crate::quota::model::Snapshot::default();
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(700.0, 600.0));
@@ -1181,12 +1181,12 @@ mod tests {
     fn the_font_family_applies_on_enter_not_per_keystroke() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
-        let _ = ctx.run_ui(Default::default(), |_| {});
+        let _ = crate::test_ui(&ctx, Default::default(), |_| {});
         let id = egui::Id::new("family-test");
         let frame = |events: Vec<egui::Event>| {
             let mut committed = None;
-            let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
-                egui::CentralPanel::default().show_inside(ui, |ui| committed = font_family_field(ui, id, "Consolas"));
+            let _ = crate::test_ui(&ctx, egui::RawInput { events, ..Default::default() }, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| committed = font_family_field(ui, id, "Consolas"));
             });
             committed
         };
@@ -1212,12 +1212,12 @@ mod tests {
     fn an_abandoned_family_draft_does_not_come_back() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
-        let _ = ctx.run_ui(Default::default(), |_| {});
+        let _ = crate::test_ui(&ctx, Default::default(), |_| {});
         let id = egui::Id::new("family-abandoned");
         let frame = |events: Vec<egui::Event>, draw: bool| {
             let mut committed = None;
-            let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
-                egui::CentralPanel::default().show_inside(ui, |ui| {
+            let _ = crate::test_ui(&ctx, egui::RawInput { events, ..Default::default() }, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     if draw {
                         committed = font_family_field(ui, id, "Consolas");
                     }
@@ -1274,7 +1274,7 @@ mod tests {
     fn the_default_profile_list_names_every_profile_once() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
-        let _ = ctx.run_ui(Default::default(), |_| {});
+        let _ = crate::test_ui(&ctx, Default::default(), |_| {});
         let mut config = Config::default();
         config.profiles.push(ProfileConfig {
             id: "mine".into(),
@@ -1288,10 +1288,10 @@ mod tests {
         let mut state = SettingsState::default();
         let rect = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 700.0));
         let mut frame = |open: bool| {
-            let output = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
-                egui::CentralPanel::default().show_inside(ui, |ui| {
+            let output = crate::test_ui(&ctx, egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     if open {
-                        let combo = ui.make_persistent_id(egui::Id::new("default-profile"));
+                        let combo = ui.make_persistent_id(egui::IdSalt::new("default-profile"));
                         egui::Popup::open_id(ui.ctx(), combo.with("popup"));
                     }
                     let mut cx = SettingsContext {
@@ -1327,8 +1327,8 @@ mod tests {
         let mut config = Config::default();
         let rect = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 700.0));
         let raw = egui::RawInput { screen_rect: Some(rect), events, ..Default::default() };
-        let _ = ctx.run_ui(raw, |ui| {
-            egui::CentralPanel::default().show_inside(ui, |ui| {
+        let _ = crate::test_ui(ctx, raw, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 let mut cx = SettingsContext {
                     config: &mut config,
                     keymap_rows: &[],
@@ -1350,7 +1350,7 @@ mod tests {
     fn arguments_can_be_typed_one_key_at_a_time() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
-        let _ = ctx.run_ui(Default::default(), |_| {});
+        let _ = crate::test_ui(&ctx, Default::default(), |_| {});
         let mut state = SettingsState { adding: true, ..SettingsState::default() };
         editor_frame(&ctx, &mut state, Vec::new());
         ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("profile-args")));
@@ -1376,8 +1376,8 @@ mod tests {
         let mut outcome = SettingsOutcome::default();
         let rect = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(900.0, 700.0));
         let raw = egui::RawInput { screen_rect: Some(rect), events, ..Default::default() };
-        let _ = ctx.run_ui(raw, |ui| {
-            egui::CentralPanel::default().show_inside(ui, |ui| {
+        let _ = crate::test_ui(ctx, raw, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 let mut cx = SettingsContext {
                     config,
                     keymap_rows: &[],
@@ -1403,7 +1403,7 @@ mod tests {
     fn a_text_field_reports_typing_and_then_its_end() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
-        let _ = ctx.run_ui(Default::default(), |_| {});
+        let _ = crate::test_ui(&ctx, Default::default(), |_| {});
         let mut config = Config::default();
         let mut state = SettingsState::default();
         let before = config.terminal.word_separators.clone();
@@ -1425,7 +1425,7 @@ mod tests {
     fn the_ai_command_can_be_typed_with_spaces() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
-        let _ = ctx.run_ui(Default::default(), |_| {});
+        let _ = crate::test_ui(&ctx, Default::default(), |_| {});
         let mut config = Config::default();
         // A loaded catalogue: the page does not start the real `opencode models`.
         let mut state = SettingsState { model_catalog: ModelCatalog::Ready(Ok(Vec::new())), ..Default::default() };

@@ -163,13 +163,13 @@ mod tests {
     fn context() -> egui::Context {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), true);
-        let _ = ctx.run_ui(Default::default(), |_| {});
+        let _ = crate::test_ui(&ctx, Default::default(), |_| {});
         ctx
     }
 
     fn painted(ctx: &egui::Context, rect: Rect, segments: &[Segment], events: Vec<egui::Event>) -> Option<BarAction> {
         let mut seen = None;
-        let _ = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), events, ..Default::default() }, |ui| {
+        let _ = crate::test_ui(ctx, egui::RawInput { screen_rect: Some(rect), events, ..Default::default() }, |ui| {
             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                 seen = show(ui, rect, segments);
             });
@@ -185,7 +185,11 @@ mod tests {
         let pieces = [Piece { text: " ↺ 2д4ч".into(), style: Style::Hint }];
         let layout = job(&pieces, false, &font);
         assert_eq!(layout.text, " ↺ 2д4ч");
-        let icon = layout.sections.iter().find(|section| &layout.text[section.byte_range.clone()] == "↺").unwrap();
+        let icon = layout
+            .sections
+            .iter()
+            .find(|section| &layout.text[section.byte_range.start.0..section.byte_range.end.0] == "↺")
+            .unwrap();
         assert!(icon.format.font_id.size < FONT_SIZE);
         for section in layout.sections.iter().filter(|section| section.byte_range != icon.byte_range) {
             assert_eq!(section.format.font_id.size, FONT_SIZE);
@@ -239,7 +243,7 @@ mod tests {
         let segments = segments();
         let font = FontId::proportional(FONT_SIZE);
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(2000.0, HEIGHT));
-        let _ = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
+        let _ = crate::test_ui(&ctx, egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
             let painter = ui.painter_at(rect);
             let measure = |text: &str| painter.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE).size().x;
             for width in 200..2000 {

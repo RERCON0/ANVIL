@@ -64,13 +64,15 @@ impl Gui {
     }
 
     pub fn paint(&mut self, window: &Window) {
-        let delta = std::mem::take(&mut self.textures_delta);
-        for (id, image) in delta.set {
-            self.painter.set_texture(id, &image);
+        let mut delta = std::mem::take(&mut self.textures_delta);
+        for (id, images) in delta.set.drain() {
+            for image in images {
+                self.painter.set_texture(id, &image);
+            }
         }
         let primitives = self.egui_ctx.tessellate(std::mem::take(&mut self.shapes), self.pixels_per_point);
         self.painter.paint_primitives(window.inner_size().into(), self.pixels_per_point, &primitives);
-        for id in delta.free {
+        for id in delta.free.drain() {
             self.painter.free_texture(id);
         }
     }

@@ -463,7 +463,11 @@ impl TerminalView {
                     &term,
                     input.palette,
                     &mut self.glyphs,
-                    &mut |c| f.has_glyph(&primary, c),
+                    // epaint 0.36's has_glyph compares the resolved face with
+                    // the replacement face, rejecting valid primary-face glyphs.
+                    // Terminal base cells need a nonzero advance; combining
+                    // marks are handled separately by the snapshot/render path.
+                    &mut |c| f.glyph_width(&primary, c) > 0.0,
                     self.frame.take(),
                 )
             });

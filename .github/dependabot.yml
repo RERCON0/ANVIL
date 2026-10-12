@@ -5,6 +5,13 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # These crates must share the versions selected by egui_glow/windows.
+    # Review new minor families with docs/DEPENDENCIES.md, not in isolation.
+    ignore:
+      - dependency-name: glow
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: windows-core
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     groups:
       graphics-stack:
         patterns: ["egui", "egui_glow", "glow"]

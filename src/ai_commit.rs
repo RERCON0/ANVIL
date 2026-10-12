@@ -219,13 +219,12 @@ fn project(value: &serde_json::Value, keys: &[&str]) -> serde_json::Value {
 /// parser's own message quotes the offending source line, and these files hold
 /// credentials (`.credentials.json` is a single line holding the OAuth tokens).
 fn syntax_error(error: &json5::Error) -> String {
-    let json5::Error::Message { location, .. } = error;
-    match location {
+    match error.position() {
         Some(at) => crate::tr_format!(
             "invalid JSON (line {}, column {})",
             "неверный JSON (строка {}, столбец {})",
-            at.line,
-            at.column
+            at.line + 1,
+            at.column + 1
         ),
         None => crate::strings::pick("invalid JSON", "неверный JSON").to_owned(),
     }

@@ -124,7 +124,7 @@ mod tests {
         let mut previous = None;
         for scale in [1.0, 1.0, 2.0] {
             ctx.set_pixels_per_point(scale);
-            let _ = ctx.run_ui(Default::default(), |ui| {
+            let _ = crate::test_ui(&ctx, Default::default(), |ui| {
                 let painter = ui.painter();
                 let font = FontId::proportional(14.0);
                 let first =
@@ -154,14 +154,14 @@ mod tests {
     fn font_reset_invalidates_cached_atlas_coordinates_and_entries_stay_bounded() {
         let ctx = egui::Context::default();
         let mut before = None;
-        let _ = ctx.run_ui(Default::default(), |ui| {
+        let _ = crate::test_ui(&ctx, Default::default(), |ui| {
             before = Some(elide_galley(ui.painter(), "title", FontId::proportional(14.0), 80.0, Color32::WHITE, false));
         });
         let mut fonts = egui::FontDefinitions::default();
         let fallback = fonts.families[&egui::FontFamily::Monospace].clone();
         fonts.families.insert(egui::FontFamily::Name("reset-fixture".into()), fallback);
         ctx.set_fonts(fonts);
-        let _ = ctx.run_ui(Default::default(), |ui| {
+        let _ = crate::test_ui(&ctx, Default::default(), |ui| {
             let after = elide_galley(ui.painter(), "title", FontId::proportional(14.0), 80.0, Color32::WHITE, false);
             assert!(!Arc::ptr_eq(before.as_ref().unwrap(), &after), "old atlas UVs cannot survive set_fonts");
             for index in 0..MAX_ENTRIES * 2 {

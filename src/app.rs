@@ -509,7 +509,7 @@ impl AnvilApp {
         // start a text selection.
         let window_edge = resize_borders(&ctx, maximized, &mut commands);
 
-        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::colors().chrome_bg)).show_inside(ui, |ui| {
+        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::colors().chrome_bg)).show(ui, |ui| {
             if self.ui.dialog.is_some() {
                 ui.disable();
             }

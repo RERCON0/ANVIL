@@ -125,7 +125,7 @@ enforcement details and remaining limits.
 ## Build
 
 Install Git, rustup and **Visual Studio Build Tools** with C++ tools and the
-Windows SDK. [rust-toolchain.toml](rust-toolchain.toml) pins Rust 1.92.0,
+Windows SDK. [rust-toolchain.toml](rust-toolchain.toml) pins Rust 1.99.0,
 rustfmt and Clippy. PowerShell, from the repository root:
 
 ```powershell

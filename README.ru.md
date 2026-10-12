@@ -137,7 +137,7 @@ CI проверяет настоящие ConPTY-сессии, Git, состав 
 ## Сборка
 
 Нужны Git, rustup и **Visual Studio Build Tools** с C++ и Windows SDK.
-[rust-toolchain.toml](rust-toolchain.toml) закрепляет Rust 1.92.0, rustfmt и
+[rust-toolchain.toml](rust-toolchain.toml) закрепляет Rust 1.99.0, rustfmt и
 Clippy. Из корня репозитория в PowerShell:
 
 ```powershell

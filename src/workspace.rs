@@ -2892,10 +2892,10 @@ fn markdown_row_job(source: &egui::text::LayoutJob, range: std::ops::Range<usize
     job.halign = source.halign;
     job.justify = source.justify;
     job.round_output_to_gui = source.round_output_to_gui;
-    let first = source.sections.partition_point(|section| section.byte_range.end <= range.start);
-    for section in source.sections[first..].iter().take_while(|section| section.byte_range.start < range.end) {
-        let start = range.start.max(section.byte_range.start);
-        let end = range.end.min(section.byte_range.end);
+    let first = source.sections.partition_point(|section| section.byte_range.end.0 <= range.start);
+    for section in source.sections[first..].iter().take_while(|section| section.byte_range.start.0 < range.end) {
+        let start = range.start.max(section.byte_range.start.0);
+        let end = range.end.min(section.byte_range.end.0);
         if start < end {
             job.append(&source.text[start..end], 0.0, section.format.clone());
         }
@@ -4079,8 +4079,8 @@ mod tests {
         let source = text_rows(text, true);
         let mut cache = WrappedRows::default();
         for width in [180.0, 700.0] {
-            let _ = ctx.run_ui(Default::default(), |ui| {
-                egui::CentralPanel::default().show_inside(ui, |ui| {
+            let _ = crate::test_ui(&ctx, Default::default(), |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     ui.set_max_width(width);
                     cache.prepare(ui, text, &source);
                     assert_eq!(
@@ -4106,8 +4106,8 @@ mod tests {
             "paragraph with wrapping and **bold** text\n".repeat(2_000)
         );
         let mut cache = MarkdownCache::default();
-        let _ = ctx.run_ui(Default::default(), |ui| {
-            egui::CentralPanel::default().show_inside(ui, |ui| {
+        let _ = crate::test_ui(&ctx, Default::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 ui.set_max_width(300.0);
                 cache.prepare(ui, &text);
                 assert!(cache.rows.iter().any(|row| row.header && row.cells.len() == 2));
@@ -4261,8 +4261,8 @@ mod tests {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 700.0));
         let frame = |workspace: &mut Workspace, events: Vec<egui::Event>, time: f64| {
             let input = egui::RawInput { screen_rect: Some(rect), time: Some(time), events, ..Default::default() };
-            ctx.run_ui(input, |ui| {
-                egui::CentralPanel::default().show_inside(ui, |ui| {
+            crate::test_ui(&ctx, input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     let _ = workspace.show(ui, rect, 1, None);
                 });
             })
@@ -4518,7 +4518,8 @@ mod tests {
     fn eliding_the_front_never_exceeds_the_given_width() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), false);
-        let output = ctx.run_ui(
+        let output = crate::test_ui(
+            &ctx,
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(800.0, 600.0))),
                 ..Default::default()
@@ -4646,8 +4647,8 @@ mod tests {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(900.0, 700.0))),
             ..Default::default()
         };
-        let output = ctx.run_ui(input, |ui| {
-            egui::CentralPanel::default().show_inside(ui, |ui| {
+        let output = crate::test_ui(&ctx, input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 let _ = workspace.show(ui, rect, pane, None);
             });
         });
@@ -4691,8 +4692,8 @@ mod tests {
                     events,
                     ..Default::default()
                 };
-                let output = ctx.run_ui(input, |ui| {
-                    egui::CentralPanel::default().show_inside(ui, |ui| {
+                let output = crate::test_ui(&ctx, input, |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
                         workspace.show(ui, rect, 1, None);
                     });
                 });
@@ -4745,8 +4746,8 @@ mod tests {
         let commit_button = strings::WORKSPACE_COMMIT().to_owned();
         let mut frame = |events: Vec<egui::Event>, time: f64| {
             let input = egui::RawInput { screen_rect: Some(rect), time: Some(time), events, ..Default::default() };
-            let output = ctx.run_ui(input, |ui| {
-                egui::CentralPanel::default().show_inside(ui, |ui| {
+            let output = crate::test_ui(&ctx, input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
                     let _ = workspace.show(ui, rect, 1, None);
                 });
             });
@@ -4989,8 +4990,8 @@ mod tests {
         };
         let mut left = panel("src/lib.rs");
         let mut right = panel("README.md");
-        let output = ctx.run_ui(input, |ui| {
-            egui::CentralPanel::default().show_inside(ui, |ui| {
+        let output = crate::test_ui(&ctx, input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 let left_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(400.0, 700.0));
                 let right_rect = egui::Rect::from_min_size(egui::Pos2::new(500.0, 0.0), egui::Vec2::new(380.0, 700.0));
                 let _ = left.show(ui, left_rect, 1, None);
@@ -5420,8 +5421,13 @@ mod tests {
         assert_eq!(job.text.len(), 100_000);
 
         let job = inline_job("x **bold** `code` **open", 11.5, egui::Color32::WHITE, 300.0);
-        let pieces: Vec<&str> = job.sections.iter().map(|section| &job.text[section.byte_range.clone()]).collect();
-        assert_eq!(pieces, ["x ", "bold", " ", "code", " ", "**open"]);
+        let pieces: Vec<&str> = job
+            .sections
+            .iter()
+            .map(|section| &job.text[section.byte_range.start.0..section.byte_range.end.0])
+            .collect();
+        // egui merges adjacent sections with the same format.
+        assert_eq!(pieces, ["x ", "bold", " ", "code", " **open"]);
         assert!(job.sections[1].format.extra_letter_spacing > 0.0, "bold keeps its format");
         assert_eq!(job.sections[3].format.background, theme::colors().tab_active_bg, "code keeps its chip");
     }
@@ -5635,8 +5641,8 @@ mod tests {
                 events,
                 ..Default::default()
             };
-            ctx.run_ui(input, |ui| {
-                egui::CentralPanel::default().show_inside(ui, |ui| workspace.commit_box(ui));
+            crate::test_ui(ctx, input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| workspace.commit_box(ui));
             })
             .shapes
         }
@@ -5866,12 +5872,11 @@ mod tests {
         let input = egui::RawInput {
             // The panel's default width: what overflows here overflows for the user.
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(380.0, 520.0))),
-            modifiers,
-            events,
+            events: std::iter::once(egui::Event::ModifiersChanged(modifiers)).chain(events).collect(),
             ..Default::default()
         };
-        ctx.run_ui(input, |ui| {
-            egui::CentralPanel::default().show_inside(ui, |ui| {
+        crate::test_ui(ctx, input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 workspace.detail_view(ui);
             });
         })

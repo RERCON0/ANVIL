@@ -81,11 +81,12 @@ impl ReadmeDemo {
         input.events.retain(|e| {
             !matches!(e, egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } | egui::Event::PointerGone)
         });
-        input.modifiers = if (80..=104).contains(&frame) {
+        let modifiers = if (80..=104).contains(&frame) {
             egui::Modifiers { ctrl: true, shift: true, command: true, ..Default::default() }
         } else {
             egui::Modifiers::default()
         };
+        input.events.push(egui::Event::ModifiersChanged(modifiers));
         if frame == 80 && self.drag.is_none() {
             let area = app.last_tab_area;
             let rects = app.tabs[0].tree.layout(
@@ -109,7 +110,7 @@ impl ReadmeDemo {
                     pos: point,
                     button: egui::PointerButton::Primary,
                     pressed: frame == 81,
-                    modifiers: input.modifiers,
+                    modifiers,
                 });
             }
         } else {

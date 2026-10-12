@@ -146,7 +146,7 @@ mod tests {
         events: Vec<egui::Event>,
     ) -> CollapsedListOutcome {
         let mut outcome = CollapsedListOutcome::None;
-        let _ = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+        let _ = crate::test_ui(ctx, egui::RawInput { events, ..Default::default() }, |ui| {
             outcome = show(ui.ctx(), list, rows);
         });
         outcome

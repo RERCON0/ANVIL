@@ -385,7 +385,7 @@ mod recycling {
             result.ok()
         }
 
-        fn PreDeleteItem(&self, flags: u32, _: Option<&IShellItem>) -> windows::core::Result<()> {
+        fn PreDeleteItem(&self, flags: u32, _: windows::core::Ref<'_, IShellItem>) -> windows::core::Result<()> {
             // FOF_ALLOWUNDO alone promises undo only "if possible". Veto the
             // Shell's permanent-delete path before it can touch the item.
             // https://learn.microsoft.com/windows/win32/api/shobjidl_core/nf-shobjidl_core-ifileoperationprogresssink-predeleteitem
@@ -400,14 +400,14 @@ mod recycling {
         fn PostDeleteItem(
             &self,
             _: u32,
-            _: Option<&IShellItem>,
+            _: windows::core::Ref<'_, IShellItem>,
             result: HRESULT,
-            recycled: Option<&IShellItem>,
+            recycled: windows::core::Ref<'_, IShellItem>,
         ) -> windows::core::Result<()> {
             // A successful PerformOperations can still mean skipped/cancelled.
             // PostDeleteItem supplies the actual item HRESULT and a non-null
             // Recycle Bin item only for recycling, not permanent deletion.
-            let result = delete_outcome(result, recycled.is_some());
+            let result = delete_outcome(result, !recycled.is_null());
             let state = self.get_impl();
             if !matches!(state.deleted.get(), Some(hr) if hr.is_err()) {
                 state.deleted.set(Some(result));
@@ -417,24 +417,29 @@ mod recycling {
 
         // No rename/copy/move/new operations are queued. Reject unexpected work
         // rather than allowing the Shell to substitute a different operation.
-        fn PreRenameItem(&self, _: u32, _: Option<&IShellItem>, _: &PCWSTR) -> windows::core::Result<()> {
+        fn PreRenameItem(
+            &self,
+            _: u32,
+            _: windows::core::Ref<'_, IShellItem>,
+            _: &PCWSTR,
+        ) -> windows::core::Result<()> {
             Err(E_NOTIMPL.into())
         }
         fn PostRenameItem(
             &self,
             _: u32,
-            _: Option<&IShellItem>,
+            _: windows::core::Ref<'_, IShellItem>,
             _: &PCWSTR,
             _: HRESULT,
-            _: Option<&IShellItem>,
+            _: windows::core::Ref<'_, IShellItem>,
         ) -> windows::core::Result<()> {
             Err(E_NOTIMPL.into())
         }
         fn PreMoveItem(
             &self,
             _: u32,
-            _: Option<&IShellItem>,
-            _: Option<&IShellItem>,
+            _: windows::core::Ref<'_, IShellItem>,
+            _: windows::core::Ref<'_, IShellItem>,
             _: &PCWSTR,
         ) -> windows::core::Result<()> {
             Err(E_NOTIMPL.into())
@@ -442,19 +447,19 @@ mod recycling {
         fn PostMoveItem(
             &self,
             _: u32,
-            _: Option<&IShellItem>,
-            _: Option<&IShellItem>,
+            _: windows::core::Ref<'_, IShellItem>,
+            _: windows::core::Ref<'_, IShellItem>,
             _: &PCWSTR,
             _: HRESULT,
-            _: Option<&IShellItem>,
+            _: windows::core::Ref<'_, IShellItem>,
         ) -> windows::core::Result<()> {
             Err(E_NOTIMPL.into())
         }
         fn PreCopyItem(
             &self,
             _: u32,
-            _: Option<&IShellItem>,
-            _: Option<&IShellItem>,
+            _: windows::core::Ref<'_, IShellItem>,
+            _: windows::core::Ref<'_, IShellItem>,
             _: &PCWSTR,
         ) -> windows::core::Result<()> {
             Err(E_NOTIMPL.into())
@@ -462,26 +467,26 @@ mod recycling {
         fn PostCopyItem(
             &self,
             _: u32,
-            _: Option<&IShellItem>,
-            _: Option<&IShellItem>,
+            _: windows::core::Ref<'_, IShellItem>,
+            _: windows::core::Ref<'_, IShellItem>,
             _: &PCWSTR,
             _: HRESULT,
-            _: Option<&IShellItem>,
+            _: windows::core::Ref<'_, IShellItem>,
         ) -> windows::core::Result<()> {
             Err(E_NOTIMPL.into())
         }
-        fn PreNewItem(&self, _: u32, _: Option<&IShellItem>, _: &PCWSTR) -> windows::core::Result<()> {
+        fn PreNewItem(&self, _: u32, _: windows::core::Ref<'_, IShellItem>, _: &PCWSTR) -> windows::core::Result<()> {
             Err(E_NOTIMPL.into())
         }
         fn PostNewItem(
             &self,
             _: u32,
-            _: Option<&IShellItem>,
+            _: windows::core::Ref<'_, IShellItem>,
             _: &PCWSTR,
             _: &PCWSTR,
             _: u32,
             _: HRESULT,
-            _: Option<&IShellItem>,
+            _: windows::core::Ref<'_, IShellItem>,
         ) -> windows::core::Result<()> {
             Err(E_NOTIMPL.into())
         }

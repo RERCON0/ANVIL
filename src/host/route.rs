@@ -142,7 +142,7 @@ mod tests {
             events,
             ..Default::default()
         };
-        let output = ctx.run_ui(input, |ui| {
+        let output = crate::test_ui(ctx, input, |ui| {
             rect = ui.label(LABEL).rect;
         });
         (rect, output)

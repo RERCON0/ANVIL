@@ -7,7 +7,7 @@ use crate::host::WindowCommand;
 use crate::strings;
 use crate::theme;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Button {
     Minimize,
     Maximize,

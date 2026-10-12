@@ -514,9 +514,10 @@ mod tests {
         events: Vec<egui::Event>,
     ) -> (egui::FullOutput, Vec<TabbarAction>) {
         let mut actions = Vec::new();
-        let output = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), events, ..Default::default() }, |ui| {
-            actions = show(ui, rect, state, tabs, false, &Default::default(), 0);
-        });
+        let output =
+            crate::test_ui(ctx, egui::RawInput { screen_rect: Some(rect), events, ..Default::default() }, |ui| {
+                actions = show(ui, rect, state, tabs, false, &Default::default(), 0);
+            });
         (output, actions)
     }
 
@@ -526,7 +527,7 @@ mod tests {
         crate::fonts::install(&ctx, "Test", &[], false);
         let mut previous = None;
         for _ in 0..3 {
-            let _ = ctx.run_ui(Default::default(), |ui| {
+            let _ = crate::test_ui(&ctx, Default::default(), |ui| {
                 let painter = ui.painter();
                 let font = theme::font(12.5);
                 let layout = painter.layout_no_wrap("cached".into(), font.clone(), Color32::WHITE);
@@ -738,14 +739,14 @@ mod tests {
     fn a_scrolled_list_still_reaches_the_tabs_past_the_fold() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), true);
-        let _ = ctx.run_ui(Default::default(), |_| {});
+        let _ = crate::test_ui(&ctx, Default::default(), |_| {});
         let blank = || TabInfo { title: "".into(), active: false, activity: false, claude: None, color: None };
         let many: Vec<TabInfo> =
             (0..12).map(|index| TabInfo { title: format!("tab {index}").into(), ..blank() }).collect();
         let mut state = TabbarState::default();
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(180.0, 120.0));
         let mut actions = Vec::new();
-        let _ = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
+        let _ = crate::test_ui(&ctx, egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
             actions = show(ui, rect, &mut state, &many, false, &Default::default(), 0);
         });
         assert!(actions.is_empty(), "painting alone reports no actions");
@@ -762,13 +763,13 @@ mod tests {
     fn a_coloured_tab_paints_a_bar_in_that_colour() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, "Consolas", &crate::fonts::registry_font_entries(), true);
-        let _ = ctx.run_ui(Default::default(), |_| {});
+        let _ = crate::test_ui(&ctx, Default::default(), |_| {});
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(180.0, 120.0));
         let bars = |color: Option<theme::TabColor>| {
             let tab = TabInfo { title: "t".into(), active: false, activity: false, claude: None, color };
             let mut state = TabbarState::default();
             let mut actions = Vec::new();
-            let output = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
+            let output = crate::test_ui(&ctx, egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
                 actions = show(ui, rect, &mut state, std::slice::from_ref(&tab), false, &Default::default(), 0);
             });
             assert!(actions.is_empty());

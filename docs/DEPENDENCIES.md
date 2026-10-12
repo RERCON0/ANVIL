@@ -1,30 +1,38 @@
 # Dependency maintenance
 
-## Dependabot PR 2
+## Reviewed upgrades (2026-10-12)
 
-[PR #2](https://github.com/RERCON0/ANVIL/pull/2), reviewed at
-`d5a20373109e5b30ea9556be313039c5220c3e3a`, proposes egui/egui_glow 0.36.2,
-glow 0.18, json5 1.3, windows-sys 0.61 and windows-core 0.100.
-The Windows job fails because the graphics stack needs Rust 1.95 while ANVIL
-pins 1.92. These are deliberate major upgrades, not a safe automatic merge.
+The changes proposed in Dependabot PRs #3, #4 and #5 are integrated with
+compatibility fixes: Rust 1.99.0, egui/egui_glow 0.36.2, json5 1.3.1,
+windows-sys 0.61 and windows/windows-core 0.62.2.
 
-Review in separate groups:
+- **Graphics:** egui_glow 0.36.2 uses glow 0.17. ANVIL keeps that same version
+  so its OpenGL context has the exact type expected by the painter. A standalone
+  glow 0.18 upgrade creates incompatible context types.
+- **Windows:** windows-core must match the `windows` crate that generates
+  the COM interfaces. Upgrading core alone to 0.100 breaks that pair; both
+  direct crates now use 0.62.2. The Recycle Bin progress sink retains its
+  permanent-deletion veto with the new borrowed COM reference API.
+- **JSON5:** error positions are converted from zero-based to one-based
+  coordinates. Diagnostics still omit source text and credentials.
+- **Input and textures:** modifiers arrive as input events; all texture
+  updates for an atlas are applied in order before painting. Headless tests
+  explicitly discard GPU updates after inspecting their UI output.
+- **Glyph detection:** epaint 0.36's `has_glyph` can reject valid glyphs that
+  share the replacement character's face. Terminal base-cell detection uses
+  the actual glyph advance instead; combining marks are rendered separately.
+  Tests cover supported primary-font text and a genuinely absent glyph so the
+  upgrade does not trigger unnecessary fallback-font loading.
 
-1. **Graphics and MSRV:** choose the new Rust minimum explicitly, update
-   egui/egui_glow/glow together, and run narrow-pane, terminal glyph, input,
-   IME, drag and graphics-initialisation checks on Windows.
-2. **Windows bindings:** windows-core must match the `windows` crate used by
-   COM macros. Do not upgrade core independently while windows stays 0.58.
-   Exercise Recycle Bin, Explorer selection, Credential Manager and process I/O.
-3. **Configuration parser:** evaluate json5 independently with malformed,
-   bounded and existing configuration fixtures. The old 0.4 line is a
-   maintenance concern; its withdrawn unmaintained advisory is not a current
-   RustSec vulnerability finding.
+Dependabot reviews graphics, Windows bindings and other dependencies in
+separate groups. Standalone minor/major upgrades of glow and windows-core are
+held until their parent libraries use those versions; patch updates remain
+enabled. Review these holds during the next egui_glow/windows migration.
 
-Every group needs locked Clippy/tests, current RustSec checks, actual ConPTY
-integration, package validation and signed release verification. Provider
-fixtures are not a claim of live API compatibility. Local audit fixes do not
-silently merge or close the remote PR.
+Validation includes locked Clippy/tests, current RustSec checks, actual ConPTY
+and Git integration, documentation and package checks in CI. Provider fixtures
+do not claim live API compatibility. This maintenance update creates no release
+and does not change existing signed packages.
 
 ## Build and security tools
 

@@ -734,7 +734,8 @@ mod tests {
             let before = tab.tree.clone();
             let mut layout_changed = 0;
             let mut frame = |time, events| {
-                let _ = ctx.run_ui(
+                let _ = crate::test_ui(
+                    &ctx,
                     egui::RawInput { screen_rect: Some(rect), time: Some(time), events, ..Default::default() },
                     |ui| {
                         layout_changed += tab
@@ -856,7 +857,7 @@ mod tests {
         let panes = tab.tree.layout(tree_rect(rect), theme::DIVIDER_WIDTH);
         for focus in [1, 2, 1] {
             tab.set_focus(focus);
-            let output = ctx.run_ui(egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
+            let output = crate::test_ui(&ctx, egui::RawInput { screen_rect: Some(rect), ..Default::default() }, |ui| {
                 tab.show(ui, rect, &env);
             });
             let dimmed: Vec<_> = output
