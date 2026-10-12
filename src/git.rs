@@ -607,18 +607,31 @@ fn read_stamp(root: &Path) -> Result<RepositoryStamp, String> {
         // so every local destination Git reports joins the same approval.
         let mut destinations = Vec::new();
         let mut receivers = Vec::new();
-        // Only the panel's own repository pushes: a submodule's remotes are
-        // `git submodule update` targets, not destinations of this branch.
-        for repository in checked.repository.iter() {
-            for destination in effective_local_destinations(repository, &checked.executable, deadline)? {
-                if let Some(git_dir) = receiver_git_dir(&destination, &checked.executable, deadline)? {
-                    // The sender pushing to itself is already covered by its own scan.
-                    let own = checked.repositories.iter().any(|known| same_path(&known.git_dir, &git_dir));
-                    if !own && !receivers.contains(&git_dir) {
-                        receivers.push(git_dir);
+        // Only an `insteadOf`/`pushInsteadOf` rule can send Git somewhere the
+        // file-level scan did not read; without one the raw URLs are the truth.
+        let rewritten = snapshots.iter().any(|(_, config)| config_has_rewrite(config));
+        if rewritten {
+            // Only the panel's own repository pushes: a submodule's remotes are
+            // `git submodule update` targets, not destinations of this branch.
+            for repository in checked.repository.iter() {
+                for destination in effective_local_destinations(repository, &checked.executable, deadline)? {
+                    if let Some(git_dir) = receiver_git_dir(&destination, &checked.executable, deadline)? {
+                        // The sender pushing to itself is already covered by its own scan.
+                        let own = checked.repositories.iter().any(|known| same_path(&known.git_dir, &git_dir));
+                        if !own && !receivers.contains(&git_dir) {
+                            receivers.push(git_dir);
+                        }
+                    }
+                    // Pushing to this repository or one of its parts runs hooks
+                    // the scan above already watches.
+                    let known = checked
+                        .repositories
+                        .iter()
+                        .any(|known| same_path(&known.root, &destination) || same_path(&known.git_dir, &destination));
+                    if !known && !destinations.contains(&destination) {
+                        destinations.push(destination);
                     }
                 }
-                destinations.push(destination);
             }
         }
         // A receiver created (or swapped for a link) after approval would
@@ -651,6 +664,14 @@ fn read_stamp(root: &Path) -> Result<RepositoryStamp, String> {
         return Ok(combined);
     }
     Err(config_refusal())
+}
+
+/// Whether a `git config --list` capture names an `insteadOf`/`pushInsteadOf`
+/// rule: only such a rule can make Git resolve a URL that the file-level scan
+/// did not read.
+fn config_has_rewrite(config: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"insteadof";
+    config.windows(NEEDLE.len()).any(|window| window.eq_ignore_ascii_case(NEEDLE))
 }
 
 /// Watches a push destination itself, not only the files inside it: a receiver
@@ -1316,7 +1337,12 @@ impl ConfigScan {
             }
             if matches!(key.as_str(), "remote.url" | "remote.pushurl") {
                 if let Some(target) = transport::local_destination(&value, &self.cwd)? {
-                    self.local_transports.entry(self.cwd.clone()).or_default().insert(target);
+                    // Pushing to itself runs this worktree's own hooks, which the
+                    // sender's own scan already covers; watching the worktree
+                    // root itself would revoke on every ordinary file write.
+                    if !same_path(&target, &self.cwd) {
+                        self.local_transports.entry(self.cwd.clone()).or_default().insert(target);
+                    }
                 }
                 continue;
             }
@@ -1689,15 +1715,24 @@ fn global_configs(executable: &Path) -> Result<Vec<PathBuf>, String> {
 /// directory) redirects there for a linked worktree. Returns the common
 /// directory when the candidate is a real git directory, `None` otherwise.
 fn valid_git_dir(git_dir: &Path, scan: &mut ConfigScan) -> Result<Option<PathBuf>, String> {
-    let git_dir = scan.source(git_dir)?;
-    let head = scan.source(&git_dir.join("HEAD"))?;
-    if !head.is_file() {
+    // Probe without watching: an ancestor candidate that turns out not to be a
+    // repository must not become a source. A busy ancestor (a shared `%TEMP%`)
+    // changes its timestamp with unrelated file traffic, which would keep
+    // revoking an approval for a repository nothing touched. A repository
+    // appearing later is still noticed through the `.git` marker of every
+    // ancestor and through the sources recorded below once this check passes.
+    if !local_path(&git_dir.join("HEAD"))?.is_file() {
         return Ok(None);
     }
     // Git reads HEAD as well and refuses the directory when it names neither a
     // ref under `refs/` nor an object: such a `.git` is skipped and the walk
     // continues, so a stray directory cannot become ANVIL's repository.
-    if !head_reference(&scan.read(&head)?.unwrap_or_default()) {
+    if !head_reference(&scan.read(&git_dir.join("HEAD"))?.unwrap_or_default()) {
+        return Ok(None);
+    }
+    let git_dir = scan.source(git_dir)?;
+    let head = scan.source(&git_dir.join("HEAD"))?;
+    if !head.is_file() {
         return Ok(None);
     }
     let common_dir = match scan.read(&git_dir.join("commondir"))? {
@@ -2110,7 +2145,6 @@ fn preflight(cwd: &Path) -> Result<std::sync::Arc<Preflight>, String> {
     }
     Err(config_refusal())
 }
-
 /// A guarded worktree-specific metadata file (not the common worktree index).
 pub fn metadata_path(root: &Path, name: &str) -> Result<PathBuf, String> {
     if name.is_empty() || name.contains(['/', '\\', ':']) || name == "." || name == ".." {

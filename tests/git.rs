@@ -1392,6 +1392,23 @@ fn rewording_the_bottom_of_a_long_chain_replays_every_commit_intact() {
 }
 
 #[test]
+fn ordinary_worktree_writes_keep_an_approval_with_a_self_remote() {
+    let Some(dir) = repo() else { return };
+    let root = dir.path();
+    run(root, &["config", "filter.hostile.clean", "cat"]);
+    run(root, &["config", "remote.origin.url", "."]);
+    let stamp = git::repository_stamp(root).unwrap();
+    assert!(!stamp.is_hazard_free(), "the filter needs approval");
+    git::remember_trust(root, stamp.clone());
+    assert!(git::trust_approved(root, &stamp));
+    std::fs::write(root.join("written-after-approval.txt"), "ignored by tracking\n").unwrap();
+    assert!(
+        git::trust_approved(root, &stamp),
+        "a self remote must not watch the worktree root, where ordinary files are written"
+    );
+}
+
+#[test]
 fn rewritten_local_push_destination_requires_approval() {
     const CHILD: &str = "ANVIL_REWRITE_URL_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {

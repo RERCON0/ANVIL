@@ -175,7 +175,11 @@ mechanism is named; the ones without a reproduction are marked as reasoning.
   (rewrite-expanded, contacts nothing, bounded output/time) now feeds the same
   receiver scan, and its sources/hooks join the stamp so hook changes revoke it.
   The destination itself is watched as well: a receiver moved or created there
-  after approval revokes it before Git can run the new hooks.
+  after approval revokes it before Git can run the new hooks. A destination that
+  is this repository itself (`.`, `remote.origin.url = .`) is excluded: its
+  hooks are already in the sender's own scan, and watching the worktree root
+  revoked the approval on ordinary file writes — the first CI run of this change
+  failed on exactly that and is covered by a regression now.
 - **Confirmed and fixed: raw transport selectors bypassed the fingerprint.**
   With a user-level `protocol.ext.allow=always`, `branch.<name>.remote`,
   `branch.<name>.pushRemote` or `remote.pushDefault` spelled as an `ext::`
@@ -212,6 +216,16 @@ mechanism is named; the ones without a reproduction are marked as reasoning.
   against 12.6 ms with 1,425 afterwards. `Tab::show` cloned an owned `PathBuf`
   per redraw, and the split walk could place a divider past a parent with a
   non-zero gap.
+- **Confirmed and fixed: a busy ancestor directory cancelled approvals.** The
+  configuration preflight recorded every ancestor it tried as a candidate
+  repository, including the ones that are not repositories. A shared `%TEMP%`
+  changes its timestamp with unrelated file traffic, so the freshness check
+  failed and the panel answered "could not read the Git configuration safely"
+  for a project nothing had touched (reproduced in 3 of 8 full-suite runs; the
+  diagnostic named `AppData\Local\Temp`). A candidate that fails the check is no
+  longer watched; a repository that appears later is still noticed through the
+  `.git` marker of each ancestor and through the sources recorded once the check
+  passes.
 - **Rejected or documented, not changed:** the RustSec run over the locked graph
   reports no vulnerability; the only warning is the already-documented
   unmaintained `unsafe-libyaml`, whose migration plan lives in
@@ -222,7 +236,7 @@ mechanism is named; the ones without a reproduction are marked as reasoning.
 
 Verification of this review: `cargo fmt`, `cargo clippy --locked --all-targets
 -- -D warnings` and `cargo test --locked --all-targets` passed on the reviewed
-revision (615 library, 1 helper, 11 ConPTY with one ignored benchmark, 48 Git
+revision (615 library, 1 helper, 11 ConPTY with one ignored benchmark, 49 Git
 integration tests), together with the repository script tests and the
 documentation/ConPTY checks. `cargo audit --deny yanked --deny unsound` over the
 locked graph reported no vulnerability. Provider APIs, packaging and signing
