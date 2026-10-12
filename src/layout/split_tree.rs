@@ -101,8 +101,8 @@ impl SplitTree {
     /// Builds a tree from saved state, fixing fractions that do not sum to 1
     /// and splits with fewer than two children.
     pub fn from_root(mut root: Node) -> SplitTree {
-        normalize(&mut root);
         collapse(&mut root);
+        normalize(&mut root);
         SplitTree { root }
     }
 
@@ -493,7 +493,11 @@ fn walk(node: &Node, rect: Rect, gap: f32, path: &mut Vec<usize>, visit: &mut Vi
                 Dir::Row => (rect.x, rect.w),
                 Dir::Column => (rect.y, rect.h),
             };
-            let avail = (total - gap * (n as f32 - 1.0)).max(0.0);
+            // Nested splits can be narrower than their dividers after a window
+            // resize. Spend only the available axis on gaps, or later panes
+            // would start outside the parent even though their size is zero.
+            let node_gap = if n > 1 { gap.min(total.max(0.0) / (n - 1) as f32) } else { 0.0 };
+            let avail = (total - node_gap * (n as f32 - 1.0)).max(0.0);
             let mut pos = start;
             let mut rects = Vec::with_capacity(n);
             for (i, (f, _)) in children.iter().enumerate() {
@@ -502,7 +506,7 @@ fn walk(node: &Node, rect: Rect, gap: f32, path: &mut Vec<usize>, visit: &mut Vi
                     Dir::Row => Rect::new(pos, rect.y, size, rect.h),
                     Dir::Column => Rect::new(rect.x, pos, rect.w, size),
                 });
-                pos += size + gap;
+                pos += size + node_gap;
             }
             visit(node, rect, path, &rects);
             for (i, (_, child)) in children.iter().enumerate() {
@@ -835,6 +839,32 @@ mod tests {
     }
 
     #[test]
+    fn undersized_nested_splits_keep_panes_and_dividers_inside_the_parent() {
+        for dir in [Dir::Row, Dir::Column] {
+            let opposite = if dir == Dir::Row { Dir::Column } else { Dir::Row };
+            let tree = SplitTree::from_root(Node::Split {
+                dir: opposite,
+                children: vec![
+                    (0.5, leaf(1)),
+                    (0.5, Node::Split { dir, children: vec![(0.5, leaf(2)), (0.5, leaf(3))] }),
+                ],
+            });
+            let area = Rect::new(10.0, 20.0, 3.0, 3.0);
+            let inside = |rect: Rect| {
+                assert!(rect.w >= 0.0 && rect.h >= 0.0);
+                assert!(rect.x >= area.x && rect.y >= area.y);
+                assert!(rect.right() <= area.right() && rect.bottom() <= area.bottom());
+            };
+            for (_, rect) in tree.layout(area, GAP) {
+                inside(rect);
+            }
+            for divider in tree.dividers(area, GAP) {
+                inside(divider.rect);
+            }
+        }
+    }
+
+    #[test]
     fn dragging_respects_min_size() {
         let mut t = SplitTree::from_root(row(vec![(0.5, leaf(1)), (0.5, leaf(2))]));
         let area = Rect::new(0.0, 0.0, 206.0, 100.0);
@@ -917,6 +947,15 @@ mod tests {
     fn from_root_repairs_saved_state() {
         let t = SplitTree::from_root(row(vec![(2.0, leaf(1)), (2.0, col(vec![(1.0, leaf(2))]))]));
         assert_eq!(t.root(), &row(vec![(0.5, leaf(1)), (0.5, leaf(2))]));
+    }
+
+    #[test]
+    fn dropping_empty_saved_splits_preserves_the_remaining_panes_proportions() {
+        let tree = SplitTree::from_root(row(vec![(0.9, col(Vec::new())), (0.05, leaf(1)), (0.05, leaf(2))]));
+        assert_eq!(
+            tree.layout(AREA, GAP),
+            vec![(1, Rect::new(0.0, 0.0, 150.0, 206.0)), (2, Rect::new(156.0, 0.0, 150.0, 206.0))]
+        );
     }
 
     #[test]

@@ -351,17 +351,22 @@ fn omp(env: &CredEnv, providers: &[&str], accept: Accept) -> Option<Credential> 
                        WHERE disabled_cause IS NULL AND provider = ?1 ORDER BY updated_at DESC, id DESC";
     let sqlite = env.sqlite.as_deref()?;
     let path = env.omp_agent_db()?;
+    let mut expired = None;
     for provider in providers {
         let rows = database_rows(env, sqlite, &path, SQL, provider)?;
         for row in rows {
             let Ok(Value::Object(mut data)) = serde_json::from_str::<Value>(&row[1]) else { continue };
             data.insert("type".into(), Value::String(row[0].clone()));
             if let Some(found) = from_entry(&Value::Object(data), Source::Omp, accept) {
-                return Some(found);
+                if found.expires_at.is_some_and(|at| at <= env.now + EXPIRY_MARGIN) {
+                    expired.get_or_insert(found);
+                } else {
+                    return Some(found);
+                }
             }
         }
     }
-    None
+    expired
 }
 
 fn opencode2(env: &CredEnv, ids: &[&str], accept: Accept) -> Option<Credential> {
@@ -369,21 +374,37 @@ fn opencode2(env: &CredEnv, ids: &[&str], accept: Accept) -> Option<Credential> 
                        WHERE integration_id = ?1 ORDER BY active DESC, time_updated DESC, id DESC";
     let sqlite = env.sqlite.as_deref()?;
     let path = env.opencode_db()?;
+    let mut expired = None;
     for id in ids {
         for row in database_rows(env, sqlite, &path, SQL, id)? {
             if let Some(found) =
                 serde_json::from_str(&row[1]).ok().and_then(|v: Value| from_entry(&v, Source::OpenCode, accept))
             {
-                return Some(found);
+                if found.expires_at.is_some_and(|at| at <= env.now + EXPIRY_MARGIN) {
+                    expired.get_or_insert(found);
+                } else {
+                    return Some(found);
+                }
             }
         }
     }
-    None
+    expired
 }
 
 fn opencode1(env: &CredEnv, ids: &[&str], accept: Accept) -> Option<Credential> {
     let value = read_json(&env.data_home()?.join("opencode").join("auth.json"))?;
-    ids.iter().find_map(|id| from_entry(value.get(*id)?, Source::OpenCode, accept))
+    let mut expired = None;
+    for id in ids {
+        let Some(found) = value.get(*id).and_then(|entry| from_entry(entry, Source::OpenCode, accept)) else {
+            continue;
+        };
+        if found.expires_at.is_some_and(|at| at <= env.now + EXPIRY_MARGIN) {
+            expired.get_or_insert(found);
+        } else {
+            return Some(found);
+        }
+    }
+    expired
 }
 
 fn database_rows(env: &CredEnv, sqlite: &Sqlite, path: &Path, sql: &str, id: &str) -> Option<Vec<Vec<String>>> {
@@ -788,6 +809,66 @@ mod tests {
         );
         let c = found(detect(ProviderId::Claude, &env(home.path())));
         assert_eq!((c.secret.expose(), c.source), ("fresh", Source::OpenCode));
+    }
+
+    #[test]
+    fn expired_entries_do_not_hide_valid_logins_in_the_same_store() {
+        let home = tempfile::tempdir().unwrap();
+        let auth = home.path().join(".local/share/opencode/auth.json");
+        write(
+            &auth,
+            &format!(
+                r#"{{"openai": {{"type":"oauth","access":"expired","expires":{}}},
+                "codex": {{"type":"oauth","access":"fresh-file","expires":{}}}}}"#,
+                NOW - 1,
+                NOW + 600
+            ),
+        );
+        let mut e = env(home.path());
+        assert_eq!(found(detect(ProviderId::ChatGpt, &e)).secret.expose(), "fresh-file");
+        write(&auth, &format!(r#"{{"openai":{{"type":"oauth","access":"expired","expires":{}}}}}"#, NOW - 1));
+        assert!(matches!(detect(ProviderId::ChatGpt, &e), Detection::Expired { source: Source::OpenCode, .. }));
+        std::fs::remove_file(&auth).unwrap();
+
+        let sqlite = Arc::new(Sqlite::load().expect("system SQLite required for this regression"));
+        let omp_db = home.path().join(".omp/agent/agent.db");
+        std::fs::create_dir_all(omp_db.parent().unwrap()).unwrap();
+        sqlite.exec_for_test(
+            &omp_db,
+            &format!(
+                "CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY, provider TEXT, credential_type TEXT,
+                    data TEXT, disabled_cause TEXT, updated_at INTEGER);
+                INSERT INTO auth_credentials VALUES (1, 'anthropic', 'oauth',
+                    '{{\"access\":\"fresh-omp\",\"expires\":{}}}', NULL, 1);
+                INSERT INTO auth_credentials VALUES (2, 'anthropic', 'oauth',
+                    '{{\"access\":\"expired\",\"expires\":{}}}', NULL, 2);",
+                NOW + 600,
+                NOW - 1
+            ),
+        );
+        e.sqlite = Some(sqlite.clone());
+        assert_eq!(found(detect(ProviderId::Claude, &e)).secret.expose(), "fresh-omp");
+        sqlite.exec_for_test(&omp_db, "DELETE FROM auth_credentials WHERE id = 1;");
+        assert!(matches!(detect(ProviderId::Claude, &e), Detection::Expired { source: Source::Omp, .. }));
+
+        let oc_db = home.path().join(".local/share/opencode/opencode.db");
+        std::fs::create_dir_all(oc_db.parent().unwrap()).unwrap();
+        sqlite.exec_for_test(
+            &oc_db,
+            &format!(
+                "CREATE TABLE credential (id TEXT, integration_id TEXT, active INTEGER, value TEXT,
+                    time_updated INTEGER);
+                INSERT INTO credential VALUES ('a', 'openai', 1,
+                    '{{\"type\":\"oauth\",\"access\":\"expired\",\"expires\":{}}}', 2);
+                INSERT INTO credential VALUES ('b', 'openai', 0,
+                    '{{\"type\":\"oauth\",\"access\":\"fresh-db\",\"expires\":{}}}', 1);",
+                NOW - 1,
+                NOW + 600
+            ),
+        );
+        assert_eq!(found(detect(ProviderId::ChatGpt, &e)).secret.expose(), "fresh-db");
+        sqlite.exec_for_test(&oc_db, "DELETE FROM credential WHERE id = 'b';");
+        assert!(matches!(detect(ProviderId::ChatGpt, &e), Detection::Expired { source: Source::OpenCode, .. }));
     }
 
     #[test]

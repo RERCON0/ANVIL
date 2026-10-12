@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use super::cache::{self, Paths};
 use super::creds::{self, CredEnv, Credential, Detection};
@@ -274,6 +274,22 @@ fn own_keys() -> HashMap<ProviderId, String> {
         .collect()
 }
 
+fn lead_retry_due(last_try: Option<i64>, now: i64) -> bool {
+    last_try.is_none_or(|at| now < at || now.saturating_sub(at) >= LEAD_RETRY)
+}
+
+fn changed_snapshot(path: &std::path::Path, seen: &mut Option<SystemTime>) -> Option<Snapshot> {
+    let modified = cache::mtime(path);
+    if modified == *seen {
+        return None;
+    }
+    let snapshot = cache::read(path)?;
+    // A temporary share lock must not acknowledge data that was never read:
+    // observers retry on their next tick even if the leader has not written again.
+    *seen = modified;
+    Some(snapshot)
+}
+
 /// The thread body: observe `quota.json`, lead when the lock is free, poll on
 /// schedule. `Shared::stop` is checked between cycles, so a request in flight
 /// finishes first, bounded by the WinHTTP timeouts.
@@ -290,14 +306,10 @@ pub(super) fn run(shared: Arc<Shared>, paths: Paths, user_agent: String) {
     let mut seen_refresh = cache::mtime(&paths.refresh);
     while !shared.stop.load(Ordering::Relaxed) {
         let now = now_unix();
-        let snapshot_mtime = cache::mtime(&paths.snapshot);
-        if snapshot_mtime != seen_snapshot {
-            seen_snapshot = snapshot_mtime;
-            if let Some(snapshot) = cache::read(&paths.snapshot) {
-                shared.publish(snapshot);
-            }
+        if let Some(snapshot) = changed_snapshot(&paths.snapshot, &mut seen_snapshot) {
+            shared.publish(snapshot);
         }
-        if leader.is_none() && last_lead_try.is_none_or(|at| now - at >= LEAD_RETRY) {
+        if leader.is_none() && lead_retry_due(last_lead_try, now) {
             last_lead_try = Some(now);
             leader = cache::try_lead(&paths.lock);
             if leader.is_some() {
@@ -781,6 +793,51 @@ mod tests {
         assert_eq!(engine.manual_wait(300), MANUAL_GAP);
         assert_eq!(engine.manual_wait(320), 10);
         assert_eq!(engine.manual_wait(340), 0);
+    }
+
+    #[test]
+    fn an_observer_retries_a_locked_snapshot_without_another_leader_write() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        let next = Engine::default().cycle(
+            1_000,
+            &Prefs::new(),
+            &Snapshot::default(),
+            only(ProviderId::Claude, || login(1)),
+            |_, _| ok(),
+        );
+        cache::write(&paths.snapshot, &next).unwrap();
+        let mut seen = None;
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&paths.snapshot).unwrap();
+        assert!(cache::mtime(&paths.snapshot).is_some(), "the lock leaves the snapshot's timestamp observable");
+        assert!(changed_snapshot(&paths.snapshot, &mut seen).is_none());
+        drop(held);
+        assert_eq!(changed_snapshot(&paths.snapshot, &mut seen), Some(next));
+        assert!(changed_snapshot(&paths.snapshot, &mut seen).is_none(), "successful reads are acknowledged");
+    }
+
+    #[test]
+    fn an_observer_can_take_over_after_a_backwards_clock_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::in_dir(dir.path());
+        let leader = cache::try_lead(&paths.lock).expect("first window leads");
+        let mut last_try = None;
+        let mut observe = |now| {
+            if lead_retry_due(last_try, now) {
+                last_try = Some(now);
+                cache::try_lead(&paths.lock)
+            } else {
+                None
+            }
+        };
+        assert!(observe(2_000).is_none(), "observer cannot take the live leader's lock");
+        drop(leader);
+        assert!(observe(2_001).is_none(), "ordinary retries retain their gap");
+        let successor = observe(1_000).expect("a clock step must not postpone the available lock");
+        assert!(cache::try_lead(&paths.lock).is_none(), "the successor holds the exclusive lock");
+        drop(successor);
     }
 
     #[test]

@@ -1390,3 +1390,160 @@ fn rewording_the_bottom_of_a_long_chain_replays_every_commit_intact() {
     let (alive, problems) = attempt(root, &["fsck", "--strict", "--no-dangling"]);
     assert!(alive, "the object store is sound: {problems}");
 }
+
+#[test]
+fn rewritten_local_push_destination_requires_approval() {
+    const CHILD: &str = "ANVIL_REWRITE_URL_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let isolated = tempfile::tempdir().unwrap();
+        let global = isolated.path().join("global.cfg");
+        std::fs::write(&global, "[url \"./\"]\n insteadOf = anvil-local:\n").unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .args(["--exact", "rewritten_local_push_destination_requires_approval", "--nocapture"])
+            .env(CHILD, "1")
+            .env("GIT_CONFIG_GLOBAL", global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", isolated.path())
+            .env("XDG_CONFIG_HOME", isolated.path().join("config"));
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            child.creation_flags(0x0800_0000);
+        }
+        let output = child.output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    let Some(dir) = repo() else { return };
+    let root = dir.path();
+    let remote = root.join("receiver.git");
+    run(root, &["init", "--quiet", "--bare", remote.to_str().unwrap()]);
+    run(root, &["remote", "add", "origin", "anvil-local:receiver.git"]);
+    let marker = root.join("rewrite-marker");
+    let hook = remote.join("hooks/pre-receive");
+    std::fs::write(&hook, "#!/bin/sh\nprintf ran > ../rewrite-marker\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let stamp = git::repository_stamp(root).unwrap();
+    assert!(!stamp.is_hazard_free(), "a rewrite-selected local receiver must join the approval");
+    assert!(!git::trust_approved(root, &stamp));
+    git::remember_trust(root, stamp.clone());
+    git::push(root).unwrap();
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran");
+    std::fs::remove_file(&marker).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\nprintf changed > ../rewrite-marker\n").unwrap();
+    assert!(!git::trust_approved(root, &stamp), "receiver hook bytes must revoke approval");
+    // A receiver replaced at the destination must revoke approval as well.
+    let changed = git::repository_stamp(root).unwrap();
+    git::remember_trust(root, changed.clone());
+    assert!(git::trust_approved(root, &changed));
+    std::fs::rename(&remote, root.join("receiver-away.git")).unwrap();
+    assert!(!git::trust_approved(root, &changed), "a moved receiver must revoke approval");
+}
+
+#[test]
+fn local_receive_hooks_require_current_approval() {
+    let Some(dir) = repo() else { return };
+    let root = dir.path();
+    let remote = root.join("receiver.git");
+    run(root, &["init", "--quiet", "--bare", remote.to_str().unwrap()]);
+    run(root, &["remote", "add", "origin", "./receiver.git"]);
+    let marker = root.join("receive-marker");
+    let hook = remote.join("hooks/pre-receive");
+    std::fs::write(&hook, "#!/bin/sh\nprintf ran > ../receive-marker\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let stamp = git::repository_stamp(root).unwrap();
+    assert!(!stamp.is_hazard_free());
+    assert!(!git::trust_approved(root, &stamp), "the panel must ask before connecting to the local receiver");
+    git::remember_trust(root, stamp.clone());
+    git::push(root).unwrap();
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran");
+    std::fs::remove_file(&marker).unwrap();
+    std::fs::write(&hook, "#!/bin/sh\nprintf changed > ../receive-marker\n").unwrap();
+    assert!(!git::trust_approved(root, &stamp), "receiver hook bytes must revoke approval");
+}
+
+#[test]
+fn raw_transport_selectors_cannot_execute_with_global_ext_enabled() {
+    const CHILD: &str = "ANVIL_RAW_TRANSPORT_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let isolated = tempfile::tempdir().unwrap();
+        let global = isolated.path().join("global.cfg");
+        std::fs::write(&global, "[protocol \"ext\"]\n allow = always\n").unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .args(["--exact", "raw_transport_selectors_cannot_execute_with_global_ext_enabled", "--nocapture"])
+            .env(CHILD, "1")
+            .env("GIT_CONFIG_GLOBAL", global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", isolated.path())
+            .env("XDG_CONFIG_HOME", isolated.path().join(".config"));
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            child.creation_flags(0x0800_0000);
+        }
+        let output = child.output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    let Some(dir) = repo() else { return };
+    let root = dir.path();
+    run(root, &["checkout", "--quiet", "-b", "transport-test"]);
+    let upstream = root.join("upstream.git");
+    run(root, &["init", "--quiet", "--bare", upstream.to_str().unwrap()]);
+    run(root, &["remote", "add", "origin", upstream.to_str().unwrap()]);
+    git::push(root).unwrap();
+    #[cfg(windows)]
+    let transport = "ext::cmd.exe /c echo% ran>transport-marker";
+    #[cfg(not(windows))]
+    let transport = "ext::sh -c touch% transport-marker";
+    for key in ["branch.transport-test.remote", "branch.transport-test.pushRemote", "remote.pushDefault"] {
+        run(root, &["config", key, transport]);
+        let result = if key.ends_with(".remote") { git::fetch(root) } else { git::push(root) };
+        assert!(!root.join("transport-marker").exists(), "unapproved {key} executed: {result:?}");
+        assert!(result.is_err());
+        run(root, &["config", "--unset", key]);
+    }
+}
+
+#[test]
+fn file_pushurl_watches_receiver_relative_hooks_and_creation() {
+    let Some(dir) = repo() else { return };
+    let root = dir.path();
+    let receiver = root.join("receiver with space");
+    run(root, &["init", "--quiet", receiver.to_str().unwrap()]);
+    run(&receiver, &["config", "receive.denyCurrentBranch", "ignore"]);
+    run(&receiver, &["config", "core.hooksPath", "custom"]);
+    run(root, &["remote", "add", "origin", "https://example.invalid/never-contacted"]);
+    let path = receiver.to_str().unwrap().replace('\\', "/").replace(' ', "%20");
+    #[cfg(windows)]
+    let url = format!("file:///{path}");
+    #[cfg(not(windows))]
+    let url = format!("file://{path}");
+    run(root, &["config", "remote.origin.pushurl", &url]);
+    let before = git::repository_stamp(root).unwrap();
+    git::remember_trust(root, before.clone());
+    let hooks = receiver.join(".git/custom");
+    std::fs::create_dir(&hooks).unwrap();
+    let hook = hooks.join("pre-receive");
+    std::fs::write(&hook, "#!/bin/sh\nprintf ran > ../../pushurl-marker\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert!(!git::trust_approved(root, &before), "creating a relative receiver hook must revoke approval");
+    let current = git::repository_stamp(root).unwrap();
+    git::remember_trust(root, current);
+    git::push(root).unwrap();
+    assert_eq!(std::fs::read_to_string(root.join("pushurl-marker")).unwrap(), "ran");
+}

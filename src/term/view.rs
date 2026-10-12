@@ -318,6 +318,7 @@ impl TerminalView {
             }
         }
 
+        self.hover_cell = if hovered { pointer.map(clamp_cell) } else { None };
         if hovered {
             // Terminal mouse reports need each raw tick, not egui's smoothed tail.
             let line_speed = ctx.options(|o| o.input_options.line_scroll_speed);
@@ -346,7 +347,6 @@ impl TerminalView {
             }
         }
 
-        self.hover_cell = if hovered { pointer.map(clamp_cell) } else { None };
         let motion_reporting = app_mouse && mouse::wants_report(MouseAction::Motion, false, modes);
         let any_button_down = ui.input(|i| i.pointer.any_down());
         if let Some(bytes) = self.hover_motion(motion_reporting, any_button_down, mods, modes) {
@@ -766,16 +766,11 @@ impl TerminalView {
     /// next real event starts clean.
     fn take_wheel_lines(&mut self, dy_points: f32, cell_height: f32) -> i32 {
         const MAX_LINES: f32 = 1_000.0;
-        self.wheel_lines =
-            if self.wheel_lines.is_finite() { self.wheel_lines.clamp(-MAX_LINES, MAX_LINES) } else { 0.0 };
-        self.wheel_lines += dy_points / cell_height;
+        let accumulated = self.wheel_lines + dy_points / cell_height;
+        self.wheel_lines = if accumulated.is_finite() { accumulated.clamp(-MAX_LINES, MAX_LINES) } else { 0.0 };
         let lines = self.wheel_lines.trunc();
         self.wheel_lines -= lines;
-        if lines.is_finite() {
-            lines as i32
-        } else {
-            0
-        }
+        lines as i32
     }
 
     fn wheel(&mut self, pane: &Pane, dy_points: f32, cell_height: f32) {
@@ -837,10 +832,7 @@ fn step_origin<L: EventListener>(
         Some((row, start, _)) => {
             // Step one cell back so the current match is not returned again.
             let line = (row as i32 - display_offset as i32).clamp(-history, last_line);
-            match start.checked_sub(1) {
-                Some(col) => Point::new(Line(line), Column(col)),
-                None => Point::new(Line((line - 1).max(-history)), Column(total_columns - 1)),
-            }
+            Point::new(Line(line), Column(start.min(total_columns - 1))).sub(term, Boundary::None, 1)
         }
         None => {
             let cursor = term.grid().cursor.point;
@@ -990,6 +982,22 @@ mod tests {
             .get(edited, || collect_matches(&term, &mut regex, edited.lines, edited.columns, edited.offset))
             .is_empty());
     }
+
+    #[test]
+    fn wheel_events_bound_the_current_delta_and_recover_after_nonfinite_input() {
+        let mut view = TerminalView::new(15.0);
+        assert_eq!(view.take_wheel_lines(120.0, 20.0), 6);
+        assert_eq!(view.take_wheel_lines(10.0, 20.0), 0);
+        assert_eq!(view.take_wheel_lines(10.0, 20.0), 1);
+        assert_eq!(view.take_wheel_lines(f32::MAX, 1.0), 1000);
+        assert_eq!(view.take_wheel_lines(-f32::MAX, 1.0), -1000);
+        for delta in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            assert_eq!(view.take_wheel_lines(delta, 20.0), 0);
+            assert_eq!(view.take_wheel_lines(20.0, 20.0), 1, "the next ordinary tick starts clean");
+        }
+        assert_eq!(view.take_wheel_lines(20.0, 0.0), 0);
+        assert_eq!(view.take_wheel_lines(20.0, 20.0), 1);
+    }
     use crate::term::style::{CellStyle, RenderCell, Underline};
     use alacritty_terminal::term::cell::Hyperlink;
     use egui::Color32;
@@ -1033,6 +1041,12 @@ mod tests {
         assert_eq!(next(&term, &mut regex, Some((1, 2, 3)), true), (0, 19), "forward wraps to the top");
         assert_eq!(next(&term, &mut regex, Some((1, 2, 3)), false), (0, 19), "backward");
         assert_eq!(next(&term, &mut regex, Some((0, 19, 20)), false), (1, 2), "backward wraps to the bottom");
+        Processor::<StdSyncHandler>::new().advance(&mut term, b"\x1b[1;1Hx");
+        assert_eq!(
+            next(&term, &mut regex, Some((0, 0, 1)), false),
+            (1, 2),
+            "backward from the first cell wraps to the last match, not the first row's last match"
+        );
     }
 
     #[test]

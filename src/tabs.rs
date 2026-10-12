@@ -381,7 +381,7 @@ impl Tab {
                             }
                         }
                         if let Some(panel_rect) = panel_rect {
-                            let cwd = cwd.clone().flatten().or_else(|| entry.start_cwd.clone());
+                            let cwd = cwd.flatten().or_else(|| entry.start_cwd.clone());
                             if let Some(cwd) = cwd {
                                 entry.workspace.poll(cwd);
                                 if entry.workspace.absorb() {

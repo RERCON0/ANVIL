@@ -127,12 +127,12 @@ pub enum Request {
 }
 
 impl Request {
-    fn requires_current_repository(&self) -> bool {
+    fn requires_current_root(&self) -> bool {
         !matches!(self, Request::Refresh { .. } | Request::Approve { .. })
     }
 }
 
-/// A request plus the repository root the panel showed when it was made.
+/// A request plus the repository or plain-folder root the panel showed.
 type Envelope = (Option<PathBuf>, Request);
 
 /// The worker's answers. Private to the module: it carries the row indexes the
@@ -365,6 +365,8 @@ pub struct Workspace {
     trust_approval_pending: bool,
     pending_identity: Option<git::RepositoryIdentity>,
     last_cwd: Option<PathBuf>,
+    /// Plain-folder root of the adopted view, not a refresh still in flight.
+    browse_cwd: Option<PathBuf>,
     log_status_seen: bool,
     tx: Option<Sender<Envelope>>,
     rx: Option<Receiver<Response>>,
@@ -438,6 +440,7 @@ impl Default for Workspace {
             trust_approval_pending: false,
             pending_identity: None,
             last_cwd: None,
+            browse_cwd: None,
             log_status_seen: false,
             tx: None,
             rx: None,
@@ -481,7 +484,7 @@ impl Workspace {
 
     fn send(&self, request: Request) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send((self.root.clone(), request));
+            let _ = tx.send((self.root.as_ref().or(self.browse_cwd.as_ref()).cloned(), request));
         }
     }
     /// `send` plus queue accounting. `send` itself stays `&self` for the read
@@ -518,6 +521,7 @@ impl Workspace {
     }
 
     fn clear_repository_view(&mut self) {
+        self.browse_cwd = None;
         self.busy = false;
         self.trust_approval_pending = false;
         self.ai_generating = false;
@@ -541,9 +545,6 @@ impl Workspace {
         self.file_rows_dirty = true;
         self.change_rows_cache.clear();
         self.changes_dirty = true;
-        self.preview_rows.clear();
-        self.preview_wrapped = WrappedRows::default();
-        self.markdown = MarkdownCache::default();
         self.log = CommitLog::default();
         self.graph.clear();
         self.prompt = None;
@@ -658,9 +659,6 @@ impl Workspace {
         self.file_rows_dirty = true;
         self.change_rows_cache.clear();
         self.changes_dirty = true;
-        self.preview_rows.clear();
-        self.preview_wrapped = WrappedRows::default();
-        self.markdown = MarkdownCache::default();
         self.log = CommitLog::default();
         self.graph.clear();
         self.prompt = None;
@@ -767,7 +765,8 @@ impl Workspace {
                 }
                 Response::Status(status, root) => {
                     self.busy = false;
-                    let root_changed = self.root != root;
+                    let browse_cwd = root.is_none().then(|| self.last_cwd.clone()).flatten();
+                    let root_changed = self.root != root || self.browse_cwd != browse_cwd;
                     let inventory_changed = root_changed
                         || self.status.head_oid != status.head_oid
                         || self
@@ -795,6 +794,7 @@ impl Workspace {
                     }
                     self.log_status_seen = true;
                     self.root = root;
+                    self.browse_cwd = browse_cwd;
                     self.trust_required = false;
                     self.pending_identity = None;
                     self.changes_dirty |= self.status.changes != status.changes;
@@ -803,12 +803,7 @@ impl Workspace {
                     self.selected.retain(|path| paths.contains(path));
                     if let Some(path) = self.diff_path.clone() {
                         if !self.status.changes.iter().any(|change| change.path == path) {
-                            self.diff_path = None;
-                            self.diff_text.clear();
-                            self.diff_hunks.clear();
-                            self.diff_rows.clear();
-                            self.diff_wrapped = WrappedRows::default();
-                            self.diff_stamp = None;
+                            self.close_diff();
                         } else {
                             let stamp = DiffStamp::for_view(self.root.as_deref(), &path, self.diff_side, &self.status);
                             self.request(Request::CheckDiff { stamp });
@@ -2197,7 +2192,14 @@ impl Workspace {
     fn file_tree(&self) -> Vec<FileRow> {
         let mut rows = Vec::new();
         let mut previous: Vec<String> = Vec::new();
+        let mut folded_prefix: Option<String> = None;
         for path in &self.files {
+            // Sorted descendants of the last folded folder cannot add rows.
+            // Avoid splitting/allocating every invisible path in a large tree.
+            if folded_prefix.as_ref().is_some_and(|prefix| path.starts_with(prefix)) {
+                continue;
+            }
+            folded_prefix = None;
             let segments: Vec<&str> = path.split('/').collect();
             let (dirs, name) = segments.split_at(segments.len() - 1);
             let folders: Vec<String> = (0..dirs.len()).map(|index| dirs[..=index].join("/")).collect();
@@ -2215,6 +2217,9 @@ impl Workspace {
                     });
                 }
                 if !self.file_expanded.contains(folder) {
+                    if !hidden {
+                        folded_prefix = Some(format!("{folder}/"));
+                    }
                     hidden = true;
                 }
             }
@@ -3425,7 +3430,7 @@ fn spawn_worker() -> (Sender<Envelope>, Receiver<Response>) {
             let send = |response: Response| {
                 let _ = response_tx.send(response);
             };
-            if request.requires_current_repository() && expected_root != root {
+            if request.requires_current_root() && expected_root.as_ref() != root.as_ref().or(cwd.as_ref()) {
                 let error = strings::WORKSPACE_REPO_CHANGED().to_owned();
                 send(match request {
                     Request::AiMessage { .. } => Response::AiMessage(Err(error)),
@@ -5163,6 +5168,22 @@ mod tests {
     }
 
     #[test]
+    fn a_folded_folder_keeps_similarly_named_siblings_visible() {
+        let mut workspace = Workspace {
+            files: ["src/a/hidden.txt", "src/a/z/hidden.txt", "src/ab/visible.txt", "src2/visible.txt"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            ..Default::default()
+        };
+        workspace.file_expanded.extend(["src", "src/ab", "src2"].map(str::to_owned));
+        assert_eq!(
+            workspace.file_tree().iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
+            ["src", "src/a", "src/ab", "src/ab/visible.txt", "src2", "src2/visible.txt"]
+        );
+    }
+
+    #[test]
     fn ai_generation_survives_unrelated_responses_until_its_result() {
         let (tx, rx) = mpsc::channel();
         let mut workspace = Workspace { rx: Some(rx), ai_generating: true, busy: true, ..Default::default() };
@@ -6314,6 +6335,53 @@ mod tests {
         assert!(git::resolve_path(&root, "../outside.txt").is_err());
         assert!(git::resolve_path(&root, "docs/../../outside.txt").is_err());
     }
+
+    #[test]
+    fn changing_plain_folders_refuses_actions_from_the_previous_view() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("note.txt"), "first").unwrap();
+        std::fs::write(second.path().join("note.txt"), "second").unwrap();
+        let mut workspace = Workspace { tab: PanelTab::Files, ..Default::default() };
+        let settle = |workspace: &mut Workspace| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while workspace.inflight > 0 {
+                workspace.absorb();
+                assert!(Instant::now() < deadline, "the folder worker did not finish");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(!workspace.trust_required, "plain folders must remain browsable: {:?}", workspace.notice);
+        };
+        workspace.poll(first.path().to_owned());
+        settle(&mut workspace);
+        assert_eq!(workspace.files, ["note.txt"]);
+        workspace.open_file_preview("note.txt".to_owned());
+        settle(&mut workspace);
+        assert_eq!(workspace.file_preview.as_ref().unwrap().1, "first");
+        workspace.prompt = Some(Prompt {
+            kind: PromptKind::Rename("note.txt".to_owned()),
+            text: "renamed.txt".to_owned(),
+            focus: false,
+        });
+
+        // The shell changed directory, but the user is still acting on the old
+        // row while the next refresh is in flight.
+        workspace.poll(second.path().to_owned());
+        workspace.request(Request::RenamePath { from: "note.txt".to_owned(), to: "renamed.txt".to_owned() });
+        settle(&mut workspace);
+
+        assert_eq!(std::fs::read_to_string(second.path().join("note.txt")).unwrap(), "second");
+        assert!(
+            !second.path().join("renamed.txt").exists(),
+            "the stale action must not rename the other folder's file"
+        );
+        assert!(first.path().join("note.txt").exists());
+        assert!(workspace.file_preview.is_none(), "a preview must not survive a folder change");
+        assert!(workspace.prompt.is_none(), "the previous folder's prompt must close");
+        workspace.request(Request::RenamePath { from: "note.txt".to_owned(), to: "renamed.txt".to_owned() });
+        settle(&mut workspace);
+        assert_eq!(std::fs::read_to_string(second.path().join("renamed.txt")).unwrap(), "second");
+    }
 }
 
 #[cfg(test)]
@@ -6433,5 +6501,50 @@ mod preview_close_tests {
         tx.send((shown, Request::Approve { identity })).unwrap();
         assert!(matches!(wait(), Response::TrustRequired { .. }));
         assert!(!root.join("hook-marker").exists(), "stale approval cannot run updated hooks");
+    }
+
+    #[test]
+    fn local_receiver_hooks_gate_push_and_revoke_worker_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        if !git(root, &["init", "--quiet"]) {
+            return;
+        }
+        assert!(git(root, &["config", "user.email", "anvil@test"]));
+        assert!(git(root, &["config", "user.name", "ANVIL test"]));
+        std::fs::write(root.join("file.txt"), "original\n").unwrap();
+        assert!(git(root, &["add", "."]));
+        assert!(git(root, &["commit", "--quiet", "-m", "initial"]));
+        assert!(git(root, &["init", "--quiet", "--bare", "receiver.git"]));
+        assert!(git(root, &["remote", "add", "origin", "./receiver.git"]));
+        let hook = root.join("receiver.git/hooks/pre-receive");
+        std::fs::write(&hook, "#!/bin/sh\nprintf requested > ../receiver-marker\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (tx, rx) = spawn_worker();
+        let wait = || rx.recv_timeout(Duration::from_secs(20)).expect("worker response");
+        tx.send((None, Request::Refresh { cwd: root.to_owned() })).unwrap();
+        let identity = match wait() {
+            Response::TrustRequired { identity: Some(identity), .. } => identity,
+            _ => panic!("a local receiver's hooks require approval"),
+        };
+        let shown = Some(identity.root.clone());
+        tx.send((shown.clone(), Request::Push)).unwrap();
+        assert!(matches!(wait(), Response::TrustRequired { .. }));
+        assert!(!root.join("receiver-marker").exists(), "a refused push must not execute the receiver");
+        tx.send((shown.clone(), Request::Approve { identity })).unwrap();
+        assert!(matches!(wait(), Response::Trusted(_)));
+        assert!(matches!(wait(), Response::Status(_, _)));
+        tx.send((shown.clone(), Request::Push)).unwrap();
+        assert!(matches!(wait(), Response::Pushed(_)));
+        assert_eq!(std::fs::read_to_string(root.join("receiver-marker")).unwrap(), "requested");
+        std::fs::remove_file(root.join("receiver-marker")).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\nprintf changed > ../receiver-marker\n").unwrap();
+        tx.send((shown, Request::Push)).unwrap();
+        assert!(matches!(wait(), Response::TrustRequired { .. }));
+        assert!(!root.join("receiver-marker").exists(), "updated receiver hooks must remain gated");
     }
 }

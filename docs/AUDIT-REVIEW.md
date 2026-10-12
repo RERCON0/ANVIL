@@ -151,3 +151,79 @@ a fresh full-codebase audit.
 
 Release verification is recorded with the published 0.1.2 notes; no static test
 count or CI success is assumed here before the final run.
+
+## 0.1.3 internal review — 2026-10-12
+
+Scope: Git transport/hook trust, the remaining terminal and layout hot paths,
+quota credential/scheduling state, dependency advisories and the file-browser
+cache. Findings below were reproduced against the pre-fix build where a
+mechanism is named; the ones without a reproduction are marked as reasoning.
+
+- **Confirmed and fixed: local receiving hooks ran without approval.** With
+  `remote.origin.url=./receiver.git` the panel's push started a local
+  `receive-pack` whose `hooks/pre-receive` executed as the user while the
+  repository stamp stayed hazard-free. Local filesystem destinations
+  (`remote.<name>.url`/`pushurl`, raw and `file://`) now enter the same hook
+  scan, the receiver is inspected in its git directory (where push-triggered
+  hooks run, so a relative `core.hooksPath` resolves correctly), and the
+  pre-fix marker test failed with `Ok("master")` before the fix and passes
+  afterwards. Different roots sending to each other keep separate identities.
+- **Confirmed and fixed: a rewrite-selected local destination was invisible.**
+  A global `url."./".insteadOf` with a repository-supplied `anvil-local:` URL
+  reached a local receiving repository without joining the approval: the
+  pre-fix regression observed a hazard-free stamp. `git remote get-url`
+  (rewrite-expanded, contacts nothing, bounded output/time) now feeds the same
+  receiver scan, and its sources/hooks join the stamp so hook changes revoke it.
+  The destination itself is watched as well: a receiver moved or created there
+  after approval revokes it before Git can run the new hooks.
+- **Confirmed and fixed: raw transport selectors bypassed the fingerprint.**
+  With a user-level `protocol.ext.allow=always`, `branch.<name>.remote`,
+  `branch.<name>.pushRemote` or `remote.pushDefault` spelled as an `ext::`
+  command executed on fetch/push (pre-fix capture `Err("fatal: Could not read
+  from remote repository…")` plus the marker file). Fetch/push now accept only a
+  configured remote name, `.` or the fallback `origin`; status/log keep
+  resolving a name without opening a transport.
+- **Confirmed and fixed: actions outlived a plain-folder change.** In a folder
+  without Git, a rename confirmed for the previous directory renamed the same
+  path in the newly selected one: the pre-fix regression found
+  `Err(OS 2 "file not found")` for the row the panel had shown. File operations
+  now carry the folder of the adopted view instead of the directory the shell
+  moved to, and the view is dropped when the folder changes.
+- **Confirmed and fixed: restored split proportions.** A saved row of
+  `[0.9 empty split, 0.05 pane, 0.05 pane]` collapsed before normalising and
+  laid the panes out at 15/285 px instead of 150/150 (pre-fix run of the
+  geometry regression printed those rectangles). Collapse now precedes
+  normalisation.
+- **Confirmed and fixed: wheel events used the previous frame's hover cell.**
+  A real ConPTY regression captured `\x1b[<80;1;1M` where the moved pointer's
+  `\x1b[<80;4;3M` was expected. The hover cell is updated before the wheel is
+  dispatched; a huge delta can no longer be converted into an unbounded batch
+  of PTY writes, and the search's backwards step from the first cell of the
+  earliest row now walks to the previous wrapped line.
+- **Confirmed and fixed: quota credential and scheduler state.** An expired
+  first entry in a store could hide a valid login further down it (pre-fix
+  standalone run panicked with `Expired { source: OpenCode, .. }` while a valid
+  `codex` entry was present); an observer could not take over the lock after a
+  backwards clock step; a snapshot whose read failed under a share lock was
+  acknowledged and then skipped until the leader wrote again.
+- **Confirmed and fixed: avoidable file-browser and terminal work.** Rebuilding
+  the folded tree reprocessed every hidden descendant: for 50,000 paths across
+  ten rebuilds the pre-fix measurement was 509.5 ms with 2,001,375 allocations
+  against 12.6 ms with 1,425 afterwards. `Tab::show` cloned an owned `PathBuf`
+  per redraw, and the split walk could place a divider past a parent with a
+  non-zero gap.
+- **Rejected or documented, not changed:** the RustSec run over the locked graph
+  reports no vulnerability; the only warning is the already-documented
+  unmaintained `unsafe-libyaml`, whose migration plan lives in
+  [DEPENDENCIES](DEPENDENCIES.md). Actions taken by a custom `aiCommitCommand`,
+  panes/tabs/window closing without confirmation, the accepted snapshot race
+  between validation and execution, and the documented scrollback/backpressure
+  limits are unchanged.
+
+Verification of this review: `cargo fmt`, `cargo clippy --locked --all-targets
+-- -D warnings` and `cargo test --locked --all-targets` passed on the reviewed
+revision (615 library, 1 helper, 11 ConPTY with one ignored benchmark, 48 Git
+integration tests), together with the repository script tests and the
+documentation/ConPTY checks. `cargo audit --deny yanked --deny unsound` over the
+locked graph reported no vulnerability. Provider APIs, packaging and signing
+were not part of this review, and no authenticated request was made.

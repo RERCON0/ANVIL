@@ -1,5 +1,5 @@
 //! Hook trust watches bytes and directory membership, never just timestamps.
-use super::{config_refusal, local_path, RepositoryPaths, RepositoryStamp};
+use super::{config_refusal, local_path, same_path, RepositoryPaths, RepositoryStamp};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -28,6 +28,12 @@ impl HookSource {
         let path = std::path::absolute(path).map_err(|_| config_refusal())?;
         let (snapshot, files) = snapshot(&path, budget)?;
         Ok(Self { repository: repository.clone(), path, snapshot: Arc::new(snapshot), files: Arc::new(files) })
+    }
+
+    pub(super) fn watches(&self, repository: &RepositoryPaths, path: &Path) -> bool {
+        same_path(&self.path, path)
+            && same_path(&self.repository.git_dir, &repository.git_dir)
+            && same_path(&self.repository.common_dir, &repository.common_dir)
     }
 }
 
@@ -152,7 +158,14 @@ pub(super) fn merge(stamp: &mut RepositoryStamp, sources: &Arc<Vec<HookSource>>)
     let hazards = Arc::make_mut(&mut stamp.hazards);
     hazards.sort();
     hazards.dedup();
-    stamp.hooks = sources.clone();
+    // A local receiving repository adds its own hook directories; the sender's
+    // own entry for the same directory stays single.
+    let watched = Arc::make_mut(&mut stamp.hooks);
+    for source in sources.iter() {
+        if !watched.iter().any(|seen| seen.watches(&source.repository, &source.path)) {
+            watched.push(source.clone());
+        }
+    }
 }
 
 #[cfg(test)]

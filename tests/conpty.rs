@@ -204,12 +204,26 @@ fn ctrl_click_on_a_link_reaches_a_mouse_tracking_app_instead_of_opening_the_brow
             .iter()
             .any(|command| matches!(command, egui::OutputCommand::OpenUrl(_))));
     }
+    // Moving and scrolling in the same frame must report the new cell, not
+    // the previous frame's hover cell (or drop the first tick on entry).
+    let metrics = anvil::term::render::cell_metrics(&ctx, &anvil::fonts::TermFonts::new(14.0));
+    let wheel_pos = pos + Vec2::new(metrics.width * 3.0, metrics.height * 2.0);
+    let _ = frame(vec![
+        Event::PointerMoved(wheel_pos),
+        Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: Vec2::new(0.0, metrics.height),
+            phase: egui::TouchPhase::Move,
+            modifiers,
+        },
+    ]);
     pane.write(b"q".to_vec());
     wait_exit(&pane);
     let bytes = std::fs::read(out).unwrap();
     let text = String::from_utf8_lossy(&bytes);
     assert!(text.contains("\x1b[<16;1;1M"), "Ctrl+press lost: {text:?}");
     assert!(text.contains("\x1b[<16;1;1m"), "Ctrl+release lost: {text:?}");
+    assert!(text.contains("\x1b[<80;4;3M"), "Ctrl+wheel used stale pointer coordinates: {text:?}");
 }
 
 #[test]

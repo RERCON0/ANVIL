@@ -232,6 +232,13 @@ hook directories, linked worktrees and initialized submodules. Hook bytes and
 directory membership are rechecked even when size/date are unchanged. `.sample`
 files are not treated as runnable hooks. Hook symlink/reparse redirects fail
 closed. Limits: 2048 entries, 256 KiB per file, 4 MiB total and depth 8.
+A push to a filesystem remote (`remote.<name>.url`/`pushurl` naming a local
+path or `file://` URL) starts a local `receive-pack` as your user, so that
+receiver's hooks — including its own relative `core.hooksPath` — join the same
+fingerprint; changing them revokes approval. Fetch/push selectors
+(`branch.<name>.remote`, `branch.<name>.pushRemote`, `remote.pushDefault`) must
+name a configured remote (`.` means this repository); a raw URL or transport
+spelled in one of those keys is refused instead of being executed.
 
 Approval is in memory for the repository across panes/tabs of that process.
 Hazardous configuration/hook changes revoke it; a stale dialog cannot approve

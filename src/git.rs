@@ -8,6 +8,7 @@ use std::process::Command;
 
 mod history;
 mod hooks;
+mod transport;
 pub use history::reword;
 
 /// One changed file, as `git status --porcelain=v2` reports it.
@@ -324,6 +325,8 @@ const MAX_REPOSITORIES: usize = 256;
 const MAX_METADATA_ENTRIES: usize = 4 * 1024 * 1024;
 const MAX_METADATA_DEPTH: usize = 64;
 const MAX_CACHED_ROOTS: usize = 128;
+/// Bound on local receiving repositories one approval may cover.
+const MAX_LOCAL_DESTINATIONS: usize = 64;
 
 /// One configuration file whose stat decides whether a cached digest is stale.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -589,14 +592,185 @@ fn read_stamp(root: &Path) -> Result<RepositoryStamp, String> {
             }
         }
         let mut combined = digest_of(&[], root, std::sync::Arc::new(sources));
-        for (repository, config) in snapshots {
-            let child = digest_of(&config, &repository.root, Default::default());
-            merge_repository_digest(&mut combined, repository, &child);
+        let mut merged = std::collections::HashSet::new();
+        for (repository, config) in &snapshots {
+            // The sender may also be its own local receiver. A second hook
+            // working directory does not introduce a second configuration.
+            if merged.insert((&repository.git_dir, &repository.common_dir)) {
+                let child = digest_of(config, &repository.root, Default::default());
+                merge_repository_digest(&mut combined, repository, &child);
+            }
         }
         hooks::merge(&mut combined, &checked.hooks);
+        // A push into a local receiving repository runs that repository's hooks
+        // as this user. Git chooses the destination itself, rewrites included,
+        // so every local destination Git reports joins the same approval.
+        let mut destinations = Vec::new();
+        let mut receivers = Vec::new();
+        // Only the panel's own repository pushes: a submodule's remotes are
+        // `git submodule update` targets, not destinations of this branch.
+        for repository in checked.repository.iter() {
+            for destination in effective_local_destinations(repository, &checked.executable, deadline)? {
+                if let Some(git_dir) = receiver_git_dir(&destination, &checked.executable, deadline)? {
+                    // The sender pushing to itself is already covered by its own scan.
+                    let own = checked.repositories.iter().any(|known| same_path(&known.git_dir, &git_dir));
+                    if !own && !receivers.contains(&git_dir) {
+                        receivers.push(git_dir);
+                    }
+                }
+                destinations.push(destination);
+            }
+        }
+        // A receiver created (or swapped for a link) after approval would
+        // otherwise stay invisible: the destination itself is watched too.
+        for destination in destinations {
+            watch_destination(&mut combined, &destination)?;
+        }
+        for git_dir in receivers {
+            let receiver = preflight(&git_dir)?;
+            let Some(paths) = receiver.repository.clone() else { continue };
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(config_refusal());
+            }
+            let mut command = base_git_command(&git_dir, &checked.executable);
+            command.args(CONFIG_ARGS);
+            let (success, config, _) = run_bounded(command, "git config", remaining, CONFIG_MAX_OUTPUT, None)?;
+            if !success || config.len() >= CONFIG_MAX_OUTPUT || config.last() != Some(&0) {
+                return Err(config_refusal());
+            }
+            let child = digest_of(&config, &paths.root, Default::default());
+            merge_repository_digest(&mut combined, &paths, &child);
+            hooks::merge(&mut combined, &receiver.hooks);
+            merge_sources(&mut combined, &receiver.sources)?;
+        }
+        if !combined.is_current() {
+            // A receiver file moved between reading and hashing: scan again.
+            continue;
+        }
         return Ok(combined);
     }
     Err(config_refusal())
+}
+
+/// Watches a push destination itself, not only the files inside it: a receiver
+/// repository created there after approval must revoke it before Git can run
+/// the new hooks. A destination that does not exist is watched as absent.
+fn watch_destination(stamp: &mut RepositoryStamp, destination: &Path) -> Result<(), String> {
+    let destination = local_path(destination)?;
+    if stamp.source_index.contains_key(&destination) {
+        return Ok(());
+    }
+    if stamp.sources.len() >= MAX_WATCHED_SOURCES {
+        return Err(config_refusal());
+    }
+    let state = std::fs::metadata(&destination).ok().map(|meta| (meta.len(), meta.modified().ok()));
+    let sources = std::sync::Arc::make_mut(&mut stamp.sources);
+    let index = std::sync::Arc::make_mut(&mut stamp.source_index);
+    index.insert(destination.clone(), sources.len());
+    sources.push(ConfigSource {
+        aliases: std::collections::HashSet::from([destination.clone()]),
+        path: destination,
+        state,
+        content: None,
+    });
+    Ok(())
+}
+
+/// Adds files that must stay untouched for the approval to hold.
+fn merge_sources(stamp: &mut RepositoryStamp, extra: &[ConfigSource]) -> Result<(), String> {
+    for source in extra {
+        let index = std::sync::Arc::make_mut(&mut stamp.source_index);
+        if index.contains_key(&source.path) {
+            continue;
+        }
+        let sources = std::sync::Arc::make_mut(&mut stamp.sources);
+        if sources.len() >= MAX_WATCHED_SOURCES {
+            return Err(config_refusal());
+        }
+        index.insert(source.path.clone(), sources.len());
+        sources.push(source.clone());
+    }
+    Ok(())
+}
+
+/// The local receiving repositories Git itself would contact, from the URLs it
+/// resolves: `git remote get-url` applies `insteadOf`/`pushInsteadOf`
+/// configuration (the user's own included) and never contacts anything.
+fn effective_local_destinations(
+    repository: &RepositoryPaths,
+    executable: &Path,
+    deadline: std::time::Instant,
+) -> Result<Vec<PathBuf>, String> {
+    const MAX_OUTPUT: usize = 64 * 1024;
+    let mut destinations = Vec::new();
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(config_refusal());
+    }
+    let mut command = base_git_command(&repository.root, executable);
+    command.args(["remote"]);
+    let (success, names, _) = run_bounded(command, "git remote", remaining, MAX_OUTPUT, None)?;
+    if !success {
+        return Ok(destinations);
+    }
+    for name in String::from_utf8_lossy(&names).lines().map(str::trim).filter(|name| !name.is_empty()) {
+        if destinations.len() >= MAX_LOCAL_DESTINATIONS {
+            return Err(config_refusal());
+        }
+        for push in [false, true] {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(config_refusal());
+            }
+            let mut command = base_git_command(&repository.root, executable);
+            command.args(["remote", "get-url"]);
+            if push {
+                command.arg("--push");
+            }
+            command.args(["--all", "--", name]);
+            let (success, urls, _) = run_bounded(command, "git remote get-url", remaining, MAX_OUTPUT, None)?;
+            if !success {
+                return Err(config_refusal());
+            }
+            for url in String::from_utf8_lossy(&urls).lines() {
+                if let Some(destination) = transport::local_destination(url, &repository.root)? {
+                    destinations.push(destination);
+                }
+            }
+        }
+    }
+    destinations.sort();
+    destinations.dedup();
+    Ok(destinations)
+}
+
+/// The git directory a push to `destination` runs its hooks in: push-triggered
+/// hooks always execute in `$GIT_DIR`, so the receiver is inspected there, and
+/// a relative `core.hooksPath` resolves from it.
+fn receiver_git_dir(
+    destination: &Path,
+    executable: &Path,
+    deadline: std::time::Instant,
+) -> Result<Option<PathBuf>, String> {
+    let destination = local_path(destination)?;
+    if !destination.is_dir() {
+        // Git would refuse the push; there is nothing for it to execute.
+        return Ok(None);
+    }
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(config_refusal());
+    }
+    let mut command = base_git_command(&destination, executable);
+    command.args(["rev-parse", "--absolute-git-dir"]);
+    let (success, stdout, _) = run_bounded(command, "git rev-parse", remaining, 64 * 1024, None)?;
+    if !success {
+        return Ok(None);
+    }
+    let text = String::from_utf8(stdout).map_err(|_| config_refusal())?;
+    let git_dir = local_path(Path::new(text.trim()))?;
+    Ok(git_dir.is_dir().then_some(git_dir))
 }
 
 fn merge_repository_digest(combined: &mut RepositoryStamp, repository: &RepositoryPaths, stamp: &RepositoryStamp) {
@@ -1020,6 +1194,7 @@ struct ConfigScan {
     git_dir: PathBuf,
     walk: Walk,
     hook_paths: HashMap<PathBuf, std::collections::HashSet<PathBuf>>,
+    local_transports: HashMap<PathBuf, std::collections::HashSet<PathBuf>>,
     hooks: Vec<hooks::HookSource>,
     hook_budget: hooks::Budget,
 }
@@ -1044,6 +1219,7 @@ impl ConfigScan {
             global_paths: Default::default(),
             walk: Walk::default(),
             hook_paths: Default::default(),
+            local_transports: Default::default(),
             hooks: Vec::new(),
             hook_budget: Default::default(),
         }
@@ -1136,6 +1312,18 @@ impl ConfigScan {
         };
         for (key, value) in config_paths(&text)? {
             if key == "submodule.path" {
+                continue;
+            }
+            if matches!(key.as_str(), "remote.url" | "remote.pushurl") {
+                if let Some(target) = transport::local_destination(&value, &self.cwd)? {
+                    self.local_transports.entry(self.cwd.clone()).or_default().insert(target);
+                }
+                continue;
+            }
+            if matches!(key.as_str(), "branch.remote" | "branch.pushremote" | "remote.pushdefault") {
+                if value == "." {
+                    self.local_transports.entry(self.cwd.clone()).or_default().insert(self.cwd.clone());
+                }
                 continue;
             }
             if key == "core.worktree" {
@@ -1276,6 +1464,11 @@ fn config_paths(text: &str) -> Result<Vec<(String, String)>, String> {
                 | "core.worktree"
                 | "core.hookspath"
                 | "submodule.path"
+                | "remote.url"
+                | "remote.pushurl"
+                | "branch.remote"
+                | "branch.pushremote"
+                | "remote.pushdefault"
         ) {
             if value.is_empty() {
                 // An empty include target is nonsense; an empty `core.*`
@@ -1716,6 +1909,9 @@ fn inspect_metadata(repository: &RepositoryPaths, scan: &mut ConfigScan, depth: 
     let mut hook_paths = scan.hook_paths.get(&repository.root).cloned().unwrap_or_default();
     hook_paths.insert(repository.common_dir.join("hooks"));
     for path in hook_paths {
+        if scan.hooks.iter().any(|source| source.watches(repository, &path)) {
+            continue;
+        }
         scan.hooks.push(hooks::HookSource::read(repository, &path, &mut scan.hook_budget)?);
     }
     // Watch HEAD as well: includeIf.onbranch can change its selected source
@@ -1759,6 +1955,19 @@ fn inspect_metadata(repository: &RepositoryPaths, scan: &mut ConfigScan, depth: 
                     }
                     inspect_metadata(&child, scan, depth + 1)?;
                 }
+            }
+        }
+    }
+    // A filesystem push runs receive-pack as this Windows user. Its hooks are
+    // local code too, including relative core.hooksPath resolved from git_dir.
+    // Reuse the same bounded config/metadata/hook walk and cycle detection.
+    let destinations = scan.local_transports.get(&repository.root).cloned().unwrap_or_default();
+    for destination in destinations {
+        let destination = scan.source(&destination)?;
+        if let Some(mut receiver) = discover_repository(&destination, scan)? {
+            if same_path(&receiver.root, &destination) {
+                receiver.root = receiver.git_dir.clone();
+                inspect_metadata(&receiver, scan, depth + 1)?;
             }
         }
     }
@@ -1869,6 +2078,7 @@ fn preflight(cwd: &Path) -> Result<std::sync::Arc<Preflight>, String> {
                     scan.repository_keys.clear();
                     scan.repositories.clear();
                     scan.hook_paths.clear();
+                    scan.local_transports.clear();
                     scan.hooks.clear();
                     scan.hook_budget = Default::default();
                     scan.metadata_dirs.clear();
@@ -3290,7 +3500,7 @@ pub fn apply_hunks(root: &Path, file: &FileDiff, selection: &[usize], from_index
 
 /// Fetches and prunes the remote of the current branch (git resolves it).
 pub fn fetch(root: &Path) -> Result<String, String> {
-    let remote = branch_remote(root, &current_branch(root)?, false)?;
+    let remote = transport_remote(root, &current_branch(root)?, false)?;
     run_git_timeout(root, &["fetch", "--no-tags", "--quiet", "--prune", "--", &remote], GIT_TIMEOUT_NETWORK)
         .map(|_| strings_fetch_done(&remote))
 }
@@ -3314,6 +3524,20 @@ fn branch_remote(root: &Path, branch: &str, pushing: bool) -> Result<String, Str
     Ok(remote)
 }
 
+fn transport_remote(root: &Path, branch: &str, pushing: bool) -> Result<String, String> {
+    let remote = branch_remote(root, branch, pushing)?;
+    // Branch selectors are remote names, not raw URLs or executable transports.
+    // Status/log may still resolve an absent remote without opening a transport.
+    if remote != "." && !run_git(root, &["remote"])?.lines().any(|name| name == remote) {
+        return Err(crate::strings::pick(
+            "The selected Git remote is not configured.",
+            "Выбранный remote Git не настроен.",
+        )
+        .to_owned());
+    }
+    Ok(remote)
+}
+
 fn current_branch(root: &Path) -> Result<String, String> {
     let branch = run_git(root, &["rev-parse", "--abbrev-ref", "HEAD"])?.trim().to_owned();
     if branch.is_empty() || branch == "HEAD" {
@@ -3329,8 +3553,8 @@ fn strings_fetch_done(remote: &str) -> String {
 /// Pushes the current branch, setting the upstream when it has none.
 pub fn push(root: &Path) -> Result<String, String> {
     let branch = current_branch(root)?;
+    let remote = transport_remote(root, &branch, true)?;
     if run_git(root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]).is_err() {
-        let remote = branch_remote(root, &branch, true)?;
         run_git_timeout(
             root,
             &[
