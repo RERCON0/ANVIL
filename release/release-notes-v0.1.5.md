@@ -6,4 +6,4 @@
 
 Windows x64 portable: extract the complete archive, keeping conpty.dll, OpenConsole.exe, the helper EXE and licenses alongside anvil.exe. Includes a signed manifest.
 
-Dependency updates and remaining upstream notices: [review](https://github.com/RERCON0/ANVIL/blob/main/docs/DEPENDENCY-REVIEW-2026-10-25.md).
+Dependency updates and remaining upstream notices: [review](https://github.com/RERCON0/ANVIL/blob/main/docs/DEPENDENCIES.md).

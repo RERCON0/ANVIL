@@ -47,3 +47,13 @@ have full SHA pins. ConPTY source archive/publisher provenance is recorded
 under `vendor/conpty`; Seti inputs and historical generator limits are described
 under `vendor/seti`. Build scripts are trusted locked Cargo inputs, not sandboxed
 code. An exact root-crate version range would not remove that trust boundary.
+
+## Dependency review, 2026-10-25
+
+- No open GitHub Dependabot security alerts at review time. Version-update PRs are separate from security findings.
+- RUSTSEC-2026-0386: upgrade Tokio to 1.53.3. The affected AsyncFd API is Unix-only; ANVIL runs on Windows.
+- Replace yanked clipboard-win 5.4.1 with 5.4.3.
+- RUSTSEC-2024-0449: unsafe-libyaml 0.2.11 is an unmaintained transitive parser dependency, not an open vulnerability. Keep parser limits and review removal when migrating its parent configuration parser.
+- Dependabot PRs #6/#7/#8 are routine version proposals (graphics stack, arboard, json5), not open security alerts. Graphics upgrades need the coupled egui/glow compatibility checks described in DEPENDENCIES.md. They are not merged as part of this patch release merely to clear the update list.
+
+Verdict: Dependabot version PRs are useful maintenance leads, but an empty alert list does not replace an up-to-date RustSec audit. Findings above are checked against the actual dependency graph and application use. Informational maintenance notices are tracked with their migration trigger.
