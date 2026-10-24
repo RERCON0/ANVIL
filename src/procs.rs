@@ -230,6 +230,76 @@ fn process_command_line(pid: u32) -> Option<String> {
     }
 }
 
+/// MSYS `exec` can replace a transient sh.exe with a native npm launcher.
+/// Its Windows parent then disappears, while MSYS still knows the shell that
+/// owns it. Reconnect those edges using POSIX PIDs mapped to live Windows PIDs.
+fn apply_msys_parents(procs: &mut [ProcInfo], listing: &str) {
+    let rows: HashMap<u32, (u32, u32, &str)> = listing
+        .lines()
+        .filter_map(|line| {
+            let mut columns = line.split_whitespace();
+            let pid = columns.next()?.parse().ok()?;
+            let ppid = columns.next()?.parse().ok()?;
+            let _pgid: u32 = columns.next()?.parse().ok()?;
+            let winpid = columns.next()?.parse().ok()?;
+            let tty = columns.next()?;
+            Some((pid, (ppid, winpid, tty)))
+        })
+        .collect();
+    let live: HashSet<u32> = procs.iter().map(|process| process.pid).collect();
+    let parents: HashMap<u32, u32> = rows
+        .values()
+        .filter_map(|&(ppid, winpid, tty)| {
+            let &(_, parent, parent_tty) = rows.get(&ppid)?;
+            (winpid != parent && tty != "?" && tty == parent_tty && live.contains(&winpid) && live.contains(&parent))
+                .then_some((winpid, parent))
+        })
+        .collect();
+    for process in procs {
+        if let Some(&parent) = parents.get(&process.pid) {
+            process.ppid = parent;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn repair_git_bash_parents(procs: &mut [ProcInfo]) -> Option<()> {
+    if !procs.iter().any(|process| process.name.eq_ignore_ascii_case("bash.exe")) {
+        return Some(());
+    }
+    // Use the registered Git installation, as the profile menu does. Never
+    // resolve a process-listing executable through a project's cwd or PATH.
+    let Some(profile) = crate::profiles::detect_builtin()
+        .into_iter()
+        .find(|profile| profile.kind == crate::profiles::ProfileKind::GitBash)
+    else {
+        return Some(());
+    };
+    let Some(root) = std::path::Path::new(&profile.command).parent().and_then(std::path::Path::parent) else {
+        return Some(());
+    };
+    let ps = root.join("usr/bin/ps.exe");
+    let mut command = std::process::Command::new(ps);
+    command.arg("-e");
+    let (success, stdout, _) = crate::process::run_bounded(
+        command,
+        "Git Bash process list",
+        std::time::Duration::from_secs(2),
+        256 * 1024,
+        None,
+    )
+    .ok()?;
+    if !success {
+        return None;
+    }
+    let listing = String::from_utf8_lossy(&stdout);
+    if !listing.lines().any(|line| line.split_whitespace().take(4).eq(["PID", "PPID", "PGID", "WINPID"])) {
+        return None;
+    }
+    apply_msys_parents(procs, &listing);
+    Some(())
+}
+
 /// All processes, via a Toolhelp snapshot. `None` when the snapshot itself
 /// failed — an empty list and "could not enumerate" are different answers, and
 /// callers that decide what is dead must not read the second as the first.
@@ -259,6 +329,9 @@ pub fn snapshot() -> Option<Vec<ProcInfo>> {
         }
         CloseHandle(snap);
     }
+    // A failed MSYS enumeration is a partial snapshot, not proof that its
+    // agents exited. Callers retain their last successful detection and retry.
+    repair_git_bash_parents(&mut out)?;
     Some(out)
 }
 
@@ -268,6 +341,45 @@ mod tests {
 
     fn p(pid: u32, ppid: u32, name: &str) -> ProcInfo {
         ProcInfo { pid, ppid, name: name.to_owned(), command_line: None }
+    }
+
+    #[test]
+    fn msys_exec_keeps_an_npm_codex_attached_to_its_own_pane() {
+        let mut processes = vec![
+            p(10, 1, "bash.exe"),
+            p(11, 10, "bash.exe"),
+            p(20, 1, "bash.exe"),
+            p(30, 999, "sh.exe"),
+            p(40, 30, "node.exe"),
+            p(50, 40, "codex.exe"),
+        ];
+        assert_eq!(ProcessIndex::new(&processes).primary_cli(10), None, "the transient Windows parent is gone");
+        apply_msys_parents(
+            &mut processes,
+            " PID PPID PGID WINPID TTY UID STIME COMMAND\n\
+              100 1 100 11 cons0 1000 10:00:00 /usr/bin/bash\n\
+              200 100 200 40 cons0 1000 10:00:01 /c/Program Files/nodejs/node\n\
+              300 1 300 20 cons1 1000 10:00:00 /usr/bin/bash\n",
+        );
+        let index = ProcessIndex::new(&processes);
+        assert_eq!(index.primary_cli(10), Some("codex"));
+        assert_eq!(index.primary_cli(20), None, "another pane must not acquire this conversation");
+        assert!(index.cli_names(10).contains("codex"));
+    }
+
+    #[test]
+    fn msys_parent_repair_requires_live_pids_and_the_same_terminal() {
+        let mut processes = vec![p(10, 1, "bash.exe"), p(20, 99, "node.exe"), p(30, 99, "node.exe")];
+        let original = processes.clone();
+        apply_msys_parents(
+            &mut processes,
+            "bad input\n\
+             100 1 100 10 cons0 1000 10:00:00 /usr/bin/bash\n\
+             200 100 200 20 cons1 1000 10:00:01 /node\n\
+             300 400 300 30 cons2 1000 10:00:01 /node\n\
+             400 1 400 999 cons2 1000 10:00:00 /usr/bin/bash\n",
+        );
+        assert_eq!(processes, original);
     }
 
     #[test]

@@ -51,7 +51,9 @@ bypass flag. Unknown names are ignored. A missing CLI or unavailable folder
 shows an error rather than resuming from another directory.
 
 Shell aliases such as `cx` are detected through the actual agent process, not
-the typed command. The process list is refreshed before saving on window exit,
+the typed command. Git Bash's process table reconnects npm launchers whose
+temporary Windows parent disappeared during MSYS `exec`. The process list is
+refreshed before saving on window exit,
 to avoid missing an agent launched since the last background poll. A failed
 enumeration keeps the last known detection. Alias arguments and
 permission-bypass flags are not replayed.
@@ -306,6 +308,11 @@ entries. API data determines usage windows, resets, balances or spending.
   variables or user Claude env. Repository config is not searched for tokens.
   OAuth refresh remains the CLI's responsibility. Claude/ChatGPT quota queries
   require subscription OAuth; API keys do not substitute. Zen uses Console OAuth.
+- OMP is optional: a working login in any supported source, including OpenCode,
+  is enough. After HTTP 401/403, ANVIL tries the next distinct key or login in
+  the same cycle and remembers refused credentials until they change. Network
+  failures, 429s and format errors do not switch accounts. Source credentials
+  are never rewritten.
 - Other provider keys can be stored in Windows Credential Manager under
   `anvil/quota/<provider>`. They are absent from config/cache JSON. This is a
   Windows account boundary, not isolation from other software of the same user.

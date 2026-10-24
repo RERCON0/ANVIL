@@ -109,7 +109,7 @@ pub enum Detection {
     /// An existing store failed to read; retain the previous row and retry.
     Unreadable,
     Found(Credential),
-    /// Only expired logins were found: nothing may be requested with them.
+    /// Only expired or previously refused logins were found.
     Expired {
         source: Source,
         marker: u64,
@@ -346,7 +346,11 @@ fn codex_cli(env: &CredEnv) -> Option<Credential> {
     Some(found)
 }
 
-fn omp(env: &CredEnv, providers: &[&str], accept: Accept) -> Option<Credential> {
+fn unusable(found: &Credential, env: &CredEnv, refused: &[u64]) -> bool {
+    refused.contains(&found.marker) || found.expires_at.is_some_and(|at| at <= env.now + EXPIRY_MARGIN)
+}
+
+fn omp(env: &CredEnv, providers: &[&str], accept: Accept, refused: &[u64]) -> Option<Credential> {
     const SQL: &str = "SELECT credential_type, data FROM auth_credentials \
                        WHERE disabled_cause IS NULL AND provider = ?1 ORDER BY updated_at DESC, id DESC";
     let sqlite = env.sqlite.as_deref()?;
@@ -358,7 +362,7 @@ fn omp(env: &CredEnv, providers: &[&str], accept: Accept) -> Option<Credential> 
             let Ok(Value::Object(mut data)) = serde_json::from_str::<Value>(&row[1]) else { continue };
             data.insert("type".into(), Value::String(row[0].clone()));
             if let Some(found) = from_entry(&Value::Object(data), Source::Omp, accept) {
-                if found.expires_at.is_some_and(|at| at <= env.now + EXPIRY_MARGIN) {
+                if unusable(&found, env, refused) {
                     expired.get_or_insert(found);
                 } else {
                     return Some(found);
@@ -369,7 +373,7 @@ fn omp(env: &CredEnv, providers: &[&str], accept: Accept) -> Option<Credential> 
     expired
 }
 
-fn opencode2(env: &CredEnv, ids: &[&str], accept: Accept) -> Option<Credential> {
+fn opencode2(env: &CredEnv, ids: &[&str], accept: Accept, refused: &[u64]) -> Option<Credential> {
     const SQL: &str = "SELECT integration_id, value FROM credential \
                        WHERE integration_id = ?1 ORDER BY active DESC, time_updated DESC, id DESC";
     let sqlite = env.sqlite.as_deref()?;
@@ -380,7 +384,7 @@ fn opencode2(env: &CredEnv, ids: &[&str], accept: Accept) -> Option<Credential> 
             if let Some(found) =
                 serde_json::from_str(&row[1]).ok().and_then(|v: Value| from_entry(&v, Source::OpenCode, accept))
             {
-                if found.expires_at.is_some_and(|at| at <= env.now + EXPIRY_MARGIN) {
+                if unusable(&found, env, refused) {
                     expired.get_or_insert(found);
                 } else {
                     return Some(found);
@@ -391,14 +395,14 @@ fn opencode2(env: &CredEnv, ids: &[&str], accept: Accept) -> Option<Credential> 
     expired
 }
 
-fn opencode1(env: &CredEnv, ids: &[&str], accept: Accept) -> Option<Credential> {
+fn opencode1(env: &CredEnv, ids: &[&str], accept: Accept, refused: &[u64]) -> Option<Credential> {
     let value = read_json(&env.data_home()?.join("opencode").join("auth.json"))?;
     let mut expired = None;
     for id in ids {
         let Some(found) = value.get(*id).and_then(|entry| from_entry(entry, Source::OpenCode, accept)) else {
             continue;
         };
-        if found.expires_at.is_some_and(|at| at <= env.now + EXPIRY_MARGIN) {
+        if unusable(&found, env, refused) {
             expired.get_or_insert(found);
         } else {
             return Some(found);
@@ -532,26 +536,30 @@ fn key_spec(id: ProviderId) -> KeySpec {
 
 /// Candidate logins in priority order, produced lazily so a valid early one
 /// stops the search before a later file or database is touched.
-fn candidates(id: ProviderId, env: &CredEnv) -> Vec<Box<dyn Fn() -> Option<Credential> + '_>> {
+fn candidates<'a>(
+    id: ProviderId,
+    env: &'a CredEnv,
+    refused: &'a [u64],
+) -> Vec<Box<dyn Fn() -> Option<Credential> + 'a>> {
     let oauth_only = Accept { key: false, oauth: true };
     match id {
         ProviderId::Claude => vec![
             Box::new(move || claude_code(env)),
-            Box::new(move || omp(env, &["anthropic"], oauth_only)),
-            Box::new(move || opencode2(env, &["anthropic"], oauth_only)),
-            Box::new(move || opencode1(env, &["anthropic"], oauth_only)),
+            Box::new(move || omp(env, &["anthropic"], oauth_only, refused)),
+            Box::new(move || opencode2(env, &["anthropic"], oauth_only, refused)),
+            Box::new(move || opencode1(env, &["anthropic"], oauth_only, refused)),
         ],
         // Zen's billing answers the OpenCode Console login only; OMP's
         // `opencode-zen` entry is a model-gateway key and cannot read it.
         ProviderId::OpencodeZen => vec![
-            Box::new(move || opencode2(env, &["opencode"], oauth_only)),
-            Box::new(move || opencode1(env, &["opencode"], oauth_only)),
+            Box::new(move || opencode2(env, &["opencode"], oauth_only, refused)),
+            Box::new(move || opencode1(env, &["opencode"], oauth_only, refused)),
         ],
         ProviderId::ChatGpt => vec![
             Box::new(move || codex_cli(env)),
-            Box::new(move || omp(env, &["openai-codex"], oauth_only)),
-            Box::new(move || opencode2(env, &["openai", "codex", "chatgpt"], oauth_only)),
-            Box::new(move || opencode1(env, &["openai", "codex", "chatgpt"], oauth_only)),
+            Box::new(move || omp(env, &["openai-codex"], oauth_only, refused)),
+            Box::new(move || opencode2(env, &["openai", "codex", "chatgpt"], oauth_only, refused)),
+            Box::new(move || opencode1(env, &["openai", "codex", "chatgpt"], oauth_only, refused)),
         ],
         _ => {
             let spec = key_spec(id);
@@ -562,25 +570,40 @@ fn candidates(id: ProviderId, env: &CredEnv) -> Vec<Box<dyn Fn() -> Option<Crede
             vec![
                 Box::new(move || env.own_keys.get(&id).cloned().map(|key| credential(key, Source::AnvilKey))),
                 Box::new(move || {
-                    spec.env
-                        .iter()
-                        .find_map(|name| env.var(name).map(|key| credential(key.to_owned(), Source::Env(name))))
+                    let mut rejected = None;
+                    for name in spec.env {
+                        if let Some(key) = env.var(name) {
+                            let found = credential(key.to_owned(), Source::Env(name));
+                            if unusable(&found, env, refused) {
+                                rejected.get_or_insert(found);
+                            } else {
+                                return Some(found);
+                            }
+                        }
+                    }
+                    rejected
                 }),
                 Box::new(move || claude_settings(env, spec.hosts)),
-                Box::new(move || omp(env, spec.omp, accept)),
-                Box::new(move || opencode2(env, spec.opencode, accept)),
-                Box::new(move || opencode1(env, spec.opencode, accept)),
+                Box::new(move || omp(env, spec.omp, accept, refused)),
+                Box::new(move || opencode2(env, spec.opencode, accept, refused)),
+                Box::new(move || opencode1(env, spec.opencode, accept, refused)),
             ]
         }
     }
 }
 
 pub fn detect(id: ProviderId, env: &CredEnv) -> Detection {
+    detect_ignoring(id, env, &[])
+}
+
+/// A revoked key in one CLI must not hide a working login in another store.
+/// Only fingerprints are supplied; source files are never edited or copied.
+pub fn detect_ignoring(id: ProviderId, env: &CredEnv, refused: &[u64]) -> Detection {
     env.read_failed.set(false);
     let mut expired = None;
-    for candidate in candidates(id, env) {
+    for candidate in candidates(id, env, refused) {
         let Some(found) = candidate() else { continue };
-        if found.expires_at.is_some_and(|at| at <= env.now + EXPIRY_MARGIN) {
+        if unusable(&found, env, refused) {
             expired.get_or_insert(Detection::Expired { source: found.source, marker: found.marker });
             continue;
         }
@@ -703,6 +726,76 @@ mod tests {
         e.own_keys.insert(ProviderId::Zai, "from-anvil".into());
         assert_eq!(found(detect(ProviderId::Zai, &e)).source, Source::AnvilKey);
         assert!(matches!(detect(ProviderId::Zhipu, &e), Detection::Missing), "Z.ai's key is not Zhipu's");
+    }
+
+    #[test]
+    fn a_revoked_omp_key_does_not_hide_a_rotated_opencode_key() {
+        let home = tempfile::tempdir().unwrap();
+        let mut e = env(home.path());
+        let sqlite = Arc::new(Sqlite::load().expect("system SQLite required for this regression"));
+        let db = home.path().join(".omp/agent/agent.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        sqlite.exec_for_test(
+            &db,
+            "CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY, provider TEXT, credential_type TEXT,
+                data TEXT, disabled_cause TEXT, updated_at INTEGER);
+             INSERT INTO auth_credentials VALUES (1, 'deepseek', 'api_key', '{\"key\":\"revoked\"}', NULL, 1);",
+        );
+        e.sqlite = Some(sqlite);
+        let auth = home.path().join(".local/share/opencode/auth.json");
+        let current = r#"{"deepseek":{"type":"api","key":"current"}}"#;
+        write(&auth, current);
+        let original_db = std::fs::read(&db).unwrap();
+        let rejected = found(detect(ProviderId::DeepSeek, &e));
+        assert_eq!(rejected.source, Source::Omp);
+        let working = found(detect_ignoring(ProviderId::DeepSeek, &e, &[rejected.marker]));
+        assert_eq!((working.secret.expose(), working.source), ("current", Source::OpenCode));
+        assert!(matches!(
+            detect_ignoring(ProviderId::DeepSeek, &e, &[rejected.marker, working.marker]),
+            Detection::Expired { .. }
+        ));
+        assert_eq!(std::fs::read(&db).unwrap(), original_db, "discovery must never rewrite another CLI's store");
+        assert_eq!(std::fs::read_to_string(&auth).unwrap(), current);
+        write(&auth, r#"{"deepseek":{"type":"api","key":"rotated-again"}}"#);
+        assert_eq!(
+            found(detect_ignoring(ProviderId::DeepSeek, &e, &[rejected.marker, working.marker])).secret.expose(),
+            "rotated-again",
+            "only OpenCode needs to receive a new key"
+        );
+    }
+
+    #[test]
+    fn refused_logins_do_not_mask_other_entries_in_the_same_store() {
+        let home = tempfile::tempdir().unwrap();
+        let mut e = env(home.path());
+        e.vars.insert("ZAI_API_KEY".into(), "revoked-env".into());
+        e.vars.insert("ZAI_CODING_PLAN_API_KEY".into(), "working-env".into());
+        assert_eq!(
+            found(detect_ignoring(ProviderId::Zai, &e, &[marker("revoked-env")])).secret.expose(),
+            "working-env"
+        );
+        let sqlite = Arc::new(Sqlite::load().expect("system SQLite required for this regression"));
+        let db = home.path().join(".local/share/opencode/opencode.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        sqlite.exec_for_test(
+            &db,
+            "CREATE TABLE credential (id TEXT, integration_id TEXT, active INTEGER, value TEXT, time_updated INTEGER);
+             INSERT INTO credential VALUES ('a', 'deepseek', 1, '{\"type\":\"key\",\"key\":\"revoked-db\"}', 2);
+             INSERT INTO credential VALUES ('b', 'deepseek', 0, '{\"type\":\"key\",\"key\":\"working-db\"}', 1);",
+        );
+        e.sqlite = Some(sqlite);
+        assert_eq!(
+            found(detect_ignoring(ProviderId::DeepSeek, &e, &[marker("revoked-db")])).secret.expose(),
+            "working-db"
+        );
+        write(
+            &home.path().join(".local/share/opencode/auth.json"),
+            r#"{"openai":{"type":"oauth","access":"revoked-file"},"codex":{"type":"oauth","access":"working-file"}}"#,
+        );
+        assert_eq!(
+            found(detect_ignoring(ProviderId::ChatGpt, &e, &[marker("revoked-file")])).secret.expose(),
+            "working-file"
+        );
     }
 
     #[test]

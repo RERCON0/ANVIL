@@ -23,14 +23,37 @@ pub const INTERVAL: i64 = 30;
 pub const MANUAL_GAP: i64 = 30;
 /// An observing window retries the lock this often.
 const LEAD_RETRY: i64 = 30;
+/// Bound both persisted fingerprints and authentication attempts per cycle.
+const MAX_REFUSED: usize = 128;
+const MAX_AUTH_ATTEMPTS: usize = 8;
+
+fn read_refused<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<u64>, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Saved {
+        One(u64),
+        Many(Vec<u64>),
+    }
+    let mut markers = match <Option<Saved> as serde::Deserialize>::deserialize(deserializer)? {
+        Some(Saved::One(marker)) => vec![marker],
+        Some(Saved::Many(markers)) => markers,
+        None => Vec::new(),
+    };
+    if markers.len() > MAX_REFUSED {
+        markers.drain(..markers.len() - MAX_REFUSED);
+    }
+    Ok(markers)
+}
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct Memory {
     /// 429s in a row.
     failures: u32,
     paused_until: i64,
-    /// The login that was refused (401/403); not retried until it changes.
-    refused: Option<u64>,
+    /// Refused logins (401/403), including sources that precede a working one.
+    /// Older schedules stored one optional fingerprint under the same name.
+    #[serde(default, deserialize_with = "read_refused")]
+    refused: Vec<u64>,
 }
 
 /// `Some(true)`/`Some(false)`: switched on/off by the user; `None`: automatic.
@@ -138,7 +161,7 @@ impl Engine {
         now: i64,
         prefs: &Prefs,
         previous: &Snapshot,
-        detect: impl Fn(ProviderId) -> Detection,
+        detect: impl Fn(ProviderId, &[u64]) -> Detection,
         fetch: impl Fn(ProviderId, &Credential) -> Result<Fetched, FetchError>,
     ) -> Snapshot {
         self.begin_cycle(now);
@@ -166,7 +189,7 @@ impl Engine {
         now: i64,
         prefs: &Prefs,
         previous: &Snapshot,
-        detect: &impl Fn(ProviderId) -> Detection,
+        detect: &impl Fn(ProviderId, &[u64]) -> Detection,
         fetch: &impl Fn(ProviderId, &Credential) -> Result<Fetched, FetchError>,
     ) -> Option<ProviderSnapshot> {
         {
@@ -193,74 +216,83 @@ impl Engine {
                 ..Memory::default()
             });
             let enabled = prefs.get(&id).copied().flatten().unwrap_or(true);
-            let entry = match detect(id) {
-                Detection::Missing => {
-                    *memory = Memory::default();
-                    None
-                }
-                Detection::Unreadable => {
-                    let state = if memory.paused_until > now {
-                        ProviderState::RateLimited { retry_at: memory.paused_until }
-                    } else {
-                        ProviderState::StoreUnreadable
-                    };
-                    Some(keep(state, old.map(|o| o.source.clone()).unwrap_or_default(), None))
-                }
-                Detection::Expired { source, .. } => Some(keep(ProviderState::AuthExpired, source.label(), None)),
-                Detection::Found(credential) => {
-                    let source = credential.source.label();
-                    let previous_state = old.map(|o| o.state.clone()).unwrap_or(ProviderState::Idle);
-                    if memory.refused.is_some_and(|m| m != credential.marker) {
-                        memory.refused = None;
+            let mut attempts = 0;
+            loop {
+                let entry = match detect(id, &memory.refused) {
+                    Detection::Missing => {
+                        *memory = Memory::default();
+                        None
                     }
-                    if !enabled {
-                        Some(keep(previous_state, source, credential.plan))
-                    } else if memory.refused.is_some() {
-                        Some(keep(ProviderState::AuthExpired, source, credential.plan))
-                    } else if memory.paused_until > now {
-                        Some(keep(
-                            ProviderState::RateLimited { retry_at: memory.paused_until },
-                            source,
-                            credential.plan,
-                        ))
-                    } else {
-                        match fetch(id, &credential) {
-                            Ok(fetched) => {
-                                memory.failures = 0;
-                                memory.paused_until = 0;
-                                let fetched = fetched.redacted(credential.secret.expose());
-                                Some(ProviderSnapshot {
-                                    id,
-                                    plan: fetched.plan.or(credential.plan),
-                                    source,
-                                    state: ProviderState::Ok,
-                                    windows: fetched.windows,
-                                    balances: fetched.balances,
-                                    fetched_at: Some(now),
-                                    checked_at: now,
-                                })
-                            }
-                            Err(error) => {
-                                // A provider's own error text is written to disk
-                                // and drawn in the GUI: a compromised or echoing
-                                // endpoint must not get the key onto either.
-                                let error = error.redacted(credential.secret.expose());
-                                let state = error.into_state(now, memory.failures);
-                                match &state {
-                                    ProviderState::AuthExpired => memory.refused = Some(credential.marker),
-                                    ProviderState::RateLimited { retry_at } => {
-                                        memory.failures = memory.failures.saturating_add(1);
-                                        memory.paused_until = *retry_at;
-                                    }
-                                    _ => memory.failures = 0,
+                    Detection::Unreadable => {
+                        let state = if memory.paused_until > now {
+                            ProviderState::RateLimited { retry_at: memory.paused_until }
+                        } else {
+                            ProviderState::StoreUnreadable
+                        };
+                        Some(keep(state, old.map(|o| o.source.clone()).unwrap_or_default(), None))
+                    }
+                    Detection::Expired { source, .. } => Some(keep(ProviderState::AuthExpired, source.label(), None)),
+                    Detection::Found(credential) => {
+                        let source = credential.source.label();
+                        let previous_state = old.map(|o| o.state.clone()).unwrap_or(ProviderState::Idle);
+                        if !enabled {
+                            Some(keep(previous_state, source, credential.plan))
+                        } else if memory.refused.contains(&credential.marker) {
+                            Some(keep(ProviderState::AuthExpired, source, credential.plan))
+                        } else if memory.paused_until > now {
+                            Some(keep(
+                                ProviderState::RateLimited { retry_at: memory.paused_until },
+                                source,
+                                credential.plan,
+                            ))
+                        } else {
+                            match fetch(id, &credential) {
+                                Ok(fetched) => {
+                                    memory.failures = 0;
+                                    memory.paused_until = 0;
+                                    let fetched = fetched.redacted(credential.secret.expose());
+                                    Some(ProviderSnapshot {
+                                        id,
+                                        plan: fetched.plan.or(credential.plan),
+                                        source,
+                                        state: ProviderState::Ok,
+                                        windows: fetched.windows,
+                                        balances: fetched.balances,
+                                        fetched_at: Some(now),
+                                        checked_at: now,
+                                    })
                                 }
-                                Some(keep(state, source, credential.plan))
+                                Err(error) => {
+                                    // A provider's own error text is written to disk
+                                    // and drawn in the GUI: a compromised or echoing
+                                    // endpoint must not get the key onto either.
+                                    let error = error.redacted(credential.secret.expose());
+                                    let state = error.into_state(now, memory.failures);
+                                    match &state {
+                                        ProviderState::AuthExpired => {
+                                            memory.refused.push(credential.marker);
+                                            if memory.refused.len() > MAX_REFUSED {
+                                                memory.refused.remove(0);
+                                            }
+                                            attempts += 1;
+                                            if attempts < MAX_AUTH_ATTEMPTS {
+                                                continue;
+                                            }
+                                        }
+                                        ProviderState::RateLimited { retry_at } => {
+                                            memory.failures = memory.failures.saturating_add(1);
+                                            memory.paused_until = *retry_at;
+                                        }
+                                        _ => memory.failures = 0,
+                                    }
+                                    Some(keep(state, source, credential.plan))
+                                }
                             }
                         }
                     }
-                }
-            };
-            entry
+                };
+                return entry;
+            }
         }
     }
 }
@@ -340,7 +372,7 @@ pub(super) fn run(shared: Arc<Shared>, paths: Paths, user_agent: String) {
                             now,
                             &prefs,
                             &previous,
-                            |id| creds::detect(id, &env),
+                            |id, refused| creds::detect_ignoring(id, &env, refused),
                             |id, credential| providers::fetch(id, http as &dyn Http, credential, now),
                         )
                     }));
@@ -402,7 +434,7 @@ mod tests {
     fn every_detected_provider_is_polled_on_every_cycle() {
         let mut engine = Engine::default();
         let calls = std::cell::RefCell::new(Vec::new());
-        let detect = |id| {
+        let detect = |id, _: &[u64]| {
             if matches!(id, ProviderId::Claude | ProviderId::Zai) {
                 login(1)
             } else {
@@ -432,7 +464,7 @@ mod tests {
     fn a_rate_limit_pauses_one_provider_without_slowing_the_rest() {
         let mut engine = Engine::default();
         let calls = std::cell::RefCell::new(Vec::new());
-        let detect = |id| {
+        let detect = |id, _: &[u64]| {
             if matches!(id, ProviderId::Claude | ProviderId::ChatGpt | ProviderId::Kimi) {
                 login(1)
             } else {
@@ -520,8 +552,8 @@ mod tests {
         assert!(!std::fs::read_to_string(&paths.schedule).unwrap().contains("secret"));
     }
 
-    fn only(id: ProviderId, detection: impl Fn() -> Detection) -> impl Fn(ProviderId) -> Detection {
-        move |asked| if asked == id { detection() } else { Detection::Missing }
+    fn only(id: ProviderId, detection: impl Fn() -> Detection) -> impl Fn(ProviderId, &[u64]) -> Detection {
+        move |asked, _: &[u64]| if asked == id { detection() } else { Detection::Missing }
     }
 
     fn ok() -> Result<Fetched, FetchError> {
@@ -535,7 +567,7 @@ mod tests {
         let mut engine = Engine::default();
         assert!(!engine.due(1_000, Some(INTERVAL - 1), false), "another window fetched moments ago");
         assert!(engine.due(1_000, Some(INTERVAL), false));
-        engine.cycle(1_000, &Prefs::new(), &Snapshot::default(), |_| Detection::Missing, |_, _| ok());
+        engine.cycle(1_000, &Prefs::new(), &Snapshot::default(), |_, _| Detection::Missing, |_, _| ok());
         assert!(!engine.due(1_000 + INTERVAL - 1, None, false));
         assert!(engine.due(1_000 + INTERVAL, None, false));
     }
@@ -567,7 +599,7 @@ mod tests {
     }
 
     fn run(engine: &mut Engine, now: i64) {
-        engine.cycle(now, &Prefs::new(), &Snapshot::default(), |_| Detection::Missing, |_, _| ok());
+        engine.cycle(now, &Prefs::new(), &Snapshot::default(), |_, _| Detection::Missing, |_, _| ok());
     }
 
     #[test]
@@ -697,6 +729,117 @@ mod tests {
     }
 
     #[test]
+    fn authentication_failure_uses_another_source_and_remembers_the_refusal_after_restart() {
+        let mut engine = Engine::default();
+        let logins: Vec<_> = [(1, Source::Omp), (2, Source::OpenCode)]
+            .into_iter()
+            .map(|(marker, source)| {
+                let Detection::Found(mut credential) = login(marker) else { unreachable!() };
+                credential.source = source;
+                credential
+            })
+            .collect();
+        let detect = |id, refused: &[u64]| {
+            if id != ProviderId::DeepSeek {
+                return Detection::Missing;
+            }
+            logins
+                .iter()
+                .find(|credential| !refused.contains(&credential.marker))
+                .cloned()
+                .map(Detection::Found)
+                .unwrap_or(Detection::Expired { source: Source::Omp, marker: 1 })
+        };
+        let calls = std::cell::RefCell::new(Vec::new());
+        let fetch = |_: ProviderId, credential: &Credential| {
+            calls.borrow_mut().push(credential.marker);
+            if credential.marker == 1 {
+                Err(FetchError::Status { code: 401, retry_after: None })
+            } else {
+                ok()
+            }
+        };
+        let first = engine.cycle(1_000, &Prefs::new(), &Snapshot::default(), detect, fetch);
+        assert_eq!(*calls.borrow(), [1, 2], "recover in the same cycle");
+        let row = first.get(ProviderId::DeepSeek).unwrap();
+        assert_eq!(row.state, ProviderState::Ok);
+        assert_eq!(row.source, Source::OpenCode.label());
+        let dir = tempfile::tempdir().unwrap();
+        let schedule = dir.path().join("schedule.json");
+        engine.save(&schedule);
+        let mut restarted = Engine::read(&schedule).unwrap();
+        calls.borrow_mut().clear();
+        let next = restarted.cycle(1_030, &Prefs::new(), &first, detect, fetch);
+        assert_eq!(*calls.borrow(), [2], "do not retry the revoked OMP key on every cycle or restart");
+        assert_eq!(next.get(ProviderId::DeepSeek).unwrap().state, ProviderState::Ok);
+    }
+
+    #[test]
+    fn transport_failures_and_rate_limits_do_not_switch_accounts() {
+        for error in [
+            FetchError::Network("offline".into()),
+            FetchError::Status { code: 429, retry_after: Some(60) },
+            FetchError::Status { code: 503, retry_after: None },
+            FetchError::Rejected("no coding plan".into()),
+        ] {
+            let mut engine = Engine::default();
+            let calls = Cell::new(0);
+            let error = std::cell::RefCell::new(Some(error));
+            engine.cycle(
+                1_000,
+                &Prefs::new(),
+                &Snapshot::default(),
+                only(ProviderId::DeepSeek, || login(1)),
+                |_, _| {
+                    calls.set(calls.get() + 1);
+                    Err(error.borrow_mut().take().expect("one request only"))
+                },
+            );
+            assert_eq!(calls.get(), 1);
+            assert!(engine.memory[&ProviderId::DeepSeek].refused.is_empty());
+        }
+    }
+
+    #[test]
+    fn auth_fallback_is_bounded_and_does_not_retry_a_failed_key() {
+        let mut engine = Engine::default();
+        let detect = |id, refused: &[u64]| {
+            if id != ProviderId::DeepSeek {
+                return Detection::Missing;
+            }
+            (1..=10)
+                .find(|marker| !refused.contains(marker))
+                .map(login)
+                .unwrap_or(Detection::Expired { source: Source::Omp, marker: 1 })
+        };
+        let calls = std::cell::RefCell::new(Vec::new());
+        let fetch = |_: ProviderId, credential: &Credential| {
+            calls.borrow_mut().push(credential.marker);
+            Err(FetchError::Status { code: 403, retry_after: None })
+        };
+        let first = engine.cycle(1_000, &Prefs::new(), &Snapshot::default(), detect, fetch);
+        assert_eq!(calls.borrow().len(), MAX_AUTH_ATTEMPTS);
+        calls.borrow_mut().clear();
+        let second = engine.cycle(1_030, &Prefs::new(), &first, detect, fetch);
+        assert_eq!(*calls.borrow(), [9, 10]);
+        calls.borrow_mut().clear();
+        engine.cycle(1_060, &Prefs::new(), &second, detect, fetch);
+        assert!(calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn old_refused_fingerprints_are_loaded_and_large_lists_are_bounded() {
+        let old: Memory = serde_json::from_str(r#"{"failures":0,"paused_until":0,"refused":42}"#).unwrap();
+        assert_eq!(old.refused, [42]);
+        let empty: Memory = serde_json::from_str(r#"{"failures":0,"paused_until":0,"refused":null}"#).unwrap();
+        assert!(empty.refused.is_empty());
+        let oversized = serde_json::json!({"failures":0,"paused_until":0,"refused":(0..1000).collect::<Vec<_>>()});
+        let bounded: Memory = serde_json::from_value(oversized).unwrap();
+        assert_eq!(bounded.refused.len(), MAX_REFUSED);
+        assert_eq!(bounded.refused.last(), Some(&999));
+    }
+
+    #[test]
     fn expired_logins_are_shown_without_a_request() {
         let mut engine = Engine::default();
         let detection = || Detection::Expired { source: Source::ClaudeCode, marker: 1 };
@@ -717,7 +860,7 @@ mod tests {
                 ok()
             }
         };
-        let s = engine.cycle(1, &Prefs::new(), &Snapshot::default(), |_| login(1), fetch);
+        let s = engine.cycle(1, &Prefs::new(), &Snapshot::default(), |_, _| login(1), fetch);
         assert_eq!(s.providers.len(), ProviderId::ALL.len());
         assert_eq!(s.get(ProviderId::Zai).unwrap().state, ProviderState::FormatError { reason: "bad".into() });
         assert!(s.providers.iter().filter(|p| p.id != ProviderId::Zai).all(|p| p.state == ProviderState::Ok));
