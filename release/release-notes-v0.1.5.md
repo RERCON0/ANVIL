@@ -5,3 +5,5 @@
 - Retry alternative credentials, including OpenCode, after HTTP 401/403: a stale OMP key no longer hides a valid key in another client.
 
 Windows x64 portable: extract the complete archive, keeping conpty.dll, OpenConsole.exe, the helper EXE and licenses alongside anvil.exe. Includes a signed manifest.
+
+Dependency updates and remaining upstream notices: [review](https://github.com/RERCON0/ANVIL/blob/main/docs/DEPENDENCY-REVIEW-2026-10-25.md).

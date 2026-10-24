@@ -9,6 +9,7 @@
   <a href="https://github.com/RERCON0/ANVIL/actions/workflows/security.yml"><img alt="Security" src="https://github.com/RERCON0/ANVIL/actions/workflows/security.yml/badge.svg?branch=main"></a>
   <a href="https://github.com/RERCON0/ANVIL/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/RERCON0/ANVIL?color=49b675"></a>
   <a href="https://github.com/RERCON0/ANVIL/releases"><img alt="Windows x64" src="https://img.shields.io/badge/Windows-x64-0078D4?logo=windows&logoColor=white"></a>
+  <a href="https://github.com/RERCON0/ANVIL/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/RERCON0/ANVIL/total?color=49b675"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/RERCON0/ANVIL?color=2f855a"></a>
   <a href="https://t.me/rercon"><img alt="Telegram" src="https://img.shields.io/badge/Telegram-@rercon-26A5E4?logo=telegram&logoColor=white"></a>
 </p>
