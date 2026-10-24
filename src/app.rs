@@ -393,7 +393,11 @@ impl AnvilApp {
         app
     }
 
-    pub fn window_attributes(&self, screens: &[(i32, i32, u32, u32)]) -> WindowAttributes {
+    pub fn window_attributes(
+        &self,
+        screens: &[(i32, i32, u32, u32)],
+        startup_monitor: Option<&winit::monitor::MonitorHandle>,
+    ) -> WindowAttributes {
         let mut attributes = Window::default_attributes()
             .with_title(strings::APP_TITLE)
             .with_decorations(false)
@@ -410,6 +414,24 @@ impl AnvilApp {
                 .with_maximized(self.window_maximized);
         } else {
             attributes = attributes.with_inner_size(winit::dpi::LogicalSize::new(1100.0, 640.0));
+        }
+        // Main launches start centered, including when a session has saved an
+        // off-center position. Extra windows keep their intentional cascade.
+        if !self.extra_window {
+            if let Some(monitor) = startup_monitor {
+                let size =
+                    attributes.inner_size.expect("initial window size").to_physical::<u32>(monitor.scale_factor());
+                let origin = monitor.position();
+                let available = monitor.size();
+                let coordinate = |origin: i32, available: u32, size: u32| {
+                    (origin as i64 + (available as i64 - size as i64).max(0) / 2)
+                        .clamp(i32::MIN as i64, i32::MAX as i64) as i32
+                };
+                attributes = attributes.with_position(winit::dpi::PhysicalPosition::new(
+                    coordinate(origin.x, available.width, size.width),
+                    coordinate(origin.y, available.height, size.height),
+                ));
+            }
         }
         attributes
     }

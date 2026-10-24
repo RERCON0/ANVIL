@@ -224,8 +224,11 @@ impl ApplicationHandler<UserEvent> for Host {
                 (p.x, p.y, s.width, s.height)
             })
             .collect();
+        let startup_monitor = event_loop.primary_monitor().or_else(|| event_loop.available_monitors().next());
         // SAFETY: called on the event-loop thread.
-        let gl = match unsafe { GlWindow::new(event_loop, self.app.window_attributes(&screens)) } {
+        let gl = match unsafe {
+            GlWindow::new(event_loop, self.app.window_attributes(&screens, startup_monitor.as_ref()))
+        } {
             Ok(gl) => gl,
             Err(error) => {
                 super::gui::show_initialization_error(&error);
