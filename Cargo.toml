@@ -25,8 +25,8 @@ path = "src/bin/anvil-probe.rs"
 test = false
 
 [dependencies]
-egui = { version = "0.36.2", default-features = false, features = ["default_fonts"] }
-egui_glow = { version = "0.36.2", features = ["winit", "clipboard", "links"] }
+egui = { version = "0.37.0", default-features = false, features = ["default_fonts"] }
+egui_glow = { version = "0.37.0", features = ["winit", "clipboard", "links"] }
 winit = { version = "0.30.5", default-features = false, features = ["rwh_06"] }
 glutin = "0.32"
 glutin-winit = "0.5"
